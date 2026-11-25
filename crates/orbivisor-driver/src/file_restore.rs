@@ -44,8 +44,10 @@ use crate::error::DriverError;
 
 /// `run_dir`·`state_dir` 아래 파일 복원 디렉터리 이름
 pub const SUBDIR: &str = "file-restore";
-/// 도우미 QEMU의 systemd scope 이름 앞(`opl-fr-<id>.scope`)
-pub const UNIT_PREFIX: &str = "opl-fr-";
+/// 도우미 QEMU의 systemd scope 이름 앞(`orbivisor-fr-<id>.scope`). QEMU `-name`도 같은 앞이다.
+pub const UNIT_PREFIX: &str = "orbivisor-fr-";
+/// 이름 바꾸기(계획 74) 앞의 데몬이 쓰던 앞. 남은 도우미 치우기가 두 앞을 다 본다.
+pub const LEGACY_UNIT_PREFIX: &str = "opl-fr-";
 /// 콘솔 로그 상한(넘으면 지킴이가 비운다 — 게스트가 쓴 내용이라 디스크를 채우지 못하게)
 pub const CONSOLE_MAX: u64 = 1 << 20;
 /// 덮개·콘솔을 보는 간격(§9.4). 부팅 중(`Hello` 전)에도 본다 — 파티션 표·저널은 부팅 때 이미 해석된다.
@@ -1460,7 +1462,7 @@ fn check_launch(host: &HostProfile, launch: &HelperLaunch) -> Result<(), DriverE
 }
 
 /// 실제 도우미 VM을 띄운다(§7.4): 덮개를 만들고, 권한 내림·sandbox를 정하고, QEMU를 띄워(Linux systemd면
-/// `opl-fr-<id>.scope`) 에이전트 채널에 붙어 `Hello`를 `boot_timeout`까지 기다린다. `Hello`의 이미지 판이 검사한 이미지와
+/// `orbivisor-fr-<id>.scope`) 에이전트 채널에 붙어 `Hello`를 `boot_timeout`까지 기다린다. `Hello`의 이미지 판이 검사한 이미지와
 /// 같아야 한다. 실패하면 띄운 것을 끝내고 치운다(까닭에 로그의 마지막 줄).
 pub async fn start_helper(
     host: &HostProfile,
@@ -1802,7 +1804,7 @@ async fn monitor_qemu(mut m: Monitor) {
 }
 
 /// opld가 시작할 때 앞 프로세스의 도우미를 치운다(§10.5 — 세션은 이어 가지 않는다): `{run_dir}/file-restore/*/qemu.pid`의
-/// 살아 있는 QEMU(명령줄에 `opl-fr-<id>`)를 끝내고, 그 세션들의 `opl-fr-<id>.scope`를 멈추고, 두 `file-restore` 디렉터리를
+/// 살아 있는 QEMU(명령줄에 `orbivisor-fr-<id>`, 옛 `opl-fr-<id>`)를 끝내고, 그 세션들의 scope를 멈추고, 두 `file-restore` 디렉터리를
 /// 지운다. 이 opld의 디렉터리에 있는 세션만 건드린다 — 같은 호스트의 다른 opld(시험, 여러 인스턴스)의 도우미는 두지 않는다.
 /// 치운 세션 수다.
 pub async fn sweep_leftovers(run_dir: &Path, state_dir: &Path, systemd_scope: bool) -> usize {
@@ -1819,9 +1821,14 @@ pub async fn sweep_leftovers(run_dir: &Path, state_dir: &Path, systemd_scope: bo
     }
     for &id in &ids {
         let paths = HelperPaths::new(run_dir, state_dir, id);
-        let marker = format!("{UNIT_PREFIX}{id}");
+        let markers = [
+            format!("{UNIT_PREFIX}{id}"),
+            format!("{LEGACY_UNIT_PREFIX}{id}"),
+        ];
         // 명령줄로 알아본다(pid가 다른 프로세스에 다시 쓰였을 수 있다). 끝난 좀비도 명령줄이 없어 끝난 것으로 본다.
-        let ours = |pid: u32| crate::tpm::process_cmdline(pid).is_some_and(|c| c.contains(&marker));
+        let ours = |pid: u32| {
+            crate::tpm::process_cmdline(pid).is_some_and(|c| markers.iter().any(|m| c.contains(m)))
+        };
         if let Some(pid) = std::fs::read_to_string(paths.pid_file())
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
@@ -1855,10 +1862,13 @@ pub async fn sweep_leftovers(run_dir: &Path, state_dir: &Path, systemd_scope: bo
     ids.len()
 }
 
-/// 세션들의 scope 이름(`opl-fr-<id>.scope`) — 치우기는 제 디렉터리에서 찾은 세션의 것만 멈춘다(모든 `opl-fr-*`가 아니라).
+/// 세션들의 scope 이름(`orbivisor-fr-<id>.scope`와 옛 `opl-fr-<id>.scope`) — 치우기는 제 디렉터리에서 찾은 세션의 것만
+/// 멈춘다(모든 `orbivisor-fr-*`가 아니라).
 fn session_scopes(ids: &std::collections::BTreeSet<Uuid>) -> Vec<String> {
     ids.iter()
-        .map(|id| format!("{UNIT_PREFIX}{id}.scope"))
+        .flat_map(|id| {
+            [UNIT_PREFIX, LEGACY_UNIT_PREFIX].map(|prefix| format!("{prefix}{id}.scope"))
+        })
         .collect()
 }
 

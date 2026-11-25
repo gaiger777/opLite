@@ -106,21 +106,27 @@ impl Drop for Diagnostics {
             "ovs-appctl",
             &[
                 "-t",
-                "/run/opl/ovn/nb.ctl",
+                "/run/orbivisor/ovn/nb.ctl",
                 "cluster/status",
                 "OVN_Northbound",
             ],
         );
-        show("ovn-sbctl", &["--db=unix:/run/opl/ovn/sb.sock", "show"]);
-        show("ovn-nbctl", &["--db=unix:/run/opl/ovn/nb.sock", "show"]);
+        show(
+            "ovn-sbctl",
+            &["--db=unix:/run/orbivisor/ovn/sb.sock", "show"],
+        );
+        show(
+            "ovn-nbctl",
+            &["--db=unix:/run/orbivisor/ovn/nb.sock", "show"],
+        );
         show(
             "systemctl",
             &[
                 "status",
                 "--no-pager",
-                "opl-ovn-nb",
-                "opl-ovn-sb",
-                "opl-ovn-northd",
+                "orbivisor-ovn-nb",
+                "orbivisor-ovn-sb",
+                "orbivisor-ovn-northd",
                 "ovn-controller",
             ],
         );
@@ -131,17 +137,17 @@ impl Drop for Diagnostics {
                 "-n",
                 "80",
                 "-u",
-                "opl-ovn-nb",
+                "orbivisor-ovn-nb",
                 "-u",
-                "opl-ovn-sb",
+                "orbivisor-ovn-sb",
                 "-u",
-                "opl-ovn-northd",
+                "orbivisor-ovn-northd",
                 "-u",
                 "ovn-controller",
             ],
         );
         for log in ["ovn-nb.log", "ovn-sb.log", "ovn-northd.log"] {
-            show("tail", &["-n", "40", &format!("/var/log/opl/{log}")]);
+            show("tail", &["-n", "40", &format!("/var/log/orbivisor/{log}")]);
         }
         show("tail", &["-n", "40", "/var/log/ovn/ovn-controller.log"]);
         let log = std::fs::read_to_string(&self.opld_log).unwrap_or_default();
@@ -280,7 +286,7 @@ impl Drop for Server {
 #[tokio::test(flavor = "multi_thread")]
 async fn orbivisord_sets_up_ovn() {
     assert!(
-        !std::path::Path::new("/etc/opl/ovn").exists(),
+        !std::path::Path::new("/etc/orbivisor/ovn").exists(),
         "this host already has an Orbivisor OVN"
     );
     let mut d = Daemon::new("node1", "[sdn]\nrefresh_secs = 5\n");
@@ -310,8 +316,8 @@ async fn orbivisord_sets_up_ovn() {
     assert!(release.starts_with("24.03."), "{release}");
     assert_eq!(status["tasks"], json!([]), "{status}");
     let known = KnownCids {
-        nb: db_cid("/var/lib/opl/ovn/nb.db"),
-        sb: db_cid("/var/lib/opl/ovn/sb.db"),
+        nb: db_cid("/var/lib/orbivisor/ovn/nb.db"),
+        sb: db_cid("/var/lib/orbivisor/ovn/sb.db"),
     };
     assert!(known.nb.is_some() && known.sb.is_some(), "{status}");
 
@@ -337,13 +343,13 @@ async fn orbivisord_sets_up_ovn() {
         assert_eq!(state.trim(), "masked", "{unit}");
     }
     assert_eq!(
-        std::fs::read_to_string("/etc/opl/ovn/distro-units").unwrap(),
+        std::fs::read_to_string("/etc/orbivisor/ovn/distro-units").unwrap(),
         "ovn-central.service\novn-northd.service\novn-ovsdb-server-nb.service\novn-ovsdb-server-sb.service\n"
     );
     for unit in [
-        "opl-ovn-nb.service",
-        "opl-ovn-sb.service",
-        "opl-ovn-northd.service",
+        "orbivisor-ovn-nb.service",
+        "orbivisor-ovn-sb.service",
+        "orbivisor-ovn-northd.service",
     ] {
         assert_eq!(
             run("systemctl", &["is-active", unit]).trim(),
@@ -374,21 +380,21 @@ async fn orbivisord_sets_up_ovn() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     };
-    assert_eq!(mode("/etc/opl/ovn"), 0o700);
-    assert_eq!(mode("/etc/opl/ovn/node.key"), 0o600);
+    assert_eq!(mode("/etc/orbivisor/ovn"), 0o700);
+    assert_eq!(mode("/etc/orbivisor/ovn/node.key"), 0o600);
 
     // 클러스터 CA mTLS: 노드 인증서만 붙는다.
     let node_tls = (
-        "/etc/opl/ovn/node.key",
-        "/etc/opl/ovn/node.crt",
-        "/etc/opl/ovn/ca.crt",
+        "/etc/orbivisor/ovn/node.key",
+        "/etc/orbivisor/ovn/node.crt",
+        "/etc/orbivisor/ovn/ca.crt",
     );
     let (ok, err) = ovsdb_client(Some(node_tls), "ssl:127.0.0.1:6641");
     assert!(ok, "{err}");
     let dir = tempfile::tempdir().unwrap();
     let (key, cert, ca) = foreign_tls(dir.path());
     let (ok, _) = ovsdb_client(
-        Some((&key, &cert, "/etc/opl/ovn/ca.crt")),
+        Some((&key, &cert, "/etc/orbivisor/ovn/ca.crt")),
         "ssl:127.0.0.1:6641",
     );
     assert!(!ok, "a certificate of another CA was accepted");
@@ -402,7 +408,7 @@ async fn orbivisord_sets_up_ovn() {
         let out = run(
             "ovn-sbctl",
             &[
-                "--db=unix:/run/opl/ovn/sb.sock",
+                "--db=unix:/run/orbivisor/ovn/sb.sock",
                 "--format=json",
                 "--columns=name",
                 "list",
@@ -426,7 +432,7 @@ async fn orbivisord_sets_up_ovn() {
     let encap: Value = serde_json::from_str(&run(
         "ovn-sbctl",
         &[
-            "--db=unix:/run/opl/ovn/sb.sock",
+            "--db=unix:/run/orbivisor/ovn/sb.sock",
             "--format=json",
             "--columns=chassis_name,ip,type",
             "list",
@@ -484,8 +490,8 @@ async fn orbivisord_sets_up_ovn() {
         assert!(parse_version(&out).is_some(), "{out}");
     }
     for (db, ctl) in [
-        (Db::Nb, "/run/opl/ovn/nb.ctl"),
-        (Db::Sb, "/run/opl/ovn/sb.ctl"),
+        (Db::Nb, "/run/orbivisor/ovn/nb.ctl"),
+        (Db::Sb, "/run/orbivisor/ovn/sb.ctl"),
     ] {
         let out = run("ovs-appctl", &["-t", ctl, "cluster/status", db.name()]);
         eprintln!("cluster/status {}:\n{out}", db.name());
@@ -536,7 +542,9 @@ async fn orbivisord_sets_up_ovn() {
     // 2. 다시 하기: 이미 된 일은 건너뛴다(DB를 다시 만들지 않는다).
     let inode = || {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata("/var/lib/opl/ovn/nb.db").unwrap().ino()
+        std::fs::metadata("/var/lib/orbivisor/ovn/nb.db")
+            .unwrap()
+            .ino()
     };
     let created = inode();
     let c = client(&d);
@@ -665,26 +673,29 @@ async fn orbivisord_sets_up_ovn() {
     run(
         "ovn-nbctl",
         &[
-            "--db=unix:/run/opl/ovn/nb.sock",
+            "--db=unix:/run/orbivisor/ovn/nb.sock",
             "ls-add",
             "opl-test-after-leave",
         ],
     );
     assert!(
-        run("ovn-nbctl", &["--db=unix:/run/opl/ovn/nb.sock", "ls-list"])
-            .contains("opl-test-after-leave")
+        run(
+            "ovn-nbctl",
+            &["--db=unix:/run/orbivisor/ovn/nb.sock", "ls-list"]
+        )
+        .contains("opl-test-after-leave")
     );
     run(
         "ovn-nbctl",
         &[
-            "--db=unix:/run/opl/ovn/nb.sock",
+            "--db=unix:/run/orbivisor/ovn/nb.sock",
             "ls-del",
             "opl-test-after-leave",
         ],
     );
 
     // 4. 에이전트: 멈춘 단위를 다시 켜고, 장치 없는 이 클러스터의 OVS 포트를 지운다(남의 포트는 둔다).
-    run("systemctl", &["stop", "opl-ovn-northd.service"]);
+    run("systemctl", &["stop", "orbivisor-ovn-northd.service"]);
     run("ip", &["tuntap", "add", "opltest0", "mode", "tap"]);
     run(
         "ovs-vsctl",
@@ -720,7 +731,7 @@ async fn orbivisord_sets_up_ovn() {
         "the agent to restart northd and remove the stale port",
         AGENT_WAIT,
         || async {
-            let active = try_run("systemctl", &["is-active", "opl-ovn-northd.service"]).1;
+            let active = try_run("systemctl", &["is-active", "orbivisor-ovn-northd.service"]).1;
             let ports = run("ovs-vsctl", &["list-ports", "br-int"]);
             active.trim() == "active" && !ports.lines().any(|p| p == "opltest0")
         },
@@ -759,7 +770,7 @@ async fn orbivisord_sets_up_ovn() {
     assert!(token.starts_with(&format!("{term}:")), "{token} {sync}");
     // 관리자가 만든 태그 없는 스위치는 남는다.
     let nbctl = |args: &[&str]| {
-        let mut all = vec!["--db=unix:/run/opl/ovn/nb.sock"];
+        let mut all = vec!["--db=unix:/run/orbivisor/ovn/nb.sock"];
         all.extend_from_slice(args);
         run("ovn-nbctl", &all)
     };
@@ -790,7 +801,7 @@ async fn orbivisord_sets_up_ovn() {
     writer.transact(NB_DB, back).await.unwrap();
     nbctl(&["ls-del", &ls_a]);
     let sbctl = |args: &[&str]| {
-        let mut all = vec!["--db=unix:/run/opl/ovn/sb.sock"];
+        let mut all = vec!["--db=unix:/run/orbivisor/ovn/sb.sock"];
         all.extend_from_slice(args);
         run("ovn-sbctl", &all)
     };
@@ -831,7 +842,7 @@ async fn orbivisord_sets_up_ovn() {
     };
     d.stop();
     assert_eq!(
-        run("systemctl", &["is-active", "opl-ovn-nb.service"]).trim(),
+        run("systemctl", &["is-active", "orbivisor-ovn-nb.service"]).trim(),
         "active"
     );
     nbctl(&["ls-del", &ls_a]);
@@ -901,9 +912,9 @@ fn lockdown_shape(tag: &str, on: bool) -> Result<(), String> {
     let mine = [me];
     let locked: &[IpAddr] = if on { &mine } else { &[] };
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
-    let config = std::path::Path::new("/etc/opl/ovn/sb.json");
+    let config = std::path::Path::new("/etc/orbivisor/ovn/sb.json");
     if on {
-        if read("/etc/opl/ovn/sb.json") != orbivisor_driver::ovn::sb_config(me, &paths) {
+        if read("/etc/orbivisor/ovn/sb.json") != orbivisor_driver::ovn::sb_config(me, &paths) {
             return Err("sb.json".into());
         }
         let mode = std::fs::metadata(config).unwrap().permissions().mode() & 0o777;
@@ -913,12 +924,12 @@ fn lockdown_shape(tag: &str, on: bool) -> Result<(), String> {
     } else if config.exists() {
         return Err("sb.json is still there".into());
     }
-    if read("/etc/systemd/system/opl-ovn-sb.service")
+    if read("/etc/systemd/system/orbivisor-ovn-sb.service")
         != orbivisor_driver::ovn::db_unit(Db::Sb, me, on, &paths)
     {
         return Err("the SB unit".into());
     }
-    if read("/etc/systemd/system/opl-ovn-northd.service")
+    if read("/etc/systemd/system/orbivisor-ovn-northd.service")
         != orbivisor_driver::ovn::northd_unit(&[me], locked, &paths)
     {
         return Err("the northd unit".into());
@@ -950,9 +961,9 @@ fn sb_as_node(port: u16, args: &[&str]) -> (bool, String) {
     let db = format!("--db=ssl:127.0.0.1:{port}");
     let mut all = vec![
         db.as_str(),
-        "--private-key=/etc/opl/ovn/node.key",
-        "--certificate=/etc/opl/ovn/node.crt",
-        "--ca-cert=/etc/opl/ovn/ca.crt",
+        "--private-key=/etc/orbivisor/ovn/node.key",
+        "--certificate=/etc/orbivisor/ovn/node.crt",
+        "--ca-cert=/etc/orbivisor/ovn/ca.crt",
         "--timeout=20",
     ];
     all.extend_from_slice(args);
@@ -975,7 +986,11 @@ async fn lockdown_section(d: &Daemon, tag: &str, node: &str) {
     lockdown_shape(tag, true).unwrap();
     let remotes = run(
         "ovs-appctl",
-        &["-t", "/run/opl/ovn/sb.ctl", "ovsdb-server/list-remotes"],
+        &[
+            "-t",
+            "/run/orbivisor/ovn/sb.ctl",
+            "ovsdb-server/list-remotes",
+        ],
     );
     eprintln!("PROBE SB list-remotes under lockdown:\n{remotes}");
     let nft = run("nft", &["list", "table", "inet", &format!("opl_ovn_{tag}")]);
@@ -983,7 +998,7 @@ async fn lockdown_section(d: &Daemon, tag: &str, node: &str) {
 
     // RBAC: 남의 chassis(이름이 UUID가 아니라 에이전트 청소가 두는 것)를 로컬 소켓으로 만든다.
     let sbctl = |args: &[&str]| {
-        let mut all = vec!["--db=unix:/run/opl/ovn/sb.sock"];
+        let mut all = vec!["--db=unix:/run/orbivisor/ovn/sb.sock"];
         all.extend_from_slice(args);
         run("ovn-sbctl", &all)
     };
@@ -1035,14 +1050,18 @@ async fn lockdown_section(d: &Daemon, tag: &str, node: &str) {
     run(
         "ovn-nbctl",
         &[
-            "--db=unix:/run/opl/ovn/nb.sock",
+            "--db=unix:/run/orbivisor/ovn/nb.sock",
             "--timeout=60",
             "--wait=hv",
             "sync",
         ],
     );
     assert_eq!(
-        run("ovn-appctl", &["-t", "/run/opl/ovn/northd.ctl", "status"]).trim(),
+        run(
+            "ovn-appctl",
+            &["-t", "/run/orbivisor/ovn/northd.ctl", "status"]
+        )
+        .trim(),
         "Status: active"
     );
 
@@ -1064,7 +1083,7 @@ async fn lockdown_section(d: &Daemon, tag: &str, node: &str) {
     run(
         "ovn-nbctl",
         &[
-            "--db=unix:/run/opl/ovn/nb.sock",
+            "--db=unix:/run/orbivisor/ovn/nb.sock",
             "--timeout=60",
             "--wait=hv",
             "sync",
@@ -1104,7 +1123,7 @@ fn set_ovs_id(key: &str, value: &str) {
 
 /// `ovn-nbctl --bare get …`(없거나 실패하면 빈 글). 식별자가 아닌 글(숫자로 시작하는 UUID 따위)의 따옴표는 뗀다.
 fn nb_get(args: &[&str]) -> String {
-    let mut all = vec!["--db=unix:/run/opl/ovn/nb.sock", "--bare", "get"];
+    let mut all = vec!["--db=unix:/run/orbivisor/ovn/nb.sock", "--bare", "get"];
     all.extend_from_slice(args);
     let (ok, out, _) = try_run("ovn-nbctl", &all);
     if ok {
@@ -1639,7 +1658,7 @@ async fn dhcp_section(d: &Daemon, tag: &str) {
 
 /// OVN 소켓으로 부르는 `ovn-sbctl`·`ovn-nbctl`의 `--bare` 출력(앞뒤 공백 없이)
 fn ovn_bare(program: &str, sock: &str, args: &[&str]) -> String {
-    let db = format!("--db=unix:/run/opl/ovn/{sock}.sock");
+    let db = format!("--db=unix:/run/orbivisor/ovn/{sock}.sock");
     let mut all = vec![db.as_str(), "--bare"];
     all.extend_from_slice(args);
     run(program, &all).trim().to_string()
@@ -2890,7 +2909,7 @@ fn service_monitors() -> std::collections::BTreeMap<String, String> {
     let out = run(
         "ovn-sbctl",
         &[
-            "--db=unix:/run/opl/ovn/sb.sock",
+            "--db=unix:/run/orbivisor/ovn/sb.sock",
             "--format=json",
             "--columns=ip,port,status",
             "list",
@@ -3023,7 +3042,10 @@ async fn services_section(d: &Daemon, tag: &str) {
         "load balancers: {:?}\nhealth checks: {:?}",
         rows.load_balancers, rows.health_checks
     );
-    show("ovn-nbctl", &["--db=unix:/run/opl/ovn/nb.sock", "lb-list"]);
+    show(
+        "ovn-nbctl",
+        &["--db=unix:/run/orbivisor/ovn/nb.sock", "lb-list"],
+    );
 
     // 다른 서브넷의 클라이언트(분산 DNAT): 두 멤버가 모두 답한다.
     wait_for("the VIP to answer from lb-t2", AGENT_WAIT, || async {
@@ -3237,7 +3259,7 @@ async fn services_section(d: &Daemon, tag: &str) {
     eprintln!("qos rows: {:?}", qos_rows().await);
     show(
         "ovn-nbctl",
-        &["--db=unix:/run/opl/ovn/nb.sock", "list", "QoS"],
+        &["--db=unix:/run/orbivisor/ovn/nb.sock", "list", "QoS"],
     );
     show("ovs-ofctl", &["-O", "OpenFlow15", "dump-meters", "br-int"]);
     let out50 = iperf("oplb1", &c.2, false);

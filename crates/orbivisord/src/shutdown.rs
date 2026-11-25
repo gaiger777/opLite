@@ -107,7 +107,7 @@ mod tests {
                 HostShutdown::Reboot,
             ),
             (String::new(), HostShutdown::None),
-            (job("opld.service", "stop"), HostShutdown::None),
+            (job("orbivisord.service", "stop"), HostShutdown::None),
             (job("apt-daily.service", "start"), HostShutdown::None),
             // start가 아닌 작업은 호스트 종료가 아니다.
             (job("reboot.target", "stop"), HostShutdown::None),

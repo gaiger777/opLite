@@ -95,10 +95,10 @@ impl Host {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let paths = OvnPaths {
-            etc: root.join("etc/opl/ovn"),
-            var_lib: root.join("var/lib/opl/ovn"),
-            run: root.join("run/opl/ovn"),
-            log: root.join("var/log/opl"),
+            etc: root.join("etc/orbivisor/ovn"),
+            var_lib: root.join("var/lib/orbivisor/ovn"),
+            run: root.join("run/orbivisor/ovn"),
+            log: root.join("var/log/orbivisor"),
             systemd: root.join("etc/systemd/system"),
             pki: root.join("pki"),
             schemas: root.join("usr/share/ovn"),
@@ -167,7 +167,7 @@ impl Host {
                 self.fake().reply(
                     &format!(
                         "ovsdb-tool db-cid {}",
-                        self.p(&format!("var/lib/opl/ovn/{file}"))
+                        self.p(&format!("var/lib/orbivisor/ovn/{file}"))
                     ),
                     CmdOutput::ok(format!("{cid}\n")),
                 );
@@ -180,14 +180,14 @@ impl Host {
         self.fake().reply(
             &format!(
                 "ovs-appctl --timeout 5 -t {} cluster/status",
-                self.p("run/opl/ovn/nb.ctl")
+                self.p("run/orbivisor/ovn/nb.ctl")
             ),
             CmdOutput::ok(nb),
         );
         self.fake().reply(
             &format!(
                 "ovs-appctl --timeout 5 -t {} cluster/status",
-                self.p("run/opl/ovn/sb.ctl")
+                self.p("run/orbivisor/ovn/sb.ctl")
             ),
             CmdOutput::ok(sb),
         );
@@ -408,19 +408,22 @@ async fn init_sets_up_the_first_central_and_chassis() {
     assert_eq!((status.pending, status.last_error), (None, None));
 
     // DB는 제자리에, 단위는 노드 주소에만 듣는다.
-    assert!(h.root.join("var/lib/opl/ovn/nb.db").exists());
-    assert!(h.root.join("var/lib/opl/ovn/sb.db").exists());
-    let unit =
-        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-nb.service")).unwrap();
+    assert!(h.root.join("var/lib/orbivisor/ovn/nb.db").exists());
+    assert!(h.root.join("var/lib/orbivisor/ovn/sb.db").exists());
+    let unit = std::fs::read_to_string(h.root.join("etc/systemd/system/orbivisor-ovn-nb.service"))
+        .unwrap();
     assert!(unit.contains("--remote=pssl:6641:127.0.0.1 "), "{unit}");
-    let northd =
-        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    let northd = std::fs::read_to_string(
+        h.root
+            .join("etc/systemd/system/orbivisor-ovn-northd.service"),
+    )
+    .unwrap();
     assert!(
         northd.contains("--ovnsb-db=ssl:127.0.0.1:6642 "),
         "{northd}"
     );
     assert_eq!(
-        std::fs::read_to_string(h.root.join("etc/opl/ovn/node.key")).unwrap(),
+        std::fs::read_to_string(h.root.join("etc/orbivisor/ovn/node.key")).unwrap(),
         "node.key"
     );
     assert_eq!(
@@ -536,8 +539,8 @@ async fn init_address_and_underlay() {
         .await;
     assert_eq!(state(&done), "succeeded", "{done}");
     assert_eq!(s.sdn().centrals[0].address, ip("10.2.0.7"));
-    let unit =
-        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+    let unit = std::fs::read_to_string(h.root.join("etc/systemd/system/orbivisor-ovn-sb.service"))
+        .unwrap();
     assert!(unit.contains("--remote=pssl:6642:10.2.0.7 "), "{unit}");
 }
 
@@ -631,8 +634,11 @@ async fn central_add_joins_the_cluster() {
         [ip("10.0.0.9"), ip("127.0.0.1")]
     );
     assert_eq!(status.pending, None);
-    let northd =
-        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    let northd = std::fs::read_to_string(
+        h.root
+            .join("etc/systemd/system/orbivisor-ovn-northd.service"),
+    )
+    .unwrap();
     assert!(
         northd.contains("--ovnnb-db=ssl:10.0.0.9:6641,ssl:127.0.0.1:6641 "),
         "{northd}"
@@ -704,9 +710,9 @@ async fn central_remove_leaves_and_keeps_the_files() {
         sdn.id
     };
     assert_eq!(id, id2);
-    std::fs::create_dir_all(h.root.join("var/lib/opl/ovn")).unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    std::fs::create_dir_all(h.root.join("var/lib/orbivisor/ovn")).unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/sb.db"), "sb").unwrap();
     let left = CmdOutput {
         status: 2,
         stdout: b"unknown cluster\n".to_vec(),
@@ -716,7 +722,7 @@ async fn central_remove_leaves_and_keeps_the_files() {
         h.fake().reply_seq(
             &format!(
                 "ovs-appctl --timeout 5 -t {} cluster/status",
-                h.p(&format!("run/opl/ovn/{db}.ctl"))
+                h.p(&format!("run/orbivisor/ovn/{db}.ctl"))
             ),
             vec![CmdOutput::ok(FOLLOWER), left.clone()],
         );
@@ -734,10 +740,12 @@ async fn central_remove_leaves_and_keeps_the_files() {
     );
     assert_eq!(
         h.calls_of("systemctl disable"),
-        ["systemctl disable --now opl-ovn-nb.service opl-ovn-sb.service opl-ovn-northd.service"]
+        [
+            "systemctl disable --now orbivisor-ovn-nb.service orbivisor-ovn-sb.service orbivisor-ovn-northd.service"
+        ]
     );
-    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
-    let kept: Vec<String> = std::fs::read_dir(h.root.join("var/lib/opl/ovn"))
+    assert!(!h.root.join("var/lib/orbivisor/ovn/nb.db").exists());
+    let kept: Vec<String> = std::fs::read_dir(h.root.join("var/lib/orbivisor/ovn"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains(".left-"))
@@ -821,7 +829,7 @@ async fn sdn_tasks_have_no_timeout() {
     h.fake().reply_seq(
         &format!(
             "ovs-appctl --timeout 5 -t {} cluster/status",
-            h.p("run/opl/ovn/sb.ctl")
+            h.p("run/orbivisor/ovn/sb.ctl")
         ),
         seq,
     );
@@ -908,7 +916,7 @@ async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
         h.fake().reply(
             &format!(
                 "ovsdb-tool db-local-address {}",
-                h.p(&format!("var/lib/opl/ovn/{db}.db"))
+                h.p(&format!("var/lib/orbivisor/ovn/{db}.db"))
             ),
             CmdOutput::ok(format!("ssl:127.0.0.1:{port}\n")),
         );
@@ -917,7 +925,7 @@ async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
     let done = s.run_op(TaskOp::SdnInit { address: None }, id).await;
     assert_eq!(state(&done), "failed", "{done}");
     assert_eq!(h.calls_of("ovsdb-tool create-cluster").len(), 2);
-    let stops = || h.calls_of("systemctl disable --now opl-ovn").len();
+    let stops = || h.calls_of("systemctl disable --now orbivisor-ovn").len();
     assert_eq!(stops(), 0);
 
     h.status(NB_LEADER, SB_LEADER);
@@ -933,7 +941,7 @@ async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
     let creates = h.calls_of("ovsdb-tool create-cluster");
     assert_eq!(creates.len(), 4, "{creates:?}");
     assert!(creates[2].ends_with("ssl:10.2.0.7:6643"), "{creates:?}");
-    let kept: Vec<String> = std::fs::read_dir(h.root.join("var/lib/opl/ovn"))
+    let kept: Vec<String> = std::fs::read_dir(h.root.join("var/lib/orbivisor/ovn"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains(".left-"))
@@ -945,7 +953,7 @@ async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
     let calls = h.fake().calls();
     let stop = calls
         .iter()
-        .position(|c| c.starts_with("systemctl disable --now opl-ovn"))
+        .position(|c| c.starts_with("systemctl disable --now orbivisor-ovn"))
         .unwrap();
     let create = calls
         .iter()
@@ -981,10 +989,12 @@ async fn a_failed_central_add_leaves_the_cluster_again() {
         2
     );
     assert_eq!(
-        h.calls_of("systemctl disable --now opl-ovn"),
-        ["systemctl disable --now opl-ovn-nb.service opl-ovn-sb.service opl-ovn-northd.service"]
+        h.calls_of("systemctl disable --now orbivisor-ovn"),
+        [
+            "systemctl disable --now orbivisor-ovn-nb.service orbivisor-ovn-sb.service orbivisor-ovn-northd.service"
+        ]
     );
-    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
+    assert!(!h.root.join("var/lib/orbivisor/ovn/nb.db").exists());
     assert_eq!(s.sdn().centrals.len(), 1);
 }
 
@@ -994,16 +1004,16 @@ async fn a_half_joined_member_can_be_removed() {
     let s = Sdn::start().await;
     let h = &s.host;
     let id = s.create(s.ready()).await;
-    std::fs::create_dir_all(h.root.join("var/lib/opl/ovn")).unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    std::fs::create_dir_all(h.root.join("var/lib/orbivisor/ovn")).unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/sb.db"), "sb").unwrap();
     h.status(FOLLOWER, FOLLOWER);
     let task = s.task(TaskOp::SdnCentralRemove, id);
     s.hold(&task).await;
     let done = s.run(task).await;
     assert_eq!(state(&done), "succeeded", "{done}");
     assert!(error(&done).contains("half joined"), "{done}");
-    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
+    assert!(!h.root.join("var/lib/orbivisor/ovn/nb.db").exists());
     assert_eq!(s.sdn().centrals.len(), 1);
     assert_eq!(s.sdn().pending, None);
 }
@@ -1015,15 +1025,15 @@ async fn a_joining_member_is_retired_without_leaving() {
     let s = Sdn::start().await;
     let h = &s.host;
     let id = s.create(s.ready()).await;
-    std::fs::create_dir_all(h.root.join("var/lib/opl/ovn")).unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    std::fs::create_dir_all(h.root.join("var/lib/orbivisor/ovn")).unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/sb.db"), "sb").unwrap();
     let joining =
         include_str!("../../orbivisor-driver/src/ovn/fixtures/cluster-status-joining.txt");
     h.fake().reply(
         &format!(
             "ovs-appctl --timeout 5 -t {} cluster/status",
-            h.p("run/opl/ovn/nb.ctl")
+            h.p("run/orbivisor/ovn/nb.ctl")
         ),
         CmdOutput::ok(joining),
     );
@@ -1031,11 +1041,11 @@ async fn a_joining_member_is_retired_without_leaving() {
     h.fake().reply(
         &format!(
             "ovs-appctl --timeout 5 -t {} cluster/status",
-            h.p("run/opl/ovn/sb.ctl")
+            h.p("run/orbivisor/ovn/sb.ctl")
         ),
         CmdOutput::fail(1, "ovs-appctl: cannot connect"),
     );
-    let sb = h.p("var/lib/opl/ovn/sb.db");
+    let sb = h.p("var/lib/orbivisor/ovn/sb.db");
     h.fake().reply(
         &format!("ovsdb-tool db-cid {sb}"),
         CmdOutput::ok(format!("{sb}: cluster ID not yet known\n")),
@@ -1052,9 +1062,9 @@ async fn a_joining_member_is_retired_without_leaving() {
         "{:?}",
         h.fake().calls()
     );
-    assert_eq!(h.calls_of("systemctl disable --now opl-ovn").len(), 1);
-    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
-    assert!(!h.root.join("var/lib/opl/ovn/sb.db").exists());
+    assert_eq!(h.calls_of("systemctl disable --now orbivisor-ovn").len(), 1);
+    assert!(!h.root.join("var/lib/orbivisor/ovn/nb.db").exists());
+    assert!(!h.root.join("var/lib/orbivisor/ovn/sb.db").exists());
 }
 
 /// 리뷰 2 N-1·N-2: 살아 있는 중앙이 꺼진(지운) 노드의 Raft 주소를 NB·SB에서 내쫓고 중앙 목록과 지운 노드 기록에서 뺀다.
@@ -1100,7 +1110,7 @@ async fn a_live_central_kicks_a_dead_one_out() {
         h.fake().reply_seq(
             &format!(
                 "ovs-appctl --timeout 5 -t {} cluster/status",
-                h.p(&format!("run/opl/ovn/{db}.ctl"))
+                h.p(&format!("run/orbivisor/ovn/{db}.ctl"))
             ),
             vec![CmdOutput::ok(text.clone()), CmdOutput::ok(one(&text))],
         );
@@ -1192,11 +1202,15 @@ async fn locked_centrals_start_with_the_sb_config_file() {
     assert_eq!(state(&done), "succeeded", "{done}");
     let status = s.sdn();
     assert_eq!(status.lockdown.unwrap().applied, [s.env.node]);
-    let sb = std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+    let sb = std::fs::read_to_string(h.root.join("etc/systemd/system/orbivisor-ovn-sb.service"))
+        .unwrap();
     assert!(sb.contains("--config-file="), "{sb}");
-    assert!(h.root.join("etc/opl/ovn/sb.json").exists());
-    let northd =
-        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    assert!(h.root.join("etc/orbivisor/ovn/sb.json").exists());
+    let northd = std::fs::read_to_string(
+        h.root
+            .join("etc/systemd/system/orbivisor-ovn-northd.service"),
+    )
+    .unwrap();
     assert!(
         northd.contains("--ovnsb-db=ssl:127.0.0.1:6645 "),
         "{northd}"
@@ -1220,8 +1234,11 @@ async fn locked_centrals_start_with_the_sb_config_file() {
     s.hold(&task).await;
     let done = s.run(task).await;
     assert_eq!(state(&done), "succeeded", "{done}");
-    let northd =
-        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    let northd = std::fs::read_to_string(
+        h.root
+            .join("etc/systemd/system/orbivisor-ovn-northd.service"),
+    )
+    .unwrap();
     assert!(
         northd.contains("--ovnsb-db=ssl:10.0.0.9:6645,ssl:127.0.0.1:6645 "),
         "{northd}"
@@ -1233,8 +1250,8 @@ async fn locked_centrals_start_with_the_sb_config_file() {
     assert_eq!(applied, want);
 
     // 중앙 빼기는 잠긴 중앙에서도 뺀다.
-    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
-    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/orbivisor/ovn/sb.db"), "sb").unwrap();
     let left = CmdOutput {
         status: 2,
         stdout: b"unknown cluster\n".to_vec(),
@@ -1244,7 +1261,7 @@ async fn locked_centrals_start_with_the_sb_config_file() {
         h.fake().reply_seq(
             &format!(
                 "ovs-appctl --timeout 5 -t {} cluster/status",
-                h.p(&format!("run/opl/ovn/{db}.ctl"))
+                h.p(&format!("run/orbivisor/ovn/{db}.ctl"))
             ),
             vec![CmdOutput::ok(FOLLOWER), left.clone()],
         );

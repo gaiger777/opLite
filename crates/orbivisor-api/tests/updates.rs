@@ -471,7 +471,7 @@ async fn wait_for_polling(apt: &FakeApt) {
 fn unit_and_log(apt: &FakeApt, task: &Value) -> (String, std::path::PathBuf) {
     let id = task["id"].as_str().unwrap();
     (
-        format!("opl-upgrade-{}", id.replace('-', "")),
+        format!("orbivisor-upgrade-{}", id.replace('-', "")),
         apt.path("log").join(format!("upgrade-{id}.log")),
     )
 }
@@ -848,6 +848,45 @@ async fn a_restarted_opld_keeps_watching_the_upgrade_unit() {
     let done = admin.wait_task(&task).await;
     assert_eq!(done["status"]["state"], "succeeded", "{done}");
     assert_eq!(apt.calls().len(), 2);
+}
+
+/// 이름 바꾸기(계획 74) 앞의 데몬이 띄운 유닛(`opl-upgrade-…`)을 업그레이드된 데몬이 이어 본다.
+#[tokio::test]
+async fn a_restarted_daemon_keeps_watching_the_old_named_upgrade_unit() {
+    let apt = FakeApt::new();
+    let (env, task) = resume_upgrade(&apt, |id| {
+        apt.set(
+            &format!("unit.state.opl-upgrade-{}.service", id.simple()),
+            "active",
+        );
+        write_log(&apt, id, "opl-upgrade: start\n");
+    })
+    .await;
+    let admin = env.admin().await;
+    let id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+    let old = format!(
+        "show -p ActiveState -p Result -p LoadState opl-upgrade-{}.service",
+        id.simple()
+    );
+    eventually("the old unit to be polled", || {
+        (apt.lines("systemctl.calls")
+            .iter()
+            .filter(|c| **c == old)
+            .count()
+            >= 2)
+            .then_some(())
+    })
+    .await;
+    let (_, now) = admin.get(&format!("/tasks/{id}")).await;
+    assert_eq!(now["status"]["state"], "running", "{now}");
+    assert!(!apt.path("systemd-run.args").exists());
+
+    apt.set(
+        &format!("unit.state.opl-upgrade-{}.service", id.simple()),
+        "success",
+    );
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "succeeded", "{done}");
 }
 
 /// 셸이 시작했는데 종료 상태 줄 없이 사라졌으면(apt가 도중에 끊겼다) dpkg가 깨끗해도 실패다.

@@ -25,7 +25,7 @@ use super::status::{
     parse_interfaces, parse_ssl, parse_table, parse_version,
 };
 use super::units::{
-    Db, NORTHD_UNIT, db_unit, is_managed, northd_unit, remotes, sb_config, ssl_addr,
+    Db, NORTHD_UNIT, db_unit, is_managed, legacy_unit, northd_unit, remotes, sb_config, ssl_addr,
 };
 use crate::ceph::runner::{Cmd, CmdOutput, CommandRunner};
 use crate::error::DriverError;
@@ -88,13 +88,13 @@ impl From<DriverError> for OvnError {
 /// OVN 파일이 있는 자리들
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OvnPaths {
-    /// 노드 TLS 사본과 배포판 단위 기록(`/etc/opl/ovn`, 0700)
+    /// 노드 TLS 사본과 배포판 단위 기록(`/etc/orbivisor/ovn`, 0700)
     pub etc: PathBuf,
-    /// 중앙 DB(`/var/lib/opl/ovn/{nb,sb}.db`)
+    /// 중앙 DB(`/var/lib/orbivisor/ovn/{nb,sb}.db`)
     pub var_lib: PathBuf,
-    /// 중앙 제어 소켓·pid 파일(`/run/opl/ovn`)
+    /// 중앙 제어 소켓·pid 파일(`/run/orbivisor/ovn`)
     pub run: PathBuf,
-    /// 중앙 로그(`/var/log/opl`)
+    /// 중앙 로그(`/var/log/orbivisor`)
     pub log: PathBuf,
     /// Orbivisor 단위 파일을 두는 곳(`/etc/systemd/system`)
     pub systemd: PathBuf,
@@ -111,12 +111,12 @@ pub struct OvnPaths {
 impl Default for OvnPaths {
     fn default() -> Self {
         Self {
-            etc: "/etc/opl/ovn".into(),
-            var_lib: "/var/lib/opl/ovn".into(),
-            run: "/run/opl/ovn".into(),
-            log: "/var/log/opl".into(),
+            etc: "/etc/orbivisor/ovn".into(),
+            var_lib: "/var/lib/orbivisor/ovn".into(),
+            run: "/run/orbivisor/ovn".into(),
+            log: "/var/log/orbivisor".into(),
             systemd: "/etc/systemd/system".into(),
-            pki: "/var/lib/opl/pki".into(),
+            pki: "/var/lib/orbivisor/pki".into(),
             schemas: "/usr/share/ovn".into(),
             distro_nb_db: "/var/lib/ovn/ovnnb_db.db".into(),
             ovs_system_id: "/etc/openvswitch/system-id.conf".into(),
@@ -129,7 +129,7 @@ impl OvnPaths {
         self.var_lib.join(format!("{}.db", db.short()))
     }
 
-    /// root만 쓰는 로컬 소켓(디버깅: `ovn-nbctl --db=unix:/run/opl/ovn/nb.sock show`)
+    /// root만 쓰는 로컬 소켓(디버깅: `ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock show`)
     pub fn db_socket(&self, db: Db) -> PathBuf {
         self.run.join(format!("{}.sock", db.short()))
     }
@@ -301,7 +301,7 @@ impl OvnHost {
     ///
     /// - 로컬 OVS DB의 `external_ids:orbivisor-cluster`가 다른 태그, 또는 이 표시 없이 `ovn-remote`가 있음(꾸러미가
     ///   정한 무작위 `system-id`만 있는 것은 괜찮다 — 덮어쓴다)
-    /// - `/var/lib/opl/ovn/{nb,sb}.db`가 있고 그 클러스터 id가 `known`(Raft가 아는 것)과 다름. 합류 중인 DB(id를 아직
+    /// - `/var/lib/orbivisor/ovn/{nb,sb}.db`가 있고 그 클러스터 id가 `known`(Raft가 아는 것)과 다름. 합류 중인 DB(id를 아직
     ///   모름)는 `joining`일 때만 받는다.
     /// - 배포판 NB DB에 논리 스위치가 하나라도 있음, 또는 그 DB가 클러스터 DB임(꾸러미가 막 만든 빈 DB는 괜찮다)
     ///
@@ -726,6 +726,7 @@ impl OvnHost {
         centrals: &[IpAddr],
         locked: &[IpAddr],
     ) -> Result<Vec<String>, OvnError> {
+        self.adopt_legacy_units().await?;
         let me_locked = locked.contains(&address);
         let mut changed = Vec::new();
         let mut files: Vec<(String, String)> = Db::ALL
@@ -894,8 +895,52 @@ impl OvnHost {
         )))
     }
 
+    /// 이름 바꾸기(계획 74) 앞의 단위(`opl-ovn-*.service`)를 새 이름으로 옮긴다. 옛 파일이 Orbivisor 표시가 있는
+    /// 진짜 파일이면 새 이름 파일에 그 글을 쓰고(새 것이 없을 때), 옛 파일을 새 이름으로의 링크(별칭)로 바꾸고, enable
+    /// 링크(`multi-user.target.wants`)도 새 이름으로 옮긴 뒤 `daemon-reload`를 한 번 한다. 돌고 있는 서버는 멈추지 않는다
+    /// (systemd가 두 이름을 한 단위로 합친다). 글이 바뀌었는지와 다시 시작은 그 뒤 [`Self::write_units`]의 규칙대로다.
+    /// 옛 이름 링크는 남긴다. 옮긴 단위 이름(새 이름)을 돌려준다.
+    pub async fn adopt_legacy_units(&self) -> Result<Vec<String>, OvnError> {
+        let mut adopted = Vec::new();
+        let wants = self.paths.systemd.join("multi-user.target.wants");
+        for unit in central_units() {
+            let Some(old_name) = legacy_unit(&unit) else {
+                continue;
+            };
+            let old = self.paths.unit_file(&old_name);
+            let real = std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_file());
+            if !real {
+                continue;
+            }
+            let Some(text) = read_optional(&old)?.filter(|t| is_managed(t)) else {
+                continue;
+            };
+            let new = self.paths.unit_file(&unit);
+            if read_optional(&new)?.is_none() {
+                write_file(&new, text.as_bytes(), 0o644)?;
+            }
+            replace_with_link(&old, Path::new(&unit))?;
+            let old_wants = wants.join(&old_name);
+            if std::fs::symlink_metadata(&old_wants).is_ok() {
+                let new_wants = wants.join(&unit);
+                if std::fs::symlink_metadata(&new_wants).is_err() {
+                    std::os::unix::fs::symlink(&new, &new_wants)
+                        .map_err(|e| io_at(&new_wants, e))?;
+                }
+                remove_file(&old_wants)?;
+            }
+            adopted.push(unit);
+        }
+        if !adopted.is_empty() {
+            self.run_ok(&Cmd::new("systemctl", &["daemon-reload"]))
+                .await?;
+        }
+        Ok(adopted)
+    }
+
     /// Orbivisor 단위 셋을 켜고 부팅 때도 켜지게 한다. `restart`에 든 단위(파일이 바뀐 것)는 다시 시작한다.
     pub async fn start_central(&self, restart: &[String]) -> Result<(), OvnError> {
+        self.adopt_legacy_units().await?;
         let units = central_units();
         let mut args = vec!["enable".to_string()];
         args.extend(units.iter().cloned());
@@ -913,6 +958,7 @@ impl OvnHost {
 
     /// 멈춘 Orbivisor 단위를 다시 켠다(에이전트). 켠 단위 이름을 돌려준다.
     pub async fn ensure_central_running(&self) -> Result<Vec<String>, OvnError> {
+        self.adopt_legacy_units().await?;
         let mut started = Vec::new();
         for unit in central_units() {
             let active = self
@@ -930,6 +976,7 @@ impl OvnHost {
 
     /// Orbivisor 단위 셋을 멈추고 끈다(파일은 남긴다).
     pub async fn stop_central(&self) -> Result<(), OvnError> {
+        self.adopt_legacy_units().await?;
         let mut args = vec!["disable".to_string(), "--now".into()];
         args.extend(central_units());
         self.run_ok(&Cmd::new("systemctl", &args)).await.map(drop)
@@ -1583,6 +1630,16 @@ fn remove_file(path: &Path) -> Result<(), OvnError> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_at(path, e)),
         _ => Ok(()),
     }
+}
+
+/// `path`를 `target`으로의 심볼릭 링크로 바꾼다(임시 링크를 만들어 이름 바꾸기 — 어느 순간에도 `path`가 있다).
+fn replace_with_link(path: &Path, target: &Path) -> Result<(), OvnError> {
+    let tmp = temp_path(path);
+    std::os::unix::fs::symlink(target, &tmp).map_err(|e| io_at(&tmp, e))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io_at(path, e)
+    })
 }
 
 /// 디렉터리의 이름 바꾸기를 디스크에 쓴다(실패는 무시 — 다음 이름 바꾸기가 다시 한다).

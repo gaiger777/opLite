@@ -693,7 +693,7 @@ pub struct HelperDisk<'a> {
 /// 파일 복원 도우미 VM(계획 69 §7.4)의 인자 재료
 #[derive(Debug, Clone)]
 pub struct RestoreHelperArgs<'a> {
-    /// 세션 id(`-name opl-fr-<id>` — 남은 것 치우기가 명령줄로 알아본다)
+    /// 세션 id(`-name orbivisor-fr-<id>` — 남은 것 치우기가 명령줄로 알아본다)
     pub id: uuid::Uuid,
     pub arch: Arch,
     pub accel: crate::host::Accel,
@@ -730,7 +730,7 @@ pub fn build_restore_helper_cmdline(
         return Err(CmdlineError::TooManyHelperDisks(a.disks.len()));
     }
     let mut v = Args::default();
-    v.opt("-name", format!("opl-fr-{}", a.id));
+    v.opt("-name", format!("orbivisor-fr-{}", a.id));
     v.flag("-nodefaults");
     v.flag("-no-user-config");
     v.opt("-display", "none".into());
@@ -897,10 +897,10 @@ mod tests {
         let spec = x86_spec();
         let disk = |i: usize, pivoted| LiveRestoreDisk {
             source: LiveRestoreSource::Nbd {
-                socket: "/run/opl/bk.sock".into(),
+                socket: "/run/orbivisor/bk.sock".into(),
                 export: format!("disk{i}"),
             },
-            overlay: format!("/var/lib/opl/vm/x/lr-disk{i}.qcow2").into(),
+            overlay: format!("/var/lib/orbivisor/vm/x/lr-disk{i}.qcow2").into(),
             pivoted,
         };
         let args = build_live_restore_cmdline(
@@ -929,17 +929,17 @@ mod tests {
         let live = [
             LiveRestoreDisk {
                 source: LiveRestoreSource::Nbd {
-                    socket: "/run/opl/bk,1.sock".into(),
+                    socket: "/run/orbivisor/bk,1.sock".into(),
                     export: "disk0".into(),
                 },
-                overlay: "/var/lib/opl/vm/x/lr-disk0.qcow2".into(),
+                overlay: "/var/lib/orbivisor/vm/x/lr-disk0.qcow2".into(),
                 pivoted: false,
             },
             LiveRestoreDisk {
                 source: LiveRestoreSource::Qcow2 {
                     chain: vec!["/bk/b2/disk1.qcow2".into(), "/bk/b1/disk1.qcow2".into()],
                 },
-                overlay: "/var/lib/opl/vm/x/lr-disk1.qcow2".into(),
+                overlay: "/var/lib/orbivisor/vm/x/lr-disk1.qcow2".into(),
                 pivoted: false,
             },
         ];
@@ -952,15 +952,15 @@ mod tests {
             .collect();
         assert_eq!(
             blockdevs[0],
-            "driver=nbd,server.type=unix,server.path=/run/opl/bk,,1.sock,export=disk0,reconnect-delay=300,read-only=on,node-name=disk0-lrsrc"
+            "driver=nbd,server.type=unix,server.path=/run/orbivisor/bk,,1.sock,export=disk0,reconnect-delay=300,read-only=on,node-name=disk0-lrsrc"
         );
         assert_eq!(
             blockdevs[1],
-            "driver=qcow2,file.driver=file,file.filename=/var/lib/opl/vm/x/lr-disk0.qcow2,backing=disk0-lrsrc,node-name=disk0-lr"
+            "driver=qcow2,file.driver=file,file.filename=/var/lib/orbivisor/vm/x/lr-disk0.qcow2,backing=disk0-lrsrc,node-name=disk0-lr"
         );
         assert_eq!(
             blockdevs[2],
-            "driver=file,filename=/var/lib/opl/pools/local/web-01-root.qcow2,node-name=disk0-file"
+            "driver=file,filename=/var/lib/orbivisor/pools/local/web-01-root.qcow2,node-name=disk0-file"
         );
         assert_eq!(blockdevs[3], "driver=qcow2,file=disk0-file,node-name=disk0");
         // 옛 백업 체인은 backing을 명시한 json(자식 → 부모 → 끝은 null)
@@ -1011,8 +1011,8 @@ mod tests {
     #[test]
     fn replica_receiver_has_no_guest_devices() {
         let args = build_replica_receiver_cmdline(
-            Path::new("/run/opl/replica-x,y/qmp.sock"),
-            Path::new("/run/opl/replica-x,y/qemu.pid"),
+            Path::new("/run/orbivisor/replica-x,y/qmp.sock"),
+            Path::new("/run/orbivisor/replica-x,y/qemu.pid"),
         );
         assert_eq!(
             args,
@@ -1024,9 +1024,9 @@ mod tests {
                 "none",
                 "-S",
                 "-qmp",
-                "unix:/run/opl/replica-x,,y/qmp.sock,server=on,wait=off",
+                "unix:/run/orbivisor/replica-x,,y/qmp.sock,server=on,wait=off",
                 "-pidfile",
-                "/run/opl/replica-x,y/qemu.pid",
+                "/run/orbivisor/replica-x,y/qemu.pid",
             ]
         );
     }
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     fn paths() -> RuntimePaths {
-        RuntimePaths::new(Path::new("/run/opl"), Uuid::nil()).unwrap()
+        RuntimePaths::new(Path::new("/run/orbivisor"), Uuid::nil()).unwrap()
     }
 
     fn x86_spec() -> VmRuntimeSpec {
@@ -1069,7 +1069,7 @@ mod tests {
             machine: MachineType::Q35,
             disks: vec![
                 RuntimeDisk {
-                    path: "/var/lib/opl/pools/local/web-01-root.qcow2".into(),
+                    path: "/var/lib/orbivisor/pools/local/web-01-root.qcow2".into(),
                     kind: DiskKind::File,
                     rbd: None,
                     format: ImageFormat::Qcow2,
@@ -1077,7 +1077,7 @@ mod tests {
                     boot_order: Some(1),
                 },
                 RuntimeDisk {
-                    path: "/var/lib/opl/pools/local/web-01-data.raw".into(),
+                    path: "/var/lib/orbivisor/pools/local/web-01-data.raw".into(),
                     kind: DiskKind::File,
                     rbd: None,
                     format: ImageFormat::Raw,
@@ -1224,7 +1224,7 @@ mod tests {
     fn guest_agent_adds_a_qga_channel() {
         let qga = [
             "-chardev",
-            "socket,id=qga0,path=/run/opl/vm/00000000-0000-0000-0000-000000000000/qga.sock,server=on,wait=off",
+            "socket,id=qga0,path=/run/orbivisor/vm/00000000-0000-0000-0000-000000000000/qga.sock,server=on,wait=off",
             "-device",
             "virtio-serial-pci,id=qgaser",
             "-device",
@@ -1397,7 +1397,7 @@ mod tests {
         ));
         assert!(args.contains(&"driver=raw,file=disk1-file,node-name=disk1".to_string()));
         assert!(args.contains(
-            &"driver=file,filename=/var/lib/opl/pools/local/web-01-root.qcow2,node-name=disk0-file"
+            &"driver=file,filename=/var/lib/orbivisor/pools/local/web-01-root.qcow2,node-name=disk0-file"
                 .to_string()
         ));
     }
@@ -1454,7 +1454,7 @@ mod tests {
         spec.cpu.max_vcpus = Some(8);
         spec.memory_mib = 4096;
         spec.disks.push(RuntimeDisk {
-            path: "/var/lib/opl/pools/local/web-01-hot.qcow2".into(),
+            path: "/var/lib/orbivisor/pools/local/web-01-hot.qcow2".into(),
             kind: DiskKind::File,
             rbd: None,
             format: ImageFormat::Qcow2,
@@ -1694,7 +1694,7 @@ mod tests {
         ];
         spec.cloud_init = Some(seed());
         let with = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
-        let dir = "/run/opl/vm/00000000-0000-0000-0000-000000000000";
+        let dir = "/run/orbivisor/vm/00000000-0000-0000-0000-000000000000";
         assert_inserted_before_vnc(
             &with,
             &without,
@@ -1744,7 +1744,7 @@ mod tests {
         spec.cdroms = vec![cdrom(Some("/pools/iso/a,b.raw"), Some(2))];
         spec.cloud_init = Some(seed());
         let with = build_cmdline(&spec, &mac_host(), &paths()).unwrap();
-        let dir = "/run/opl/vm/00000000-0000-0000-0000-000000000000";
+        let dir = "/run/orbivisor/vm/00000000-0000-0000-0000-000000000000";
         assert_inserted_before_vnc(
             &with,
             &without,
@@ -1834,7 +1834,7 @@ mod tests {
             epoch: 0,
         });
         let sock =
-            "socket,id=chrtpm,path=/run/opl/vm/00000000-0000-0000-0000-000000000000/tpm.sock";
+            "socket,id=chrtpm,path=/run/orbivisor/vm/00000000-0000-0000-0000-000000000000/tpm.sock";
         for (spec, host, dev) in [
             (x86_spec(), x86_host(), "tpm-crb,tpmdev=tpm0"),
             (mac_spec(), mac_host(), "tpm-tis-device,tpmdev=tpm0"),
@@ -1880,7 +1880,7 @@ mod tests {
             "if=pflash,unit=0,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
         );
         assert!(args.contains(
-            &"if=pflash,unit=1,format=raw,file=/run/opl/vm/00000000-0000-0000-0000-000000000000/uefi-vars.fd"
+            &"if=pflash,unit=1,format=raw,file=/run/orbivisor/vm/00000000-0000-0000-0000-000000000000/uefi-vars.fd"
                 .to_string()
         ));
         // 끄면 Secure Boot 펌웨어가 있어도 계획 58과 같다.
@@ -2133,8 +2133,8 @@ mod tests {
             memory_mib: 512,
             vcpus: 2,
             disks,
-            ctl_socket: Path::new("/run/opl/file-restore/x/ctl.sock"),
-            console_log: Path::new("/var/lib/opl/file-restore/x/console.log"),
+            ctl_socket: Path::new("/run/orbivisor/file-restore/x/ctl.sock"),
+            console_log: Path::new("/var/lib/orbivisor/file-restore/x/console.log"),
             drop,
             sandbox,
         }
@@ -2145,7 +2145,7 @@ mod tests {
     #[test]
     fn restore_helper_cmdline_aarch64_tcg() {
         let nbd = LiveRestoreSource::Nbd {
-            socket: "/run/opl/file-restore/x/nbd,1.sock".into(),
+            socket: "/run/orbivisor/file-restore/x/nbd,1.sock".into(),
             export: "disk0".into(),
         };
         let chain = LiveRestoreSource::Qcow2 {
@@ -2154,11 +2154,11 @@ mod tests {
         let disks = [
             HelperDisk {
                 source: &nbd,
-                overlay: Path::new("/var/lib/opl/file-restore/x/ov0.qcow2"),
+                overlay: Path::new("/var/lib/orbivisor/file-restore/x/ov0.qcow2"),
             },
             HelperDisk {
                 source: &chain,
-                overlay: Path::new("/var/lib/opl/file-restore/x/ov1.qcow2"),
+                overlay: Path::new("/var/lib/orbivisor/file-restore/x/ov1.qcow2"),
             },
         ];
         let args = build_restore_helper_cmdline(&helper_args(
@@ -2171,12 +2171,12 @@ mod tests {
         .unwrap();
         let line = args.join(" ");
         let expected = [
-            "-name opl-fr-00000000-0000-0000-0000-000000000000 -nodefaults -no-user-config -display none -net none",
+            "-name orbivisor-fr-00000000-0000-0000-0000-000000000000 -nodefaults -no-user-config -display none -net none",
             " -machine virt,accel=tcg,gic-version=max -cpu max,pauth-impdef=on -smp 2 -m 512M",
             " -kernel /usr/share/orbivisor/restore/aarch64/Image -initrd /usr/share/orbivisor/restore/aarch64/initrd.img",
             " -append console=ttyAMA0 panic=-1 quiet opl.session=00000000-0000-0000-0000-000000000000 opl.proto=2",
-            " -blockdev driver=nbd,server.type=unix,server.path=/run/opl/file-restore/x/nbd,,1.sock,export=disk0,read-only=on,node-name=src0",
-            " -blockdev driver=qcow2,file.driver=file,file.filename=/var/lib/opl/file-restore/x/ov0.qcow2,backing=src0,node-name=ov0",
+            " -blockdev driver=nbd,server.type=unix,server.path=/run/orbivisor/file-restore/x/nbd,,1.sock,export=disk0,read-only=on,node-name=src0",
+            " -blockdev driver=qcow2,file.driver=file,file.filename=/var/lib/orbivisor/file-restore/x/ov0.qcow2,backing=src0,node-name=ov0",
             " -device virtio-blk-pci,drive=ov0,serial=opl-disk0",
         ]
         .concat();
@@ -2189,9 +2189,9 @@ mod tests {
         assert_eq!(src1["backing"]["backing"], serde_json::Value::Null);
         assert!(line.ends_with(concat!(
             " -device virtio-blk-pci,drive=ov1,serial=opl-disk1 -device virtio-serial-pci",
-            " -chardev socket,id=ctl,path=/run/opl/file-restore/x/ctl.sock,server=on,wait=off",
+            " -chardev socket,id=ctl,path=/run/orbivisor/file-restore/x/ctl.sock,server=on,wait=off",
             " -device virtserialport,chardev=ctl,name=org.orbivisor.restore.0 -device virtio-rng-pci",
-            " -chardev file,id=con,path=/var/lib/opl/file-restore/x/console.log,append=on -serial chardev:con",
+            " -chardev file,id=con,path=/var/lib/orbivisor/file-restore/x/console.log,append=on -serial chardev:con",
             " -no-reboot -run-with user=nobody",
             " -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny"
         )), "{line}");

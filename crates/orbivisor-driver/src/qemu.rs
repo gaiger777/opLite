@@ -181,9 +181,9 @@ pub fn uefi_vars_path(state_dir: &Path, id: Uuid) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
     pub host: HostProfile,
-    /// 소켓과 pidfile을 두는 휘발성 디렉터리 (Linux: `/run/opl`)
+    /// 소켓과 pidfile을 두는 휘발성 디렉터리 (Linux: `/run/orbivisor`)
     pub run_dir: PathBuf,
-    /// UEFI 변수처럼 재부팅 후에도 남아야 하는 VM별 파일 (Linux: `/var/lib/opl`)
+    /// UEFI 변수처럼 재부팅 후에도 남아야 하는 VM별 파일 (Linux: `/var/lib/orbivisor`)
     pub state_dir: PathBuf,
     /// 브리지 NIC의 tap을 만들고 지운다. 없으면(macOS) 브리지 NIC를 가진 VM은 시작하지 않는다.
     pub net: Option<Arc<dyn HostNet>>,
@@ -4670,7 +4670,7 @@ fn read_pinning(dir: &Path) -> Option<RuntimePinning> {
 }
 
 /// QEMU를 감싸는 `systemd-run`의 인자(`--` 앞). 스코프는 QEMU가 끝날 때까지 남고, `--collect`면 실패로
-/// 끝나도 남기지 않는다. `Before=opld.service`: 멈출 때는 순서가 거꾸로라 호스트가 꺼질 때 opld가 끝난 뒤에
+/// 끝나도 남기지 않는다. `Before=orbivisord.service`: 멈출 때는 순서가 거꾸로라 호스트가 꺼질 때 opld가 끝난 뒤에
 /// 스코프가 멈춘다(종료 정책이 VM이 살아 있을 때 돈다). `After=network-online.target remote-fs.target`: 망과
 /// 원격 파일시스템보다 먼저 멈춘다(NFS·iSCSI 디스크를 쓰는 QEMU가 망이 끊긴 뒤에 남지 않게).
 fn scope_args(id: Uuid) -> Vec<String> {
@@ -4679,7 +4679,7 @@ fn scope_args(id: Uuid) -> Vec<String> {
         "--quiet".into(),
         "--collect".into(),
         format!("--unit=opl-vm-{id}"),
-        "--property=Before=opld.service".into(),
+        "--property=Before=orbivisord.service".into(),
         "--property=After=network-online.target remote-fs.target".into(),
     ]
 }
@@ -5147,7 +5147,7 @@ mod tests {
         assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
     }
 
-    /// VM 스코프는 opld보다 먼저 시작한 것으로 묶여(`Before=opld.service`) 호스트가 꺼질 때 opld 뒤에 멈추고,
+    /// VM 스코프는 opld보다 먼저 시작한 것으로 묶여(`Before=orbivisord.service`) 호스트가 꺼질 때 opld 뒤에 멈추고,
     /// 망·원격 파일시스템보다는 먼저 멈춘다.
     #[test]
     fn the_vm_scope_is_ordered_before_opld() {
@@ -5159,7 +5159,7 @@ mod tests {
                 "--quiet",
                 "--collect",
                 "--unit=opl-vm-00000000-0000-0000-0000-000000000000",
-                "--property=Before=opld.service",
+                "--property=Before=orbivisord.service",
                 "--property=After=network-online.target remote-fs.target",
             ]
         );
@@ -8525,7 +8525,7 @@ time.sleep(60)
                 name: "b2".into(),
                 source: DiskLocation::Path("/dev/vg/opl-b".into(), DiskKind::Block),
                 format: ImageFormat::Raw,
-                overlay: Some("/var/lib/opl/replicas/overlays/r-b.qcow2".into()),
+                overlay: Some("/var/lib/orbivisor/replicas/overlays/r-b.qcow2".into()),
             },
         ];
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8571,7 +8571,7 @@ time.sleep(60)
             serde_json::json!({
                 "driver": "qcow2", "node-name": "opl-repl-1",
                 "file": { "driver": "file",
-                          "filename": "/var/lib/opl/replicas/overlays/r-b.qcow2" },
+                          "filename": "/var/lib/orbivisor/replicas/overlays/r-b.qcow2" },
                 "backing": { "driver": "raw",
                              "file": { "driver": "host_device", "filename": "/dev/vg/opl-b" } }
             })

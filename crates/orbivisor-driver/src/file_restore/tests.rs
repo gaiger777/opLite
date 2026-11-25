@@ -760,7 +760,7 @@ sleep 30"#,
     assert!(!paths.run.exists() && !paths.state.exists());
 }
 
-/// 다시 뜬 opld: 앞 프로세스가 남긴 도우미(명령줄에 `opl-fr-<id>`)를 끝내고 두 디렉터리를 지운다. 남의 프로세스는 두지 않는다.
+/// 다시 뜬 opld: 앞 프로세스가 남긴 도우미(명령줄에 `orbivisor-fr-<id>`, 이름 바꾸기 앞의 판은 `opl-fr-<id>`)를 끝내고 두 디렉터리를 지운다. 남의 프로세스는 두지 않는다.
 #[tokio::test]
 async fn sweep_stops_leftover_helpers_and_removes_their_files() {
     if std::process::Command::new("perl")
@@ -777,8 +777,9 @@ async fn sweep_stops_leftover_helpers_and_removes_their_files() {
     let paths = HelperPaths::new(&run, &state, id);
     paths.prepare().unwrap();
     std::fs::write(paths.overlay(0), b"x").unwrap();
+    // 이름 바꾸기(계획 74) 앞의 판이 띄운 도우미
     let mut helper = std::process::Command::new("perl")
-        .args(["-e", "sleep 60", &format!("{UNIT_PREFIX}{id}")])
+        .args(["-e", "sleep 60", &format!("{LEGACY_UNIT_PREFIX}{id}")])
         .spawn()
         .unwrap();
     std::fs::write(paths.pid_file(), helper.id().to_string()).unwrap();
@@ -812,7 +813,8 @@ async fn sweep_stops_leftover_helpers_and_removes_their_files() {
     assert!(paths_b.run.exists() && paths_b.state.exists());
     let ids = [id, other_id].into_iter().collect();
     let scopes = session_scopes(&ids);
-    assert_eq!(scopes.len(), 2);
+    assert_eq!(scopes.len(), 4);
+    assert!(scopes.contains(&format!("orbivisor-fr-{id}.scope")));
     assert!(scopes.contains(&format!("opl-fr-{id}.scope")));
     assert!(!scopes.iter().any(|u| u.contains(&id_b.to_string())));
     assert_eq!(sweep_leftovers(&run_b, &state_b, false).await, 1);

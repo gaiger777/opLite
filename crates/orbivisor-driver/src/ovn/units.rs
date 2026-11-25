@@ -1,6 +1,6 @@
 //! Orbivisor 소유 OVN 중앙 단위(계획 65 §7.3): NB·SB `ovsdb-server`(Raft 클러스터 DB)와 `ovn-northd`의 명령줄과
 //! systemd 단위 파일. 배포판 `ovn-ctl` 대신 직접 쓰는 까닭은 듣는 주소를 노드 주소 하나로 묶고(`pssl:PORT:ADDR`) DB를
-//! Orbivisor 자리(`/var/lib/opl/ovn`)에 두려는 것이다. 모두 순수 함수다(시험은 고정 기대 글과 견준다).
+//! Orbivisor 자리(`/var/lib/orbivisor/ovn`)에 두려는 것이다. 모두 순수 함수다(시험은 고정 기대 글과 견준다).
 //!
 //! OVN 접근 잠금(계획 67 §10.2)이 켜진 중앙의 SB 서버는 명령줄 `--remote` 대신 설정 파일(`sb.json`)로 뜬다: 6642는
 //! `ovn-controller` 역할(chassis는 자기 행만 쓴다), 6645(특권)는 northd만, 로컬 `punix`는 root. northd는 잠금이 켜진
@@ -19,7 +19,11 @@ pub const OVSDB_SERVER: &str = "/usr/sbin/ovsdb-server";
 /// `ovn-northd`(ovn-central)
 pub const OVN_NORTHD: &str = "/usr/bin/ovn-northd";
 /// northd 단위 이름
-pub const NORTHD_UNIT: &str = "opl-ovn-northd.service";
+pub const NORTHD_UNIT: &str = "orbivisor-ovn-northd.service";
+/// 단위 이름의 머리
+pub const UNIT_PREFIX: &str = "orbivisor-ovn-";
+/// 이름 바꾸기(계획 74) 앞의 단위 이름 머리. 그 이름은 새 단위로의 별칭 링크로 남는다.
+pub const LEGACY_UNIT_PREFIX: &str = "opl-ovn-";
 
 /// OVN 중앙 DB 둘
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -71,9 +75,9 @@ impl Db {
         }
     }
 
-    /// systemd 단위 이름(`opl-ovn-nb.service`)
+    /// systemd 단위 이름(`orbivisor-ovn-nb.service`)
     pub fn unit(self) -> String {
-        format!("opl-ovn-{}.service", self.short())
+        format!("{UNIT_PREFIX}{}.service", self.short())
     }
 
     fn description(self) -> &'static str {
@@ -270,11 +274,17 @@ pub fn db_unit(db: Db, address: IpAddr, locked: bool, paths: &OvnPaths) -> Strin
 pub fn northd_unit(centrals: &[IpAddr], locked: &[IpAddr], paths: &OvnPaths) -> String {
     render(
         "Orbivisor OVN northd",
-        "network-online.target opl-ovn-nb.service opl-ovn-sb.service",
+        &format!("network-online.target {} {}", Db::Nb.unit(), Db::Sb.unit()),
         OVN_NORTHD,
         &northd_args(centrals, locked, paths),
         paths,
     )
+}
+
+/// 새 단위 이름의 옛 이름(`orbivisor-ovn-nb.service` → `opl-ovn-nb.service`)
+pub fn legacy_unit(unit: &str) -> Option<String> {
+    unit.strip_prefix(UNIT_PREFIX)
+        .map(|rest| format!("{LEGACY_UNIT_PREFIX}{rest}"))
 }
 
 /// 단위 파일이 Orbivisor 것인지(첫 줄이 표시)
@@ -300,7 +310,12 @@ mod tests {
             remotes(&[ip("10.0.0.1"), ip("10.0.0.2")], 6642),
             "ssl:10.0.0.1:6642,ssl:10.0.0.2:6642"
         );
-        assert_eq!(Db::Nb.unit(), "opl-ovn-nb.service");
+        assert_eq!(Db::Nb.unit(), "orbivisor-ovn-nb.service");
+        assert_eq!(
+            legacy_unit(NORTHD_UNIT).as_deref(),
+            Some("opl-ovn-northd.service")
+        );
+        assert_eq!(legacy_unit("x.service"), None);
         assert_eq!((Db::Sb.port(), Db::Sb.raft_port()), (6642, 6644));
         assert_eq!(exec_word("a b"), "\"a b\"");
         assert_eq!(exec_word("a\"b"), "\"a\\\"b\"");
@@ -321,12 +336,12 @@ mod tests {
              \n\
              [Service]\n\
              Type=simple\n\
-             ExecStartPre=/bin/mkdir -p /run/opl/ovn /var/log/opl\n\
-             ExecStart=/usr/sbin/ovsdb-server /var/lib/opl/ovn/nb.db --remote=pssl:6641:10.0.0.1 \
-             --remote=punix:/run/opl/ovn/nb.sock --private-key=/etc/opl/ovn/node.key \
-             --certificate=/etc/opl/ovn/node.crt --ca-cert=/etc/opl/ovn/ca.crt \
-             --unixctl=/run/opl/ovn/nb.ctl --pidfile=/run/opl/ovn/nb.pid -vconsole:emer -vsyslog:err \
-             -vfile:info --log-file=/var/log/opl/ovn-nb.log --no-chdir\n\
+             ExecStartPre=/bin/mkdir -p /run/orbivisor/ovn /var/log/orbivisor\n\
+             ExecStart=/usr/sbin/ovsdb-server /var/lib/orbivisor/ovn/nb.db --remote=pssl:6641:10.0.0.1 \
+             --remote=punix:/run/orbivisor/ovn/nb.sock --private-key=/etc/orbivisor/ovn/node.key \
+             --certificate=/etc/orbivisor/ovn/node.crt --ca-cert=/etc/orbivisor/ovn/ca.crt \
+             --unixctl=/run/orbivisor/ovn/nb.ctl --pidfile=/run/orbivisor/ovn/nb.pid -vconsole:emer -vsyslog:err \
+             -vfile:info --log-file=/var/log/orbivisor/ovn-nb.log --no-chdir\n\
              Restart=on-failure\n\
              RestartSec=2\n\
              LimitNOFILE=65535\n\
@@ -337,19 +352,19 @@ mod tests {
         assert!(is_managed(&nb));
         let sb = db_unit(Db::Sb, ip("fd00::1"), false, &paths);
         assert!(sb.contains(
-            "ExecStart=/usr/sbin/ovsdb-server /var/lib/opl/ovn/sb.db --remote=pssl:6642:[fd00::1] \
-             --remote=punix:/run/opl/ovn/sb.sock"
+            "ExecStart=/usr/sbin/ovsdb-server /var/lib/orbivisor/ovn/sb.db --remote=pssl:6642:[fd00::1] \
+             --remote=punix:/run/orbivisor/ovn/sb.sock"
         ));
-        assert!(sb.contains("--log-file=/var/log/opl/ovn-sb.log"));
+        assert!(sb.contains("--log-file=/var/log/orbivisor/ovn-sb.log"));
         let northd = northd_unit(&[ip("10.0.0.1"), ip("10.0.0.2")], &[], &paths);
-        assert!(
-            northd.contains("After=network-online.target opl-ovn-nb.service opl-ovn-sb.service\n")
-        );
+        assert!(northd.contains(
+            "After=network-online.target orbivisor-ovn-nb.service orbivisor-ovn-sb.service\n"
+        ));
         assert!(northd.contains(
             "ExecStart=/usr/bin/ovn-northd --ovnnb-db=ssl:10.0.0.1:6641,ssl:10.0.0.2:6641 \
-             --ovnsb-db=ssl:10.0.0.1:6642,ssl:10.0.0.2:6642 --private-key=/etc/opl/ovn/node.key \
-             --certificate=/etc/opl/ovn/node.crt --ca-cert=/etc/opl/ovn/ca.crt \
-             --unixctl=/run/opl/ovn/northd.ctl --pidfile=/run/opl/ovn/northd.pid"
+             --ovnsb-db=ssl:10.0.0.1:6642,ssl:10.0.0.2:6642 --private-key=/etc/orbivisor/ovn/node.key \
+             --certificate=/etc/orbivisor/ovn/node.crt --ca-cert=/etc/orbivisor/ovn/ca.crt \
+             --unixctl=/run/orbivisor/ovn/northd.ctl --pidfile=/run/orbivisor/ovn/northd.pid"
         ));
         assert!(!is_managed("[Unit]\nDescription=x\n"));
         // 잠금은 NB 단위를 바꾸지 않는다.
@@ -362,9 +377,9 @@ mod tests {
         let paths = OvnPaths::default();
         assert_eq!(
             sb_config(ip("10.0.0.1"), &paths),
-            "{\n  \"databases\": {\n    \"/var/lib/opl/ovn/sb.db\": {}\n  },\n  \"remotes\": {\n    \
+            "{\n  \"databases\": {\n    \"/var/lib/orbivisor/ovn/sb.db\": {}\n  },\n  \"remotes\": {\n    \
              \"pssl:6642:10.0.0.1\": {\n      \"role\": \"ovn-controller\"\n    },\n    \
-             \"pssl:6645:10.0.0.1\": {},\n    \"punix:/run/opl/ovn/sb.sock\": {}\n  }\n}\n"
+             \"pssl:6645:10.0.0.1\": {},\n    \"punix:/run/orbivisor/ovn/sb.sock\": {}\n  }\n}\n"
         );
         let v: serde_json::Value = serde_json::from_str(&sb_config(ip("fd00::1"), &paths)).unwrap();
         assert_eq!(
@@ -374,10 +389,10 @@ mod tests {
         let sb = db_unit(Db::Sb, ip("10.0.0.1"), true, &paths);
         assert!(
             sb.contains(
-                "ExecStart=/usr/sbin/ovsdb-server --config-file=/etc/opl/ovn/sb.json \
-                 --private-key=/etc/opl/ovn/node.key --certificate=/etc/opl/ovn/node.crt \
-                 --ca-cert=/etc/opl/ovn/ca.crt --unixctl=/run/opl/ovn/sb.ctl --pidfile=/run/opl/ovn/sb.pid \
-                 -vconsole:emer -vsyslog:err -vfile:info --log-file=/var/log/opl/ovn-sb.log --no-chdir\n"
+                "ExecStart=/usr/sbin/ovsdb-server --config-file=/etc/orbivisor/ovn/sb.json \
+                 --private-key=/etc/orbivisor/ovn/node.key --certificate=/etc/orbivisor/ovn/node.crt \
+                 --ca-cert=/etc/orbivisor/ovn/ca.crt --unixctl=/run/orbivisor/ovn/sb.ctl --pidfile=/run/orbivisor/ovn/sb.pid \
+                 -vconsole:emer -vsyslog:err -vfile:info --log-file=/var/log/orbivisor/ovn-sb.log --no-chdir\n"
             ),
             "{sb}"
         );

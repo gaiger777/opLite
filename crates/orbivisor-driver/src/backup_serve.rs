@@ -1,6 +1,6 @@
 //! `orbivisord backup-serve` 헬퍼 띄우기·지켜보기·멈추기(계획 68 설계 §11.1). 헬퍼는 저장소 백업 디스크를 읽기 전용
 //! NBD로 내보낸다(보통 복원의 `qemu-img convert`, 라이브 복원의 QEMU backing). 설정(자격 증명·키)은 표준 입력의
-//! JSON으로만 준다. Linux에서 systemd가 있으면 `systemd-run --scope --unit opl-bkserve-<id>`로 띄워 opld가 다시
+//! JSON으로만 준다. Linux에서 systemd가 있으면 `systemd-run --scope --unit orbivisor-bkserve-<id>`로 띄워 opld가 다시
 //! 떠도 산다(swtpm과 같은 꼴). 아니면 opld의 자식이다.
 
 use std::path::{Path, PathBuf};
@@ -29,8 +29,13 @@ pub struct ServeHelper {
     pub socket: PathBuf,
 }
 
-/// 헬퍼의 systemd scope 이름(`opl-bkserve-<id>.scope`)
+/// 헬퍼의 systemd scope 이름(`orbivisor-bkserve-<id>.scope`)
 pub fn backup_serve_unit(id: Uuid) -> String {
+    format!("orbivisor-bkserve-{id}")
+}
+
+/// 이름 바꾸기(계획 74) 앞의 데몬이 쓰던 scope 이름. 같은 세션의 남은 scope를 치울 때 함께 본다.
+fn legacy_backup_serve_unit(id: Uuid) -> String {
     format!("opl-bkserve-{id}")
 }
 
@@ -51,14 +56,16 @@ pub async fn start_backup_serve(
     stop_backup_serve(pid_file, &cfg.socket).await;
     let mut cmd = if scope {
         let unit = backup_serve_unit(id);
-        crate::qemu::clear_stale_scope(&format!("{unit}.scope")).await;
+        for stale in [&unit, &legacy_backup_serve_unit(id)] {
+            crate::qemu::clear_stale_scope(&format!("{stale}.scope")).await;
+        }
         let mut cmd = tokio::process::Command::new("systemd-run");
         cmd.args([
             "--scope",
             "--quiet",
             "--collect",
             &format!("--unit={unit}"),
-            "--property=Before=opld.service",
+            "--property=Before=orbivisord.service",
             "--property=After=network-online.target remote-fs.target",
             "--",
         ])

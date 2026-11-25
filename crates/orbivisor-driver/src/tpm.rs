@@ -261,7 +261,7 @@ fn scope_args(id: Uuid) -> Vec<String> {
         "--quiet".into(),
         "--collect".into(),
         format!("--unit=opl-tpm-{id}"),
-        "--property=Before=opld.service".into(),
+        "--property=Before=orbivisord.service".into(),
         "--property=After=network-online.target remote-fs.target".into(),
     ]
 }
@@ -604,16 +604,16 @@ mod tests {
 
     #[test]
     fn swtpm_runs_detached_and_terminates_with_its_qemu() {
-        let paths = RuntimePaths::new(Path::new("/run/opl"), Uuid::nil()).unwrap();
-        let dir = "/run/opl/vm/00000000-0000-0000-0000-000000000000";
-        let args = swtpm_args(&paths, Path::new("/var/lib/opl,x/vm/1/tpm"));
+        let paths = RuntimePaths::new(Path::new("/run/orbivisor"), Uuid::nil()).unwrap();
+        let dir = "/run/orbivisor/vm/00000000-0000-0000-0000-000000000000";
+        let args = swtpm_args(&paths, Path::new("/var/lib/orbivisor,x/vm/1/tpm"));
         assert_eq!(
             args,
             [
                 "socket".to_string(),
                 "--tpm2".into(),
                 "--tpmstate".into(),
-                "dir=/var/lib/opl,,x/vm/1/tpm,mode=0600".into(),
+                "dir=/var/lib/orbivisor,,x/vm/1/tpm,mode=0600".into(),
                 "--ctrl".into(),
                 format!("type=unixio,path={dir}/tpm.sock,mode=0600"),
                 "--pid".into(),

@@ -8,7 +8,8 @@
 //!   `systemd-run.stderr`를 표준 오류로 내고 그 코드로 끝나고, 없으면 `unit.state`에 `active`를 쓴다.
 //!   명령은 돌리지 않는다.
 //! - `systemctl`: 인자를 `systemctl.calls`에 더하고 `unit.state`(`active`·`success`·`failed`, 없거나
-//!   `gone`이면 사라진 유닛)에 맞는 `ActiveState=`·`Result=`·`LoadState=` 줄을 출력한다.
+//!   `gone`이면 사라진 유닛)에 맞는 `ActiveState=`·`Result=`·`LoadState=` 줄을 출력한다. `unit.state.<유닛>`(마지막
+//!   인자)이 있으면 그 유닛은 그것을 따른다.
 //! - `dpkg`: 인자를 `dpkg.calls`에 더하고 `audit.txt`(있으면)를 출력한다.
 //!
 //! ```ignore
@@ -56,6 +57,8 @@ d=$(dirname "$0")
 echo "$*" >> "$d/systemctl.calls"
 state=gone
 if [ -f "$d/unit.state" ]; then state=$(cat "$d/unit.state"); fi
+for u; do :; done
+if [ -f "$d/unit.state.$u" ]; then state=$(cat "$d/unit.state.$u"); fi
 case $state in
 active) printf 'ActiveState=active\nResult=success\nLoadState=loaded\n' ;;
 success) printf 'ActiveState=inactive\nResult=success\nLoadState=loaded\n' ;;

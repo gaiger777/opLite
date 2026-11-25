@@ -51,10 +51,10 @@ impl Env {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let paths = OvnPaths {
-            etc: root.join("etc/opl/ovn"),
-            var_lib: root.join("var/lib/opl/ovn"),
-            run: root.join("run/opl/ovn"),
-            log: root.join("var/log/opl"),
+            etc: root.join("etc/orbivisor/ovn"),
+            var_lib: root.join("var/lib/orbivisor/ovn"),
+            run: root.join("run/orbivisor/ovn"),
+            log: root.join("var/log/orbivisor"),
             systemd: root.join("etc/systemd/system"),
             pki: root.join("pki"),
             schemas: root.join("usr/share/ovn"),
@@ -296,10 +296,10 @@ async fn central_databases_must_be_ours() {
     };
     let env = Env::new();
     env.missing("ovs-vsctl");
-    env.write("var/lib/opl/ovn/nb.db", "x");
-    env.write("var/lib/opl/ovn/sb.db", "x");
-    let nb = env.p("var/lib/opl/ovn/nb.db");
-    let sb = env.p("var/lib/opl/ovn/sb.db");
+    env.write("var/lib/orbivisor/ovn/nb.db", "x");
+    env.write("var/lib/orbivisor/ovn/sb.db", "x");
+    let nb = env.p("var/lib/orbivisor/ovn/nb.db");
+    let sb = env.p("var/lib/orbivisor/ovn/sb.db");
     env.fake().reply(
         &format!("ovsdb-tool db-cid {nb}"),
         CmdOutput::ok(format!("{CID_NB}\n")),
@@ -433,9 +433,9 @@ async fn tls_copy() {
     env.write("pki/node.crt", "CERT");
     env.write("pki/node.key", "KEY");
     assert!(env.host.write_tls().unwrap());
-    assert_eq!(mode(&env.path("etc/opl/ovn")), 0o700);
+    assert_eq!(mode(&env.path("etc/orbivisor/ovn")), 0o700);
     for (file, text) in [("ca.crt", "CA"), ("node.crt", "CERT"), ("node.key", "KEY")] {
-        let path = env.path(&format!("etc/opl/ovn/{file}"));
+        let path = env.path(&format!("etc/orbivisor/ovn/{file}"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert_eq!(mode(&path), 0o600);
     }
@@ -443,7 +443,7 @@ async fn tls_copy() {
     env.write("pki/node.crt", "CERT2");
     assert!(env.host.write_tls().unwrap());
     assert_eq!(
-        std::fs::read_to_string(env.path("etc/opl/ovn/node.crt")).unwrap(),
+        std::fs::read_to_string(env.path("etc/orbivisor/ovn/node.crt")).unwrap(),
         "CERT2"
     );
 }
@@ -481,7 +481,7 @@ async fn distro_units_are_disabled_and_masked() {
         ]
     );
     assert_eq!(
-        std::fs::read_to_string(env.path("etc/opl/ovn/distro-units")).unwrap(),
+        std::fs::read_to_string(env.path("etc/orbivisor/ovn/distro-units")).unwrap(),
         "ovn-central.service\novn-northd.service\n"
     );
     // 모두 가렸으면 아무것도 하지 않는다.
@@ -490,14 +490,14 @@ async fn distro_units_are_disabled_and_masked() {
         .reply("systemctl show -p LoadState", CmdOutput::ok("masked\n"));
     assert!(env.host.disable_distro_units().await.unwrap().is_empty());
     assert!(env.calls_of("systemctl mask").is_empty());
-    assert!(!env.path("etc/opl/ovn/distro-units").exists());
+    assert!(!env.path("etc/orbivisor/ovn/distro-units").exists());
 }
 
 /// 새 클러스터 DB는 임시 파일에 만들어 id를 돌려주고, 제자리에 옮긴 뒤에는 다시 만들지 않는다.
 #[tokio::test]
 async fn cluster_databases() {
     let env = Env::new();
-    let tmp = env.p("var/lib/opl/ovn/.nb.db.opl-new");
+    let tmp = env.p("var/lib/orbivisor/ovn/.nb.db.opl-new");
     env.fake().reply(
         &format!("ovsdb-tool db-cid {tmp}"),
         CmdOutput::ok(format!("{CID_NB}\n")),
@@ -517,10 +517,10 @@ async fn cluster_databases() {
     );
     // 가짜 실행기는 파일을 만들지 않으므로 손수 둔다.
     std::fs::write(&tmp, "db").unwrap();
-    assert!(!env.path("var/lib/opl/ovn/nb.db").exists());
+    assert!(!env.path("var/lib/orbivisor/ovn/nb.db").exists());
     env.host.commit_db(Db::Nb).unwrap();
-    assert!(env.path("var/lib/opl/ovn/nb.db").exists());
-    assert!(!env.path("var/lib/opl/ovn/.nb.db.opl-new").exists());
+    assert!(env.path("var/lib/orbivisor/ovn/nb.db").exists());
+    assert!(!env.path("var/lib/orbivisor/ovn/.nb.db.opl-new").exists());
     // 다시 하면 이미 있다.
     assert_eq!(
         env.host
@@ -570,7 +570,7 @@ async fn join_cluster_writes_into_place() {
             .await
             .unwrap()
     );
-    let tmp = env.p("var/lib/opl/ovn/.sb.db.opl-new");
+    let tmp = env.p("var/lib/orbivisor/ovn/.sb.db.opl-new");
     assert_eq!(
         runner.0.calls(),
         [format!(
@@ -578,7 +578,7 @@ async fn join_cluster_writes_into_place() {
         )]
     );
     assert_eq!(
-        std::fs::read_to_string(env.path("var/lib/opl/ovn/sb.db")).unwrap(),
+        std::fs::read_to_string(env.path("var/lib/orbivisor/ovn/sb.db")).unwrap(),
         "joining"
     );
     assert!(
@@ -606,12 +606,13 @@ async fn units_are_written_and_started() {
     assert_eq!(
         changed,
         [
-            "opl-ovn-nb.service",
-            "opl-ovn-sb.service",
-            "opl-ovn-northd.service"
+            "orbivisor-ovn-nb.service",
+            "orbivisor-ovn-sb.service",
+            "orbivisor-ovn-northd.service"
         ]
     );
-    let nb = std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-nb.service")).unwrap();
+    let nb =
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-nb.service")).unwrap();
     assert_eq!(nb, db_unit(Db::Nb, ip("10.0.0.1"), false, env.host.paths()));
     assert_eq!(env.calls_of("systemctl daemon-reload").len(), 1);
     env.host.start_central(&changed).await.unwrap();
@@ -621,10 +622,10 @@ async fn units_are_written_and_started() {
             .skip(1)
             .collect::<Vec<_>>(),
         [
-            "systemctl enable opl-ovn-nb.service opl-ovn-sb.service opl-ovn-northd.service",
-            "systemctl restart opl-ovn-nb.service",
-            "systemctl restart opl-ovn-sb.service",
-            "systemctl restart opl-ovn-northd.service",
+            "systemctl enable orbivisor-ovn-nb.service orbivisor-ovn-sb.service orbivisor-ovn-northd.service",
+            "systemctl restart orbivisor-ovn-nb.service",
+            "systemctl restart orbivisor-ovn-sb.service",
+            "systemctl restart orbivisor-ovn-northd.service",
         ]
     );
 
@@ -641,35 +642,108 @@ async fn units_are_written_and_started() {
         .write_units(ip("10.0.0.1"), &[ip("10.0.0.1"), ip("10.0.0.2")], &[])
         .await
         .unwrap();
-    assert_eq!(changed, ["opl-ovn-northd.service"]);
+    assert_eq!(changed, ["orbivisor-ovn-northd.service"]);
 
-    env.write("etc/systemd/system/opl-ovn-sb.service", "[Unit]\n");
+    env.write("etc/systemd/system/orbivisor-ovn-sb.service", "[Unit]\n");
     let err = env
         .host
         .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")], &[])
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, OvnError::Foreign(m) if m.contains("opl-ovn-sb.service was not written by Orbivisor")),
+        matches!(&err, OvnError::Foreign(m) if m.contains("orbivisor-ovn-sb.service was not written by Orbivisor")),
         "{err}"
     );
 
     // 에이전트: 멈춘 단위만 켠다.
     let env = Env::new();
     env.fake().reply(
-        "systemctl is-active opl-ovn-northd.service",
+        "systemctl is-active orbivisor-ovn-northd.service",
         CmdOutput::fail(3, ""),
     );
     let started = env.host.ensure_central_running().await.unwrap();
-    assert_eq!(started, ["opl-ovn-northd.service"]);
+    assert_eq!(started, ["orbivisor-ovn-northd.service"]);
     assert_eq!(
         env.calls_of("systemctl start"),
-        ["systemctl start opl-ovn-northd.service"]
+        ["systemctl start orbivisor-ovn-northd.service"]
     );
     env.host.stop_central().await.unwrap();
     assert_eq!(
         env.calls_of("systemctl disable"),
-        ["systemctl disable --now opl-ovn-nb.service opl-ovn-sb.service opl-ovn-northd.service"]
+        [
+            "systemctl disable --now orbivisor-ovn-nb.service orbivisor-ovn-sb.service orbivisor-ovn-northd.service"
+        ]
+    );
+}
+
+/// 이름 바꾸기(계획 74): 옛 이름(`opl-ovn-*`)의 Orbivisor 단위 파일은 새 이름 파일로 옮기고 옛 이름은 새 이름으로의
+/// 링크(별칭)로, enable 링크도 새 이름으로 옮긴 뒤 daemon-reload 한 번. 멈추지 않는다. 그 뒤는 비교·다시 시작 규칙대로.
+#[tokio::test]
+async fn legacy_units_become_aliases() {
+    let env = Env::new();
+    let old_nb = db_unit(Db::Nb, ip("10.0.0.1"), false, env.host.paths());
+    env.write("etc/systemd/system/opl-ovn-nb.service", &old_nb);
+    env.write(
+        "etc/systemd/system/opl-ovn-sb.service",
+        "# Managed by Orbivisor (orbivisord); changes are overwritten.\nold\n",
+    );
+    // 표시 없는 옛 이름 파일은 손대지 않는다.
+    env.write("etc/systemd/system/opl-ovn-northd.service", "[Unit]\n");
+    let wants = env.path("etc/systemd/system/multi-user.target.wants");
+    std::fs::create_dir_all(&wants).unwrap();
+    std::os::unix::fs::symlink(
+        env.path("etc/systemd/system/opl-ovn-nb.service"),
+        wants.join("opl-ovn-nb.service"),
+    )
+    .unwrap();
+
+    let adopted = env.host.adopt_legacy_units().await.unwrap();
+    assert_eq!(
+        adopted,
+        ["orbivisor-ovn-nb.service", "orbivisor-ovn-sb.service"]
+    );
+    for db in ["nb", "sb"] {
+        let old = env.path(&format!("etc/systemd/system/opl-ovn-{db}.service"));
+        assert_eq!(
+            std::fs::read_link(&old).unwrap(),
+            Path::new(&format!("orbivisor-ovn-{db}.service"))
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-nb.service")).unwrap(),
+        old_nb
+    );
+    assert!(std::fs::symlink_metadata(wants.join("opl-ovn-nb.service")).is_err());
+    assert_eq!(
+        std::fs::read_link(wants.join("orbivisor-ovn-nb.service")).unwrap(),
+        env.path("etc/systemd/system/orbivisor-ovn-nb.service")
+    );
+    assert!(
+        std::fs::symlink_metadata(env.path("etc/systemd/system/opl-ovn-northd.service"))
+            .unwrap()
+            .is_file()
+    );
+    assert_eq!(env.calls_of("systemctl daemon-reload").len(), 1);
+    assert!(
+        env.calls_of("systemctl stop").is_empty() && env.calls_of("systemctl restart").is_empty()
+    );
+    // 한 번 더 해도 같다.
+    assert!(env.host.adopt_legacy_units().await.unwrap().is_empty());
+    assert_eq!(env.calls_of("systemctl daemon-reload").len(), 1);
+
+    // 그 뒤 쓰기: 같은 글(NB)은 그대로, 다른 글(SB)과 새 northd만 바뀐다.
+    let changed = env
+        .host
+        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")], &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        ["orbivisor-ovn-sb.service", "orbivisor-ovn-northd.service"]
+    );
+    assert_eq!(
+        std::fs::read_link(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap(),
+        Path::new("orbivisor-ovn-sb.service")
     );
 }
 
@@ -683,14 +757,18 @@ async fn locked_units_use_the_sb_config_file() {
     let centrals = [me, ip("10.0.0.2")];
     env.host.write_units(me, &centrals, &[]).await.unwrap();
     let plain_sb =
-        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-sb.service")).unwrap();
     let plain_northd =
-        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-northd.service")).unwrap();
-    assert!(!env.path("etc/opl/ovn/sb.json").exists());
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-northd.service"))
+            .unwrap();
+    assert!(!env.path("etc/orbivisor/ovn/sb.json").exists());
 
     let changed = env.host.write_units(me, &centrals, &[me]).await.unwrap();
-    assert_eq!(changed, ["opl-ovn-sb.service", "opl-ovn-northd.service"]);
-    let config = env.path("etc/opl/ovn/sb.json");
+    assert_eq!(
+        changed,
+        ["orbivisor-ovn-sb.service", "orbivisor-ovn-northd.service"]
+    );
+    let config = env.path("etc/orbivisor/ovn/sb.json");
     assert_eq!(
         std::fs::read_to_string(&config).unwrap(),
         sb_config(me, env.host.paths())
@@ -699,13 +777,15 @@ async fn locked_units_use_the_sb_config_file() {
         std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let sb = std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+    let sb =
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-sb.service")).unwrap();
     assert!(
         sb.contains(&format!("--config-file={}", config.display())),
         "{sb}"
     );
     let northd =
-        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-northd.service"))
+            .unwrap();
     assert!(
         northd.contains("--ovnsb-db=ssl:10.0.0.1:6645,ssl:10.0.0.2:6642 "),
         "{northd}"
@@ -716,7 +796,7 @@ async fn locked_units_use_the_sb_config_file() {
         .write_units(me, &centrals, &[me, ip("10.0.0.2")])
         .await
         .unwrap();
-    assert_eq!(changed, ["opl-ovn-northd.service"]);
+    assert_eq!(changed, ["orbivisor-ovn-northd.service"]);
     // 설정 파일만 달라도(손으로 바꿈) SB 단위를 다시 띄울 것으로 알린다.
     std::fs::write(&config, "{}").unwrap();
     let changed = env
@@ -724,17 +804,18 @@ async fn locked_units_use_the_sb_config_file() {
         .write_units(me, &centrals, &[me, ip("10.0.0.2")])
         .await
         .unwrap();
-    assert_eq!(changed, ["opl-ovn-sb.service"]);
+    assert_eq!(changed, ["orbivisor-ovn-sb.service"]);
 
     // 풀기: 계획 66 글 그대로, 설정 파일은 치운다.
     env.host.write_units(me, &centrals, &[]).await.unwrap();
     assert!(!config.exists());
     assert_eq!(
-        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap(),
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-sb.service")).unwrap(),
         plain_sb
     );
     assert_eq!(
-        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-northd.service")).unwrap(),
+        std::fs::read_to_string(env.path("etc/systemd/system/orbivisor-ovn-northd.service"))
+            .unwrap(),
         plain_northd
     );
 }
@@ -743,16 +824,16 @@ async fn locked_units_use_the_sb_config_file() {
 #[tokio::test]
 async fn reads_the_running_sb_remotes() {
     let env = Env::new();
-    let ctl = env.p("run/opl/ovn/sb.ctl");
+    let ctl = env.p("run/orbivisor/ovn/sb.ctl");
     let cmd = format!("ovs-appctl --timeout 5 -t {ctl} ovsdb-server/list-remotes");
     env.fake().reply(
         &cmd,
-        CmdOutput::ok("pssl:6642:10.0.0.1\npssl:6645:10.0.0.1\npunix:/run/opl/ovn/sb.sock\n"),
+        CmdOutput::ok("pssl:6642:10.0.0.1\npssl:6645:10.0.0.1\npunix:/run/orbivisor/ovn/sb.sock\n"),
     );
     assert_eq!(env.host.sb_running_locked().await, Some(true));
     env.fake().reply(
         &cmd,
-        CmdOutput::ok("pssl:6642:10.0.0.1\npunix:/run/opl/ovn/sb.sock\n"),
+        CmdOutput::ok("pssl:6642:10.0.0.1\npunix:/run/orbivisor/ovn/sb.sock\n"),
     );
     assert_eq!(env.host.sb_running_locked().await, Some(false));
     env.fake().reply(&cmd, CmdOutput::fail(1, "cannot connect"));
@@ -760,7 +841,7 @@ async fn reads_the_running_sb_remotes() {
     env.host.restart_sb().await.unwrap();
     assert_eq!(
         env.calls_of("systemctl"),
-        ["systemctl restart opl-ovn-sb.service"]
+        ["systemctl restart orbivisor-ovn-sb.service"]
     );
 }
 
@@ -769,7 +850,7 @@ async fn reads_the_running_sb_remotes() {
 async fn cleans_chassis_of_removed_nodes_over_the_local_socket() {
     let env = Env::new();
     let gone = "22222222-2222-2222-2222-222222222222";
-    let sock = env.p("run/opl/ovn/sb.sock");
+    let sock = env.p("run/orbivisor/ovn/sb.sock");
     let read = format!(
         "ovsdb-client --timeout=10 transact unix:{sock} [\"OVN_Southbound\",{{\"columns\":[\"name\"],\"op\":\"select\""
     );
@@ -863,7 +944,7 @@ async fn lockdown_firewall_and_peers() {
 #[tokio::test]
 async fn waits_for_the_raft_cluster() {
     let env = Env::new();
-    let ctl = env.p("run/opl/ovn/nb.ctl");
+    let ctl = env.p("run/orbivisor/ovn/nb.ctl");
     env.fake().reply_seq(
         &format!("ovs-appctl --timeout 5 -t {ctl} cluster/status OVN_Northbound"),
         vec![
@@ -875,7 +956,7 @@ async fn waits_for_the_raft_cluster() {
     assert_eq!(s.cid, Some(CID_NB.parse().unwrap()));
 
     let env = Env::new();
-    let ctl = env.p("run/opl/ovn/nb.ctl");
+    let ctl = env.p("run/orbivisor/ovn/nb.ctl");
     env.fake().reply_seq(
         &format!("ovs-appctl --timeout 5 -t {ctl} cluster/status"),
         vec![CmdOutput::ok(JOINING), CmdOutput::ok(FOLLOWER)],
@@ -912,7 +993,7 @@ async fn waits_for_the_raft_cluster() {
 #[tokio::test]
 async fn leaving_the_cluster() {
     let env = Env::new();
-    let ctl = env.p("run/opl/ovn/sb.ctl");
+    let ctl = env.p("run/orbivisor/ovn/sb.ctl");
     let status = format!("ovs-appctl --timeout 5 -t {ctl} cluster/status OVN_Southbound");
     env.fake().reply_seq(
         &status,
@@ -946,7 +1027,7 @@ async fn leaving_the_cluster() {
         "ovs-appctl",
         CmdOutput::fail(
             1,
-            "ovs-appctl: cannot connect to \"/run/opl/ovn/sb.ctl\" (No such file or directory)",
+            "ovs-appctl: cannot connect to \"/run/orbivisor/ovn/sb.ctl\" (No such file or directory)",
         ),
     );
     let err = env.host.leave_cluster(Db::Sb).await.unwrap_err();
@@ -954,17 +1035,17 @@ async fn leaving_the_cluster() {
 
     // 떠난 DB는 이름만 바꾼다.
     let env = Env::new();
-    env.write("var/lib/opl/ovn/nb.db", "nb");
-    env.write("var/lib/opl/ovn/sb.db", "sb");
+    env.write("var/lib/orbivisor/ovn/nb.db", "nb");
+    env.write("var/lib/orbivisor/ovn/sb.db", "sb");
     let moved = env.host.retire_dbs(1_700_000_000).unwrap();
     assert_eq!(
         moved,
         [
-            env.path("var/lib/opl/ovn/nb.db.left-1700000000"),
-            env.path("var/lib/opl/ovn/sb.db.left-1700000000")
+            env.path("var/lib/orbivisor/ovn/nb.db.left-1700000000"),
+            env.path("var/lib/orbivisor/ovn/sb.db.left-1700000000")
         ]
     );
-    assert!(!env.path("var/lib/opl/ovn/nb.db").exists());
+    assert!(!env.path("var/lib/orbivisor/ovn/nb.db").exists());
     assert_eq!(std::fs::read_to_string(&moved[1]).unwrap(), "sb");
 }
 
@@ -974,11 +1055,14 @@ async fn leaving_the_cluster() {
 #[tokio::test]
 async fn servers_outside_the_raft_configuration_have_nothing_to_leave() {
     let env = Env::new();
-    let nb = env.p("var/lib/opl/ovn/nb.db");
-    env.write("var/lib/opl/ovn/nb.db", "nb");
+    let nb = env.p("var/lib/orbivisor/ovn/nb.db");
+    env.write("var/lib/orbivisor/ovn/nb.db", "nb");
     env.fake().reply(
         "ovs-appctl",
-        CmdOutput::fail(1, "ovs-appctl: cannot connect to \"/run/opl/ovn/nb.ctl\""),
+        CmdOutput::fail(
+            1,
+            "ovs-appctl: cannot connect to \"/run/orbivisor/ovn/nb.ctl\"",
+        ),
     );
     env.fake().reply(
         &format!("ovsdb-tool db-cid {nb}"),
@@ -1007,7 +1091,7 @@ async fn servers_outside_the_raft_configuration_have_nothing_to_leave() {
 #[tokio::test]
 async fn kicking_a_dead_server_out() {
     let env = Env::new();
-    let ctl = env.p("run/opl/ovn/nb.ctl");
+    let ctl = env.p("run/orbivisor/ovn/nb.ctl");
     let status = format!("ovs-appctl --timeout 5 -t {ctl} cluster/status OVN_Northbound");
     let after = NB_LEADER
         .lines()
@@ -1057,9 +1141,9 @@ async fn chassis_configuration() {
         encap_ip: ip("10.1.0.5"),
     };
     assert!(env.host.configure_chassis(&chassis).await.unwrap());
-    let key = env.p("etc/opl/ovn/node.key");
-    let cert = env.p("etc/opl/ovn/node.crt");
-    let ca = env.p("etc/opl/ovn/ca.crt");
+    let key = env.p("etc/orbivisor/ovn/node.key");
+    let cert = env.p("etc/orbivisor/ovn/node.crt");
+    let ca = env.p("etc/orbivisor/ovn/ca.crt");
     assert_eq!(
         env.calls()
             .into_iter()
@@ -1092,9 +1176,9 @@ async fn chassis_configuration() {
         "ovs-vsctl get-ssl",
         CmdOutput::ok(format!(
             "Private key: {}\nCertificate: {}\nCA Certificate: {}\nBootstrap: false\n",
-            env2.p("etc/opl/ovn/node.key"),
-            env2.p("etc/opl/ovn/node.crt"),
-            env2.p("etc/opl/ovn/ca.crt")
+            env2.p("etc/orbivisor/ovn/node.key"),
+            env2.p("etc/orbivisor/ovn/node.crt"),
+            env2.p("etc/orbivisor/ovn/ca.crt")
         )),
     );
     env2.write("etc/openvswitch/system-id.conf", &format!("{NODE}\n"));
@@ -1163,14 +1247,14 @@ async fn chassis_probe_and_unconfigure() {
             encap_ip: Some(ip("10.1.0.5")),
         }
     );
-    let key = env.p("etc/opl/ovn/node.key");
+    let key = env.p("etc/orbivisor/ovn/node.key");
     assert_eq!(
         env.calls_of("ovn-sbctl"),
         [format!(
             "ovn-sbctl --db=ssl:10.0.0.1:6642 --private-key={key} --certificate={} --ca-cert={} \
              --timeout=5 --no-leader-only --format=json --columns=name find Chassis name={NODE}",
-            env.p("etc/opl/ovn/node.crt"),
-            env.p("etc/opl/ovn/ca.crt")
+            env.p("etc/orbivisor/ovn/node.crt"),
+            env.p("etc/orbivisor/ovn/ca.crt")
         )]
     );
     env.fake().reply(
@@ -1201,19 +1285,22 @@ async fn chassis_probe_and_unconfigure() {
 #[tokio::test]
 async fn central_health() {
     let env = Env::new();
-    let nb = env.p("run/opl/ovn/nb.ctl");
+    let nb = env.p("run/orbivisor/ovn/nb.ctl");
     env.fake().reply(
         &format!("ovs-appctl --timeout 5 -t {nb} cluster/status"),
         CmdOutput::ok(NB_LEADER),
     );
     env.fake().reply(
-        &format!("ovs-appctl --timeout 5 -t {}", env.p("run/opl/ovn/sb.ctl")),
+        &format!(
+            "ovs-appctl --timeout 5 -t {}",
+            env.p("run/orbivisor/ovn/sb.ctl")
+        ),
         CmdOutput::fail(1, "cannot connect"),
     );
     env.fake().reply(
         &format!(
             "ovn-appctl --timeout 5 -t {} status",
-            env.p("run/opl/ovn/northd.ctl")
+            env.p("run/orbivisor/ovn/northd.ctl")
         ),
         CmdOutput::ok("Status: active\n"),
     );
@@ -1228,7 +1315,7 @@ async fn central_health() {
     env.fake().reply(
         &format!(
             "ovn-appctl --timeout 5 -t {} status",
-            env.p("run/opl/ovn/northd.ctl")
+            env.p("run/orbivisor/ovn/northd.ctl")
         ),
         CmdOutput::ok("Status: standby\n"),
     );
@@ -1239,7 +1326,7 @@ async fn central_health() {
 #[tokio::test]
 async fn schema_conversion() {
     let env = Env::new();
-    let sock = env.p("run/opl/ovn/nb.sock");
+    let sock = env.p("run/orbivisor/ovn/nb.sock");
     let schema = env.p("usr/share/ovn/ovn-nb.ovsschema");
     env.fake().reply("ovs-appctl", CmdOutput::ok(NB_LEADER));
     env.fake()
@@ -1296,9 +1383,9 @@ fn quoting() {
     assert_eq!(
         central_units(),
         [
-            "opl-ovn-nb.service",
-            "opl-ovn-sb.service",
-            "opl-ovn-northd.service"
+            "orbivisor-ovn-nb.service",
+            "orbivisor-ovn-sb.service",
+            "orbivisor-ovn-northd.service"
         ]
     );
 }
@@ -1329,8 +1416,8 @@ async fn database_address_and_membership() {
     };
     assert!(!env.host.has_cluster_db(known).await);
 
-    env.write("var/lib/opl/ovn/nb.db", "nb");
-    let nb = env.p("var/lib/opl/ovn/nb.db");
+    env.write("var/lib/orbivisor/ovn/nb.db", "nb");
+    let nb = env.p("var/lib/orbivisor/ovn/nb.db");
     env.fake().reply(
         &format!("ovsdb-tool db-local-address {nb}"),
         CmdOutput::ok("ssl:10.0.0.1:6643\n"),
@@ -1389,7 +1476,7 @@ async fn database_address_and_membership() {
     let moved = env.host.retire_db(Db::Nb, 1_700_000_000).unwrap();
     assert_eq!(
         moved,
-        Some(env.path("var/lib/opl/ovn/nb.db.left-1700000000"))
+        Some(env.path("var/lib/orbivisor/ovn/nb.db.left-1700000000"))
     );
     assert_eq!(env.host.retire_db(Db::Nb, 1).unwrap(), None);
 }

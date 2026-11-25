@@ -222,8 +222,25 @@ impl Updates {
     }
 
     async fn run_upgrade(&self, task: Uuid, resume: bool) -> Result<(), String> {
-        let unit = upgrade_unit(task);
-        let log = self.config.log_dir.join(format!("upgrade-{task}.log"));
+        let mut unit = upgrade_unit(task);
+        // 이름 바꾸기(계획 74) 앞의 데몬이 띄운 유닛(`opl-upgrade-…`)을 이어 본다 — 업그레이드가 그 데몬을 이 판으로
+        // 바꾼다. 새 이름의 유닛이 없고 옛 이름의 유닛이 있으면 그것이다.
+        if resume && self.unit_state(&unit).await? == Some(UnitState::Gone) {
+            let legacy = legacy_upgrade_unit(task);
+            if matches!(self.unit_state(&legacy).await?, Some(s) if s != UnitState::Gone) {
+                unit = legacy;
+            }
+        }
+        let mut log = self.config.log_dir.join(format!("upgrade-{task}.log"));
+        // 배치 맞추기가 옛 로그 디렉터리를 옮기지 못했으면(둘 다 진짜 등) 옛 판이 띄운 유닛의 로그는 옛 이름 아래다.
+        if resume && !log.exists() {
+            let legacy = PathBuf::from(
+                orbivisor_types::layout::to_legacy(&log.to_string_lossy()).into_owned(),
+            );
+            if legacy.exists() {
+                log = legacy;
+            }
+        }
         // 이 opld가 유닛을 띄웠는지. 이어 볼 때는 이전 opld가 띄우지 못했을 수 있다.
         let mut started = !resume;
         if started {
@@ -421,8 +438,13 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// 업그레이드 Task `task`의 일시 유닛 이름(Task id 전체). opld가 다시 시작해도 Task id로 다시 만든다.
+/// 업그레이드 Task `task`의 일시 유닛 이름(Task id 전체). 데몬이 다시 시작해도 Task id로 다시 만든다.
 fn upgrade_unit(task: Uuid) -> String {
+    format!("orbivisor-upgrade-{}", task.simple())
+}
+
+/// 이름 바꾸기(계획 74) 앞의 데몬이 쓰던 업그레이드 유닛 이름
+fn legacy_upgrade_unit(task: Uuid) -> String {
     format!("opl-upgrade-{}", task.simple())
 }
 
@@ -1169,6 +1191,10 @@ Conf orbivisor (1:0.2.1~rc1 opLite:trixie [amd64])
         let id: Uuid = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".parse().unwrap();
         assert_eq!(
             upgrade_unit(id),
+            "orbivisor-upgrade-0193a1b2c3d47e5f8a9b0c1d2e3f4a5b"
+        );
+        assert_eq!(
+            legacy_upgrade_unit(id),
             "opl-upgrade-0193a1b2c3d47e5f8a9b0c1d2e3f4a5b"
         );
         assert_eq!(

@@ -314,8 +314,8 @@ impl Node {
     /// 이 중앙의 NB·SB `cluster/status`
     fn cluster_status(&self, db: &str) -> ClusterStatus {
         let (ctl, name) = match db {
-            "nb" => ("/run/opl/ovn/nb.ctl", "OVN_Northbound"),
-            _ => ("/run/opl/ovn/sb.ctl", "OVN_Southbound"),
+            "nb" => ("/run/orbivisor/ovn/nb.ctl", "OVN_Northbound"),
+            _ => ("/run/orbivisor/ovn/sb.ctl", "OVN_Southbound"),
         };
         let out = self.exec(&["ovs-appctl", "-t", ctl, "cluster/status", name]);
         eprintln!("{} cluster/status {name}:\n{out}", self.name);
@@ -324,7 +324,7 @@ impl Node {
 
     /// 이 중앙의 `ovn-nbctl`·`ovn-sbctl --no-leader-only --bare …`(실패하면 빈 글, 따옴표는 뗀다)
     fn ovn_bare(&self, program: &str, db: &str, args: &[&str]) -> String {
-        let socket = format!("--db=unix:/run/opl/ovn/{db}.sock");
+        let socket = format!("--db=unix:/run/orbivisor/ovn/{db}.sock");
         // 팔로어의 로컬 소켓에는 leader-only(기본) 클라이언트가 붙지 못한다(계획 67 스테이지 6에서 확인) — 읽기만 하므로
         // 어느 중앙에서든 읽는다.
         let mut all = vec![program, socket.as_str(), "--no-leader-only", "--bare"];
@@ -476,13 +476,13 @@ impl Fleet {
                     &["ovs-vsctl", "show"][..],
                     &[
                         "ovn-sbctl",
-                        "--db=unix:/run/opl/ovn/sb.sock",
+                        "--db=unix:/run/orbivisor/ovn/sb.sock",
                         "--no-leader-only",
                         "show",
                     ],
                     &[
                         "ovn-nbctl",
-                        "--db=unix:/run/opl/ovn/nb.sock",
+                        "--db=unix:/run/orbivisor/ovn/nb.sock",
                         "--no-leader-only",
                         "show",
                     ],
@@ -493,9 +493,9 @@ impl Fleet {
                         "orbivisord",
                         "ovn-controller",
                         "ovs-vswitchd",
-                        "opl-ovn-nb",
-                        "opl-ovn-sb",
-                        "opl-ovn-northd",
+                        "orbivisor-ovn-nb",
+                        "orbivisor-ovn-sb",
+                        "orbivisor-ovn-northd",
                     ],
                     &[
                         "journalctl",
@@ -507,7 +507,7 @@ impl Fleet {
                         "-u",
                         "ovs-vswitchd",
                         "-u",
-                        "opl-ovn-northd",
+                        "orbivisor-ovn-northd",
                     ],
                     &["tail", "-n", "40", "/var/log/ovn/ovn-controller.log"],
                 ] {
@@ -1122,9 +1122,9 @@ fn ovsdb_within(from: &Node, to: &str, port: u16, secs: u32) -> bool {
     let (ok, out, err) = from.try_exec(&[
         "ovsdb-client",
         &timeout,
-        "--private-key=/etc/opl/ovn/node.key",
-        "--certificate=/etc/opl/ovn/node.crt",
-        "--ca-cert=/etc/opl/ovn/ca.crt",
+        "--private-key=/etc/orbivisor/ovn/node.key",
+        "--certificate=/etc/orbivisor/ovn/node.crt",
+        "--ca-cert=/etc/orbivisor/ovn/ca.crt",
         "list-dbs",
         &format!("ssl:{to}:{port}"),
     ]);
@@ -1186,7 +1186,7 @@ async fn removed_node_section(fleet: &Fleet) {
     // 붙지 못한다. 역할과 두 읽기를 남긴다.
     for n in [c1, c3] {
         let role = n.cluster_status("sb").role;
-        let socket = "--db=unix:/run/opl/ovn/sb.sock";
+        let socket = "--db=unix:/run/orbivisor/ovn/sb.sock";
         let leader_only = n.try_exec(&[
             "ovn-sbctl",
             socket,
@@ -1498,7 +1498,7 @@ async fn migration_section(fleet: &Fleet) {
                         "exec",
                         &container,
                         "ovn-nbctl",
-                        "--db=unix:/run/opl/ovn/nb.sock",
+                        "--db=unix:/run/orbivisor/ovn/nb.sock",
                         "--bare",
                         "get",
                         "Logical_Switch_Port",

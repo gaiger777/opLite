@@ -80,7 +80,7 @@ async fn env() -> Option<Env> {
         run_dir: root.join("run"),
         state_dir: root.join("state"),
         net: None,
-        // `ORBIVISOR_RESTORE_SCOPE=1`(Linux root·systemd): `opl-fr-<id>.scope`로 감싼다
+        // `ORBIVISOR_RESTORE_SCOPE=1`(Linux root·systemd): `orbivisor-fr-<id>.scope`로 감싼다
         systemd_scope: std::env::var_os("ORBIVISOR_RESTORE_SCOPE").is_some(),
         swtpm: Default::default(),
     };
@@ -295,7 +295,7 @@ async fn fixtures_are_browsed_through_the_helper() {
                 "-p",
                 "MemoryMax,TasksMax,CPUQuotaPerSecUSec,ActiveState",
             ])
-            .arg(format!("opl-fr-{id}.scope"))
+            .arg(format!("orbivisor-fr-{id}.scope"))
             .output()
             .unwrap();
         let show = String::from_utf8_lossy(&out.stdout).replace('\n', " ");
@@ -433,7 +433,7 @@ async fn fixtures_are_browsed_through_the_helper() {
     assert!(!paths.run.exists() && !paths.state.exists());
     if env.config.systemd_scope {
         let out = std::process::Command::new("systemctl")
-            .args(["is-active", &format!("opl-fr-{id}.scope")])
+            .args(["is-active", &format!("orbivisor-fr-{id}.scope")])
             .output()
             .unwrap();
         assert!(!out.status.success(), "the scope is still there");

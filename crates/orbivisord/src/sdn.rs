@@ -1165,7 +1165,7 @@ mod tests {
             ]),
         );
         f.reply(
-            "systemctl is-active opl-ovn-sb.service",
+            "systemctl is-active orbivisor-ovn-sb.service",
             CmdOutput::fail(3, ""),
         );
         f.reply("ovs-appctl", CmdOutput::ok(NB_LEADER));
@@ -1210,7 +1210,7 @@ mod tests {
 
         let calls = f.calls();
         assert!(
-            calls.contains(&"systemctl start opl-ovn-sb.service".to_string()),
+            calls.contains(&"systemctl start orbivisor-ovn-sb.service".to_string()),
             "{calls:?}"
         );
         assert!(
@@ -1224,7 +1224,7 @@ mod tests {
         );
         assert!(calls.contains(&"ovs-vsctl --if-exists del-port br-int opstale".to_string()));
         let northd =
-            std::fs::read_to_string(s.root.join("systemd/opl-ovn-northd.service")).unwrap();
+            std::fs::read_to_string(s.root.join("systemd/orbivisor-ovn-northd.service")).unwrap();
         assert!(northd.contains("--ovnnb-db=ssl:10.0.0.1:6641,ssl:10.0.0.2:6641 "));
         assert_eq!(
             std::fs::read_to_string(s.root.join("etc/node.key")).unwrap(),
@@ -1935,11 +1935,12 @@ mod tests {
         s.agent.tick().await;
         let calls = f.calls();
         assert!(
-            calls.contains(&"systemctl restart opl-ovn-sb.service".to_string()),
+            calls.contains(&"systemctl restart orbivisor-ovn-sb.service".to_string()),
             "{calls:?}"
         );
         assert!(s.root.join("etc/sb.json").exists());
-        let unit = std::fs::read_to_string(s.root.join("systemd/opl-ovn-sb.service")).unwrap();
+        let unit =
+            std::fs::read_to_string(s.root.join("systemd/orbivisor-ovn-sb.service")).unwrap();
         assert!(unit.contains("--config-file="), "{unit}");
         let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
         assert_eq!(sdn.status.lockdown.as_ref().unwrap().applied, [node]);
@@ -2046,7 +2047,7 @@ mod tests {
         s.agent.tick().await;
         let after: Vec<String> = f.calls()[before..].to_vec();
         assert!(
-            after.contains(&"systemctl restart opl-ovn-sb.service".to_string()),
+            after.contains(&"systemctl restart orbivisor-ovn-sb.service".to_string()),
             "{after:?}"
         );
         let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();

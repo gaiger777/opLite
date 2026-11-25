@@ -176,10 +176,10 @@ async fn session_id(d: &Daemon, backup: &str) -> String {
     out.split_whitespace().nth(3).unwrap().to_string()
 }
 
-/// 세션의 도우미 QEMU pid(명령줄의 `opl-fr-<id>`)
+/// 세션의 도우미 QEMU pid(명령줄의 `orbivisor-fr-<id>`)
 fn helper_pid(id: &str) -> Option<u32> {
     let out = Command::new("pgrep")
-        .args(["-f", &format!("opl-fr-{id}")])
+        .args(["-f", &format!("orbivisor-fr-{id}")])
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout)
