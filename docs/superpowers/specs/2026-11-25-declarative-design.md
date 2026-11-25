@@ -531,3 +531,5 @@ opld 수용 시험·Terraform·웹 데모가 함께 쓰는 실행 파일(`crates
 - 웹: Terraform 객체 되돌리기는 숨기지 않고, 막힘이 모두 `managed_elsewhere`이면 "Terraform에서 넘겨받아 그래도 되돌리기" 체크(경고: 다음 `terraform apply`가 되돌림)를 보이고 켜면 `force_conflicts: true`로 다시 계획한다. 숨기면 지원 이력에서 웹 편집을 되돌릴 길이 CLI뿐이고, 계획(막힘 이유)을 보인 뒤 고르게 하는 편이 낫다고 보았다. 다른 막힘이 섞이면 보이지 않는다.
 - 웹: `toYaml`은 JSON이 탈출하지 않는 DEL·C1·NEL·U+2028/2029·BOM·U+FFFE/FFFF를 `\uXXXX`로 쓴다(교차 고정 파일에 한 경우 — `web_cross.rs` 통과). 짝 없는 대리 글자는 API 값에 나올 수 없어 다루지 않았다.
 - 웹: 갱신 응답 `tasks`의 형 변환(`as unknown as Task`)은 그대로 둔다 — 서버가 `RenewStarted.tasks`를 `Task`로 고쳐 `schema.d.ts`를 다시 만들어도 그대로 컴파일된다(그때 지우면 된다).
+- 합치기: **되돌리기는 spec 전체(위 "본 것"을 고침).** `plan::Request.replace`(되돌리기 둘만 켬)면 바꾸기 단계의 "앞 선언"을 지금 값의 매니페스트 spec 전체(비밀 칸 뺌)로 두어 `forget_dropped`가 문서에 없는 끝 칸을 지운다 — 그 줄에서 기본값이라 빠진 칸(알림 대상 `enabled`, VM `max_memory_mib` 등)이 기본값으로 돌아간다. 타입으로 기본값을 적어 내는 길(왕복)은 `skip_serializing_if`가 다시 빼므로 쓰지 않았다. 비밀 칸은 문서에 없어도 지금 값(그 줄 뒤에 넣은 토큰도 남음), 이름·전원·노드·MAC 같은 서버 칸은 `keep_server_fields`가 그대로 둔다. 적용 묶음의 앞 선언 세 갈래 비교는 되돌리기에서 쓰지 않는다(되돌리기는 묶음 없이 계획한다).
+- 합치기: `RenewStarted.tasks`가 `Task` 형이 되어 웹의 `as unknown as Task` 형 변환을 지웠다. `schema.d.ts`는 세 갈래를 합친 트리에서 다시 만들었다.

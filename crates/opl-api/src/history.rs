@@ -1123,6 +1123,7 @@ pub async fn restore_one(
                 documents: vec![doc.clone()],
                 force_conflicts: req.force_conflicts,
                 reuse_ids: reuse,
+                replace: true,
                 ..plan::Request::default()
             };
             Box::pin(plan::make_plan(&state, &principal, &request, meta)).await?
@@ -1456,6 +1457,7 @@ pub async fn restore_point(
         force_conflicts: req.force_conflicts,
         delete,
         reuse_ids: reuse,
+        replace: true,
         ..plan::Request::default()
     };
     let meta = meta_for(req.reason.as_deref(), point_revision);

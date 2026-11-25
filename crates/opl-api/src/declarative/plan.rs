@@ -42,6 +42,9 @@ pub(crate) struct Request {
     pub delete: Vec<(ManifestKind, Uuid)>,
     /// 만들기 단계가 쓸 옛 id(지운 것 살리기 — §12.3, (종류, 문서 열쇠) → id)
     pub reuse_ids: BTreeMap<(ManifestKind, String), Uuid>,
+    /// 되돌리기(§12): 문서가 spec 전체다 — 지금 값에 있고 문서에 없는 칸(그때 기본값이라 이력 줄에 빠진 칸)은 기본값으로
+    /// 돌아간다. 비밀 칸은 문서에 없어도 지금 값 그대로다(비밀은 되돌리지 않는다).
+    pub replace: bool,
 }
 
 /// 객체를 맡은 관리자(§8.2 7 — 객체 통째 단위)
@@ -678,6 +681,17 @@ pub(crate) fn compare(
     Ok(Ok((merged, desired, changes)))
 }
 
+/// 되돌리기의 "앞 선언": 지금 값의 매니페스트 spec 전체에서 비밀 칸을 뺀 것. 문서에 없는 끝 칸은 [`forget_dropped`]가
+/// 지워 기본값으로 돌아가고, 비밀 칸은 지금 값 그대로다.
+fn whole_spec(a: &dyn super::kinds::Adapter, live: &Live, world: &World) -> Value {
+    let mut spec = a.to_manifest(&live.spec, world);
+    for path in a.secret_paths() {
+        let path: Vec<String> = path.split('.').map(str::to_string).collect();
+        super::diff::remove_path(&mut spec, &path);
+    }
+    spec
+}
+
 /// 문서 하나의 단계
 #[allow(clippy::too_many_arguments)]
 async fn plan_doc(
@@ -856,13 +870,14 @@ async fn plan_doc(
                 .iter()
                 .find(|o| o.id == live.id && o.kind == kind.kind())
                 .map(|o| &o.declared);
+            let whole = req.replace.then(|| whole_spec(a, live, world));
             let (merged, desired, mut changes) = match compare(
                 state,
                 world,
                 live,
                 doc,
                 folder,
-                prev.and_then(|p| p.get("spec")),
+                whole.as_ref().or(prev.and_then(|p| p.get("spec"))),
             )? {
                 Ok(c) => c,
                 Err(e) => {

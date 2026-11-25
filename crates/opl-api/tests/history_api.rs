@@ -331,6 +331,88 @@ async fn webhook_targets_restore_without_their_hidden_url_and_headers() {
     );
 }
 
+/// 리뷰 1 합치기: 되돌리기는 그 줄의 spec 전체다 — 그때 기본값이라 줄에 없던 칸(webhook `enabled: true`, VM
+/// `max_memory_mib` 없음)도 되살린다. 그 뒤 넣은 비밀(webhook 토큰)은 되돌리지 않는다(지금 값 그대로).
+#[tokio::test]
+async fn restore_brings_back_fields_that_were_at_their_default() {
+    let (env, admin) = start().await;
+    let hook = |extra: Value| {
+        let mut target =
+            json!({ "kind": "webhook", "url": "https://hooks.example.com/T0", "format": "ntfy" });
+        let mut spec = json!({});
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "enabled" {
+                spec[k] = v.clone();
+            } else {
+                target[k] = v.clone();
+            }
+        }
+        spec["target"] = target;
+        doc("NotificationTarget", "hook", spec)
+    };
+    apply(&admin, json!({ "documents": [hook(json!({}))] })).await;
+    apply(
+        &admin,
+        json!({ "documents": [hook(json!({ "enabled": false, "token": "TOKEN-1" }))] }),
+    )
+    .await;
+    let items = rows(&admin, "notification-target", "hook").await;
+    let created = items.last().unwrap()["revision"].as_u64().unwrap();
+    let (plan, _) = restore(
+        &admin,
+        "/history/notification-target/hook/restore",
+        json!({ "revision": created }),
+    )
+    .await;
+    assert_eq!(summary(&plan), [0, 1, 0, 0, 0], "{plan}");
+    let now = env
+        .cluster
+        .get_by_name::<NotificationTargetSpec>("hook")
+        .unwrap()
+        .unwrap();
+    assert!(now.spec.enabled, "enabled goes back to its default");
+    let TargetConfig::Webhook(w) = &now.spec.target else {
+        panic!("webhook")
+    };
+    assert_eq!(
+        w.token.as_deref(),
+        Some("TOKEN-1"),
+        "secrets are not restored"
+    );
+    // 다시 되돌려도 바뀔 것이 없다.
+    let (status, plan) = admin
+        .post(
+            "/history/notification-target/hook/restore",
+            json!({ "revision": created, "dry_run": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(summary(&plan), [0, 0, 0, 1, 0], "{plan}");
+
+    // 시점 되돌리기도 같다(VM의 최대 메모리를 그 뒤 넣었다).
+    let docs = |max: Option<u32>| {
+        let mut web = vm("web01", "/prod", 256);
+        if let Some(max) = max {
+            web["spec"]["max_memory_mib"] = json!(max);
+        }
+        json!({ "documents": [doc("Folder", "prod", json!({ "kind": "vm" })), volume("web01-root"), web] })
+    };
+    apply(&admin, docs(None)).await;
+    let point = env.cluster.revision();
+    apply(&admin, docs(Some(1024))).await;
+    let web01 = env.cluster.get_by_name::<VmSpec>("web01").unwrap().unwrap();
+    assert_eq!(web01.spec.max_memory_mib, Some(1024));
+    let (plan, _) = restore(
+        &admin,
+        "/history/restore",
+        json!({ "at": { "revision": point }, "scope": { "folder": "/prod" } }),
+    )
+    .await;
+    assert_eq!(summary(&plan)[1], 1, "{plan}");
+    let web01 = env.cluster.get_by_name::<VmSpec>("web01").unwrap().unwrap();
+    assert_eq!(web01.spec.max_memory_mib, None);
+}
+
 #[tokio::test]
 async fn deleted_objects_come_back_with_their_id_unless_they_hold_data() {
     let (env, admin) = start().await;

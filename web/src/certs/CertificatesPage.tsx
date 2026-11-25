@@ -6,7 +6,6 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
-import type { Task } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import {
   type AcmeAccount,
@@ -123,7 +122,7 @@ export function CertificatesPage() {
         api.POST("/certificates/{key}/actions/renew", { params: { path: { key: cert.id } } }),
       );
       for (const task of started.tasks) {
-        trackTask(task as unknown as Task, t("tasks.op.acme-order", { target: cert.name }));
+        trackTask(task, t("tasks.op.acme-order", { target: cert.name }));
       }
       await refreshCerts(queryClient);
     } catch (err) {

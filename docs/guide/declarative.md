@@ -238,6 +238,8 @@ orbivisorctl restore --at 81000 --set web --kind vm --key Network/web-net --dele
 ```
 
 - **하나 되돌리기**(`KIND NAME --revision REV`): 그 리소스만 그 줄의 spec으로. 지금 객체의 revision으로 `If-Match`한다.
+- 되돌리기의 문서는 그 줄의 **spec 전체**다: `apply`와 달리 선언하지 않은 칸도 그 줄의 값이고, 그때 기본값이라 줄에 없던 칸(예: 알림
+  대상 `enabled: true`, VM `max_memory_mib` 없음)은 기본값으로 돌아간다(비밀 칸은 빼고).
 - **지운 리소스 살리기.** 마지막 줄이 지우기인 리소스는 지우기 직전 spec으로 **같은 id**로 다시 만든다(다른 리소스가 id로 가리키던
   참조가 다시 산다). 폴더·grant(이름이 곧 id)·원격·백업 저장소는 새 id다. 이름이 쓰이면 409 `name_taken` — `--name NEW`(새 id).
   **데이터 종류는 막는다**(`data_lost`): 볼륨(디스크 내용이 없다 — 백업에서 복원한다), 백업 저장소, 디스크 볼륨이 하나라도 없는 VM.
