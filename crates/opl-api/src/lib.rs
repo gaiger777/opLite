@@ -24,6 +24,7 @@ mod cpu;
 mod cpu_baseline;
 mod declarative;
 mod drain;
+mod drift;
 pub mod error;
 mod fan_out;
 pub mod file_restore;
@@ -35,6 +36,7 @@ mod ha_checks;
 mod ha_groups;
 mod ha_health;
 pub mod health;
+mod history;
 mod images;
 mod incoming;
 mod ipam;
@@ -118,6 +120,7 @@ pub use ceph::CephPeerSource;
 pub use ceph_agent::CephAgent;
 pub use cpu::CpuRefresher;
 pub use drain::start_drain;
+pub use drift::{DriftChecker, DriftCheckerConfig};
 pub use file_restore::FileRestoreSessions;
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, LEASE_EXPIRED, RecoveryWriter};
@@ -567,6 +570,12 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             declarative::get_apply_set,
             declarative::delete_apply_set
         ))
+        .routes(routes!(drift::adopt))
+        .routes(routes!(history::timeline))
+        .routes(routes!(history::restore_point))
+        .routes(routes!(history::resource_history))
+        .routes(routes!(history::history_row))
+        .routes(routes!(history::restore_one))
 }
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.

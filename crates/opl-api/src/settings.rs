@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::history::HistorySettings;
 use opl_types::node::{CPU_MODELS, FAST_HA, HA_PLACEMENT, METRICS_HISTORY, PLACEMENT, TWO_FACTOR};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
@@ -105,6 +106,42 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub acme: Option<AcmeSettingsPatch>,
+    /// 설정 이력 보존 한도(계획 73 §7.3): 리소스당 줄 수(10~1000)·나이(일, 7~3650)·전체 크기(MiB, 8~512). 준 칸만 바꾼다.
+    /// 모든 노드가 `config-history`를 알아야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub history: Option<HistorySettingsPatch>,
+}
+
+/// 설정 이력 보존 한도에서 바꿀 값
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySettingsPatch {
+    #[serde(default)]
+    #[schema(nullable = false, minimum = 10, maximum = 1000)]
+    pub max_per_resource: Option<u32>,
+    #[serde(default)]
+    #[schema(nullable = false, minimum = 7, maximum = 3650)]
+    pub max_age_days: Option<u32>,
+    #[serde(default)]
+    #[schema(nullable = false, minimum = 8, maximum = 512)]
+    pub max_total_mib: Option<u32>,
+}
+
+impl HistorySettingsPatch {
+    /// 준 값만 `current`에 합친다.
+    fn apply(&self, mut current: HistorySettings) -> HistorySettings {
+        if let Some(n) = self.max_per_resource {
+            current.max_per_resource = n;
+        }
+        if let Some(n) = self.max_age_days {
+            current.max_age_days = n;
+        }
+        if let Some(n) = self.max_total_mib {
+            current.max_total_mib = n;
+        }
+        current
+    }
 }
 
 /// ACME 동작에서 바꿀 값
@@ -438,9 +475,21 @@ pub async fn patch_settings(
         && req.two_factor.is_none()
         && req.cpu.is_none()
         && req.acme.is_none()
+        && req.history.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor, cpu or acme",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor, cpu, acme or history",
+        ));
+    }
+    // 옛 노드는 설정 `history`를 풀지 못한다(계획 73, 검증보다 먼저).
+    if req.history.is_some() {
+        crate::cluster::require_feature(&state.cluster, opl_types::node::CONFIG_HISTORY)?;
+    }
+    if let Some(patch) = req.history
+        && !patch.apply(HistorySettings::default()).valid()
+    {
+        return Err(ApiError::bad_request(
+            "history: max_per_resource must be 10-1000, max_age_days 7-3650 and max_total_mib 8-512",
         ));
     }
     // 옛 노드는 설정 `acme`를 풀지 못한다(계획 73).
@@ -600,6 +649,11 @@ pub async fn patch_settings(
                 acme.renew_jitter = v;
             }
             spec.acme = (acme != opl_types::settings::AcmeSettings::default()).then_some(acme);
+        }
+        // 모두 기본값이면 쓰지 않는다.
+        if let Some(patch) = req.history {
+            let history = patch.apply(spec.history());
+            spec.history = (history != HistorySettings::default()).then_some(history);
         }
         Ok(())
     })

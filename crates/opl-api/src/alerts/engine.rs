@@ -693,6 +693,11 @@ impl Engine {
                         None => continue,
                     }
                 }
+                // 적용 묶음 드리프트(계획 73 §12.5 — 리더 DriftChecker가 status에 쓴 것): 목록을 읽지 못하면 그대로 둔다.
+                AlertCondition::ApplySetDrift => match self.drift_findings() {
+                    Some(f) => self.subject_rule(now, &rule, f, "The apply set was deleted."),
+                    None => continue,
+                },
                 ref c if c.is_sdn() => {
                     // 입력을 읽지 못했으면 그대로 둔다(빈 입력으로 보면 경보를 알림 없이 뺀다).
                     let Some(world) = &sdn else { continue };
@@ -923,6 +928,34 @@ impl Engine {
     }
 
     /// 인증서마다: 이어진 주문 실패가 `failures`번 이상이면 참(마지막 오류를 자세히)
+    /// 묶음마다: 드리프트 검사가 선언과 다른 객체를 하나라도 찾았으면 참(값은 그 수)
+    fn drift_findings(&self) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
+        let (_, sets) = self
+            .cluster()
+            .list::<opl_types::apply_set::ApplySetSpec>()
+            .ok()?;
+        Some(
+            sets.iter()
+                .map(|s| {
+                    let n = s.status.drift.as_ref().map_or(0, |d| d.items.len());
+                    let subject = AlertSubject {
+                        kind: SubjectKind::ApplySet,
+                        id: s.id,
+                        name: s.name.clone(),
+                        node: None,
+                    };
+                    let detail = (n > 0).then(|| {
+                        format!(
+                            "Apply set {} drifted: {n} object(s) differ from the declaration",
+                            s.name
+                        )
+                    });
+                    (subject, n > 0, detail)
+                })
+                .collect(),
+        )
+    }
+
     fn renew_findings(&self, failures: u32) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
         let (_, certs) = self
             .cluster()

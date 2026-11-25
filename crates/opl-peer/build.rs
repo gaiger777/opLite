@@ -146,6 +146,12 @@ fn main() {
             "crate::topology::TopologyRequest",
             "opl_types::numa::TopologyLive",
         ))
+        .method(json(
+            "read_history",
+            "ReadHistory",
+            "crate::history::HistoryRequest",
+            "crate::history::HistoryReadReply",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

@@ -654,9 +654,14 @@ impl Cluster {
     }
 
     pub async fn create<S: ResourceSpec>(&self, resource: &Typed<S>) -> Result<u64, ClusterError> {
+        let mut resource = to_raw(resource)?;
+        // 지운 것 살리기가 연 범위면 옛 id로(계획 73 §12.3)
+        if let Some(id) = crate::change::take_reused_id(S::KIND) {
+            resource.id = id;
+        }
         self.write(Command::Create {
             kind: S::KIND,
-            resource: to_raw(resource)?,
+            resource,
         })
         .await
     }
@@ -1225,6 +1230,24 @@ impl Cluster {
         get_object(self.store.db(), S::KIND, id)?
             .map(from_raw)
             .transpose()
+    }
+
+    /// 종류를 값으로 받아 읽는다(JSON 그대로 — 설정 이력처럼 여러 종류를 함께 다룰 때)
+    pub fn get_raw(
+        &self,
+        kind: Kind,
+        id: Uuid,
+    ) -> Result<Option<crate::types::RawResource>, ClusterError> {
+        Ok(get_object(self.store.db(), kind, id)?)
+    }
+
+    /// 종류를 값으로 받아 이름으로 읽는다
+    pub fn get_raw_by_name(
+        &self,
+        kind: Kind,
+        name: &str,
+    ) -> Result<Option<crate::types::RawResource>, ClusterError> {
+        Ok(get_object_by_name(self.store.db(), kind, name)?)
     }
 
     pub fn get_by_name<S: ResourceSpec>(

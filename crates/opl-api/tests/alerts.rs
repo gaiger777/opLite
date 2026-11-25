@@ -1578,3 +1578,36 @@ async fn certificate_alerts_follow_expiry_and_renew_failures() {
         "{texts:?}"
     );
 }
+
+/// 적용 묶음 드리프트 경보(계획 73 §12.5): 리더가 드리프트 보고에 객체가 있는 묶음마다 알린다(대상은 묶음).
+#[tokio::test]
+async fn apply_set_drift_alerts_name_the_set() {
+    use opl_types::apply_set::{ApplySet, ApplySetSpec, DriftItem, DriftReport, DriftState};
+
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    rig.rule(
+        "drift",
+        json!({"condition": {"kind": "apply_set_drift"}, "severity": "warning", "targets": ["ops"]}),
+    )
+    .await;
+    let mut set: ApplySet = Resource::new("web", ApplySetSpec::default());
+    set.status.drift = Some(DriftReport {
+        checked_at: 1,
+        revision: 1,
+        items: vec![DriftItem {
+            kind: opl_types::resource::Kind::SecurityGroup,
+            id: Uuid::now_v7(),
+            name: "web-sg".into(),
+            state: DriftState::Modified,
+            paths: vec!["description".into()],
+            by: None,
+        }],
+    });
+    rig.env.cluster.create(&set).await.unwrap();
+    let _engine = rig.engine();
+    let hits = rig.hook.wait(1).await;
+    let text = hits[0].json().to_string();
+    assert!(text.contains("\"rule\":\"drift\""), "{text}");
+    assert!(text.contains("Apply set web drifted: 1 object"), "{text}");
+}

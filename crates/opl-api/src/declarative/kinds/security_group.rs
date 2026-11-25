@@ -155,6 +155,11 @@ impl Adapter for GroupAdapter {
         })
     }
 
+    /// 만들기 처리기가 `Cluster::create` 뒤에 id를 다시 쓰지 않는다(지운 것을 같은 id로 살린다).
+    fn keeps_id_on_restore(&self) -> bool {
+        true
+    }
+
     fn write_labels<'a>(
         &'a self,
         cluster: &'a Cluster,

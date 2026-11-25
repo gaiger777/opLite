@@ -4,10 +4,10 @@
 //! 새 권한은 없다: 단계마다 그 종류·대상의 지금 권한을 본다.
 
 mod apply;
-mod diff;
-mod export;
-mod kinds;
-mod plan;
+pub(crate) mod diff;
+pub(crate) mod export;
+pub(crate) mod kinds;
+pub(crate) mod plan;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -83,6 +83,10 @@ pub struct ApplyRequest {
     #[serde(default)]
     #[schema(nullable = false)]
     pub manager: Option<Manager>,
+    /// 다른 관리자(Terraform 레이블·다른 적용 묶음)의 객체도 바꾸고 관리를 넘겨받는다. 없으면 그 단계가
+    /// `blocked: managed_elsewhere`다.
+    #[serde(default)]
+    pub force_conflicts: bool,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -215,7 +219,7 @@ pub struct ApplyStarted {
 pub(crate) struct Plans(Mutex<HashMap<Uuid, Arc<StoredPlan>>>);
 
 impl Plans {
-    fn keep(&self, plan: StoredPlan) -> Arc<StoredPlan> {
+    pub(crate) fn keep(&self, plan: StoredPlan) -> Arc<StoredPlan> {
         let plan = Arc::new(plan);
         let mut plans = self.0.lock().unwrap();
         plans.retain(|_, p| p.created.elapsed() < PLAN_TTL);
@@ -312,6 +316,8 @@ pub async fn apply(
         prune: req.prune,
         prune_data: req.prune_data,
         manager: req.manager,
+        force_conflicts: req.force_conflicts,
+        ..plan::Request::default()
     };
     let stored = match req.plan {
         Some(id) => {
@@ -350,31 +356,7 @@ pub async fn apply(
             stored
         }
     };
-    if stored.blocked() {
-        let mut e = ApiError::conflict(
-            "plan_blocked",
-            format!(
-                "{} step(s) are blocked; nothing was applied (see details.steps)",
-                stored.view.summary.blocked
-            ),
-        );
-        e.details = Some(serde_json::to_value(&stored.view).expect("plan"));
-        return Err(e);
-    }
-    let set = match &stored.apply_set {
-        Some(name) => Some(ensure_set(&state, name).await?),
-        None => None,
-    };
-    let task = crate::tasks::create_task(
-        &state.cluster,
-        TaskOp::Apply {
-            set,
-            plan: stored.id,
-        },
-        set.unwrap_or(stored.id),
-        state.node,
-    )
-    .await?;
+    let started = start(&state, &stored).await?;
     let s = &stored.view.summary;
     audit.detail(format!(
         "apply ({}{} create, {} update, {} delete, plan {})",
@@ -387,14 +369,41 @@ pub async fn apply(
         s.delete,
         stored.id
     ));
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApplyStarted {
-            plan: stored.view.clone(),
-            task,
-        }),
+    Ok((StatusCode::ACCEPTED, Json(started)).into_response())
+}
+
+/// 계획을 적용한다(Task `apply`): 막힌 단계가 있으면 409 `plan_blocked`(`details`가 계획)이고 아무것도 하지 않는다.
+/// 되돌리기(`/history/…/restore`)도 이 길로 적용한다.
+pub(crate) async fn start(state: &AppState, stored: &StoredPlan) -> Result<ApplyStarted, ApiError> {
+    if stored.blocked() {
+        let mut e = ApiError::conflict(
+            "plan_blocked",
+            format!(
+                "{} step(s) are blocked; nothing was applied (see details.steps)",
+                stored.view.summary.blocked
+            ),
+        );
+        e.details = Some(serde_json::to_value(&stored.view).expect("plan"));
+        return Err(e);
+    }
+    let set = match &stored.apply_set {
+        Some(name) => Some(ensure_set(state, name).await?),
+        None => None,
+    };
+    let task = crate::tasks::create_task(
+        &state.cluster,
+        TaskOp::Apply {
+            set,
+            plan: stored.id,
+        },
+        set.unwrap_or(stored.id),
+        state.node,
     )
-        .into_response())
+    .await?;
+    Ok(ApplyStarted {
+        plan: stored.view.clone(),
+        task,
+    })
 }
 
 /// 적용 묶음(없으면 만든다)의 id
@@ -471,6 +480,12 @@ pub async fn delete_manifest(
     let world = World::load(&state.cluster)?;
     let live = export::find(&state, &principal, &world, kind, &key)?;
     let a = adapter(kind).ok_or_else(|| ApiError::internal("no adapter"))?;
+    if !a.deletable() {
+        return Err(ApiError::bad_request(format!(
+            "{} documents cannot be deleted",
+            kind.as_str()
+        )));
+    }
     check_route(&state, &principal, a.delete_route(), Some(live.id))?;
     let done = Box::pin(a.delete(&state, &principal, &live)).await?;
     audit.detail(format!("manifest delete {} {}", kind.as_str(), live.name));
@@ -478,7 +493,7 @@ pub async fn delete_manifest(
 }
 
 /// 적용 묶음에서 볼 수 없는 객체를 뺀다(§13 — 묶음 안 객체는 보이는 것만).
-fn visible_set(
+pub(crate) fn visible_set(
     state: &AppState,
     principal: &Principal,
     mut set: ApplySet,
@@ -574,6 +589,15 @@ pub async fn delete_apply_set(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 스키마 `T`와 그것이 가리키는 스키마를 없으면 더한다.
+fn register<T: ToSchema>(components: &mut utoipa::openapi::Components) {
+    let mut all = vec![(T::name().into_owned(), T::schema())];
+    T::schemas(&mut all);
+    for (name, schema) in all {
+        components.schemas.entry(name).or_insert(schema);
+    }
+}
+
 /// OpenAPI에 종류마다 매니페스트 꼴 `Manifest{Kind}`(spec은 그 종류의 저장 spec — 폴더는 `metadata.folder` 경로)를 낸다
 /// (Terraform 공급자의 스키마 맞춤 시험·웹 타입이 쓴다 — §13).
 pub(crate) struct ManifestSchemas;
@@ -581,6 +605,43 @@ pub(crate) struct ManifestSchemas;
 impl Modify for ManifestSchemas {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let components = openapi.components.get_or_insert_with(Default::default);
+        // 처리기가 보기 꼴만 내는 종류의 저장 spec(매니페스트 spec이 가리킨다)
+        register::<opl_types::backup_store::BackupStoreSpec>(components);
+        register::<opl_types::alert::NotificationTargetSpec>(components);
+        // 역할 spec은 API 본문에 나오지 않는다(보기 `AccessRoleView`) — 매니페스트가 가리키도록 낸다.
+        components
+            .schemas
+            .entry("AccessRoleSpec".into())
+            .or_insert_with(<opl_types::authz::AccessRoleSpec as utoipa::PartialSchema>::schema);
+        // grant 매니페스트 spec은 저장 꼴이 아니라 이름으로 적는다(`kinds/grant.rs`).
+        let text = || ObjectBuilder::new().schema_type(Type::String);
+        components.schemas.insert(
+            "ManifestGrantSpec".into(),
+            RefOr::T(Schema::Object(
+                ObjectBuilder::new()
+                    .property("user", text().description(Some("user name (or group)")))
+                    .property("group", text().description(Some("group name (or user)")))
+                    .property(
+                        "role",
+                        text().description(Some("built-in role (admin, operator, viewer) or access role name")),
+                    )
+                    .required("role")
+                    .property(
+                        "target",
+                        text().description(Some(
+                            "\"/\", a folder \"vm:/path\" (vm, network, storage) or an object \"vm/name\"",
+                        )),
+                    )
+                    .required("target")
+                    .property(
+                        "propagate",
+                        ObjectBuilder::new()
+                            .schema_type(Type::Boolean)
+                            .default(Some(serde_json::Value::Bool(true))),
+                    )
+                    .build(),
+            )),
+        );
         for kind in kinds::ORDER {
             let spec = match kind {
                 ManifestKind::Vm => "VmSpec",
@@ -592,7 +653,23 @@ impl Modify for ManifestSchemas {
                 ManifestKind::StoragePool => "StoragePoolSpec",
                 ManifestKind::Folder => "FolderSpec",
                 ManifestKind::PlacementRule => "PlacementRuleSpec",
-                _ => continue,
+                ManifestKind::BackupStore => "BackupStoreSpec",
+                // 저장 spec에 스키마가 없다(또는 서버 칸 `ca_pem`이 있다) — 같은 칸의 처리기 본문
+                ManifestKind::Remote => "RemoteRequest",
+                ManifestKind::BackupJob => "BackupJobSpec",
+                ManifestKind::Realm => "RealmRequest",
+                ManifestKind::NotificationTarget => "NotificationTargetSpec",
+                ManifestKind::AlertRule => "AlertRuleSpec",
+                ManifestKind::Settings => "SettingsSpec",
+                ManifestKind::LoadBalancer => "LoadBalancerSpec",
+                ManifestKind::HaGroup => "HaGroupSpec",
+                ManifestKind::HaCheck => "HaCheckSpec",
+                ManifestKind::AccessRole => "AccessRoleSpec",
+                ManifestKind::Group => "GroupSpec",
+                ManifestKind::Grant => "ManifestGrantSpec",
+                ManifestKind::AcmeAccount => "AcmeAccountSpec",
+                ManifestKind::AcmeDns => "AcmeDnsSpec",
+                ManifestKind::Certificate => "CertificateSpec",
             };
             let mut object = ObjectBuilder::new()
                 .property(

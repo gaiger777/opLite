@@ -2,12 +2,29 @@
 //! 쓰기는 그 종류의 지금 처리기를 그대로 부른다 — 검증·권한·할당량·독점 키·감사 메모·Task 만들기를 비껴가지 않는다.
 //! 처리기 앞의 경로표 권한은 [`check_route`]가 같은 표로 본다.
 
+mod access_role;
+mod acme_account;
+mod acme_dns;
+mod alert_rule;
+mod backup_job;
+mod backup_store;
+mod certificate;
 mod floating_ip;
 mod folder;
+mod grant;
+mod group;
+mod ha_check;
+mod ha_group;
+mod load_balancer;
 mod network;
+mod notification_target;
 mod placement_rule;
+mod realm;
+mod remote;
 mod router;
+mod secret;
 mod security_group;
+mod settings;
 mod storage_pool;
 mod vm;
 mod volume;
@@ -41,17 +58,35 @@ use crate::state::AppState;
 
 pub(crate) type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
 
-/// 적용 차례(같은 층 안의 종류 차례 — §8.1 표): 폴더·풀·네트워크·보안 그룹 → 라우터 → 볼륨 → VM → 유동 IP·배치 규칙
-pub(crate) const ORDER: [ManifestKind; 9] = [
+/// 적용 차례(같은 층 안의 종류 차례 — §8.1 표): 폴더·풀·네트워크·보안 그룹 → 라우터 → HA 묶음 → 볼륨 → VM → 유동
+/// IP·부하 분산기·배치 규칙 → HA 검사 → 백업 저장소·원격·백업 작업 → realm·역할·그룹·grant → 알림 대상·경보 규칙 →
+/// 설정 → ACME 계정·DNS 공급자·인증서. 내보내기도 이 차례다(grant 열쇠가 앞 종류의 이름을 쓴다 — 역할·그룹이 grant보다 앞).
+pub(crate) const ORDER: [ManifestKind; 25] = [
     ManifestKind::Folder,
     ManifestKind::StoragePool,
     ManifestKind::Network,
     ManifestKind::SecurityGroup,
     ManifestKind::Router,
+    ManifestKind::HaGroup,
     ManifestKind::Volume,
     ManifestKind::Vm,
     ManifestKind::FloatingIp,
+    ManifestKind::LoadBalancer,
     ManifestKind::PlacementRule,
+    ManifestKind::HaCheck,
+    ManifestKind::BackupStore,
+    ManifestKind::Remote,
+    ManifestKind::BackupJob,
+    ManifestKind::Realm,
+    ManifestKind::AccessRole,
+    ManifestKind::Group,
+    ManifestKind::Grant,
+    ManifestKind::NotificationTarget,
+    ManifestKind::AlertRule,
+    ManifestKind::Settings,
+    ManifestKind::AcmeAccount,
+    ManifestKind::AcmeDns,
+    ManifestKind::Certificate,
 ];
 
 /// 적용 차례에서의 자리(다루지 않는 종류는 끝)
@@ -59,7 +94,7 @@ pub(crate) fn rank(kind: ManifestKind) -> usize {
     ORDER.iter().position(|k| *k == kind).unwrap_or(ORDER.len())
 }
 
-/// 종류의 어댑터. 이 스테이지가 다루지 않는 종류(백업·HA·권한·알림·realm·설정·ACME — 계획 73 스테이지 3·4)는 None.
+/// 종류의 어댑터(계획 73 스테이지 3부터 스물다섯 종류 모두 — 다루지 않는 종류가 생기면 None).
 pub(crate) fn adapter(kind: ManifestKind) -> Option<&'static dyn Adapter> {
     Some(match kind {
         ManifestKind::Folder => &folder::FolderAdapter,
@@ -71,7 +106,22 @@ pub(crate) fn adapter(kind: ManifestKind) -> Option<&'static dyn Adapter> {
         ManifestKind::Vm => &vm::VmAdapter,
         ManifestKind::FloatingIp => &floating_ip::FipAdapter,
         ManifestKind::PlacementRule => &placement_rule::RuleAdapter,
-        _ => return None,
+        ManifestKind::BackupStore => &backup_store::StoreAdapter,
+        ManifestKind::Remote => &remote::RemoteAdapter,
+        ManifestKind::BackupJob => &backup_job::JobAdapter,
+        ManifestKind::Realm => &realm::RealmAdapter,
+        ManifestKind::NotificationTarget => &notification_target::TargetAdapter,
+        ManifestKind::AlertRule => &alert_rule::AlertRuleAdapter,
+        ManifestKind::Settings => &settings::SettingsAdapter,
+        ManifestKind::LoadBalancer => &load_balancer::LbAdapter,
+        ManifestKind::HaGroup => &ha_group::HaGroupAdapter,
+        ManifestKind::HaCheck => &ha_check::HaCheckAdapter,
+        ManifestKind::AccessRole => &access_role::RoleAdapter,
+        ManifestKind::Group => &group::GroupAdapter,
+        ManifestKind::Grant => &grant::GrantAdapter,
+        ManifestKind::AcmeAccount => &acme_account::AccountAdapter,
+        ManifestKind::AcmeDns => &acme_dns::DnsAdapter,
+        ManifestKind::Certificate => &certificate::CertificateAdapter,
     })
 }
 
@@ -287,6 +337,27 @@ pub(crate) trait Adapter: Sync {
     fn create_carries_labels(&self) -> bool {
         true
     }
+
+    /// 지운 것 살리기(계획 73 §12.3)가 같은 id로 만들 수 있는지: 만들기 처리기가 `Cluster::create` 뒤에 그 id를 다시
+    /// 쓰지 않아야 한다(살리기는 그 만들기 한 번의 id를 옛 id로 바꾼다). 아니면 새 id로 살린다.
+    fn keeps_id_on_restore(&self) -> bool {
+        false
+    }
+
+    /// 지울 수 있는 종류인지(설정은 아니다 — 가지치기가 건너뛰고 `DELETE /manifests`는 400)
+    fn deletable(&self) -> bool {
+        true
+    }
+
+    /// 문서 열쇠를 이름이 아니라 매니페스트 spec에서 정하는 종류(grant — 내용 전체가 열쇠)
+    fn doc_key(&self, _spec: &Value) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// 내보내는 문서의 `metadata.name`(기본: 리소스 이름)
+    fn export_name(&self, live: &Live, _spec: &Value) -> String {
+        live.name.clone()
+    }
 }
 
 /// `spec`에서 칸들을 뺀 것
@@ -396,6 +467,7 @@ fn obj(kind: ManifestKind) -> Option<Obj> {
         ManifestKind::Folder => Obj::Folder,
         ManifestKind::Router => Obj::Router,
         ManifestKind::FloatingIp => Obj::FloatingIp,
+        ManifestKind::LoadBalancer => Obj::LoadBalancer,
         _ => return None,
     })
 }
@@ -446,6 +518,8 @@ pub(crate) struct World {
     folders: BTreeMap<Uuid, (String, Option<Uuid>, FolderKind)>,
     nodes: Vec<(Uuid, String)>,
     vms: Vec<(Uuid, String)>,
+    /// 사용자(매니페스트 종류가 아니다 — 그룹 멤버·grant 주체가 이름으로 가리킨다)
+    users: Vec<(Uuid, String)>,
     /// (종류, 문서 열쇠) → 객체
     pub objects: BTreeMap<(ManifestKind, String), Live>,
 }
@@ -471,11 +545,18 @@ impl World {
             .into_iter()
             .map(|v| (v.id, v.name))
             .collect();
+        let users = cluster
+            .list::<opl_types::auth::UserSpec>()?
+            .1
+            .into_iter()
+            .map(|u| (u.id, u.name))
+            .collect();
         let mut world = Self {
             revision,
             folders,
             nodes,
             vms,
+            users,
             objects: BTreeMap::new(),
         };
         for kind in ORDER {
@@ -502,6 +583,17 @@ impl World {
         }
         parts.reverse();
         Some(format!("/{}", parts.join("/")))
+    }
+
+    /// 아직 없는 폴더를 경로 풀기에 더한다(시점 되돌리기가 함께 살릴 폴더 — 계획 73 §12.4)
+    pub(crate) fn add_folder(
+        &mut self,
+        id: Uuid,
+        name: String,
+        parent: Option<Uuid>,
+        tree: FolderKind,
+    ) {
+        self.folders.entry(id).or_insert((name, parent, tree));
     }
 
     pub(crate) fn folder_tree(&self, id: Uuid) -> Option<FolderKind> {
@@ -569,8 +661,38 @@ impl World {
             .map_or_else(|| id.to_string(), |(_, name)| name.clone())
     }
 
-    /// 지금 객체의 문서 열쇠(폴더는 `트리:경로`, 그 밖은 이름)
+    pub(crate) fn user_id(&self, name: &str) -> Option<Uuid> {
+        self.users
+            .iter()
+            .find(|(_, n)| n == name)
+            .map(|(id, _)| *id)
+    }
+
+    pub(crate) fn user_name(&self, id: Uuid) -> String {
+        self.users
+            .iter()
+            .find(|(u, _)| *u == id)
+            .map_or_else(|| id.to_string(), |(_, name)| name.clone())
+    }
+
+    /// 종류 `kind`의 이름 `name`인 지금 객체 id(폴더 아닌 종류)
+    pub(crate) fn id_of(&self, kind: ManifestKind, name: &str) -> Option<Uuid> {
+        self.objects.get(&(kind, name.to_string())).map(|l| l.id)
+    }
+
+    /// 종류 `kind`의 id인 지금 객체 이름(모르면 id 문자열)
+    pub(crate) fn name_of(&self, kind: ManifestKind, id: Uuid) -> String {
+        self.by_id(kind, id)
+            .map_or_else(|| id.to_string(), |l| l.name.clone())
+    }
+
+    /// 지금 객체의 문서 열쇠(폴더는 `트리:경로`, grant는 내용, 그 밖은 이름)
     pub(crate) fn key_of_live(&self, live: &Live) -> String {
+        if let Some(a) = adapter(live.kind)
+            && let Ok(Some(key)) = a.doc_key(&a.to_manifest(&live.spec, self))
+        {
+            return key;
+        }
         if live.kind == ManifestKind::Folder {
             let tree = self.folder_tree(live.id).unwrap_or(FolderKind::Vm);
             let path = self
@@ -597,13 +719,13 @@ impl World {
         for path in a.secret_paths() {
             let pointer = format!("/{}", path.replace('.', "/"));
             if let Some(v) = spec.pointer_mut(&pointer)
-                && v.is_object()
+                && !v.is_null()
             {
                 *v = serde_json::to_value(SecretValue::reference(live.kind, &live.name, path))
                     .expect("a secret reference serializes");
             }
         }
-        let mut m = Manifest::new(live.kind, live.name.clone(), Value::Null);
+        let mut m = Manifest::new(live.kind, a.export_name(live, &spec), Value::Null);
         m.metadata.folder = live.folder().and_then(|f| self.folder_path(f));
         m.metadata.labels = live
             .labels
@@ -625,6 +747,9 @@ pub(crate) fn key_of_doc(doc: &Manifest) -> Result<String, String> {
         let tree = folder::tree_of(&doc.spec)?;
         let parent = doc.metadata.folder.as_deref().unwrap_or("/");
         return Ok(folder_key(tree, &join_path(parent, &doc.metadata.name)));
+    }
+    if let Some(key) = adapter(doc.kind).map_or(Ok(None), |a| a.doc_key(&doc.spec))? {
+        return Ok(key);
     }
     Ok(doc.metadata.name.clone())
 }

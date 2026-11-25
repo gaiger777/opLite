@@ -225,6 +225,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: crate::declarative::SetCmd,
     },
+    /// 설정 이력(계획 73): 누가·언제·어디서·왜 바꿨나(`history show`는 줄 하나의 비교)
+    History(crate::history::HistoryArgs),
+    /// 설정 되돌리기(계획 73): 리소스 하나를 이력 줄로(지운 것은 같은 id로 살림), 또는 `--at`으로 여러 개를 한 시점으로
+    Restore(crate::history::RestoreArgs),
+    /// 적용 묶음의 드리프트(선언과 실제의 차이·누가 바꿨나) — 끝 코드 0 없음, 1 있음
+    Drift {
+        /// 이 묶음만
+        set: Option<String>,
+    },
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -6678,6 +6687,13 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         }
         Cmd::Plan(args) => Box::pin(crate::declarative::plan(&client, args, json_out, out)).await?,
         Cmd::Set { cmd } => Box::pin(crate::declarative::set(&client, cmd, json_out, out)).await?,
+        Cmd::History(args) => {
+            Box::pin(crate::history::history(&client, args, json_out, out)).await?
+        }
+        Cmd::Restore(args) => {
+            Box::pin(crate::history::restore(&client, args, json_out, out)).await?
+        }
+        Cmd::Drift { set } => Box::pin(crate::history::drift(&client, set, json_out, out)).await?,
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
                 let list = client.get("/tasks").await?;

@@ -3395,3 +3395,65 @@ async fn guest_agent_requests_reach_the_node_running_the_vm() {
         .unwrap_err();
     assert_eq!(err, GuestAgentError::Unsupported);
 }
+
+/// 설정 이력 읽기(계획 73 — 관찰 노드의 API가 구성원에게 묻는다): 구성원은 자기 상태 머신의 이력 줄을 보낸다.
+#[tokio::test]
+async fn members_serve_their_configuration_history() {
+    use opl_peer::history::HistoryRequest;
+    use opl_types::history::HistoryOp;
+    use opl_types::resource::Kind;
+
+    let (_ca, _root, nodes) = start(2).await;
+    for (i, node) in nodes.iter().enumerate() {
+        let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
+            format!("node-{i}"),
+            NodeSpec {
+                sdn: None,
+                host_resources: None,
+                address: node.addr.clone(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        r.id = node.id().0;
+        r.status.features = opl_types::node::FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        nodes[0].cluster.create(&r).await.unwrap();
+    }
+    let v = volume("disk-h");
+    nodes[0].cluster.create(&v).await.unwrap();
+    let rows = nodes[1]
+        .peers
+        .read_history(
+            nodes[0].id(),
+            &nodes[0].addr,
+            HistoryRequest::Resource {
+                kind: Kind::Volume,
+                id: v.id,
+            },
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .expect("the RPC is known");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].op, HistoryOp::Create);
+    let timeline = nodes[1]
+        .peers
+        .read_history(
+            nodes[0].id(),
+            &nodes[0].addr,
+            HistoryRequest::Timeline {
+                before: None,
+                limit: 10,
+            },
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(timeline.first().map(|r| r.id), Some(v.id));
+}

@@ -135,7 +135,7 @@ pub(crate) fn time_ms(s: &str, now_ms: i64) -> anyhow::Result<i64> {
 }
 
 /// 유닉스 밀리초를 `2026-11-06T09:30:05Z`처럼(UTC)
-fn ms_time(ms: i64) -> String {
+pub(crate) fn ms_time(ms: i64) -> String {
     match time::OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)) {
         Ok(t) => format!(
             "{}T{:02}:{:02}:{:02}Z",

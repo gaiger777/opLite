@@ -664,6 +664,15 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/apply-sets", Root(SystemRead)),
     ("GET", "/apply-sets/{key}", Root(SystemRead)),
     ("DELETE", "/apply-sets/{key}", Handler),
+    // 드리프트 받아들이기(계획 73 §12.5): 묶음 객체 모두의 바꾸기 권한(핸들러)
+    ("POST", "/apply-sets/{key}/adopt", Handler),
+    // 설정 이력(계획 73 §12): 보기는 그 리소스를 지금 읽을 수 있는 것만(핸들러가 거른다), 되돌리기는 단계마다 그 종류·대상의
+    // 지금 쓰기 권한(선언형 계획).
+    ("GET", "/history", Handler),
+    ("POST", "/history/restore", Handler),
+    ("GET", "/history/{kind}/{key}", Handler),
+    ("GET", "/history/{kind}/{key}/{revision}", Handler),
+    ("POST", "/history/{kind}/{key}/restore", Handler),
 ];
 
 /// (메서드, 경로 템플릿)의 규칙. HEAD는 GET으로 본다.

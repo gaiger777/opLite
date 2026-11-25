@@ -83,7 +83,9 @@ pub fn overlay(base: &mut Value, top: &Value) {
                     b.remove(k);
                 } else {
                     match b.get_mut(k) {
-                        Some(slot) if slot.is_object() && v.is_object() => overlay(slot, v),
+                        Some(slot) if slot.is_object() && v.is_object() && same_tag(slot, v) => {
+                            overlay(slot, v)
+                        }
                         // 새 객체도 얹는 것처럼(안의 `null`은 칸이 없음)
                         _ if v.is_object() => {
                             let mut fresh = Value::Object(Map::new());
@@ -99,6 +101,17 @@ pub fn overlay(base: &mut Value, top: &Value) {
         }
         (b, t) => *b = t.clone(),
     }
+}
+
+/// 태그 붙은 갈래(`kind`·`type` 칸) 객체가 같은 갈래인지. 갈래가 바뀌면 칸마다 얹지 않고 통째로 바꾼다 — 옛 갈래의 칸이
+/// 남으면 새 갈래 꼴(`deny_unknown_fields`)에 맞지 않는다(DNS 공급자 `cloudflare` → `power_dns` 등).
+fn same_tag(a: &Value, b: &Value) -> bool {
+    ["kind", "type"]
+        .iter()
+        .all(|t| match (a.get(*t), b.get(*t)) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        })
 }
 
 /// 객체 칸을 따라 내려간 끝 칸들의 경로(목록·값·빈 객체가 끝이다). 맨 위가 객체가 아니면 없다.
@@ -225,6 +238,23 @@ mod tests {
             base,
             json!({ "cpu": { "cores": 4, "model": "host" }, "nics": [3] })
         );
+    }
+
+    #[test]
+    fn a_changed_tag_replaces_the_object() {
+        let mut base =
+            json!({ "provider": { "kind": "cloudflare", "api_token": "t" }, "zones": [] });
+        overlay(
+            &mut base,
+            &json!({ "provider": { "kind": "hook", "path": "/etc/opl/acme-hooks/x" } }),
+        );
+        assert_eq!(
+            base["provider"],
+            json!({ "kind": "hook", "path": "/etc/opl/acme-hooks/x" })
+        );
+        let mut base = json!({ "scope": { "kind": "per_node", "nodes": ["a"] } });
+        overlay(&mut base, &json!({ "scope": { "nodes": ["b"] } }));
+        assert_eq!(base["scope"], json!({ "kind": "per_node", "nodes": ["b"] }));
     }
 
     #[test]

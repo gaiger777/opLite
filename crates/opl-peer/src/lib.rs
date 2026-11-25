@@ -17,6 +17,7 @@ pub mod fence;
 pub mod file_restore;
 pub mod firmware;
 pub mod guest;
+pub mod history;
 pub mod metrics;
 pub mod migration;
 pub mod monitor;

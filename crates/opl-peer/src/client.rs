@@ -1027,6 +1027,30 @@ impl Peers {
         }
     }
 
+    /// Raft 구성원 `node`(첫 링크 `addr`)에서 설정 이력을 읽는다(계획 73 — 관찰 노드의 API가 쓴다). 그 노드가 이 RPC를
+    /// 모르면(옛 노드) None이다.
+    pub async fn read_history(
+        &self,
+        node: NodeId,
+        addr: &str,
+        request: crate::history::HistoryRequest,
+        timeout: Duration,
+    ) -> Result<Option<Vec<opl_types::history::HistoryRecord>>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(request.clone());
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(node));
+                async move { within(timeout, client.read_history(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner().records)),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+
     /// mon 노드 `node`(첫 링크 `addr`)에서 Ceph 상태를 읽는다. 그 노드가 이 RPC를 모르면(옛 노드) None이다. 그
     /// 노드가 상태를 읽지 못하면(정족수 없음 등) `failed_precondition`이다.
     pub async fn ceph_status(

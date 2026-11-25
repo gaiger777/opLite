@@ -42,6 +42,7 @@ use crate::firmware::{
 use crate::guest::{
     GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
 };
+use crate::history::{HistoryReadReply, HistoryRequest, MAX_HISTORY_READ};
 use crate::metrics::{
     MAX_HISTORY_BYTES, MetricsReply, MetricsSource, PushMetricsHistoryReply,
     PushMetricsHistoryRequest,
@@ -588,6 +589,31 @@ impl Peer for PeerService {
             .await?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(live))
+    }
+
+    async fn read_history(
+        &self,
+        req: Request<HistoryRequest>,
+    ) -> Result<Response<HistoryReadReply>, Status> {
+        self.authorize(&req)?;
+        if self.cluster.mode() == opl_cluster::store::NodeMode::Observer {
+            return Err(Status::failed_precondition(
+                "an observer node has no configuration history",
+            ));
+        }
+        let cluster = self.cluster.clone();
+        let records = self
+            .offload(async move {
+                match req.into_inner() {
+                    HistoryRequest::Resource { kind, id } => cluster.history_of(kind, id),
+                    HistoryRequest::Timeline { before, limit } => {
+                        cluster.history_timeline(before, limit.min(MAX_HISTORY_READ))
+                    }
+                }
+            })
+            .await?
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(HistoryReadReply { records }))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;

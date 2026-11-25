@@ -40,10 +40,13 @@ pub(crate) async fn run(
         .ok_or("the plan is gone (it expired or the node restarted); apply again")?;
     let mut meta = plan.meta.clone();
     meta.actor.task = Some(task.id);
-    meta.source = match plan.manager {
-        Some(Manager::Terraform) => ChangeSource::Terraform,
-        None => ChangeSource::Apply,
-    };
+    // 되돌리기는 요청한 곳의 출처(웹·CLI)를 그대로 둔다 — 이력 줄이 `restored_from`으로 되돌리기임을 보인다.
+    if meta.restored_from.is_none() {
+        meta.source = match plan.manager {
+            Some(Manager::Terraform) => ChangeSource::Terraform,
+            None => ChangeSource::Apply,
+        };
+    }
     meta.apply_set = match &plan.apply_set {
         Some(name) => state
             .cluster
@@ -259,9 +262,20 @@ async fn run_step(
             } else {
                 Default::default()
             };
-            let done = a
-                .create(state, owner, step.name.clone(), labels, store)
-                .await?;
+            let create = a.create(state, owner, step.name.clone(), labels, store);
+            let done = match step.reuse_id {
+                // 지운 것 살리기: 처리기의 만들기 한 번이 옛 id를 쓴다(§12.3).
+                Some(id) => {
+                    let (done, used) =
+                        opl_cluster::change::reuse_id(step.kind.kind(), id, create).await;
+                    let mut done = done?;
+                    if used {
+                        done.id = id;
+                    }
+                    done
+                }
+                None => create.await?,
+            };
             if let Some(t) = done.task {
                 wait_task(&state.cluster, t).await?;
             }

@@ -69,12 +69,9 @@ fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     if spec.condition.is_acme() {
         require_feature(&state.cluster, opl_types::node::ACME)?;
     }
-    // 드리프트 조건(계획 73)도 옛 노드가 풀지 못하고, 평가는 드리프트(스테이지 3)가 더한다. 그 전에는 받지 않는다.
+    // 드리프트 조건(계획 73 §12.5)도 옛 노드가 풀지 못한다.
     if spec.condition.is_declarative() {
         require_feature(&state.cluster, opl_types::node::DECLARATIVE)?;
-        return Err(ApiError::bad_request(
-            "apply set alert conditions are not available yet",
-        ));
     }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;

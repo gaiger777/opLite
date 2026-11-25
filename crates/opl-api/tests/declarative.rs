@@ -571,9 +571,10 @@ async fn bad_documents_are_refused_with_their_index() {
             ]),
             "manifest_duplicate",
         ),
+        // 모든 종류에 어댑터가 있다(스테이지 3): 빠진 칸은 그 종류의 꼴 오류다.
         (
             json!([doc("BackupJob", "a", json!({}))]),
-            "manifest_unsupported",
+            "manifest_invalid",
         ),
     ];
     for (documents, code) in cases {

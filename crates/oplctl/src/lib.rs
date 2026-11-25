@@ -15,6 +15,7 @@ mod declarative;
 mod fake_api;
 mod file_restore;
 mod firmware;
+mod history;
 mod lb;
 mod media;
 mod metrics;

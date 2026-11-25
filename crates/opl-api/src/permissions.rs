@@ -720,7 +720,7 @@ fn yes() -> bool {
 }
 
 /// 역할의 권한(없는 사용자 정의 역할은 400)
-fn role_set(state: &AppState, role: &RoleRef) -> Result<(PrivSet, String), ApiError> {
+pub(crate) fn role_set(state: &AppState, role: &RoleRef) -> Result<(PrivSet, String), ApiError> {
     match role {
         RoleRef::Builtin { role } => Ok((builtin_privileges(*role), role.as_str().into())),
         RoleRef::Custom { id } => {
@@ -796,7 +796,7 @@ fn target_name(state: &AppState, t: &GrantTarget) -> String {
 /// 대상 자체이고, propagate면 그 아래 모두다. 아래 모두에 닿는 자기 권한은 대상이나 조상의 propagate grant뿐이라서
 /// 폴더 안 객체 층(루트면 루트의 객체 층)으로 본다. 그래서 propagate가 아닌 폴더 grant로 받은 권한을 propagate grant로
 /// 넓히지 못한다. 대상이 없거나 볼 수 없으면 404다.
-fn check_delegation(
+pub(crate) fn check_delegation(
     state: &AppState,
     principal: &Principal,
     target: &GrantTarget,

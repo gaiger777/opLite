@@ -57,6 +57,9 @@ pub(crate) struct Files {
     /// 가지치기가 VM·볼륨·백업 저장소도 지운다.
     #[arg(long, requires = "prune")]
     prune_data: bool,
+    /// Terraform·다른 적용 묶음이 관리하는 객체도 바꾸고 관리를 넘겨받는다.
+    #[arg(long)]
+    force_conflicts: bool,
 }
 
 #[derive(Args)]
@@ -116,6 +119,13 @@ pub(crate) enum SetCmd {
     /// 묶음을 지운다(리소스는 그대로, 레이블만 뗀다).
     Delete {
         name: String,
+    },
+    /// 드리프트를 받아들인다: 묶음의 선언을 지금 값으로(리소스는 그대로 — 그 뒤 `export --set`으로 파일을 맞춘다)
+    Adopt {
+        name: String,
+        /// 이 객체만(`종류/이름`, 여러 번). 없으면 드리프트 보고의 모두
+        #[arg(long = "object", value_name = "KIND/NAME")]
+        objects: Vec<String>,
     },
 }
 
@@ -303,10 +313,13 @@ fn body(files: &Files, documents: Vec<Value>) -> Value {
     if files.prune_data {
         b["prune_data"] = json!(true);
     }
+    if files.force_conflicts {
+        b["force_conflicts"] = json!(true);
+    }
     b
 }
 
-async fn post(
+pub(crate) async fn post(
     client: &Client,
     path: &str,
     body: &Value,
@@ -322,7 +335,7 @@ async fn post(
     client.send(r).await
 }
 
-fn summary(plan: &Value) -> [u64; 5] {
+pub(crate) fn summary(plan: &Value) -> [u64; 5] {
     let s = &plan["summary"];
     ["create", "update", "delete", "unchanged", "blocked"].map(|k| s[k].as_u64().unwrap_or(0))
 }
@@ -569,10 +582,26 @@ fn export_file(kind: &str) -> String {
         ("Network", "networks"),
         ("SecurityGroup", "security-groups"),
         ("Router", "routers"),
+        ("HaGroup", "ha-groups"),
         ("Volume", "volumes"),
         ("Vm", "vms"),
         ("FloatingIp", "floating-ips"),
+        ("LoadBalancer", "load-balancers"),
         ("PlacementRule", "placement-rules"),
+        ("HaCheck", "ha-checks"),
+        ("BackupStore", "backup-stores"),
+        ("Remote", "remotes"),
+        ("BackupJob", "backup-jobs"),
+        ("Realm", "realms"),
+        ("AccessRole", "access-roles"),
+        ("Group", "groups"),
+        ("Grant", "grants"),
+        ("NotificationTarget", "notification-targets"),
+        ("AlertRule", "alert-rules"),
+        ("Settings", "settings"),
+        ("AcmeAccount", "acme-accounts"),
+        ("AcmeDns", "acme-dns"),
+        ("Certificate", "certificates"),
     ];
     match order.iter().position(|(k, _)| *k == kind) {
         Some(i) => format!("{}-{}.yaml", (i + 1) * 10, order[i].1),
@@ -674,6 +703,22 @@ pub(crate) async fn set(
             let set = client.get(&format!("/apply-sets/{}", seg(&name))).await?;
             print_json(out, &set)?;
         }
+        SetCmd::Adopt { name, objects } => {
+            let set = post(
+                client,
+                &format!("/apply-sets/{}/adopt", seg(&name)),
+                &json!({ "objects": objects }),
+                None,
+            )
+            .await?;
+            if json_out {
+                return Ok(print_json(out, &set)?);
+            }
+            writeln!(
+                out,
+                "apply-set {name}: the live values are now the declaration; run `orbivisorctl export --set {name}` to update your files"
+            )?;
+        }
         SetCmd::Delete { name } => {
             client
                 .delete(&format!("/apply-sets/{}", seg(&name)))
@@ -699,6 +744,7 @@ mod tests {
             set: None,
             prune: false,
             prune_data: false,
+            force_conflicts: false,
         }
     }
 
@@ -753,7 +799,7 @@ mod tests {
         ];
         let text = to_yaml(&docs).unwrap();
         assert_eq!(parse_text(&text, Path::new("x.yaml")).unwrap(), docs);
-        assert_eq!(export_file("Vm"), "70-vms.yaml");
+        assert_eq!(export_file("Vm"), "80-vms.yaml");
         assert_eq!(export_file("Folder"), "10-folders.yaml");
     }
 

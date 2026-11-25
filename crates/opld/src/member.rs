@@ -215,6 +215,7 @@ struct Services {
     vmware: VmwareScheduler,
     /// 리더가 ACME 인증서를 주문한다(계획 73).
     acme: opl_api::acme::AcmeRenewer,
+    drift: opl_api::DriftChecker,
     /// ACME HTTP-01 리스너(`[api] http_listen`이 없으면 없다)
     http01: Option<opl_api::acme::http01::Http01Server>,
     /// 리더가 SDN 네트워크를 OVN NB에 맞추고 지운 노드의 SB chassis를 지운다(계획 65).
@@ -291,6 +292,7 @@ impl Services {
         self.replication.shutdown().await;
         self.vmware.shutdown().await;
         self.acme.shutdown().await;
+        self.drift.shutdown().await;
         if let Some(h) = self.http01 {
             h.shutdown().await;
         }
@@ -1086,6 +1088,10 @@ impl Member {
         let acme = on(&rt.work, || {
             opl_api::acme::AcmeRenewer::spawn(state.clone(), Default::default())
         });
+        // 적용 묶음 드리프트: 리더가 선언과 실제를 견준다(계획 73 §12.5).
+        let drift = on(&rt.work, || {
+            opl_api::DriftChecker::spawn(state.clone(), Default::default())
+        });
         let http01 = match http01_listener {
             Some(l) => Some(on(&rt.api, || {
                 opl_api::acme::http01::Http01Server::spawn(l, cluster.clone(), config.listen.port())
@@ -1182,6 +1188,7 @@ impl Member {
                 replication,
                 vmware,
                 acme,
+                drift,
                 http01,
                 ovn_sync,
                 telemetry,

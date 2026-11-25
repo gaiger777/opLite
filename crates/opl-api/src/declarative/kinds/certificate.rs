@@ -1,0 +1,299 @@
+//! 인증서(`Certificate` — 루트): 계정·DNS 공급자는 이름(참조 — 같은 계획의 계정·공급자 뒤에 만든다), 노드마다 범위의
+//! 노드는 이름(저장은 id). 받은 인증서·키는 status라 매니페스트에 없다. 모든 칸을 바꿀 수 있다(`PATCH` — 이름·범위·도전·
+//! 키가 바뀌면 리더가 다음 틱에 다시 받는다).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use opl_cluster::Cluster;
+use opl_types::acme::{
+    AcmeAccountSpec, AcmeDnsSpec, CertificateKey, CertificateSpec, ChallengeKind,
+};
+use opl_types::manifest::{ManifestKind, ManifestState};
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::{
+    Adapter, Check, Done, Fut, Live, Update, World, bad, check_route, lives_of, problem, roundtrip,
+    typed, write_labels_as,
+};
+use crate::acme::api::{
+    CertificatePatch, CreateCertificateRequest, check_certificate, create_certificate,
+    delete_certificate, patch_certificate,
+};
+use crate::audit::AuditNote;
+use crate::auth::Principal;
+use crate::declarative::Problem;
+use crate::error::{ApiError, Json};
+use crate::state::AppState;
+
+pub(crate) struct CertificateAdapter;
+
+const FIELDS: &[&str] = &[
+    "account",
+    "names",
+    "scope",
+    "challenge",
+    "key",
+    "profile",
+    "renew",
+    "preferred_chain",
+    "install",
+    "precheck",
+];
+
+/// `scope.nodes`의 값마다 `f`
+fn map_nodes(spec: &Value, f: impl Fn(&str) -> Result<String, String>) -> Result<Value, String> {
+    let mut out = spec.clone();
+    if let Some(list) = out
+        .pointer_mut("/scope/nodes")
+        .and_then(Value::as_array_mut)
+    {
+        for n in list.iter_mut() {
+            if let Some(s) = n.as_str() {
+                *n = Value::String(f(s)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+impl Adapter for CertificateAdapter {
+    fn lives(&self, cluster: &Cluster) -> Result<Vec<Live>, ApiError> {
+        lives_of::<CertificateSpec>(cluster, ManifestKind::Certificate)
+    }
+
+    fn to_manifest(&self, spec: &Value, world: &World) -> Value {
+        map_nodes(spec, |s| {
+            Ok(s.parse::<Uuid>()
+                .map_or_else(|_| s.to_string(), |id| world.node_name(id)))
+        })
+        .expect("names map without errors")
+    }
+
+    fn to_store(
+        &self,
+        spec: &Value,
+        _name: &str,
+        _folder: Option<Uuid>,
+        _state: Option<ManifestState>,
+        world: &World,
+    ) -> Result<Value, String> {
+        map_nodes(spec, |s| {
+            world
+                .node_id(s)
+                .map(|id| id.to_string())
+                .ok_or_else(|| format!("node {s:?} not found"))
+        })
+    }
+
+    fn normalize(&self, store: &Value) -> Result<Value, String> {
+        roundtrip::<CertificateSpec>(store)
+    }
+
+    fn updatable(&self) -> Update {
+        Update::Fields(FIELDS)
+    }
+
+    fn keeps_id_on_restore(&self) -> bool {
+        true
+    }
+
+    fn refs(&self, spec: &Value) -> Vec<(ManifestKind, String)> {
+        let mut out = Vec::new();
+        if let Some(a) = spec.get("account").and_then(Value::as_str) {
+            out.push((ManifestKind::AcmeAccount, a.to_string()));
+        }
+        if spec.pointer("/challenge/kind").and_then(Value::as_str) == Some("dns01")
+            && let Some(d) = spec.pointer("/challenge/dns").and_then(Value::as_str)
+        {
+            out.push((ManifestKind::AcmeDns, d.to_string()));
+        }
+        out
+    }
+
+    fn may_create(
+        &self,
+        state: &AppState,
+        principal: &Principal,
+        _desired: &Value,
+        _folder: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        check_route(state, principal, ("POST", "/certificates"), None)
+    }
+
+    fn update_route(&self) -> (&'static str, &'static str) {
+        ("PATCH", "/certificates/{key}")
+    }
+
+    fn delete_route(&self) -> (&'static str, &'static str) {
+        ("DELETE", "/certificates/{key}")
+    }
+
+    /// 처리기의 검사(꼴·키 종류·HTTP-01 리스너). 계정·공급자를 같은 계획이 만들면 꼴과 키 종류만 본다.
+    fn precheck<'a>(&'a self, check: Check<'a>) -> Fut<'a, Vec<Problem>> {
+        Box::pin(async move {
+            let Ok(spec) = typed::<CertificateSpec>(check.desired) else {
+                return Ok(Vec::new());
+            };
+            let cluster = &check.state.cluster;
+            let planned_refs = cluster
+                .get_by_name::<AcmeAccountSpec>(&spec.account)?
+                .is_none()
+                || match &spec.challenge {
+                    ChallengeKind::Dns01 { dns } => {
+                        cluster.get_by_name::<AcmeDnsSpec>(dns)?.is_none()
+                    }
+                    ChallengeKind::Http01 => false,
+                };
+            let result = if planned_refs {
+                spec.validate()
+                    .map_err(|e| ApiError::bad_request(e.to_string()).with_code("invalid_acme"))
+                    .and_then(|()| {
+                        if spec.key == CertificateKey::Rsa2048 {
+                            Err(ApiError::bad_request(
+                                "rsa2048 keys cannot be generated by this build; use ecdsa-p256 or ecdsa-p384",
+                            )
+                            .with_code("invalid_acme"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+            } else {
+                check_certificate(check.state, &spec)
+            };
+            Ok(match result {
+                Err(e) => vec![problem(None, e)],
+                Ok(()) => Vec::new(),
+            })
+        })
+    }
+
+    fn create<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        principal: &'a Principal,
+        name: String,
+        labels: BTreeMap<String, String>,
+        spec: Value,
+    ) -> Fut<'a, Done> {
+        Box::pin(async move {
+            let spec: CertificateSpec = typed(&spec).map_err(bad)?;
+            Box::pin(create_certificate(
+                State(state.clone()),
+                principal.clone(),
+                AuditNote::detached(),
+                Json(CreateCertificateRequest {
+                    name: name.clone(),
+                    labels,
+                    spec,
+                }),
+            ))
+            .await?;
+            let id = state
+                .cluster
+                .get_by_name::<CertificateSpec>(&name)?
+                .map(|c| c.id)
+                .ok_or_else(|| ApiError::not_found(format!("certificate {name:?} is gone")))?;
+            Ok(Done { id, task: None })
+        })
+    }
+
+    fn update<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        principal: &'a Principal,
+        live: &'a Live,
+        _labels: BTreeMap<String, String>,
+        desired: Value,
+        fields: Vec<String>,
+    ) -> Fut<'a, Done> {
+        Box::pin(async move {
+            let s: CertificateSpec = typed(&desired).map_err(bad)?;
+            let has = |f: &str| fields.iter().any(|x| x == f);
+            let patch = CertificatePatch {
+                account: has("account").then(|| s.account.clone()),
+                names: has("names").then(|| s.names.clone()),
+                scope: has("scope").then(|| s.scope.clone()),
+                challenge: has("challenge").then(|| s.challenge.clone()),
+                key: has("key").then_some(s.key),
+                profile: has("profile").then(|| s.profile.clone()),
+                renew: has("renew").then_some(s.renew),
+                preferred_chain: has("preferred_chain").then(|| s.preferred_chain.clone()),
+                install: has("install").then_some(s.install),
+                precheck: has("precheck").then_some(s.precheck),
+            };
+            Box::pin(patch_certificate(
+                State(state.clone()),
+                principal.clone(),
+                AuditNote::detached(),
+                Path(live.id.to_string()),
+                super::if_match(live.revision),
+                Json(patch),
+            ))
+            .await?;
+            Ok(Done {
+                id: live.id,
+                task: None,
+            })
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        state: &'a Arc<AppState>,
+        principal: &'a Principal,
+        live: &'a Live,
+    ) -> Fut<'a, Done> {
+        Box::pin(async move {
+            Box::pin(delete_certificate(
+                State(state.clone()),
+                principal.clone(),
+                AuditNote::detached(),
+                Path(live.id.to_string()),
+                super::if_match(live.revision),
+            ))
+            .await?;
+            Ok(Done {
+                id: live.id,
+                task: None,
+            })
+        })
+    }
+
+    fn write_labels<'a>(
+        &'a self,
+        cluster: &'a Cluster,
+        id: Uuid,
+        revision: u64,
+        labels: BTreeMap<String, String>,
+    ) -> Fut<'a, ()> {
+        write_labels_as::<CertificateSpec>(cluster, id, revision, labels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn per_node_scope_names_nodes_and_refs_follow_the_challenge() {
+        let spec = json!({ "account": "le", "names": ["a.example.com"],
+            "scope": { "kind": "per_node", "nodes": ["n1"] }, "challenge": { "kind": "dns01", "dns": "cf" } });
+        let id = Uuid::now_v7();
+        let store = map_nodes(&spec, |_| Ok(id.to_string())).unwrap();
+        assert_eq!(store["scope"]["nodes"][0], id.to_string());
+        assert!(map_nodes(&spec, |s| Err(format!("node {s:?} not found"))).is_err());
+        assert_eq!(
+            CertificateAdapter.refs(&spec),
+            vec![
+                (ManifestKind::AcmeAccount, "le".into()),
+                (ManifestKind::AcmeDns, "cf".into())
+            ]
+        );
+        let http = json!({ "account": "le", "challenge": { "kind": "http01" } });
+        assert_eq!(CertificateAdapter.refs(&http).len(), 1);
+    }
+}

@@ -232,6 +232,10 @@ impl Adapter for VmAdapter {
             .flatten()
             .filter_map(|g| g.as_str().map(str::to_string));
         out.extend(refs_of(ManifestKind::SecurityGroup, groups));
+        // HA 묶음(`ha.group`)은 VM보다 먼저
+        if let Some(g) = spec.pointer("/ha/group").and_then(Value::as_str) {
+            out.push((ManifestKind::HaGroup, g.to_string()));
+        }
         out
     }
 
@@ -273,10 +277,21 @@ impl Adapter for VmAdapter {
                         ));
                         return Ok(out);
                     }
+                    // 같은 계획이 먼저 만들 HA 묶음은 아직 없다(그 묶음의 검사는 그 단계가 본다).
+                    let mut spec = check.desired.clone();
+                    if let Some(g) = spec.pointer("/ha/group").and_then(Value::as_str)
+                        && check
+                            .planned
+                            .docs
+                            .contains_key(&(ManifestKind::HaGroup, g.to_string()))
+                        && let Some(ha) = spec.get_mut("ha").and_then(Value::as_object_mut)
+                    {
+                        ha.remove("group");
+                    }
                     let req = VmCheckRequest {
                         name: check.name.to_string(),
                         labels: check.labels.clone(),
-                        spec: check.desired.clone(),
+                        spec,
                         volumes: check
                             .planned
                             .volumes
@@ -441,6 +456,11 @@ impl Adapter for VmAdapter {
                 task: None,
             })
         })
+    }
+
+    /// 만들기 처리기가 `Cluster::create` 뒤에 id를 다시 쓰지 않는다(지운 것을 같은 id로 살린다).
+    fn keeps_id_on_restore(&self) -> bool {
+        true
     }
 
     fn write_labels<'a>(

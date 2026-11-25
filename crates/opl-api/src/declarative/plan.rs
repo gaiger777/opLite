@@ -29,12 +29,64 @@ use crate::resources::{CreateRequest, check_name};
 use crate::state::AppState;
 
 /// 계획을 세울 요청(문서는 풀어 둔 것)
+#[derive(Default)]
 pub(crate) struct Request {
     pub documents: Vec<Manifest>,
     pub apply_set: Option<String>,
     pub prune: bool,
     pub prune_data: bool,
     pub manager: Option<Manager>,
+    /// 다른 관리자(Terraform·다른 적용 묶음)의 객체도 바꾼다(`--force-conflicts` — 관리를 넘겨받는다)
+    pub force_conflicts: bool,
+    /// 문서와 따로 지울 객체(시점 되돌리기의 "그 뒤 만든 것" — §12.4). 데이터 종류는 `prune_data`가 있어야 한다.
+    pub delete: Vec<(ManifestKind, Uuid)>,
+    /// 만들기 단계가 쓸 옛 id(지운 것 살리기 — §12.3, (종류, 문서 열쇠) → id)
+    pub reuse_ids: BTreeMap<(ManifestKind, String), Uuid>,
+}
+
+/// 객체를 맡은 관리자(§8.2 7 — 객체 통째 단위)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    Terraform,
+    Set(String),
+}
+
+fn owner_of(labels: &BTreeMap<String, String>) -> Option<Owner> {
+    if labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("terraform") {
+        return Some(Owner::Terraform);
+    }
+    labels.get(APPLY_SET_LABEL).cloned().map(Owner::Set)
+}
+
+/// 이 요청이 다른 관리자의 객체를 바꾸는지. 묶음 없는 적용(되돌리기 포함)은 묶음 객체를 바꿔도 묶음을 빼앗지 않아
+/// 충돌이 아니다 — Terraform 객체만 막는다.
+fn conflict(labels: &BTreeMap<String, String>, req: &Request) -> Option<Owner> {
+    let owner = owner_of(labels)?;
+    let me = match (req.manager, &req.apply_set) {
+        (Some(Manager::Terraform), _) => Some(Owner::Terraform),
+        (None, Some(set)) => Some(Owner::Set(set.clone())),
+        (None, None) => None,
+    };
+    match (&owner, &me) {
+        (o, Some(m)) if o == m => None,
+        (Owner::Set(_), None) => None,
+        _ => Some(owner),
+    }
+}
+
+fn managed_elsewhere(kind: ManifestKind, name: &str, owner: &Owner) -> Problem {
+    let by = match owner {
+        Owner::Terraform => "Terraform".to_string(),
+        Owner::Set(s) => format!("apply set {s:?}"),
+    };
+    Problem::error(
+        "managed_elsewhere",
+        format!(
+            "{} {name:?} is managed by {by}; change it there, or take it over with --force-conflicts (force_conflicts)",
+            kind.as_str()
+        ),
+        None,
+    )
 }
 
 /// 계획의 단계 하나(적용이 쓰는 것까지)
@@ -58,6 +110,8 @@ pub(crate) struct Step {
     pub fields: Vec<String>,
     pub spec_changed: bool,
     pub labels_changed: bool,
+    /// 만들기가 되살릴 옛 id(지운 것 살리기)
+    pub reuse_id: Option<Uuid>,
 }
 
 /// 저장한 계획(받은 노드 메모리에 30분 — §8.3)
@@ -88,6 +142,8 @@ pub(crate) fn hash(req: &Request) -> String {
         "prune": req.prune,
         "prune_data": req.prune_data,
         "manager": req.manager,
+        "force_conflicts": req.force_conflicts,
+        "delete": req.delete,
     });
     hex::encode(Sha256::digest(
         serde_json::to_vec(&body).expect("documents serialize"),
@@ -236,11 +292,18 @@ fn labels_of(
         }
     }
     out.extend(doc.metadata.labels.clone());
-    if let Some(set) = set {
-        out.insert(APPLY_SET_LABEL.into(), set.into());
-    }
-    if manager == Some(Manager::Terraform) {
-        out.insert(MANAGED_BY_LABEL.into(), "terraform".into());
+    match manager {
+        Some(Manager::Terraform) => {
+            // Terraform이 넘겨받으면 묶음 레이블을 뗀다(그 묶음의 가지치기가 지우지 않게).
+            out.remove(APPLY_SET_LABEL);
+            out.insert(MANAGED_BY_LABEL.into(), "terraform".into());
+        }
+        None => {
+            if let Some(set) = set {
+                out.insert(APPLY_SET_LABEL.into(), set.into());
+                out.remove(MANAGED_BY_LABEL);
+            }
+        }
     }
     out
 }
@@ -396,6 +459,9 @@ pub(crate) async fn make_plan(
             let Some(live) = world.by_id(kind, obj.id) else {
                 continue;
             };
+            if !adapter(kind).is_some_and(|a| a.deletable()) {
+                continue;
+            }
             if live.labels.get(APPLY_SET_LABEL) != Some(&set.name)
                 || !readable(state, principal, live)
             {
@@ -421,65 +487,60 @@ pub(crate) async fn make_plan(
             (std::cmp::Reverse(rank(l.kind)), std::cmp::Reverse(depth))
         });
         for (obj, live) in gone {
-            let a = adapter(live.kind).expect("adapter");
-            let n = steps.len() + 1;
-            let mut problems = Vec::new();
-            if check_route(state, principal, a.delete_route(), Some(live.id)).is_err() {
-                problems.push(forbidden(live.kind, &live.name));
-            } else if live.kind.holds_data() && set.spec.protect_data && !req.prune_data {
-                problems.push(Problem::error(
-                    "protected",
-                    format!(
-                        "{} {:?} holds data; prune it with --prune-data (prune_data)",
-                        live.kind.as_str(),
-                        live.name
-                    ),
-                    None,
-                ));
-            }
-            let action = if problems.iter().any(Problem::is_error) {
-                StepAction::Blocked
-            } else {
-                StepAction::Delete
-            };
-            views.push(StepView {
-                n,
-                kind: live.kind,
-                name: live.name.clone(),
-                folder: live.folder().and_then(|f| world.folder_path(f)),
-                action,
-                diff: Vec::new(),
-                problems,
-                restart: false,
-                after: Vec::new(),
-            });
-            steps.push(Step {
-                kind: live.kind,
-                key: world.key_of_live(live),
-                name: live.name.clone(),
-                action,
-                seen: Some((live.id, live.revision)),
-                doc: None,
-                declared_spec: Value::Null,
-                declared: obj.declared.clone(),
-                labels: live.labels.clone(),
-                fields: Vec::new(),
-                spec_changed: false,
-                labels_changed: false,
-            });
+            let protect = set.spec.protect_data && !req.prune_data;
+            let (step, view) = delete_step(
+                state,
+                principal,
+                &world,
+                live,
+                obj.declared.clone(),
+                protect,
+                steps.len() + 1,
+            );
+            steps.push(step);
+            views.push(view);
         }
     }
 
-    let mut summary = Summary::default();
-    for v in &views {
-        match v.action {
-            StepAction::Create => summary.create += 1,
-            StepAction::Update => summary.update += 1,
-            StepAction::Delete => summary.delete += 1,
-            StepAction::Unchanged => summary.unchanged += 1,
-            StepAction::Blocked => summary.blocked += 1,
+    // 따로 지울 것(시점 되돌리기): 같은 역순
+    let mut extra: Vec<&Live> = req
+        .delete
+        .iter()
+        .filter_map(|(k, id)| world.by_id(*k, *id))
+        .filter(|l| adapter(l.kind).is_some_and(|a| a.deletable()))
+        .filter(|l| {
+            !steps
+                .iter()
+                .any(|s| s.seen.is_some_and(|(id, _)| id == l.id))
+        })
+        .collect();
+    extra.sort_by_key(|l| {
+        let depth = world
+            .folder_path(l.id)
+            .map_or(0, |p| p.matches('/').count());
+        (std::cmp::Reverse(rank(l.kind)), std::cmp::Reverse(depth))
+    });
+    for live in extra {
+        if !readable(state, principal, live) {
+            continue;
         }
+        let (step, view) = delete_step(
+            state,
+            principal,
+            &world,
+            live,
+            Value::Null,
+            !req.prune_data,
+            steps.len() + 1,
+        );
+        steps.push(step);
+        views.push(view);
     }
+    for step in steps.iter_mut().filter(|s| s.action == StepAction::Create) {
+        step.reuse_id = req.reuse_ids.get(&(step.kind, step.key.clone())).copied();
+    }
+
+    let summary = summarize(&views);
     let id = Uuid::now_v7();
     Ok(StoredPlan {
         id,
@@ -498,6 +559,112 @@ pub(crate) async fn make_plan(
         manager: req.manager,
         meta,
     })
+}
+
+/// 단계 수 세기
+pub(crate) fn summarize(views: &[StepView]) -> Summary {
+    let mut summary = Summary::default();
+    for v in views {
+        match v.action {
+            StepAction::Create => summary.create += 1,
+            StepAction::Update => summary.update += 1,
+            StepAction::Delete => summary.delete += 1,
+            StepAction::Unchanged => summary.unchanged += 1,
+            StepAction::Blocked => summary.blocked += 1,
+        }
+    }
+    summary
+}
+
+/// 지우기 단계 하나(권한이 없으면 `forbidden`, 데이터 종류는 `protect`면 `protected`로 막힘)
+fn delete_step(
+    state: &AppState,
+    principal: &Principal,
+    world: &World,
+    live: &Live,
+    declared: Value,
+    protect: bool,
+    n: usize,
+) -> (Step, StepView) {
+    let a = adapter(live.kind).expect("adapter");
+    let mut problems = Vec::new();
+    if check_route(state, principal, a.delete_route(), Some(live.id)).is_err() {
+        problems.push(forbidden(live.kind, &live.name));
+    } else if live.kind.holds_data() && protect {
+        problems.push(Problem::error(
+            "protected",
+            format!(
+                "{} {:?} holds data; prune it with --prune-data (prune_data)",
+                live.kind.as_str(),
+                live.name
+            ),
+            None,
+        ));
+    }
+    let action = if problems.iter().any(Problem::is_error) {
+        StepAction::Blocked
+    } else {
+        StepAction::Delete
+    };
+    let view = StepView {
+        n,
+        kind: live.kind,
+        name: live.name.clone(),
+        folder: live.folder().and_then(|f| world.folder_path(f)),
+        action,
+        diff: Vec::new(),
+        problems,
+        restart: false,
+        after: Vec::new(),
+    };
+    let step = Step {
+        kind: live.kind,
+        key: world.key_of_live(live),
+        name: live.name.clone(),
+        action,
+        seen: Some((live.id, live.revision)),
+        doc: None,
+        declared_spec: Value::Null,
+        declared,
+        labels: live.labels.clone(),
+        fields: Vec::new(),
+        spec_changed: false,
+        labels_changed: false,
+        reuse_id: None,
+    };
+    (step, view)
+}
+
+/// 지금 객체에 선언을 얹은 비교(§8.2 4 — 선언한 칸만 + 앞 선언에서 빠진 칸). 답은 (얹은 매니페스트 spec, 원하는 저장
+/// spec, 바뀐 칸). 참조를 풀지 못하면 안쪽 `Err`(문구)다. 계획과 드리프트 검사가 함께 쓴다.
+#[allow(clippy::type_complexity)]
+pub(crate) fn compare(
+    state: &AppState,
+    world: &World,
+    live: &Live,
+    doc: &Manifest,
+    folder: Option<Uuid>,
+    prev_spec: Option<&Value>,
+) -> Result<Result<(Value, Value, Vec<Change>), String>, ApiError> {
+    let a = adapter(live.kind).expect("adapter");
+    let mut merged = a.to_manifest(&live.spec, world);
+    overlay(&mut merged, &doc.spec);
+    if let Some(prev_spec) = prev_spec {
+        forget_dropped(&mut merged, prev_spec, &doc.spec);
+    }
+    let mut store = match a.to_store(&merged, &live.name, folder, doc.state, world) {
+        Ok(s) => s,
+        Err(e) => return Ok(Err(e)),
+    };
+    a.keep_server_fields(state, &doc.spec, &mut store, &live.spec);
+    let desired = a
+        .normalize(&store)
+        .map_err(|e| invalid_doc(live.kind, &doc.metadata.name, e))?;
+    let current = a
+        .normalize(&live.spec)
+        .unwrap_or_else(|_| live.spec.clone());
+    let changes = diff(&current, &desired);
+    Ok(Ok((merged, desired, changes)))
 }
 
 /// 문서 하나의 단계
@@ -531,6 +698,7 @@ async fn plan_doc(
         fields: Vec::new(),
         spec_changed: false,
         labels_changed: false,
+        reuse_id: None,
     };
     let mut view = StepView {
         n,
@@ -676,27 +844,20 @@ async fn plan_doc(
                 .iter()
                 .find(|o| o.id == live.id && o.kind == kind.kind())
                 .map(|o| &o.declared);
-            let live_m = a.to_manifest(&live.spec, world);
-            let mut merged = live_m;
-            overlay(&mut merged, &doc.spec);
-            if let Some(prev_spec) = prev.and_then(|p| p.get("spec")) {
-                forget_dropped(&mut merged, prev_spec, &doc.spec);
-            }
-            let mut store = match a.to_store(&merged, &live.name, folder, doc.state, world) {
-                Ok(s) => s,
+            let (merged, desired, mut changes) = match compare(
+                state,
+                world,
+                live,
+                doc,
+                folder,
+                prev.and_then(|p| p.get("spec")),
+            )? {
+                Ok(c) => c,
                 Err(e) => {
                     problems.push(Problem::error("missing_reference", e, None));
                     return Ok(blocked(view, step, problems));
                 }
             };
-            a.keep_server_fields(state, &doc.spec, &mut store, &live.spec);
-            let desired = a
-                .normalize(&store)
-                .map_err(|e| invalid_doc(kind, &name, e))?;
-            let current = a
-                .normalize(&live.spec)
-                .unwrap_or_else(|_| live.spec.clone());
-            let mut changes = diff(&current, &desired);
             let fields = top_fields(&changes);
             step.labels = labels_of(Some(live), doc, prev, set, req.manager);
             step.labels_changed = step.labels != live.labels;
@@ -716,6 +877,11 @@ async fn plan_doc(
             {
                 problems.push(forbidden(kind, &name));
                 return Ok(blocked(view, step, problems));
+            }
+            if !req.force_conflicts
+                && let Some(owner) = conflict(&live.labels, req)
+            {
+                problems.push(managed_elsewhere(kind, &name, &owner));
             }
             // 폴더는 `POST /folders/{id}/members`로만 옮긴다(옮기기 권한을 따로 본다).
             let field = if kind == ManifestKind::Folder {
@@ -849,6 +1015,56 @@ mod tests {
         let keys = check_documents(&docs).unwrap();
         assert_eq!(keys[3], "vm:/prod");
         assert_eq!(order(&docs, &keys).unwrap(), [3, 2, 1, 0]);
+    }
+
+    fn request(manager: Option<Manager>, set: Option<&str>) -> Request {
+        Request {
+            apply_set: set.map(str::to_string),
+            manager,
+            ..Request::default()
+        }
+    }
+
+    #[test]
+    fn terraform_and_sets_do_not_take_each_others_objects() {
+        let tf = BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "terraform".to_string())]);
+        let web = BTreeMap::from([(APPLY_SET_LABEL.to_string(), "web".to_string())]);
+        let none = BTreeMap::new();
+        let terraform = request(Some(Manager::Terraform), None);
+        assert_eq!(conflict(&tf, &terraform), None);
+        assert_eq!(conflict(&tf, &request(None, None)), Some(Owner::Terraform));
+        assert_eq!(
+            conflict(&tf, &request(None, Some("web"))),
+            Some(Owner::Terraform)
+        );
+        assert_eq!(conflict(&web, &terraform), Some(Owner::Set("web".into())));
+        assert_eq!(
+            conflict(&web, &request(None, Some("db"))),
+            Some(Owner::Set("web".into()))
+        );
+        assert_eq!(conflict(&web, &request(None, Some("web"))), None);
+        // 묶음 없는 적용·되돌리기는 묶음 객체를 빼앗지 않는다.
+        assert_eq!(conflict(&web, &request(None, None)), None);
+        assert_eq!(conflict(&none, &terraform), None);
+        // 넘겨받으면 다른 관리자의 레이블을 뗀다.
+        let doc = Manifest::new(ManifestKind::SecurityGroup, "sg", json!({}));
+        let live = Live {
+            kind: ManifestKind::SecurityGroup,
+            id: Uuid::nil(),
+            name: "sg".into(),
+            revision: 1,
+            labels: tf.clone(),
+            spec: json!({}),
+        };
+        let labels = labels_of(Some(&live), &doc, None, Some("web"), None);
+        assert_eq!(labels.get(APPLY_SET_LABEL).map(String::as_str), Some("web"));
+        assert!(!labels.contains_key(MANAGED_BY_LABEL));
+        let live = Live {
+            labels: web,
+            ..live
+        };
+        let labels = labels_of(Some(&live), &doc, None, None, Some(Manager::Terraform));
+        assert!(!labels.contains_key(APPLY_SET_LABEL));
     }
 
     #[test]

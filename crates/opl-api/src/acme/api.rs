@@ -377,7 +377,7 @@ fn provider_kind(p: &DnsProvider) -> &'static str {
 }
 
 /// 이 노드에서 만들 수 있는지까지 본다(TSIG base64·서버 주소 꼴).
-fn check_dns(state: &AppState, spec: &AcmeDnsSpec) -> Result<(), ApiError> {
+pub(crate) fn check_dns(state: &AppState, spec: &AcmeDnsSpec) -> Result<(), ApiError> {
     spec.validate().map_err(invalid)?;
     super::dns::Provider::new(spec, &state.acme)
         .map(drop)
@@ -581,7 +581,7 @@ pub struct CertificatePatch {
 }
 
 /// 스펙 검사: 꼴, 계정·DNS 공급자가 있는지, 키 종류, HTTP-01이면 대상 노드가 포트 80을 듣는지
-fn check_certificate(state: &AppState, spec: &CertificateSpec) -> Result<(), ApiError> {
+pub(crate) fn check_certificate(state: &AppState, spec: &CertificateSpec) -> Result<(), ApiError> {
     spec.validate().map_err(invalid)?;
     if spec.key == CertificateKey::Rsa2048 {
         return Err(invalid(
