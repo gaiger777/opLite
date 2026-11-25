@@ -620,7 +620,7 @@ impl AppState {
             principal.token = Some(stored.id);
             return Ok(principal);
         }
-        let (user, found) = self.session_login(parts)?;
+        let (user, found, _) = self.session_login(parts)?;
         // 둘째 단계가 남은 세션은 그 경로(`PendingPrincipal`)에서만 쓴다.
         if found.pending.is_some() {
             return Err(second_factor_required());
@@ -632,11 +632,22 @@ impl AppState {
     }
 
     /// 쿠키 세션과 그 사용자. 대기 세션도 돌려준다(부르는 쪽이 `pending`을 본다).
-    fn session_login(&self, parts: &Parts) -> Result<(User, FoundSession), ApiError> {
+    fn session_login(&self, parts: &Parts) -> Result<(User, FoundSession, String), ApiError> {
         let session = session_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
-        let found = self
-            .find_session(session)?
-            .ok_or_else(ApiError::unauthorized)?;
+        // 계획 74: 새 이름 쿠키의 세션이 끝났으면 옛 이름 쿠키를 본다 — 옛 판 노드에서 로그아웃(옛 이름만 지움)하고
+        // 다시 로그인한 브라우저에는 끝난 `orbivisor_session`이 남는다(다음 판에서 뺌).
+        let (session, found) = match self.find_session(session)? {
+            Some(found) => (session, found),
+            None => {
+                let legacy = cookie_value(&parts.headers, LEGACY_SESSION_COOKIE)
+                    .filter(|legacy| *legacy != session)
+                    .ok_or_else(ApiError::unauthorized)?;
+                let found = self
+                    .find_session(legacy)?
+                    .ok_or_else(ApiError::unauthorized)?;
+                (legacy, found)
+            }
+        };
         self.check_cookie_origin(parts)?;
         let user = self
             .cluster
@@ -651,7 +662,7 @@ impl AppState {
         if !self.realm_exists(&user)? {
             return Err(ApiError::unauthorized());
         }
-        Ok((user, found))
+        Ok((user, found, session.to_string()))
     }
 
     /// 대기 세션의 둘째 단계가 끝났다: `pending`을 지우고 수명을 [`SESSION_TTL`]로 늘린다(Raft 세션은 revision
@@ -845,16 +856,13 @@ impl FromRequestParts<Arc<AppState>> for PendingPrincipal {
         if parts.headers.contains_key(AUTHORIZATION) {
             return Err(ApiError::unauthorized());
         }
-        let (user, found) = state.session_login(parts)?;
+        let (user, found, cookie) = state.session_login(parts)?;
         let Some(pending) = found.pending else {
             return Err(ApiError::conflict(
                 "already_signed_in",
                 "this session has already finished signing in",
             ));
         };
-        let cookie = session_cookie(&parts.headers)
-            .unwrap_or_default()
-            .to_string();
         crate::audit::note_auth(parts, Some(&principal_of(user.clone())));
         Ok(Self {
             user,

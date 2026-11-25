@@ -134,7 +134,10 @@ async fn legacy_session_cookie_name_is_accepted() {
     // 둘 다 있으면 새 이름을 읽는다.
     let both = format!("opl_session={:064x}; {new}", 1);
     assert_eq!(whoami_with_cookie(&env.base, &both).await.0, StatusCode::OK);
+    // 새 이름 쿠키의 세션이 끝났으면(옛 판 노드에서 로그아웃하고 다시 로그인) 옛 이름 쿠키로 된다.
     let both = format!("orbivisor_session={:064x}; {legacy}", 1);
+    assert_eq!(whoami_with_cookie(&env.base, &both).await.0, StatusCode::OK);
+    let both = format!("orbivisor_session={:064x}; opl_session={:064x}", 1, 2);
     assert_eq!(
         whoami_with_cookie(&env.base, &both).await.0,
         StatusCode::UNAUTHORIZED
