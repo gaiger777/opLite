@@ -10,6 +10,8 @@
 //! (`builder.spec.ts`, QEMU를 켜지 않음).
 //! 계획 72: 시험 안에 띄운 가짜 vSphere로 원본 더하기(지문) → 마법사 → 따뜻한 동기화 → 전환 → VM 링크, 그 VM을 OVA로
 //! 내보내 내려받기(`vmware.spec.ts`, QEMU를 켜지 않음).
+//! 계획 73: 웹에서 VM 메모리를 바꾸고 ⋯ "설정 기록…" 서랍의 전후 표를 본 뒤 만든 줄로 되돌리고, 인증서 보기를 연다
+//! (`history.spec.ts`, QEMU를 켜지 않음).
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -511,5 +513,49 @@ async fn browser_migrates_a_vmware_vm_and_exports_it() {
     }
     let export = d.ctl_json(&["export", "get", "web01-ova"]).await;
     assert_eq!(export["status"]["phase"], "ready", "{export}");
+    d.stop();
+}
+
+/// 계획 73: CLI로 꺼진 VM `hist`(메모리 256 MiB, 디스크 없음)를 만들고, 브라우저가 웹 편집으로 메모리를 512로 바꾼 뒤 ⋯ "설정
+/// 기록…" 서랍에서 두 줄과 전후 표를 보고 만든 줄로 되돌린다(`history.spec.ts`, QEMU를 켜지 않음). 메모리가 256으로 돌아오고
+/// 이력의 맨 위 줄이 되돌린 줄(출처 web, `restored_from`)이다.
+#[tokio::test]
+async fn browser_restores_a_vm_from_its_config_history() {
+    let _one = BROWSER.lock().await;
+    web_dir();
+    let mut d = Daemon::new("node1", "");
+    d.start().await;
+    d.init("web-history").await;
+    d.login().await;
+    d.ctl(&["vm", "create", "hist", "--memory", "256", "--nic", "user"])
+        .await
+        .unwrap();
+
+    let out = playwright(
+        "e2e/history.spec.ts",
+        vec![
+            ("OPL_URL", d.server()),
+            ("OPL_USER", "admin".into()),
+            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
+            ("OPL_VM", "hist".into()),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "playwright failed:\n{}\n{}\nopld log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        d.log()
+    );
+    let vm = d.ctl_json(&["vm", "get", "hist"]).await;
+    assert_eq!(vm["spec"]["memory_mib"], 256, "{vm}");
+    let rows = d.ctl_json(&["history", "vm", "hist"]).await;
+    let rows = rows["items"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    // 되돌리기는 요청한 쪽의 출처(웹)를 지킨다 — 적용 Task가 썼어도 `apply`가 아니다.
+    assert_eq!(rows[0]["source"], "web", "{rows:?}");
+    assert_eq!(rows[0]["restored_from"], rows[2]["revision"], "{rows:?}");
+    assert_eq!(rows[1]["source"], "web", "{rows:?}");
     d.stop();
 }

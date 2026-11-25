@@ -53,6 +53,7 @@ cargo run -p oplctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sh
 | [웹 화면 둘러보기](docs/guide/web-ui.md) | 영역과 탭, 명령 팔레트, 목록·일괄 동작, 알림 센터, 단축키, 휴대폰 보기, 클러스터 지도, VM 빌더 |
 | [접근과 보안](docs/guide/access.md) | 웹 UI, 로그인과 세션, LDAP, SSO(OIDC), 감사 로그 |
 | [폴더와 권한](docs/guide/folders.md) | 폴더, 권한·역할·그룹·위임, 토큰 범위, 할당량, 2단계 인증 |
+| [선언형 운영](docs/guide/declarative.md) | YAML 매니페스트 apply·diff·plan·export, 적용 묶음·가지치기, 설정 기록과 되돌리기, 드리프트, Terraform/OpenTofu 공급자 |
 | [구독과 텔레메트리](docs/guide/subscription.md) | 구독 키 발급·적용과 텔레메트리 |
 | [개발](docs/guide/development.md) | 빌드와 시험 명령 |
 | [아키텍처](docs/architecture.md) | 구성 요소, Raft 투표·리더 역할, 노드 간 통신, 웹·API, reconciler, 지표 수집, 보안, 규모 |

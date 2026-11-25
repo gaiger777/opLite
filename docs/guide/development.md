@@ -166,6 +166,35 @@ OPL_TEST_VCSIM=127.0.0.1:8989 OPL_TEST_VCSIM_USER=user OPL_TEST_VCSIM_PASSWORD=p
 cargo test -p opld --features qemu-it,fake-vsphere --test vmware_migration
 pnpm -C web test src/vmware src/exports                             # 원본 지문 흐름·비밀번호가 저장소에 없음, 나무·찾기, 마법사, 상세·서랍·전환·되돌리기, 내보내기(msw, axe)
 pnpm -C web build && cargo test -p opld --features web-it --test web browser_migrates_a_vmware_vm_and_exports_it   # 브라우저: 원본 → 마법사 → 전환 → VM 링크 → OVA 내려받기
+# 선언형 운영(계획 73) — 적용·설정 기록·되돌리기·드리프트·ACME. API 시험은 FakeStorage(PATH에 qemu-img가 없어야 가짜 길)
+cargo test -p opl-types -- manifest apply_set history acme                # 순수: 매니페스트·비밀 값, 이력 가림(history_mask)·사유·출처, ACME 스펙 검증·가림
+cargo test -p opl-cluster --test history                                  # 출처를 단 명령(Attributed)·이력 표·보존·스냅샷 칸
+cargo test --release -p opl-cluster --test history -- --ignored --nocapture   # 쓰기 길 비용(노드 하나, update_spec 300번 — 기록 +1.3%)
+cargo test --release -p opl-cluster --lib -- --ignored history_overhead --nocapture   # 상태 머신 1000번 바꾸기(파일 +1.0%)
+PATH=/usr/bin:/bin cargo test -p opl-api --test declarative --test declarative_kinds_a --test declarative_kinds_b \
+  --test history_api --test config_history --test acme_api               # 계획·막힘·저장한 계획·가지치기·충돌, 종류 스물다섯 왕복, 이력·되돌리기·드리프트, ACME API·HTTP-01·SNI
+cargo test -p opl-api --lib -- declarative history drift acme            # diff·overlay proptest, 시점 판단, JWS·EAB·ARI id·DNS 메시지·TSIG·훅 검사·due·plan
+cargo test -p oplctl -- declarative history cert web_cross               # apply·plan·diff 끝 코드·export 파일·크기·secretFrom, history·restore·drift, cert, 웹 YAML 쓰개 ↔ CLI 읽개
+# 실제 QEMU, 노드 둘: examples/declarative/web/ apply → diff 0 → plan(restart 표시) → apply --reason → 다른 노드에서 웹처럼 바꿈 →
+# drift(누가) → restore --revision → export 왕복 diff 0 → --minimal을 다른 묶음으로 → restore --at(폴더) → apply --prune --prune-data
+cargo test -p opld --features qemu-it --test declarative
+pnpm -C web test src/history src/declarative src/certs                    # 설정 기록·서랍·되돌리기·시점, 선언 묶음·adopt, ⋯ 메뉴·YAML·Terraform 칩, 인증서(msw, axe)
+pnpm -C web build && cargo test -p opld --features web-it --test web browser_restores_a_vm_from_its_config_history   # 브라우저: 메모리 바꿈 → ⋯ 설정 기록 → 되돌리기
+# ACME 실제(아래 "ACME 시험"): Pebble·challtestsrv(v2.10.1), 있으면 BIND(RFC 2136)
+OPL_TEST_PEBBLE_DIR=/tmp/pebble-bin cargo test -p opl-api --features acme-it --test acme -- --nocapture
+eval "$(.github/scripts/acme-bind.sh "$(command -v named)" /tmp/opl-bind 15353)"   # OPL_TEST_BIND·OPL_TEST_BIND_KEY를 내보낸다
+OPL_TEST_PEBBLE_DIR=/tmp/pebble-bin OPL_TEST_BIND=$OPL_TEST_BIND OPL_TEST_BIND_KEY=$OPL_TEST_BIND_KEY \
+  cargo test -p opl-api --features acme-it --test acme -- --nocapture
+# 개발 서버(Terraform 수용 시험·웹 데모): 노드 하나, 가짜 하이퍼바이저·메모리 스토리지, 연결 정보 JSON 한 줄
+cargo run -p opld --features devserver --bin opl-devserver -- --port 8006   # --dir DIR(없으면 임시, 끝날 때 지움), --exit-on-stdin-eof
+cargo test -p opld --features devserver --test devserver
+# Terraform/OpenTofu 공급자(Go, 아래 "Terraform 공급자 시험")
+cargo run -q -p opl-api --bin opl-api-openapi > /tmp/openapi.json && cargo build -p opld --features devserver --bin opl-devserver
+cd terraform && go vet ./... && OPL_OPENAPI=/tmp/openapi.json go test ./...    # 단위와 스키마 맞춤(OpenAPI의 Manifest{Kind})
+TF_ACC=1 TF_ACC_TERRAFORM_PATH=$(command -v terraform) OPL_DEVSERVER=$PWD/../target/debug/opl-devserver \
+  go test ./internal/provider/ -count=1 -v -timeout 30m                 # 수용 시험 여덟(terraform)
+TF_ACC=1 TF_ACC_TERRAFORM_PATH=$(command -v tofu) TF_ACC_PROVIDER_HOST=registry.opentofu.org OPL_DEVSERVER=$PWD/../target/debug/opl-devserver \
+  go test ./internal/provider/ -count=1 -v -timeout 30m                 # 같은 시험을 OpenTofu로
 # 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
 sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
@@ -390,6 +419,26 @@ root로 만들고, root로 `restore_helper`(`OPL_RESTORE_SCOPE=1`)와 opld E2E (
 더 돌린다. `check (ubuntu)`는 musl 두 타깃의 `cargo tree -p opl-restore`에 C 빌드 스크립트(`cc`·`ring`·`openssl-sys`)가 없는지와
 `archive_tools`를, `shell`은 `restore-image-test.sh`를, `package`는 `orbivisor-restore-image` deb 빌드·설치를 본다.
 
+**ACME 시험**(`crates/opl-api/tests/acme.rs`, 기능 `acme-it`, 계획 73)은 Let's Encrypt의 시험 서버 Pebble과 `pebble-challtestsrv`
+실행 파일이 든 디렉터리 `OPL_TEST_PEBBLE_DIR`이 있어야 돈다(없으면 건너뜀 — GitHub 릴리스 v2.10.1, 체크섬 파일이 없어 CI가 SHA-256을
+핀한다). Pebble(`-strict`, 무작위 badNonce 5% 그대로)로 HTTP-01 노드마다 받기·키 파일 0600·끼우기·`replaces` 갱신 뒤 새 일련번호(열린
+연결 그대로)·ARI 창, DNS-01 훅 공유 와일드카드·짧은 프로필, EAB, 실패 물러서기를 본다. RFC 2136은 `OPL_TEST_BIND`(`ip:port`)·
+`OPL_TEST_BIND_KEY`(base64, hmac-sha256, 키 이름 `acme-key`, 영역 `bind.test`)가 있을 때만 돈다 — `.github/scripts/acme-bind.sh NAMED DIR
+PORT`가 그 BIND를 띄우고 두 변수를 `KEY=VALUE` 줄로 찍는다(macOS는 `brew install bind`). `OPL_TEST_PEBBLE_LOG=1`이면 Pebble 출력을 보인다.
+CI **`acme`** 작업(Ubuntu 24.04)은 Pebble·challtestsrv 리눅스 판(SHA-256 핀)과 `bind9`(AppArmor 프로필을 비껴가게 `named`를 복사해
+띄움)로 이 시험을 돌린다.
+
+**Terraform 공급자 시험**(`terraform/`, Go 1.26 — `go.mod`의 `toolchain go1.26.11`)은 `go vet`·`gofmt`·`go mod verify`·staticcheck·
+govulncheck, 단위 시험과 스키마 맞춤(`TestSchemasMatchTheServer` — `OPL_OPENAPI`의 매니페스트 스키마와 리소스 맨 위 칸의 이름·타입·필수),
+그리고 `TF_ACC=1`의 수용 시험 여덟이다(VM 묶음·할당량을 넘는 VM이 plan에서 오류·네트워크·권한·백업·인증서·데이터 소스·템플릿).
+수용 시험의 `TestMain`이 `OPL_DEVSERVER`의 `opl-devserver`를 `--exit-on-stdin-eof`로 띄우고, terraform 실행 파일은
+`TF_ACC_TERRAFORM_PATH`(OpenTofu면 `TF_ACC_PROVIDER_HOST=registry.opentofu.org`도)로 준다. `opl-devserver`는 메모리 스토리지 노드 하나
+(풀 `local`·`backup`, SDN을 세운 것처럼 적음 — OVN 없음, ACME 계정 `dev` — CA에 등록하지 않음, 노드 기능 모두와 `http01`)를 클러스터 CA가
+서명한 HTTPS(127.0.0.1)로 띄우고 `{"url","token","ca_pem","ca_fingerprint","admin_password","node","dir"}` 한 줄을 찍는다. 스키마를 바꾸면
+`terraform/docs/`를 `tfplugindocs`로 다시 만든다(명령은 `terraform/main.go` 머리). CI **`terraform`** 작업(행렬 terraform 1.17.2·tofu 1.13.9,
+SHA-256 핀, setup-go 1.26.11, staticcheck v0.8.2, govulncheck v1.9.0)이 `opl-devserver`·OpenAPI를 cargo로 만들고 위 검사 전부와 수용 시험을
+돌린다.
+
 웹 UI (`web/`):
 
 ```bash
@@ -429,6 +478,11 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 (`Space`·`Tab`·`Space`, 알림 줄, `Esc` 초점), (3) 390 × 844 "Add parts" 서랍 → 누르기 → "Drop here", 가로 스크롤 없음. 끝에 Rust가 CLI로
 만든 VM의 스펙·볼륨·폴더를 본다. 터치 길게 누르기는 vitest에만 있다(Playwright Desktop Chrome에 터치가 없음). 세 시험은 spec 하나씩을 돌리고
 하나씩 차례로 돈다.
+
+넷째 브라우저 E2E(`web/e2e/history.spec.ts`, 계획 73)는 `web.rs`의 `browser_restores_a_vm_from_its_config_history`가 돌린다(QEMU를 켜지
+않음). Rust 쪽이 꺼진 VM `hist`(메모리 256 MiB)를 CLI로 만들고, 브라우저는 웹 편집으로 메모리를 512로 바꾼 뒤 VM ⋯ "설정 기록…" 서랍에서
+줄 둘과 전·후 표를 보고 만든 줄로 되돌린다. 이어서 설정 › 보안 › 인증서 보기를 열어 빈 목록을 본다. 끝에 Rust가 메모리 256과 이력 맨 위 줄(`restored_from`)을 본다. 선언 묶음·설정 기록·인증서 보기의
+390px 폭 가로 넘침 없음은 `builder.spec.ts`가 본다.
 
 **웹 CLI 미리 보기 교차 시험.** 빌더 모델 시험(`web/src/vmBuilder/model/cli.test.ts`)이 대표 상태 열둘의 CLI 명령(셸을 거치지 않는 인자 배열)·
 user-data 파일·웹 요청 본문을 `web/src/vmBuilder/model/__fixtures__/cli.json`과 견주고(다르면 실패), `crates/oplctl/src/web_cross.rs`가 같은

@@ -21,6 +21,7 @@
 - [클러스터 지도 화면](#클러스터-지도-화면)
 - [VM 빌더 화면](#vm-빌더-화면)
 - [VMware 이전 화면](#vmware-이전-화면)
+- [설정 기록·선언 묶음·인증서 화면](#설정-기록선언-묶음인증서-화면)
 - [접근성과 모양](#접근성과-모양)
 - [한계](#한계)
 
@@ -36,8 +37,8 @@
 | 가상 머신 `/vms` | VM(목록 `/vms` \| 폴더 `/vm-folders`) · 템플릿 `/templates` · 이미지·ISO(이미지 라이브러리 `/images` \| ISO 이미지 `/isos`) · 가져오기(가져오기 `/imports` \| VMware 이전 `/vmware-migrations` \| VMware 원본 `/vmware-sources` \| 내보내기 `/vm-exports` — 계획 72) |
 | 인프라 `/infra` | 노드(노드 `/nodes` \| 지도 `/cluster/map` — 계획 70 \| 클러스터 `/cluster`) · 스토리지 풀(목록 `/storage-pools` \| 폴더 `/storage-folders`) · 볼륨 `/volumes` · Ceph `/ceph` · 네트워크(목록 `/networks` \| 폴더 `/network-folders` \| 라우터 `/routers` \| 유동 IP `/floating-ips` \| 부하 분산 `/load-balancers` \| 토폴로지 `/networks/topology` \| SDN `/sdn`) · 보안 그룹 `/security-groups` |
 | 보호 `/protect` | 백업 `/backups`(파일 찾아보기 `/backups/<id>/files` — 계획 69) · 백업 작업 `/backup-jobs` · 백업 저장소 `/backup-stores`(계획 68) · 원격 복제 `/remotes`(원격 읽기 권한) · HA 그룹 `/ha-groups` · HA 검사 `/ha-checks` · 배치(배치 규칙 `/placement-rules` \| 최적 배치 `/placement`) |
-| 활동 `/activity` | 작업 `/tasks` · 경보 `/alerts` · 감사 로그 `/audit`(admin) |
-| 설정 `/settings` (아래 고정) | 일반 `/settings` · 사용자 `/settings/users`(사용자 읽기 권한) · 인증 영역 `/settings/realms`(영역 읽기 권한) · 권한 `/settings/permissions`(admin) · 역할 `/settings/roles`(admin) · 그룹 `/settings/groups`(그룹 읽기 권한) · 보안 `/settings/security`(admin, 2단계 인증 정책) · API 토큰 `/settings/tokens`(모두, 자기 토큰) · 2단계 인증 `/settings/account`(모두, 자기 요소) · 원격 클러스터 `/settings/remotes`(admin) · 알림 대상 `/settings/notifications`(admin) · 구독 `/settings/subscription` |
+| 활동 `/activity` | 작업 `/tasks` · 경보 `/alerts` · 감사(감사 로그 `/audit`(admin) \| 설정 기록 `/history` \| 선언 묶음 `/apply-sets`(루트 `system.read`) — 계획 73) |
+| 설정 `/settings` (아래 고정) | 일반 `/settings` · 사용자 `/settings/users`(사용자 읽기 권한) · 인증 영역 `/settings/realms`(영역 읽기 권한) · 권한 `/settings/permissions`(admin) · 역할 `/settings/roles`(admin) · 그룹 `/settings/groups`(그룹 읽기 권한) · 보안(보안 `/settings/security`(admin, 2단계 인증 정책) \| 인증서 `/settings/certificates`(루트 `cluster.read`, ACME — 계획 73)) · API 토큰 `/settings/tokens`(모두, 자기 토큰) · 2단계 인증 `/settings/account`(모두, 자기 요소) · 원격 클러스터 `/settings/remotes`(admin) · 알림 대상 `/settings/notifications`(admin) · 구독 `/settings/subscription` |
 
 - **권한.** 화면은 `/permissions/mine`(전역 역할과 폴더·객체 grant를 합친 내 권한)으로 **객체마다** 할 수 있는 동작만 보인다.
   루트에서 읽을 수 없는 종류의 탭(노드·Ceph·보안 그룹·백업 작업·HA·배치·설정 › 일반·구독 등)은 숨기고, 보이는 탭이 하나도 없는
@@ -47,7 +48,7 @@
   상세(`/vm-folders/:id` 등)는 `내용 | 할당량 | 권한` 탭이다. 행을 트리로 끌어 놓거나 일괄 막대의 "폴더로 옮기기…"로 옮긴다.
   VM 상세에는 "권한" 탭이, 풀·네트워크 행에는 같은 내용을 서랍으로 여는 방패 단추가 있다([폴더와 권한](folders.md#웹-화면)).
 - **상세 화면은 그 탭에 속한다.** `/vms/web`·`/vms/-new`·`/vms/-new/builder`·`/vms/web/edit`은 VM 탭, `/nodes/node1`은 노드 탭,
-  `/vm-folders/x`는 VM 탭의 폴더 보기, `/security-groups/web`은 보안 그룹 탭, `/imports/x`·`/vmware-migrations/x`(이전 계획 상세)·`/vmware-migrations/-new`(마법사)는 가져오기 탭, `/remotes/dr`(원격 클러스터의 VM)은 원격 복제 탭이다.
+  `/vm-folders/x`는 VM 탭의 폴더 보기, `/security-groups/web`은 보안 그룹 탭, `/imports/x`·`/vmware-migrations/x`(이전 계획 상세)·`/vmware-migrations/-new`(마법사)는 가져오기 탭, `/remotes/dr`(원격 클러스터의 VM)은 원격 복제 탭, `/apply-sets/web`(선언 묶음 상세)은 감사 탭이다.
   콘솔(`/vms/web/console`)만 영역 탭 없이 전체 폭이다.
 - **원격.** 보호 › 원격 복제는 원격 클러스터의 상태 카드, 원격 대상이 있는 백업 작업, 원격 VM 보기다. 주소·토큰의
   추가·고치기·지우기는 설정 › 원격 클러스터(admin)에 있다.
@@ -611,6 +612,45 @@ VM 빌더(계획 71)는 VM 만들기를 **부품을 VM 틀에 끌어 놓아 조�
 - **묶음.** VMware 보기 넷은 늦게 읽는 조각 하나(`vmware/pages`, gzip 약 15 KB), 내보내기는 `exports/pages`(약 3 KB), 문구는 늦게 받는
   묶음이다. 첫 화면 묶음 증가는 1 KB 밑이다.
 
+## 설정 기록·선언 묶음·인증서 화면
+
+계획 73. 새 사이드바 항목·탭은 없다 — **활동 › 감사** 탭의 보기 전환이 셋이다: **감사 로그**(`/audit`, admin) | **설정 기록**
+(`/history`, 누구나 — 서버가 읽을 수 있는 리소스의 줄만 준다) | **선언 묶음**(`/apply-sets`, 루트 `system.read`). **설정 › 보안** 탭은
+**보안**(`/settings/security`, admin — 2단계 인증 정책) | **인증서**(`/settings/certificates`, 루트 `cluster.read`)다. 그래서 operator·
+viewer에게도 감사·보안 탭이 보이고, 탭을 누르면 보이는 첫 보기(감사 탭은 설정 기록, 보안 탭은 인증서)로 간다. 팔레트에서 "설정
+기록"·"history"·"drift"·"인증서"·"ACME"로 찾는다. 안내는 [선언형 운영](declarative.md)과 [API 인증서(ACME)](cluster.md#api-인증서acme)에.
+
+- **설정 기록.** 거르기 줄(종류·사용자·출처·기간 — 지난 1시간·24시간·7일·30일·남은 기록 모두, 폴더·선언 묶음) 아래 날짜로 묶은 시간 줄
+  목록이다. 줄마다 시각·"만듦/바꿈/지움 종류 이름"·사용자·출처 칩(웹·CLI·API·적용·Terraform·Task·시스템)·사유·되돌린 줄 표시,
+  "더 오래된 바뀜"으로 더 읽는다. 자동으로 다시 읽지 않는다(열 때·새로고침·되돌리기 뒤).
+- **바뀜 서랍.** 줄을 누르면 오른쪽 서랍: 언제·누가·revision·사유·되돌린 줄·**감사 줄 id**(복사 단추 — 감사 로그 보기가 id로 거르지
+  못해 링크는 없다), 비교할 것(바로 앞 바뀜 | 지금 리소스), 바뀐 칸만의 전·후 표, 펼치면 그 revision의 전체 설정. 비밀은 "(비밀 바뀜)"
+  같은 표시뿐이다.
+- **되돌리기 대화상자.** 서랍의 "이 revision으로 되돌리기…"(지운 리소스는 "…다시 만들기…")가 서버 계획(요약·단계·바뀌는 칸·경고
+  `secret_not_restored` 등)을 보이고, "되돌리기"를 누르면 **그 계획을** 적용한다(그사이 바뀌었으면 오류 문구). 막힘이 있거나 이미 같으면
+  단추가 꺼진다. 사유를 적으면 사유와 함께 다시 계획해 단계가 같을 때만 적용하고, 다르면 새 계획을 보이고 다시 묻는다. 지운 리소스의
+  이름이 그새 쓰이면 새 이름 칸이 나온다(새 id). 비밀·이름·전원은 되돌리지 않는다고 대화상자가 알린다.
+- **한 시점으로 되돌리기.** 설정 기록 보기의 단추 → 대화상자: 시점(시각 또는 revision), 범위(폴더·선언 묶음·종류 가운데 하나 이상 — 있어야
+  "계획 보기"가 켜짐), "그 뒤 지운 리소스를 다시 만들기"(기본 켬)·"그 뒤 만든 리소스를 지우기"·"그 뒤 만든 VM·볼륨·백업 저장소도
+  지우기"(지우기를 골랐을 때만). 무엇이든 바꾸면 본 계획을 버린다.
+- **선언 묶음.** 목록(이름·객체 수·마지막 적용·누가·드리프트 칩 — 같음·N개 다름·아직 견주지 않음·마지막 적용 실패), 상세
+  `/apply-sets/<이름>`(객체 표 — 상태 칩 같음·다름·없음·관리 밖, 다른 칸 펼침과 "누가 바꿨나"(시각·사용자·출처·revision), 고른 것 또는
+  모두 "실제를 선언으로 받아들이기", 묶음의 "YAML로 내보내기", 그 묶음으로 거른 설정 기록 링크).
+- **⋯ 메뉴 두 줄.** VM·보안 그룹·폴더 상세 머리의 ⋯와, 볼륨·네트워크·백업 작업·라우터·부하 분산기·배치 규칙·HA 그룹 목록의 줄 ⋯
+  ("{이름} 더 보기")에 **"설정 기록…"**(그 리소스로 거른 서랍 "{이름}의 설정 기록")과 **"YAML로 내보내기"**(`GET /manifests/{kind}/{key}`를
+  YAML로 — 복사·내려받기, 비밀은 `secretRef`, `orbivisorctl apply -f`가 그대로 읽는다)가 있다. 네트워크·백업 작업·배치 규칙·HA 그룹은 동작
+  칸이 쓰기 권한이 있을 때만 있어 읽기 사용자는 줄 ⋯이 없다(설정 기록 보기에서 종류로 거른다). VM 케밥은 이제 viewer에게도 보인다.
+  원격·HA 검사·ACME에는 없다.
+- **Terraform 칩.** 레이블 `orbivisor.io/managed-by=terraform`인 VM·보안 그룹의 머리에 "Terraform이 관리" 칩이 있다 — 여기서 바꾸면
+  다음 `terraform apply`가 되돌린다.
+- **인증서.** ACME 계정·DNS 공급자·인증서 목록(노드마다 만료·다음 갱신·오류 칩, "지금 갱신"), 만들기 대화상자 셋: 계정(디렉터리 고르기·
+  약관 동의 필수·EAB), DNS 공급자(종류마다 칸, 비밀은 비밀번호 칸이고 저장 뒤 다시 보이지 않음), 인증서(이름·노드마다/공유·도전·키
+  P-256/P-384·프로필, HTTP-01이면 `http_listen`이 없는 노드 경고, 와일드카드는 DNS-01만). 쓰기 단추는 루트 `cluster.admin`일 때만 보인다.
+- **링크·실시간.** 경보의 대상 링크는 인증서 → `/settings/certificates`, 적용 묶음 → `/apply-sets/<이름>`이고, Task `apply`·`acme-order`의
+  대상도 링크다. 선언 묶음·인증서 목록은 watch 사건이 오면 다시 읽는다. 되돌리기·adopt 단추는 그 종류의 쓰기 권한이 있을 때만
+  보인다(서버가 단계마다 다시 본다).
+- **묶음.** 네 보기는 늦게 읽는 조각 하나(`history/pages`), 문구는 늦게 받는 묶음 셋이다. 첫 화면 묶음 증가는 868 B(gzip)다.
+
 ## 접근성과 모양
 
 - **테마**: 시스템(기본)·밝게·어둡게. **밀도**: 편안하게(기본)·촘촘하게. 둘 다 사용자 메뉴에 있고 브라우저에 남는다.
@@ -632,6 +672,9 @@ VM 빌더(계획 71)는 VM 만들기를 **부품을 VM 틀에 끌어 놓아 조�
 - 일괄 동작은 VM 목록에만, 미리 보기 서랍은 VM·노드 목록에만 있다. 열 순서 바꾸기, 표 CSV 내보내기, 셀 안 편집, 사용자 정의
   대시보드, 여러 클러스터를 한 표로 보기는 없다.
 - 오른쪽에서 왼쪽으로 쓰는 언어와 고대비 테마는 없다.
+- 설정 기록·선언 묶음(계획 73): 웹에 YAML 편집기(붙여 넣어 적용)가 없고, 목록에서 여러 줄을 골라 한꺼번에 YAML로 내보내지 못한다(선언 묶음 상세가
+  묶음 전체를 낸다). 서랍의 감사 줄은 id 복사뿐이다(감사 로그 보기로 가는 링크 없음). 설정 기록은 실시간으로 바뀌지 않는다. 인증서 만들기
+  대화상자에 노드 고르기·`preferred_chain`·갱신 정책·`install`이 없다(CLI·매니페스트로).
 - 폴더 트리는 가상 스크롤이 없고(펼친 노드만 그린다) 템플릿 탭에는 트리가 없다. 끌어 놓기는 확인 없이 바로 옮긴다. 토큰 범위를
   정하는 화면은 없다(CLI). 볼륨·ISO·이미지·가져오기·백업 복원·템플릿 배포 단추는 그 권한이 어디에든 있으면 보이고, 그 객체에서
   되는지는 서버가 정한다.

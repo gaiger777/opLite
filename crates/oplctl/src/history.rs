@@ -326,7 +326,8 @@ pub(crate) async fn restore(
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     let (path, body) = restore_request(&args)?;
-    let plan = post(client, &path, &body, None).await?;
+    // 사유는 계획에 담기므로 계획을 세우는 요청에 보낸다.
+    let plan = post(client, &path, &body, args.reason.as_deref()).await?;
     if json_out {
         print_json(out, &plan)?;
     } else {

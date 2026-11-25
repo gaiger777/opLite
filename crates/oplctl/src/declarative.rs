@@ -444,7 +444,8 @@ pub(crate) async fn apply(
     } else {
         let documents = read_documents(&args.files)?;
         let b = body(&args.files, documents);
-        let plan = post(client, "/apply?dry_run=true", &b, None).await?;
+        // 사유는 계획에 담긴다(서버가 미리 확인 때의 출처·사유로 계획을 세운다) — 미리 확인에도 보낸다.
+        let plan = post(client, "/apply?dry_run=true", &b, reason).await?;
         if json_out {
             print_json(out, &plan)?;
         } else {

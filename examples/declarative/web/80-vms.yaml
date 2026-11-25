@@ -1,0 +1,20 @@
+# 켜진 VM 둘(state: running). 디스크·NIC은 이름으로 가리킨다 — 차례(폴더 → 네트워크 → 볼륨 → VM)는 서버가 정한다.
+apiVersion: orbivisor.io/v1
+kind: Vm
+metadata: { name: web01, folder: /demo/web, labels: { tier: web } }
+state: running
+spec:
+  cpu: { cores: 1 }
+  memory_mib: 256Mi
+  disks: [{ volume: web01-root, bus: virtio-blk }]
+  nics: [{ network: web-net, model: virtio }]
+---
+apiVersion: orbivisor.io/v1
+kind: Vm
+metadata: { name: web02, folder: /demo/web, labels: { tier: web } }
+state: running
+spec:
+  cpu: { cores: 1 }
+  memory_mib: 256Mi
+  disks: [{ volume: web02-root, bus: virtio-blk }]
+  nics: [{ network: web-net, model: virtio }]

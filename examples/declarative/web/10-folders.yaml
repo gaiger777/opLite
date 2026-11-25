@@ -1,0 +1,11 @@
+# 계획 73 선언형 적용 예: VM 폴더 /demo/web (폴더의 열쇠는 트리와 경로 — metadata.folder가 부모)
+#   orbivisorctl apply -f examples/declarative/web/ --set web
+apiVersion: orbivisor.io/v1
+kind: Folder
+metadata: { name: demo }
+spec: { kind: vm }
+---
+apiVersion: orbivisor.io/v1
+kind: Folder
+metadata: { name: web, folder: /demo }
+spec: { kind: vm }

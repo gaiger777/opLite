@@ -58,6 +58,7 @@ CLI `orbivisorctl`이나 그 데몬이 내장한 웹 UI로 한다.
 | 노드 수 | 투표 멤버 3/5/7 + learner·관찰 노드, 300노드 시험 | corosync 한계(수십 노드) | 클러스터당 96호스트 |
 | HA | 리스 + watchdog·IPMI/Redfish 펜싱, 기본 복구 약 22초 | watchdog 펜싱, 보통 2분 안팎 | HA 에이전트·하트비트 데이터스토어 |
 | SDN | 브리지·VLAN·정적 VXLAN, nftables 보안 그룹, OVN SDN(논리 스위치·IPAM·DHCP 계획 65, 공급자 네트워크·분산 라우터·게이트웨이 HA·SNAT·유동 IP·DHCPv6·RA·OVN ACL 보안 그룹 계획 66, OVN 부하 분산·NIC QoS·단순 → SDN 옮기기·OVN 접근 잠금·SDN 경보·2.5D 토폴로지 계획 67) | SDN(EVPN 포함) | NSX(따로) |
+| 선언형 운영 | YAML 매니페스트 `orbivisorctl apply·diff·plan·export`(서버가 계획, 적용 묶음·가지치기·드리프트), 같은 저장소의 Terraform/OpenTofu 공급자(레지스트리 게시 전), 리소스마다 설정 기록(누가·출처·사유)과 되돌리기·지운 것 살리기·한 시점으로 되돌리기, 클러스터가 조율하는 ACME API 인증서(계획 73) | 공식 Terraform 공급자 없음(커뮤니티), 노드마다 ACME, 설정 diff·되돌리기 없음 | 공식 Terraform 공급자(따로 판), PowerCLI·Ansible, VM 설정 되돌리기 없음, ACME 없음(VMCA) |
 | 백업 | 백업 풀(qcow2·증분 체인)과 백업 저장소(계획 68: 4 MiB 청크 중복 제거·노드 암호화·S3·검증·GC·라이브 복원·읽기 전용 붙이기), 파일 단위 복원(계획 69: 일회용 도우미 VM, zip·tar.gz, 게스트 에이전트로 되돌려 쓰기), 따로 둘 서버 없음 | Proxmox Backup Server(따로) | VADP + 서드파티(Veeam 등) |
 
 Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
@@ -66,7 +67,7 @@ Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에
 
 | 크레이트 | 줄 수(대략) | 하는 일 |
 |---|---|---|
-| `opl-types` | 30k | 리소스 모델(43종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
+| `opl-types` | 30k | 리소스 모델(47종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
 | `opl-qemu` | 7k | QEMU 명령줄 만들기, QMP·QGA 클라이언트, 펌웨어 찾기, cloud-init ISO 만들기 |
 | `opl-store` | 9k | 백업 저장소(계획 68): 청크·고정 인덱스·매니페스트 v3 형식, 암호화 키 계층·복구 키·escrow, 로컬·S3 백엔드(직접 짠 SigV4), GC 표시·쓸기·Bloom 필터, 검증, NBD 클라이언트·서버(`backup-serve` 헬퍼), 가짜 S3(`fake-s3` 기능) |
 | `opl-restore` | 5k | 파일 단위 복원(계획 69): 도우미 VM과의 통신 규약(프레임·메시지·한도·`StreamCheck`), 에이전트 몸통(`Fs` trait·탐지 해석·마운트 옵션·나열·읽기·걷기)과 PID 1 바이너리 `orbivisor-restore-agent`(정적 musl — C 의존성 없음, 그래서 opl-types도 쓰지 않음), zip·tar.gz 흘려 쓰기 작성기 |
@@ -302,13 +303,15 @@ sequenceDiagram
 | `raft_log` | 로그 index → 항목(JSON) |
 | `objects` | (kind, id) → 리소스(JSON) |
 | `names` | (kind, name) → id (이름 유일성 색인) |
-| `meta` | `vote`, `committed`, `last_applied`, `last_purged`, `last_membership`, `snapshot_meta`, `snapshot_data`, `node_mode`, `schema_version` … |
+| `meta` | `vote`, `committed`, `last_applied`, `last_purged`, `last_membership`, `snapshot_meta`, `snapshot_data`, `node_mode`, `schema_version`, `history_count`, `history_bytes` … |
+| `history` | (kind, id, revision) → 설정 기록 한 줄(lz4 JSON, 계획 73) |
+| `history_seq` | revision → (kind, id, at_ms, 줄 바이트) — 시간 차례 타임라인과 전역 보존 |
 
-- **리소스 43종** (`crates/opl-types/src/resource.rs`의 `Kind`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
+- **리소스 47종** (`crates/opl-types/src/resource.rs`의 `Kind`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
   Cluster, JoinToken, Network, Snapshot, SecurityGroup, Backup, BackupJob, VmImport, Settings, Realm, Remote, Session,
   VipHolder, HaGroup, PlacementRule, NodeFence, HaCheck, Ceph, AlertRule, NotificationTarget, Folder, Grant,
   AccessRole, Group, TwoFactor, CpuCatalog, Sdn, Router, FloatingIp, LoadBalancer, NetworkMigration, BackupStore(계획 68),
-  VmwareSource, VmwareMigration, VmwareVm, VmExport(계획 72).
+  VmwareSource, VmwareMigration, VmwareVm, VmExport(계획 72), ApplySet, AcmeAccount, AcmeDns, Certificate(계획 73).
 - 모든 리소스는 같은 봉투 `Resource<S,T> { id, name, revision, labels, spec, status }`다(`resource.rs:7-18`).
 - **revision은 클러스터 전체에 하나인 순서다.** 리소스의 `revision`은 마지막으로 바꾼 Raft 로그 index이고
   (`crates/opl-cluster/src/state_machine.rs:381,419,427,443`), 목록의 revision은 `last_applied`다
@@ -316,11 +319,12 @@ sequenceDiagram
 - **스키마 버전.** `SCHEMA_VERSION = 1`이고 더 새 파일·스냅샷은 거부한다(`store.rs:20,121-125`).
 - 모든 쓰기 트랜잭션은 `orbivisor-store` 스레드 하나에서 돈다. `append`는 fsync 커밋 뒤에 돌아온다
   (`crates/opl-cluster/src/log_store.rs:195-196`).
-- **지표와 감사 로그, 노드 알림 상태는 Raft에 넣지 않는다**(§12, §13).
+- **지표와 감사 로그, 노드 알림 상태는 Raft에 넣지 않는다**(§12, §13). 설정 기록(계획 73)은 Raft 안이다(아래 §3.2).
 
 ### 3.2 명령과 상태 머신의 검사
 
-Raft에 들어가는 명령은 다섯 가지다: `Create`, `UpdateSpec`, `UpdateStatus`, `UpdateStatusIf`, `Delete`
+Raft에 들어가는 명령은 다섯 가지다: `Create`, `UpdateSpec`, `UpdateStatus`, `UpdateStatusIf`, `Delete`(그리고 이것을 싸는
+`Attributed` — 아래 "출처를 단 명령")
 (`crates/opl-cluster/src/types.rs:39-68`). `UpdateSpec`·`Delete`는 `expected_revision`을 줄 수 있고, `UpdateStatusIf`는
 늘 준다. 리더에게 보내는 요청은 따로 `LeaderRequest { Write, AddLearner, AddVoter, Remove, RenewLease, RenewVip,
 ReadIndex }`다(`types.rs:114-162`).
@@ -347,6 +351,18 @@ ReadIndex }`다(`types.rs:114-162`).
 - API 핸들러는 적용 전에 같은 검사를 먼저 해(예: `crates/opl-api/src/quota.rs`) 대개 빠르게 거절하지만, 경쟁하는
   두 쓰기 사이의 최종 판정은 상태 머신이 한다.
 
+**출처를 단 명령과 설정 기록(계획 73).** 여섯째 명령 `Command::Attributed { meta, command }`(`types.rs:73`)는 안의 명령을 그대로
+적용하고, 기록 종류(`Kind::history_tracked()` — 스물아홉)의 `Create`·`UpdateSpec`(spec·labels가 실제로 바뀐 때만)·`Delete`(지우기 직전
+spec)마다 `history`·`history_seq`에 줄 하나를 같은 redb 거래로 쓴다. `meta`는 `{at_ms, actor{user, user_id, auth: session|token|system,
+task}, source: api|web|cli|apply|terraform|task|system, reason?, request?(감사 id), apply_set?, restored_from?}`다. API 감사 층이 요청마다
+작업 지역 값 `ChangeContext`(머리 `Orbivisor-Client`·`Orbivisor-Change-Reason`, 주체)를 열고, Task 실행기·적용 Task가 겹쳐 덮으며,
+`Cluster::write`가 그것으로 싼다. `at_ms`는 **리더가 제안 직전에 찍어** 적용이 결정적이다. 싸는 조건은 노드 리소스가 하나 이상이고
+모두 기능 `config-history`를 알릴 때뿐이다(옛 노드가 모르는 명령을 받지 않음 — 그 전 바뀜은 기록이 없다). status 쓰기와 기록하지 않는
+종류는 옛 명령 그대로다. 비밀 칸은 상태 머신 안에서 앞 줄과 견줘 `{"$secret": "set|same|changed|cleared"}`로만 남는다(해시도 없음).
+보존(리소스마다 N줄·나이·전체 MiB — 설정 `history`)은 적용 때 결정적으로 다듬고(명령마다 `history_seq` 앞에서 최대 256줄), "지금"은 명령의
+`at_ms`다. 관찰 노드에는 기록이 없어(Follow는 객체만) API가 구성원에게 RPC `ReadHistory`로 읽는다. 잰 비용은 파일 저장소에서 spec 쓰기
++1.0%, 쓰기 길 전체 +1.3%(계획 73 설계 §18 스테이지 1).
+
 ### 3.3 watch
 
 - `WatchHub`가 적용 묶음을 메모리에 1024개(`HISTORY`) 두고 redb 커밋 뒤 tokio broadcast로 보낸다
@@ -361,7 +377,8 @@ ReadIndex }`다(`types.rs:114-162`).
 - opld의 `raft_config`(`crates/opld/src/member.rs:162-176`)는 스냅샷 정책을 정하지 않으므로 openraft 0.9.25 기본값을
   쓴다: 로그 **5000개마다** 스냅샷(`LogsSinceLast(5000)`), 스냅샷 뒤 로그 **1000개** 남김. 바꾼 것은 조각 크기 1 MiB와
   조각마다 제한 시간 10초뿐이다.
-- 스냅샷은 상태 전체를 JSON 문서 하나 `{schema_version, objects: [(Kind, Resource)]}`로 만든다
+- 스냅샷은 상태 전체를 JSON 문서 하나 `{schema_version, objects: [(Kind, Resource)], history?}`로 만든다(`history`는 설정 기록
+  `[kind, id, revision, at_ms, base64(lz4)]` — 비면 쓰지 않아 기능 전 스냅샷과 바이트가 같다, 계획 73)
   (`state_machine.rs:37-41`). `spawn_blocking`에서 만들고 같은 redb의 `meta.snapshot_data`에 둔다. 옛 스냅샷이 새것을
   덮지 않는다(`state_machine.rs:147-161,528-543`).
 - 설치하면 `objects`·`names`를 지우고 다시 쓴 뒤 watch에 `Reset`을 보낸다(`state_machine.rs:180-212,590-609`).
@@ -508,6 +525,8 @@ sequenceDiagram
 | `TelemetryReporter` | 텔레메트리 보고 | 틱 60초, 24시간마다 | `telemetry.rs:221-229,292` |
 | `RemotePoller` | 원격 클러스터 상태 모으기 | 30초 | `remotes.rs:558-559,608` |
 | `OvnSync` | Raft의 SDN 네트워크·서브넷·VM NIC·라우터·유동 IP·보안 그룹·부하 분산기·QoS·옮기기 다리를 OVN NB에 맞추기(다른 것만, 펜싱 토큰), 지운 노드의 SB chassis 지우기(모든 노드가 `sdn-services`면 중앙 에이전트가 대신), 10초마다 게이트웨이 주인·LB 멤버 건강 관찰(SDN 경보 입력), `SdnStatus.sync`(§11.4~§11.6). `Sdn`이 `ready`가 아니면 쉼 | 바뀌면 0.5초 모아, 60초마다, 리더 확인 1초 | `ovn_sync/mod.rs:44-48,82-83,136,486` |
+| `DriftChecker` | 적용 묶음마다 선언(`declared`)과 실제를 계획과 같은 비교 함수(`declarative::plan::compare`)로 견줘 `ApplySet.status.drift`(modified·missing·unmanaged, 칸마다 처음 바꾼 이력 줄 `by`)를 쓰기(결과가 바뀔 때만). 경보 `apply_set_drift`의 입력(계획 73) | 10초(그사이 revision이 바뀌었으면), 아니어도 300초 | `drift.rs:45-46` |
+| `AcmeRenewer` | 인증서마다 할 일(받은 것 없음·이름·키 바뀜·`renew_at` 지남, 물러서는 중 제외)을 순수 함수 `due`·`plan`으로 정해 Task `acme-order` 만들기(노드마다는 그 노드, 공유는 리더 또는 id가 가장 작은 온라인 노드, 클러스터 동시 2), 하루 한 번 ARI 창 다시 묻기, 지난 HTTP-01 답 치우기. 진행은 인증서 status(Raft)에 있어 새 리더가 잇는다(계획 73) | 60초 | `acme/renewer.rs:36` |
 | `VmwareScheduler` | VMware 이전 계획(`running`)의 항목마다 `vmware-sync`(전체·델타)·`vmware-cutover`(예약 전환 `cutover.at`, 항목에 요청 시각을 먼저 적어 한 번만)·`vmware-cleanup`(취소) Task 만들기. 계획의 동시 수·같은 ESXi 호스트·같은 노드 한도(모든 계획의 Task를 셈), 델타·전환이 새 전체 복사보다 먼저. 모든 항목이 끝난 계획을 `finished`로. 진행은 항목(Raft)에 있어 새 리더가 다음 틱에 잇는다(계획 72). 기능 `vmware-migrate`가 모든 노드에 있을 때만 | 15초 | `vmware_scheduler.rs:40-51,383` |
 | 리스 표 | 노드의 `RenewLease`를 받아 메모리에 기록(§5.1) | 요청마다 | `crates/opl-cluster/src/lease.rs` |
 
@@ -743,10 +762,15 @@ reconciler나 Task 실행기가 한다. `remote_proxy.rs`는 다른 **클러스�
 
 - axum 0.8 + rustls 0.23(ring). 자체 `TlsListener`가 핸드셰이크 제한 시간 10초, 동시 256개, ALPN `http/1.1`만
   (WebSocket 때문)이다(`crates/opl-peer/src/tls.rs:23-158`). 클라이언트 인증서는 요구하지 않는다.
-- 포트 8006(`listen`). **평문 HTTP 리스너와 HTTP→HTTPS 넘기기는 없다.**
-- **API 인증서.** 설정 `[api] tls_cert`/`tls_key` 파일이 있으면 그것, 없으면 노드 인증서. 클러스터 설정 `api_names`가
-  있으면 `ApiCertAgent`가 그 이름을 넣은 serverAuth 인증서(CN `orbivisor-api`)를 클러스터 CA로 서명해 연결을 끊지 않고
-  바꾼다(`crates/opl-api/src/api_cert.rs:1-65`, `crates/opl-peer/src/tls.rs:28-53`). 인증서 올리기 API는 없다.
+- 포트 8006(`listen`). 평문 API 리스너는 없다. 선택 리스너 `[api] http_listen`(예 `0.0.0.0:80`, 계획 73)은 ACME HTTP-01 답
+  (`/.well-known/acme-challenge/*` — Raft의 도전 값이라 어느 노드든 답함)과 https로의 308 넘기기(설정 `acme.http_redirect`)만 하는
+  손으로 짠 HTTP/1.1 서버다(`crates/opl-api/src/acme/http01.rs` — 머리 8 KiB, 연결당 요청 하나, 초당 100).
+- **API 인증서.** 차례는 (1) 설정 `[api] tls_cert`/`tls_key` 파일(있으면 그것만 — 에이전트를 띄우지 않음), (2) 살아 있는 ACME
+  인증서(계획 73: 이 노드의 노드마다 인증서가 기본, 모든 ACME 인증서를 **TLS SNI 이름**으로 고름 — `ApiCert::set_named`, 정확히 같거나
+  `*.` 한 레이블), (3) 클러스터 설정 `api_names`가 있으면 `ApiCertAgent`가 그 이름을 넣은 serverAuth 인증서(CN `orbivisor-api`)를
+  클러스터 CA로 서명, 없으면 노드 인증서. 모두 연결을 끊지 않고 바꾼다(`crates/opl-api/src/api_cert.rs`, `crates/opl-api/src/acme/install.rs`,
+  `crates/opl-peer/src/tls.rs`). `ApiCertAgent::spawn_with_acme`가 설정·인증서 watch와 1시간마다 다시 맞춘다. 노드마다 ACME 키는
+  `{data_dir}/pki/acme/{id}.key`(0600)에만, 공유 인증서 키는 Raft status의 비밀이다. 인증서 올리기 API는 없다.
 - **제어 소켓** `opld.sock`(0600, 인증 없음, 루트 전용)은 `GET /v1/status`, `POST /v1/init|join|leave`만 있는 따로 된
   axum 라우터다(`crates/opld/src/control.rs:95-132`). `orbivisorctl cluster init|join|leave`가 쓴다.
 
@@ -1603,6 +1627,8 @@ graph LR
 | 권한 | 경로 표의 규칙, 폴더로 내려가는 grant, 역할·그룹, 404/403로 존재 숨김, watch·콘솔 계속 다시 확인 | §7.5 |
 | 할당량 | 폴더마다 vCPU·메모리·디스크·VM 수, Raft 적용에서 최종 판정 | §3.2 |
 | 감사 로그 | 노드마다 `{data_dir}/audit/audit.log`(JSON 줄, 1초마다 fsync, 16 MiB × 8). 쓰기 요청·콘솔 열기·OIDC 콜백. `GET /audit`이 fan-out으로 모음. **Raft에 없다** | `crates/opl-api/src/audit.rs:1-470` |
+| 설정 기록·선언형 적용(계획 73) | 기록은 Raft 상태 머신 안(§3.2), 줄의 `request`가 감사 id. 비밀은 기록에 `$secret` 표시만(평문·해시·지문 없음 — 낮은 엔트로피 비밀번호의 오프라인 대입을 막음), 기록 보기는 지금 읽을 수 있는 리소스만(지운 것은 마지막 폴더). 새 권한 없음 — 적용·되돌리기는 단계마다 그 종류의 지금 처리기·권한을 거친다(`POST /apply`는 어딘가의 `system.read`, 숨은 리소스는 없는 것과 같은 문구) | `crates/opl-api/src/declarative/`, `history.rs` |
+| ACME(계획 73) | 계정 키·EAB HMAC·DNS 공급자 비밀·공유 인증서 키는 Raft에(보기·watch·감사·설정 기록에서 뺌 — `opl_types::acme::redact_*`), 노드마다 인증서 키는 그 노드 디스크에만, 훅은 `/etc/opl/acme-hooks/` 아래 root 소유·그룹/남 쓰기 불가 파일만(환경 비움·60초), 쓰기 루트 `cluster.admin`·읽기 `cluster.read`. RFC 2136 응답의 TSIG는 확인하지 않음 | `crates/opl-api/src/acme/` |
 | 제어 소켓 | 0600 유닉스 소켓, 인증 없음(루트 전용) | §7.1 |
 | OVN(계획 65~67) | NB·SB·Raft는 `pssl`만, 클러스터 CA mTLS(노드 인증서 사본), OvnSync는 서버 이름도 확인. 잠금(계획 67, 새 클러스터 기본): SB 역할 포트 `role=ovn-controller`(chassis는 자기 행만), northd 전용 특권 포트 6645, Raft 멤버십을 따르는 nftables 주소 허용 목록(지운 노드는 인증서가 살아 있어도 끊김). `Port_Binding`·`MAC_Binding`·`FDB`는 OVN RBAC가 id를 보지 않음, NB에는 RBAC 없음. SDN NIC의 보안 그룹은 OVN ACL(포트 보안이 IP 위조도 막음), 포트는 Port_Group이 있어야 생김(실패하면 닫힘) | §11.4~§11.6 |
 | swtpm | AppArmor 추가 규칙 | §9.2 |
@@ -1611,13 +1637,14 @@ graph LR
 | 백업 저장소(계획 68) | 노드에서 AES-256-GCM(HKDF로 나눈 키, HMAC 청크 id, 결정적 nonce, 매니페스트 HMAC 인증), 주 키는 Raft에(API·watch·감사·`Debug`에서 뺌), 복구 키·저장소 안 argon2id escrow, S3는 rustls + SigV4(인증서 검증 실패는 다시 하지 않음), `backup-serve` 소켓 0600·설정은 표준 입력 | §10.3 |
 
 **저장된 비밀은 암호화하지 않는다.** LDAP `bind_password`, OIDC `client_secret`, IPMI/Redfish 비밀번호, SMTP 비밀번호,
-webhook 토큰, TOTP 비밀, 백업 저장소의 암호화 주 키와 S3 비밀 키(계획 68), **클러스터 CA 개인 키**가 Raft(redb)에 평문으로 있다. API 응답·watch·`Debug` 출력에서만 숨긴다
+webhook 토큰, TOTP 비밀, 백업 저장소의 암호화 주 키와 S3 비밀 키(계획 68), ACME 계정 키·EAB·DNS 비밀·공유 인증서 키(계획 73), **클러스터 CA 개인 키**가 Raft(redb)에 평문으로 있다. API 응답·watch·설정 기록·`Debug` 출력에서만 숨긴다
 (`crates/opl-types/src/` 아래 `realm.rs:59,111`, `fence.rs:92,123`, `alert.rs:764`, `two_factor.rs:133`, `cluster.rs:23`).
 보호는 0700 데이터 디렉터리뿐이다(계획 62 설계도 그렇게 적었다). 그래서 노드 하나의 `cluster.redb`나 백업을 얻으면
 클러스터 CA로 노드 인증서를 만들 수 있다. 복구 코드와 API 토큰·세션·합류 토큰은 해시, 패스키는 공개 키만, cloud-init
 비밀번호는 SHA-512 crypt 해시(`crates/opl-types/src/crypt.rs:1-2`)로 둔다.
 
-인증서 자동 갱신·CA 교체는 없다. 노드 인증서는 824일, CA는 20년이다.
+내부 인증서 자동 갱신·CA 교체는 없다. 노드 인증서는 824일(경보 `certificate_expiring`이 만료를 알린다), CA는 20년이다. 공개 API 인증서는
+ACME로 자동 갱신할 수 있다(계획 73).
 
 ---
 
@@ -1625,7 +1652,8 @@ webhook 토큰, TOTP 비밀, 백업 저장소의 암호화 주 키와 S3 비밀 
 
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
-  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store`, `file-restore`, `vm-check` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store`, `file-restore`, `vm-check`, …,
+  `declarative`, `config-history`, `acme`)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.
@@ -1804,7 +1832,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 **사용 안내**: [시작하기](guide/getting-started.md), [가상 머신](guide/vms.md), [스토리지](guide/storage.md),
 [네트워크](guide/network.md), [고가용성](guide/ha.md), [클러스터 운영](guide/cluster.md),
 [백업·복제·가져오기](guide/backup.md), [웹 화면](guide/web-ui.md), [접근과 보안](guide/access.md),
-[폴더와 권한](guide/folders.md), [구독과 텔레메트리](guide/subscription.md), [개발](guide/development.md).
+[폴더와 권한](guide/folders.md), [선언형 운영](guide/declarative.md), [구독과 텔레메트리](guide/subscription.md), [개발](guide/development.md).
 
 **설계 문서**(코드와 다르면 코드가 맞다):
 
@@ -1832,6 +1860,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
   [템플릿·링크드 클론](superpowers/specs/2026-11-17-templates-linked-clones-design.md),
   [vTPM·Secure Boot·게스트 에이전트](superpowers/specs/2026-11-18-vtpm-secure-boot-guest-agent-design.md)
 - 배포: [설치·업데이트·구독](superpowers/specs/2026-11-05-install-update-subscription-design.md)
+- 운영: [선언형 운영 — 적용·Terraform·ACME·설정 기록(계획 73)](superpowers/specs/2026-11-25-declarative-design.md)
 - 전체 목록: [docs/index.md](index.md)
 
 ### 설계 문서와 코드가 다른 곳(요약)
@@ -1886,10 +1915,15 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
   못했다(aarch64 TCG, VMware 게스트 없음 — 바이트 같음만). OVA 내보내기는 govc `import.ova`(vcsim)로만 받아 보았고 실제 vSphere·ovftool·
   VirtualBox와 `vmw:Config addressType=manual`의 MAC 지킴은 손 확인이다. 속도는 가짜 vSphere 루프백 수치뿐이다. 손 확인 절차는
   [안내](guide/backup.md#vcenter-일괄-이전과-따뜻한-이전).
+- **계획 73(선언형 운영)에서 확인하지 못한 것.** 실제 Let's Encrypt·ZeroSSL·Google ACME와 실제 Cloudflare·Route 53·PowerDNS는 시험하지
+  않았다 — Pebble 2.10.1·pebble-challtestsrv·BIND 9(RFC 2136)와 가짜 Cloudflare·Route 53·PowerDNS로만 보았다(스테이징 손 확인 절차는
+  [안내](guide/cluster.md#lets-encrypt-스테이징으로-손-확인), 결과는 아직 없다). Terraform 공급자는 레지스트리에 게시하지 않았다(`dev_overrides`로만
+  — 수용 시험은 terraform 1.17.2·OpenTofu 1.13.9와 `opl-devserver`). 수백 노드에서 설정 기록의 크기·스냅샷 보내기·`GET /history` 훑기(한 요청
+  5만 줄)의 부하는 재지 않았다(잰 것은 노드 하나의 쓰기 비용뿐). 관찰 노드의 기록 읽기는 RPC 시험만, 여러 노드 opld 끝까지는 보지 않았다.
 - **OVN 24.03 RBAC가 막지 않는 것.** 잠금은 SB `Chassis`·`Encap`·`Chassis_Private`의 주인만 보고, `Port_Binding`·`MAC_Binding`·`FDB` 쓰기는 id 검사
   없이 받는다(OVN이 그렇게 정의). 망가진 chassis의 포트 가로채기는 막지 못하고 탐지 경보도 아직 없다.
 - **OVN 판에 기대는 것.** 바깥 → 안의 큰 DF 패킷에 ICMP가 없는 것(`gateway_mtu`가 게이트웨이로 나가는 방향만 잼), ACL 우선순위
   65532의 이웃 찾기 허용, 맺은 연결을 끊는 `ct_mark.blocked`는 OVN 24.03.8에서 본 동작이다. 다른 판에서는 다시 봐야 한다.
 - **없는 것으로 확인한 것**(찾았지만 없음): `.proto` 파일, EVPN/BGP, L7 부하 분산·QoS 정책 리소스, 구독 보고 루프,
-  SSE, 평문 HTTP 리스너, 시리얼 콘솔, Task 취소, 데몬 재시작 뒤 Task 이어가기(업그레이드 제외), 클러스터 전체 VM 잠금,
-  인증서 자동 갱신과 CA 교체, 저장 비밀 암호화, keepalived, 대량 전송용 망, 꺼진 VM의 저장소 옮기기.
+  SSE, 평문 API 리스너(포트 80은 ACME HTTP-01 답과 넘기기만), 시리얼 콘솔, Task 취소, 데몬 재시작 뒤 Task 이어가기(업그레이드 제외), 클러스터 전체 VM 잠금,
+  내부 인증서 자동 갱신과 CA 교체, 저장 비밀 암호화, keepalived, 대량 전송용 망, 꺼진 VM의 저장소 옮기기.

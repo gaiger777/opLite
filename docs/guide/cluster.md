@@ -1,9 +1,10 @@
 # 클러스터 운영
 
-제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 클러스터 CPU 기준, 호스트 준비(예약·전용 CPU와 hugepages), 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+제어부 가용성, 앞단 프록시·VIP, API 인증서(ACME), 대규모 클러스터, 다중 링크, 노드 유지보수, 클러스터 CPU 기준, 호스트 준비(예약·전용 CPU와 hugepages), 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [제어부 가용성](#제어부-가용성)
 - [앞단 프록시와 VIP (API 가용성)](#앞단-프록시와-vip-api-가용성)
+- [API 인증서(ACME)](#api-인증서acme)
 - [대규모 클러스터](#대규모-클러스터)
 - [클러스터 통신 다중 링크](#클러스터-통신-다중-링크)
 - [노드 유지보수와 비우기](#노드-유지보수와-비우기)
@@ -196,7 +197,7 @@ tls_cert = "/etc/opl/api.crt"   # PEM, 중간 인증서를 이어 붙여도 된�
 tls_key = "/etc/opl/api.key"    # 둘 다 있어야 한다
 ```
 
-관리자 인증서가 있으면 API 리스너가 그것을 쓰고 `api_names`로 다시 발급하지 않는다(파일을 읽지 못하면 시작하지 못한다).
+관리자 인증서가 있으면 API 리스너가 그것을 쓰고 `api_names`로 다시 발급하지 않으며 ACME 인증서도 끼우지 않는다(파일을 읽지 못하면 시작하지 못한다). 공인 인증서를 자동으로 받으려면 아래 [API 인증서(ACME)](#api-인증서acme)를 쓴다.
 파일은 시작할 때만 읽는다. 인증서를 갱신하면(certbot 등) `systemctl restart opld`로 다시 읽게 한다(VM은 그대로 돈다,
 갱신 훅 예: certbot `--deploy-hook "systemctl restart opld"`).
 
@@ -366,6 +367,195 @@ backend orbivisor_portal
     server portal orbivisor-portal.default.svc.cluster.local:8080 check
 # backend orbivisor_api는 위 HAProxy 예와 같다(노드 주소는 클러스터 밖의 노드 IP)
 ```
+
+## API 인증서(ACME)
+
+공개 API·웹 리스너(8006)의 인증서를 Let's Encrypt·ZeroSSL·Google Trust Services·사내 ACME 서버(step-ca 등)에서 받는다(계획 73,
+[설계 문서](../superpowers/specs/2026-11-25-declarative-design.md) §11). 주문은 리더가 Raft로 조율하고(인증서 하나에 주문 하나),
+노드는 받은 인증서를 다시 시작 없이 끼운다(열린 연결은 그대로, 새 연결부터). 모든 노드가 기능 `acme`를 알아야 한다(409
+`cluster_upgrading`). 노드 사이 mTLS(8007) 인증서는 건드리지 않는다.
+
+**인증서 차례.** 노드는 (1) `[api] tls_cert` 파일이 있으면 그것만 쓴다(ACME·`api_names`를 보지 않는다 — 위 [API 이름](#api-이름)),
+(2) 아니면 살아 있는 ACME 인증서(`install: api`)를 끼운다 — 이 노드의 노드마다 인증서가 기본이고, 모든 ACME 인증서를 TLS SNI 이름
+(정확히 같거나 `*.` 한 레이블)으로 골라 낸다. 그래서 노드 이름 인증서와 VIP 이름 공유 인증서를 함께 낼 수 있다. (3) 끼울 것이 없으면
+내부 CA가 서명한 인증서(`api_names`)로 돌아간다. 공인 인증서로 로그인할 때는 `orbivisorctl login --system-ca`다.
+
+### 계정
+
+```bash
+orbivisorctl cert account add le --directory letsencrypt --email ops@example.com --agree-tos   # 곧 CA에 등록한다
+orbivisorctl cert account add zs --directory zerossl --email ops@example.com --agree-tos \
+  --eab-kid KID --eab-hmac-file eab-hmac.txt        # EAB: 파일(base64url, `-`면 OPL_ACME_EAB_HMAC)
+orbivisorctl cert account add corp --directory https://ca.corp.example/acme/acme/directory --agree-tos \
+  --ca-bundle corp-root.pem                         # 사내 ACME: 그 루트만 믿는다
+orbivisorctl cert account list
+orbivisorctl cert account get le                    # 계정 URL·약관·CA가 주는 프로필
+orbivisorctl cert account check le                  # CA에 다시 묻는다
+orbivisorctl cert account delete le                 # 쓰는 인증서가 있으면 409 account_in_use
+```
+
+- 디렉터리 별명은 `letsencrypt`·`letsencrypt-staging`·`zerossl`·`google`, 그 밖은 `https://` URL이다. 계정 키(ES256)는 서버가 만들어
+  Raft에 비밀로 둔다(보기·watch·감사·설정 기록에서 뺀다). 나중에 바꿀 수 있는 것은 `email`·`ca_bundle`뿐이다(디렉터리·EAB는 새 계정).
+- 등록 오류: CA가 EAB를 요구하는데 없으면 400 `acme_rejected`, 닿지 않으면 502 `acme_unreachable`, 속도 한도 429.
+
+### 인증서
+
+```bash
+orbivisorctl cert add nodes --account le --name '{node}.pve.example.com'        # 노드마다(기본), HTTP-01(기본)
+orbivisorctl cert add vip --account le --name api.example.com --shared --dns01 cf   # VIP 이름: 한 번 받아 모든 노드가 낸다
+orbivisorctl cert add wild --account le --name '*.example.com' --name example.com --shared --dns01 cf --profile shortlived
+orbivisorctl cert list
+# NAME   SCOPE     CHALLENGE    NODE        SERIAL  EXPIRES           RENEW             ERROR
+# nodes  per-node  http-01      0193a7c2-…  04a1…   2027-02-23 10:00  2027-01-24 08:12
+# vip    shared    dns-01 cf    shared      03ff…   2027-02-23 10:02  2027-01-24 11:40
+orbivisorctl cert renew vip --wait                  # 곧 주문한다(물러서기를 지움, 돌고 있으면 409 acme_order_running)
+orbivisorctl cert get vip                           # 가린 JSON(노드마다 발급·다음 갱신·실패 수·오류)
+orbivisorctl cert delete vip
+```
+
+- **칸.** `--name`(여러 번), `--per-node`(기본)·`--shared`, `--node ID`(노드마다 받을 노드 id, 여러 번 — 없으면 모든 노드),
+  `--http01`(기본)·`--dns01 DNS`, `--key p256|p384`(기본 ECDSA P-256), `--profile`, `--days-before N`, `--preferred-chain CN`(고를
+  사슬의 루트 CN), `--no-install`(받기만 — 리스너에 끼우지 않음), `--no-precheck`. 리더가 다음 틱(60초)에 주문한다.
+- **노드마다와 공유.** 노드마다 인증서는 그 노드에서 주문 Task가 돌고 키가 **그 노드 디스크에만** 있다(`{data_dir}/pki/acme/{인증서
+  id}.key`, 0600 — Raft에 없다). 이름 자리 `{node}`(노드 이름)·`{node_address}`(노드 주소)는 노드마다 인증서에서만 쓴다. 꺼진 노드는
+  건너뛰고 돌아오면 잇는다. **공유** 인증서는 리더(위트니스면 id가 가장 작은 온라인 노드)가 한 번 받고, 키는 Raft status의 비밀이라
+  (보기·watch·감사·기록에서 뺀다) 모든 노드가 읽어 끼운다. 같은 이름 묶음을 노드 수만큼 주문하지 않으므로 CA 속도 한도(Let's Encrypt는
+  같은 이름 묶음 주에 5장)에 걸리지 않는다 — VIP·로드밸런서 이름은 공유로 받는다.
+- **키.** ECDSA P-256·P-384만 된다. `rsa2048`은 400이다(이 빌드의 rcgen은 ring 백엔드라 RSA 키를 만들지 못한다).
+- **와일드카드**(`*.`)는 DNS-01만이다.
+- **프로필**(`--profile`)은 디렉터리의 `meta.profiles`에 있을 때만 보낸다(Let's Encrypt `classic`·`tlsserver`·`shortlived`).
+- **갱신.** 기본은 CA가 알려 주는 갱신 창(ARI, RFC 9773) 안의 무작위 시각이고(설정 `acme.renew_jitter`, 기본 켬), 리더가 하루 한 번 창을
+  다시 묻는다. 창이 없으면 유효 기간의 1/3이 남았을 때, `--days-before N`이면 만료 N일 전이다. 갱신 주문은 옛 인증서를 `replaces`로
+  알린다. 리더 `AcmeRenewer`가 60초마다 할 일(받은 것 없음·이름 바뀜·키 종류 바뀜·갱신 시각 지남)을 보고 Task `acme-order`를 만든다
+  (클러스터 전체에 동시 2개). 실패하면 5분 × 2^(n−1)(6시간까지, 속도 한도면 `Retry-After`) 물러서고, 받은 인증서가 살아 있으면 계속 쓴다.
+- 지운 인증서의 노드 키 파일은 지우지 않는다. 키와 사슬이 맞지 않는 인증서는 경고하고 끼우지 않는다.
+
+### HTTP-01
+
+```toml
+# /etc/opl/opld.toml (HTTP-01로 받을 노드마다 — 공유 인증서면 모든 노드)
+[api]
+http_listen = "0.0.0.0:80"     # listen·cluster_listen과 다른 포트
+```
+
+- 이 리스너는 `GET /.well-known/acme-challenge/{token}`에만 Raft에 적힌 도전 값으로 답한다 — 그래서 이름이 VIP나 DNS 라운드 로빈으로
+  **어느 노드를 가리켜도** 답한다. 그 밖의 요청은 설정 `acme.http_redirect`(기본 켬)면 `308 https://{Host}:{listen 포트}{경로}`, 끄면
+  404다. 본문을 읽지 않고, 머리 8 KiB·연결당 요청 하나·10초·초당 100·동시 256이다. 밖에서 포트 80이 닿아야 한다(방화벽).
+- `http_listen`을 켠 노드는 노드 기능에 `http01`을 알린다. HTTP-01 인증서를 만들거나 바꿀 때 대상 노드(공유면 모든 노드)가
+  `http01`을 알리지 않으면 400 `http01_unavailable`(노드 이름)이다.
+- **스스로 확인.** 주문 전에 노드가 `http://{이름}/.well-known/acme-challenge/{token}`을 스스로 불러 보고, 안 되면 CA에 묻지 않고 실패한다
+  (CA의 실패 검증 속도 한도를 아낌). 밖에서만 닿는 이름이면 `--no-precheck`.
+- `acme.http_redirect`·`acme.renew_jitter`는 `orbivisorctl settings set`에 아직 키가 없어 `PATCH /api/v1/settings {"acme":
+  {"http_redirect": false}}`나 `Settings` 매니페스트([선언형 운영](declarative.md))로 바꾼다.
+
+### DNS-01
+
+와일드카드와 포트 80이 밖에서 닿지 않는 클러스터는 DNS-01을 쓴다. TXT `_acme-challenge.{이름}`을 공급자에 쓰고 지운다.
+
+```bash
+orbivisorctl cert dns add cf --provider cloudflare --secret-file cf-token.txt --zones example.com   # API 토큰(Zone.DNS 편집)
+orbivisorctl cert dns add r53 --provider route53 --access-key-id AKIA… --secret-file aws-secret.txt \
+  --hosted-zone-id Z123 --region us-east-1
+orbivisorctl cert dns add ns1 --provider rfc2136 --server 192.0.2.53:53 --key-name acme-key \
+  --algorithm hmac-sha256 --secret-file tsig.b64 --zone example.com                 # DNS UPDATE + TSIG(TCP 53)
+orbivisorctl cert dns add pdns --provider pdns --url https://pdns.example.com:8081 --secret-file pdns-key.txt
+orbivisorctl cert dns add lego --provider hook --path /etc/opl/acme-hooks/nsupdate.sh
+orbivisorctl cert dns list
+orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으면 409 dns_in_use
+```
+
+- 비밀(Cloudflare 토큰·Route 53 비밀 키·TSIG 비밀(base64)·PowerDNS API 키)은 인자로 받지 않는다: `--secret-file` > 환경 변수
+  `OPL_ACME_DNS_SECRET` > 터미널에서 묻기. 저장한 뒤 다시 보이지 않는다. Cloudflare `--zone-id`·Route 53 `--hosted-zone-id`·RFC 2136
+  `--zone`은 없으면 이름으로 찾는다. PowerDNS `--server-id` 기본은 `localhost`. API 꼴의 공급자 이름은 `cloudflare`·`route53`·
+  `rfc2136`·`power_dns`·`hook`이다.
+- **전파 확인.** 도전을 알리기 전에 영역의 권한 서버(NS)들에 직접 TXT를 묻고 모두 보일 때까지 기다린다(기본 180초 —
+  `--propagation-timeout`, 끄려면 `--no-propagation-check`). 사내·분리 DNS면 노드 설정으로 물을 서버를 정한다:
+
+  ```toml
+  # /etc/opl/opld.toml
+  [acme]
+  dns_resolver = "10.0.0.53:53"   # 이 서버만 권한 서버로 보고 묻는다(없으면 SOA → NS → A를 찾아 모두)
+  ```
+
+- **위임.** `_acme-challenge.web.example.com CNAME web.acme.example.net`이 있으면 CNAME을 따라가 그 이름에 쓴다(쓰기 권한을 좁힌
+  영역에 맡김). 와일드카드와 기본 이름처럼 같은 TXT 이름의 값 둘은 한 번에 넣는다.
+- **훅.** `{path} add|remove {fqdn} {value}`(예: `add _acme-challenge.example.com Abc…`)를 **주문을 도는 노드에서** 부른다(노드마다
+  인증서는 각 노드, 공유는 고른 노드 — 그러니 모든 노드에 같은 파일을 둔다). 경로는 `/etc/opl/acme-hooks/` 아래 파일만(`..` 없음 —
+  만들 때 검사), 주인은 root(또는 orbivisord를 돌리는 사용자), 그룹·다른 사용자가 쓸 수 없고 실행할 수 있어야 한다(부를 때마다 검사).
+  환경은 비우고 `PATH`만 주며 60초 한도, 표준 출력·오류는 4 KiB까지만 로그에 남는다. 그래서 자격 증명은 파일에서 읽는다. acme.sh·
+  lego의 많은 공급자를 이 길로 잇는다. 예(BIND `nsupdate`):
+
+  ```sh
+  #!/bin/sh
+  # /etc/opl/acme-hooks/nsupdate.sh — root:root 0755, 모든 노드에. 키 파일은 root 0600
+  set -eu
+  action=$1 fqdn=$2 value=$3
+  case "$action" in
+    add)    line="update add $fqdn. 60 TXT \"$value\"" ;;
+    remove) line="update delete $fqdn. TXT \"$value\"" ;;
+    *)      exit 2 ;;
+  esac
+  nsupdate -k /etc/opl/acme-hooks/tsig.key <<EOT
+  server 192.0.2.53
+  $line
+  send
+  EOT
+  ```
+
+### 만료 경보
+
+경보 조건 둘이 있다(계획 60 [경보 규칙](#경보-규칙)과 같은 평가·보내기).
+
+| 조건 | 무엇 | 누가 평가 | 대상 |
+|---|---|---|---|
+| `certificate_expiring {days: 14}` | 이 노드 리스너가 낼 수 있는 인증서(기본 + SNI — 출처가 무엇이든)와 **내부 노드 인증서**(824일, 자동 갱신 없음) 가운데 가장 이른 만료가 `days`일 안(값은 남은 날) | 그 노드 | 노드 |
+| `certificate_renew_failed {failures: 3}` | ACME 인증서의 연속 실패가 `failures`번 이상 | **리더** | 인증서 |
+
+`orbivisorctl alert rule create`와 웹 규칙 폼에는 아직 없다. API나 `AlertRule` 매니페스트로 만든다:
+
+```bash
+curl --cacert cluster-ca.pem -H "Authorization: Bearer $OPL_TOKEN" -H 'Content-Type: application/json' \
+  https://node1:8006/api/v1/alert-rules -d '{"name":"cert-expiry","spec":{"condition":
+  {"kind":"certificate_expiring","days":21},"severity":"critical","targets":["ops-mail"]}}'
+```
+
+### 웹·권한
+
+설정 › 보안 탭의 보기 "인증서"(`/settings/certificates`)가 계정·DNS 공급자·인증서 목록(노드마다 만료·다음 갱신·오류 칩, "지금 갱신",
+만들기 대화상자 — HTTP-01이면 `http_listen`이 없는 노드 경고)이다([웹 화면](web-ui.md#설정-기록선언-묶음인증서-화면)). 읽기는 루트
+`cluster.read`(가린 보기 — 비밀 칸은 없다), 쓰기·지금 갱신은 루트 `cluster.admin`이다. 감사는 `acme-account create le (letsencrypt,
+tos agreed)`·`certificate create …`·`acme-order NAME issued (serial …, until …)` 꼴이고 EAB·계정 키·DNS 비밀·공유 키는 적지 않는다.
+API는 `/acme-accounts`·`/acme-dns`·`/certificates`(GET·POST, `{key}` GET·PATCH·DELETE), `/certificates/{key}/actions/renew`,
+`/acme-accounts/{key}/actions/check`. 선언형 종류 `AcmeAccount`·`AcmeDns`·`Certificate`로도 다룬다.
+
+### Let's Encrypt 스테이징으로 손 확인
+
+CI는 Pebble·pebble-challtestsrv·BIND로만 시험한다(아래 한계). 실제 CA는 스테이징으로 노드 하나에서 이렇게 본다(이 절차의 결과는 아직
+확인하지 않았다):
+
+1. 노드 이름 `node1.example.com`의 공인 A(또는 AAAA) 레코드가 그 노드를 가리키고 밖에서 포트 80이 닿게 한다. `[api] http_listen =
+   "0.0.0.0:80"`을 넣고 `systemctl restart opld`, `orbivisorctl -o json node get node1`의 `features`에 `http01`이 있는지 본다.
+2. `orbivisorctl cert account add stg --directory letsencrypt-staging --email ops@example.com --agree-tos`.
+3. HTTP-01: `orbivisorctl cert add stg-http --account stg --name node1.example.com --node <node1 id>` → `orbivisorctl cert renew stg-http
+   --wait` → `cert list`에 일련번호·만료가 보이고 오류가 없다. `openssl s_client -connect node1.example.com:8006 -servername
+   node1.example.com </dev/null | openssl x509 -noout -issuer -dates`의 발급자가 `(STAGING)`으로 시작한다(스테이징 루트는 브라우저가 믿지
+   않는다 — 맞는 동작).
+4. DNS-01 훅: 위 `nsupdate.sh`(또는 쓰는 DNS의 훅)를 노드에 두고 `orbivisorctl cert dns add hook --provider hook --path
+   /etc/opl/acme-hooks/nsupdate.sh` → `orbivisorctl cert add stg-dns --account stg --name '*.example.com' --shared --dns01 hook` →
+   `cert renew stg-dns --wait` → `openssl s_client -servername x.example.com …`가 와일드카드 인증서를 받는다.
+5. `orbivisorctl cert renew stg-http --wait`를 한 번 더 해 새 일련번호가 끼워지는지(열린 연결은 그대로) 본다.
+6. 치우기: `cert delete stg-http`·`cert delete stg-dns`·`cert dns delete hook`·`cert account delete stg`, `{data_dir}/pki/acme/`의 키
+   파일과 `http_listen` 줄을 지운다(CA 쪽 스테이징 계정은 남는다).
+
+### 한계
+
+- 실제 Let's Encrypt·ZeroSSL·Google과 실제 Cloudflare·Route 53·PowerDNS는 시험하지 않았다 — Pebble 2.10.1(`-strict`, badNonce 5%)·
+  challtestsrv·BIND 9(RFC 2136 TSIG)와 가짜 Cloudflare·Route 53·PowerDNS로만 본다.
+- RFC 2136은 응답의 TSIG 서명을 확인하지 않고 rcode만 본다(속인 성공 응답은 CA 검증 실패로 끝난다).
+- RSA 키, TLS-ALPN-01, 내부 노드 인증서(8007 mTLS, 824일)의 갱신은 없다 — 내부 인증서는 만료 경보만 있다.
+- `[api] tls_cert` 손 파일은 시작할 때만 읽는다(ACME와 함께 쓰지 않는다).
+- `cert` 명령은 아직 `--reason`이 없다. 인증서 만들기 대화상자(웹)에는 노드 고르기·`preferred_chain`·갱신 정책·`install`이 없다(CLI·매니페스트로).
+- 인증서 경보 조건은 CLI 경보 명령·웹 폼에 아직 없다.
 
 ## 대규모 클러스터
 

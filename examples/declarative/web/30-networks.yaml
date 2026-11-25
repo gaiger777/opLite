@@ -1,0 +1,5 @@
+# 노드마다 미리 만든 Linux 브리지 vmbr0에 잇는 단순 네트워크(SDN 없음). 브리지 이름은 노드에 맞게 바꾼다.
+apiVersion: orbivisor.io/v1
+kind: Network
+metadata: { name: web-net }
+spec: { bridge: vmbr0 }

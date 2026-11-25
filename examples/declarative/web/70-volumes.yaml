@@ -1,0 +1,10 @@
+# 빈 루트 디스크 둘(풀 이름은 클러스터에 맞게). 크기 문자열(64Mi·40Gi)은 CLI가 바이트로 바꾼다.
+apiVersion: orbivisor.io/v1
+kind: Volume
+metadata: { name: web01-root }
+spec: { pool: local, size_bytes: 64Mi }
+---
+apiVersion: orbivisor.io/v1
+kind: Volume
+metadata: { name: web02-root }
+spec: { pool: local, size_bytes: 64Mi }
