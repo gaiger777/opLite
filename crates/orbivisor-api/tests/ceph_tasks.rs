@@ -76,7 +76,7 @@ impl Host {
         let paths = CephPaths {
             etc_ceph: root.join("etc/ceph"),
             var_lib_ceph: root.join("var/lib/ceph"),
-            client_dir: root.join("etc/opl/ceph"),
+            client_dir: root.join("etc/orbivisor/ceph"),
             by_id: root.join("dev/disk/by-id"),
         };
         let options = CephOptions {
@@ -303,13 +303,13 @@ async fn init_bootstraps_a_monitor_and_a_manager() {
         h.read("etc/ceph/ceph.client.admin.keyring")
             .starts_with("[client.admin]\n\tkey = AQadmin\n")
     );
-    let keyring = h.path("etc/opl/ceph/ceph.client.orbivisor.keyring");
+    let keyring = h.path("etc/orbivisor/ceph/ceph.client.orbivisor.keyring");
     assert_eq!(
         std::fs::read_to_string(&keyring).unwrap(),
         "[client.orbivisor]\n\tkey = AQclient\n"
     );
     assert_eq!(
-        h.read("etc/opl/ceph/ceph.conf"),
+        h.read("etc/orbivisor/ceph/ceph.conf"),
         format!(
             "{CONF_MARK}\n[global]\nfsid = {FSID}\nmon_host = {addrv}\n\
              auth_cluster_required = cephx\nauth_service_required = cephx\nauth_client_required = cephx\n\
@@ -482,7 +482,7 @@ async fn adding_a_monitor_updates_every_client_config() {
     );
     let id = c.create(c.ready()).await;
     let agent = CephAgent::spawn(c.env.cluster.clone(), c.env.node, h.host.clone());
-    let client = h.path("etc/opl/ceph/ceph.conf");
+    let client = h.path("etc/orbivisor/ceph/ceph.conf");
     wait_file(
         &client,
         "mon_host = [v2:127.0.0.9:3300,v1:127.0.0.9:6789]\n",
@@ -603,7 +603,7 @@ async fn adding_osds() {
     );
     let osd_tree = format!(
         "ceph --conf {} --id orbivisor --connect-timeout 10 osd tree",
-        h.path("etc/opl/ceph/ceph.conf").display()
+        h.path("etc/orbivisor/ceph/ceph.conf").display()
     );
     h.fake
         .reply("ceph-volume lvm list --format json", CmdOutput::ok("{}"));
@@ -684,7 +684,7 @@ async fn adding_osds() {
     assert_eq!(h.count("ceph --connect-timeout"), 0);
     assert!(!h.path("etc/ceph/ceph.client.admin.keyring").exists());
     assert!(
-        h.read("etc/opl/ceph/ceph.conf")
+        h.read("etc/orbivisor/ceph/ceph.conf")
             .contains("mon_host = [v2:127.0.0.9:3300,v1:127.0.0.9:6789]")
     );
     assert!(
@@ -764,7 +764,7 @@ async fn creating_a_pool_registers_an_rbd_storage_pool() {
             pool: "vmpool".into(),
             namespace: None,
             user: Some("orbivisor".into()),
-            conf: Some(h.path("etc/opl/ceph/ceph.conf").display().to_string()),
+            conf: Some(h.path("etc/orbivisor/ceph/ceph.conf").display().to_string()),
         }
     );
     assert!(pool.spec.shared && pool.spec.nodes.is_empty());
@@ -867,7 +867,7 @@ async fn the_agent_writes_client_configs() {
     // mon이 없으면 쓰지 않는다.
     let id = c.create(CephStatus::default()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!h.path("etc/opl/ceph").exists());
+    assert!(!h.path("etc/orbivisor/ceph").exists());
 
     let mut status = c.ready();
     status.mgrs.push(c.env.node);
@@ -876,14 +876,14 @@ async fn the_agent_writes_client_configs() {
         .update_status::<CephSpec>(id, &status)
         .await
         .unwrap();
-    let client = h.path("etc/opl/ceph/ceph.conf");
+    let client = h.path("etc/orbivisor/ceph/ceph.conf");
     wait_file(
         &client,
         "mon_host = [v2:127.0.0.9:3300,v1:127.0.0.9:6789]\n",
     )
     .await;
     assert_eq!(
-        h.read("etc/opl/ceph/ceph.client.orbivisor.keyring"),
+        h.read("etc/orbivisor/ceph/ceph.client.orbivisor.keyring"),
         "[client.orbivisor]\n\tkey = AQclient\n"
     );
     let written = std::fs::metadata(&client).unwrap().modified().unwrap();
@@ -901,7 +901,7 @@ async fn the_agent_writes_client_configs() {
         written
     );
     assert_eq!(h.read("etc/ceph/ceph.conf"), "[global]\nfsid = x\n");
-    assert!(!w.path("etc/opl/ceph").exists());
+    assert!(!w.path("etc/orbivisor/ceph").exists());
     agent.shutdown().await;
     witness_agent.shutdown().await;
 }

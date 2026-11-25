@@ -2088,7 +2088,7 @@ mod tests {
     #[tokio::test]
     async fn migration_setup_commands_send_their_arguments() {
         let (client, mut fake, _dir) = setup().await;
-        let dir = Path::new("/var/lib/opl/migration-tls");
+        let dir = Path::new("/var/lib/orbivisor/migration-tls");
         let (r, cmd) = tokio::join!(
             client.add_tls_creds("opl-mig-tls", dir, TlsEndpoint::Server),
             async {
@@ -2103,7 +2103,7 @@ mod tests {
             cmd["arguments"],
             json!({
                 "qom-type": "tls-creds-x509", "id": "opl-mig-tls",
-                "dir": "/var/lib/opl/migration-tls", "endpoint": "server", "verify-peer": true
+                "dir": "/var/lib/orbivisor/migration-tls", "endpoint": "server", "verify-peer": true
             })
         );
         let (r, cmd) = tokio::join!(client.add_tls_creds("c", dir, TlsEndpoint::Client), async {
@@ -2359,14 +2359,14 @@ mod tests {
             ])
         );
         let (r, cmd) = tokio::join!(
-            client.nbd_server_start_unix(Path::new("/run/opl/vms/x/backup.sock")),
+            client.nbd_server_start_unix(Path::new("/run/orbivisor/vms/x/backup.sock")),
             reply(&mut fake, json!({}))
         );
         r.unwrap();
         assert_eq!(cmd["execute"], "nbd-server-start");
         assert_eq!(
             cmd["arguments"],
-            json!({ "addr": { "type": "unix", "data": { "path": "/run/opl/vms/x/backup.sock" } } })
+            json!({ "addr": { "type": "unix", "data": { "path": "/run/orbivisor/vms/x/backup.sock" } } })
         );
         let bitmaps = [("disk0".to_string(), "opl-fl-point".to_string())];
         let (r, cmd) = tokio::join!(

@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn builds_mount_arguments() {
-        let dir = Path::new("/var/lib/opl/pools/p1");
+        let dir = Path::new("/var/lib/orbivisor/pools/p1");
         // 사용자 옵션이 있든 없든 nosuid,nodev,noexec,retry=0을 먼저 붙인다(사용자 옵션이 이긴다).
         assert_eq!(
             mount_args("nas.lan", "/srv/vm", None, dir),
@@ -1165,7 +1165,7 @@ mod tests {
                 "-o",
                 "nosuid,nodev,noexec,retry=0",
                 "nas.lan:/srv/vm",
-                "/var/lib/opl/pools/p1"
+                "/var/lib/orbivisor/pools/p1"
             ]
         );
         assert_eq!(
@@ -1176,7 +1176,7 @@ mod tests {
                 "-o",
                 "nosuid,nodev,noexec,retry=0,vers=4.2,hard",
                 "10.0.0.5:/srv/vm",
-                "/var/lib/opl/pools/p1"
+                "/var/lib/orbivisor/pools/p1"
             ]
         );
         assert_eq!(

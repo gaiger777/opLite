@@ -6319,7 +6319,7 @@ export interface components {
             /** Format: uuid */
             init_node?: string;
             last_error?: string;
-            /** @description 노드가 관리 Ceph에 붙는 클라이언트 설정(`/etc/opl/ceph/ceph.conf`) */
+            /** @description 노드가 관리 Ceph에 붙는 클라이언트 설정(`/etc/orbivisor/ceph/ceph.conf`) */
             managed_conf: string;
             mgrs: string[];
             mons: components["schemas"]["CephMon"][];

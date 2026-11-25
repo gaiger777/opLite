@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn internal_error_hides_details() {
-        let e = ApiError::internal("disk /var/lib/opl is full");
+        let e = ApiError::internal("disk /var/lib/orbivisor is full");
         assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(e.message, "internal error");
     }

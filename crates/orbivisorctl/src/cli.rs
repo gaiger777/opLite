@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -20,7 +20,7 @@ use crate::client::{
     ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
     UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header, warning_header,
 };
-use crate::config::{CliConfig, default_path};
+use crate::config::{CliConfig, default_paths};
 use crate::cpu::{CpuArgs, CpuCmd, cpu, cpu_lines, migrate_warnings, node_cpu, vm_cpu};
 use crate::firmware::{
     FirmwareArgs, FirmwareCmd, GuestArgs, Preset, WINDOWS11_CORES, WINDOWS11_MEMORY,
@@ -48,7 +48,7 @@ use crate::two_factor::{TwoFactorCmd, ask_terminal, second_step, two_factor};
     about = "Orbivisor command-line client"
 )]
 struct Cli {
-    /// 로그인 정보 파일 (기본: ~/.config/opl/oplctl.json)
+    /// 로그인 정보 파일 (기본: ~/.config/orbivisor/orbivisorctl.json — 없으면 옛 ~/.config/opl/oplctl.json을 읽는다)
     #[arg(long, global = true, env = "ORBIVISOR_CONFIG")]
     config: Option<PathBuf>,
     /// API 주소. 로그인할 때 저장한 주소 대신 쓴다.
@@ -352,9 +352,29 @@ struct LoginArgs {
 /// 이 기계의 opld에 제어 소켓으로 보내는 명령의 공통 인자
 #[derive(Args)]
 struct LocalArgs {
-    /// orbivisord 제어 소켓
-    #[arg(long, env = "ORBIVISOR_SOCKET", default_value = "/run/opl/opld.sock")]
-    socket: PathBuf,
+    /// orbivisord 제어 소켓 (기본: /run/orbivisor/orbivisord.sock — 없고 옛 /run/opl/opld.sock이 있으면 그것)
+    #[arg(long, env = "ORBIVISOR_SOCKET")]
+    socket: Option<PathBuf>,
+}
+
+impl LocalArgs {
+    fn socket(&self) -> PathBuf {
+        self.socket.clone().unwrap_or_else(|| {
+            default_socket(
+                Path::new("/run/orbivisor/orbivisord.sock"),
+                Path::new("/run/opl/opld.sock"),
+            )
+        })
+    }
+}
+
+/// 제어 소켓 기본값: 새 자리, 그것이 없고 옛 자리가 있으면 옛 자리(옛 판 데몬이 도는 노드의 새 CLI)
+fn default_socket(new: &Path, old: &Path) -> PathBuf {
+    if !new.exists() && old.exists() {
+        old.to_path_buf()
+    } else {
+        new.to_path_buf()
+    }
 }
 
 #[derive(Subcommand)]
@@ -6256,8 +6276,11 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
     {
         bail!("-o haproxy is only for `orbivisorctl cluster api-endpoints`");
     }
-    let config_path = cli.config.clone().unwrap_or_else(default_path);
-    let mut config = CliConfig::load(&config_path)?;
+    let (load_path, config_path) = match cli.config.clone() {
+        Some(path) => (path.clone(), path),
+        None => default_paths(),
+    };
+    let mut config = CliConfig::load(&load_path)?;
     let server = cli.server.clone().or(config.server.clone());
 
     if let Cmd::Login(args) = &cli.cmd {
@@ -7869,7 +7892,7 @@ async fn cluster_local(
     let run = async {
         match cmd {
             ClusterCmd::Init { name, local: l } => {
-                let r = local(&l.socket, "/init", &json!({ "cluster_name": name })).await?;
+                let r = local(&l.socket(), "/init", &json!({ "cluster_name": name })).await?;
                 writeln!(out, "cluster {name} created")?;
                 writeln!(
                     out,
@@ -7891,7 +7914,7 @@ async fn cluster_local(
                 )?;
             }
             ClusterCmd::Join { url, local: l } => {
-                let r = local(&l.socket, "/join", &json!({ "url": url })).await?;
+                let r = local(&l.socket(), "/join", &json!({ "url": url })).await?;
                 writeln!(
                     out,
                     "node {} joined cluster {}",
@@ -7900,7 +7923,7 @@ async fn cluster_local(
                 )?;
             }
             ClusterCmd::Leave { local: l } => {
-                local(&l.socket, "/leave", &json!({})).await?;
+                local(&l.socket(), "/leave", &json!({})).await?;
                 writeln!(out, "this node left the cluster")?;
             }
             _ => return Ok(false),
@@ -10814,6 +10837,18 @@ mod tests {
     }
 
     /// `--replicate`는 `NODE[,*/N][,pool=POOL]`이다. 주기의 기본은 `*/15`이고 문법은 서버와 같다.
+    #[test]
+    fn control_socket_falls_back_to_the_old_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("orbivisord.sock");
+        let old = dir.path().join("opld.sock");
+        assert_eq!(default_socket(&new, &old), new);
+        std::fs::write(&old, "").unwrap();
+        assert_eq!(default_socket(&new, &old), old);
+        std::fs::write(&new, "").unwrap();
+        assert_eq!(default_socket(&new, &old), new);
+    }
+
     #[test]
     fn replicate_targets_parse() {
         let target = |node: &str, schedule: &str, pool: Option<&str>| ReplicateArg {

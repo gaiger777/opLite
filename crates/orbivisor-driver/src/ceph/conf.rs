@@ -201,7 +201,7 @@ mod tests {
         let conf = render_client_conf(
             &spec("10.0.0.0/24", Some("10.1.0.0/24")),
             &[mon("node2", "10.0.0.2"), mon("node1", "10.0.0.1")],
-            "/etc/opl/ceph/ceph.client.orbivisor.keyring",
+            "/etc/orbivisor/ceph/ceph.client.orbivisor.keyring",
         );
         assert_eq!(
             conf,
@@ -213,7 +213,7 @@ mod tests {
              auth_service_required = cephx\n\
              auth_client_required = cephx\n\
              [client.orbivisor]\n\
-             keyring = /etc/opl/ceph/ceph.client.orbivisor.keyring\n"
+             keyring = /etc/orbivisor/ceph/ceph.client.orbivisor.keyring\n"
         );
     }
 

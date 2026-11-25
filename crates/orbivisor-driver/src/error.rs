@@ -138,8 +138,8 @@ mod tests {
         assert!(DriverError::Timeout("qmp").is_transient());
         assert!(DriverError::NotAttached(Uuid::nil()).is_transient());
         // NFS 풀을 다시 마운트하면 풀린다.
-        assert!(DriverError::PoolNotMounted("/var/lib/opl/pools/p".into()).is_transient());
-        assert!(DriverError::PoolNotResponding("/var/lib/opl/pools/p".into()).is_transient());
+        assert!(DriverError::PoolNotMounted("/var/lib/orbivisor/pools/p".into()).is_transient());
+        assert!(DriverError::PoolNotResponding("/var/lib/orbivisor/pools/p".into()).is_transient());
         // 활성화하면 장치 노드가 생긴다.
         assert!(DriverError::VolumeNotActive("/dev/vg0/opl-x".into()).is_transient());
         // 잠금을 쥔 프로세스가 끝나거나 NFS 임대가 끝나면 풀린다.

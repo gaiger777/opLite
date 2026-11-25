@@ -23,7 +23,7 @@ use serde::Deserialize;
 
 use crate::metrics::history::{MAX_FLUSH_SECS, MIN_FLUSH_SECS, WriterConfig};
 
-/// `opld --config <path>`로 읽는 TOML 설정.
+/// `orbivisord --config <path>`로 읽는 TOML 설정(기본 `/etc/orbivisor/orbivisord.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -47,7 +47,8 @@ pub struct Config {
     /// 노드 인증서에 들어간다.
     #[serde(default)]
     pub cluster_addresses: Vec<String>,
-    /// `oplctl cluster init|join|leave`를 받는 유닉스 소켓. 기본은 `{run_dir}/opld.sock`이다.
+    /// `oplctl cluster init|join|leave`를 받는 유닉스 소켓. 기본은 `{run_dir}/orbivisord.sock`이다
+    /// (옆에 옛 이름 링크 `opld.sock`을 둔다 — 손으로 준 경로에는 두지 않는다).
     /// opld를 실행한 사용자만 쓸 수 있다(0600).
     pub control_socket: Option<PathBuf>,
     /// 클러스터 저장소, 노드 인증서, VM별 영구 파일, 올린 이미지를 둔다.
@@ -1213,7 +1214,7 @@ impl CephSection {
 }
 
 fn default_ceph_client_dir() -> PathBuf {
-    "/etc/opl/ceph".into()
+    "/etc/orbivisor/ceph".into()
 }
 fn default_ceph_packages() -> Vec<String> {
     DAEMON_PACKAGES.iter().map(|p| p.to_string()).collect()
@@ -1467,7 +1468,7 @@ fn default_dpkg() -> PathBuf {
     "/usr/bin/dpkg".into()
 }
 fn default_log_dir() -> PathBuf {
-    "/var/log/opl".into()
+    "/var/log/orbivisor".into()
 }
 fn default_upgrade_poll() -> Duration {
     Duration::from_secs(2)
@@ -1589,10 +1590,10 @@ fn default_cluster_listen() -> SocketAddr {
     "0.0.0.0:8007".parse().unwrap()
 }
 fn default_data_dir() -> PathBuf {
-    "/var/lib/opl".into()
+    "/var/lib/orbivisor".into()
 }
 fn default_run_dir() -> PathBuf {
-    "/run/opl".into()
+    "/run/orbivisor".into()
 }
 fn default_qemu_share_dir() -> PathBuf {
     "/opt/homebrew/share/qemu".into()
@@ -2121,7 +2122,7 @@ impl Config {
     pub fn control_socket(&self) -> PathBuf {
         self.control_socket
             .clone()
-            .unwrap_or_else(|| self.run_dir.join("opld.sock"))
+            .unwrap_or_else(|| self.run_dir.join("orbivisord.sock"))
     }
 }
 
@@ -2161,8 +2162,11 @@ mod tests {
         assert_eq!(c.listen, "0.0.0.0:8006".parse().unwrap());
         assert_eq!(c.api_address(), "10.0.0.5:8006");
         assert_eq!(c.cluster_address(), "10.0.0.5:8007");
-        assert_eq!(c.data_dir, Path::new("/var/lib/opl"));
-        assert_eq!(c.control_socket(), Path::new("/run/opl/opld.sock"));
+        assert_eq!(c.data_dir, Path::new("/var/lib/orbivisor"));
+        assert_eq!(
+            c.control_socket(),
+            Path::new("/run/orbivisor/orbivisord.sock")
+        );
         assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
         let schedule = c.schedule.scheduler_config();
         assert_eq!(schedule.tick, Duration::from_secs(60));
@@ -2484,10 +2488,10 @@ mod tests {
     fn sdn_section_defaults_and_overrides() {
         let c = parse("name = \"n\"\naddress = \"h\"");
         c.validate().unwrap();
-        let host = c.sdn.host(Path::new("/var/lib/opl"), "abc");
-        assert_eq!(host.paths().pki, Path::new("/var/lib/opl/pki"));
-        assert_eq!(host.paths().etc, Path::new("/etc/opl/ovn"));
-        assert_eq!(host.paths().var_lib, Path::new("/var/lib/opl/ovn"));
+        let host = c.sdn.host(Path::new("/var/lib/orbivisor"), "abc");
+        assert_eq!(host.paths().pki, Path::new("/var/lib/orbivisor/pki"));
+        assert_eq!(host.paths().etc, Path::new("/etc/orbivisor/ovn"));
+        assert_eq!(host.paths().var_lib, Path::new("/var/lib/orbivisor/ovn"));
         assert_eq!(host.options().central_packages, CENTRAL_PACKAGES);
         assert_eq!(host.options().host_packages, HOST_PACKAGES);
         assert_eq!(host.options().install_timeout, Duration::from_secs(1800));
@@ -2516,7 +2520,7 @@ mod tests {
         let c = parse("name = \"n\"\naddress = \"h\"");
         c.validate().unwrap();
         let host = c.ceph.host();
-        assert_eq!(host.paths().client_dir, Path::new("/etc/opl/ceph"));
+        assert_eq!(host.paths().client_dir, Path::new("/etc/orbivisor/ceph"));
         assert_eq!(host.paths().etc_ceph, Path::new("/etc/ceph"));
         assert_eq!(host.options().packages, DAEMON_PACKAGES);
         assert_eq!(host.options().client_packages, CLIENT_PACKAGES);
@@ -2582,7 +2586,7 @@ mod tests {
         assert_eq!(u.systemd_run, Path::new("/usr/bin/systemd-run"));
         assert_eq!(u.systemctl, Path::new("/usr/bin/systemctl"));
         assert_eq!(u.dpkg, Path::new("/usr/bin/dpkg"));
-        assert_eq!(u.log_dir, Path::new("/var/log/opl"));
+        assert_eq!(u.log_dir, Path::new("/var/log/orbivisor"));
         assert_eq!(u.poll, Duration::from_secs(2));
 
         let c = parse(
@@ -2763,7 +2767,7 @@ mod tests {
         std::fs::write(&path, "name = \"n\"").unwrap();
         assert_eq!(
             Config::data_dir_of(&path).unwrap(),
-            Path::new("/var/lib/opl")
+            Path::new("/var/lib/orbivisor")
         );
         std::fs::write(&path, "data_dir = 5").unwrap();
         assert!(Config::data_dir_of(&path).is_err());

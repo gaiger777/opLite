@@ -129,7 +129,7 @@ pub(crate) struct DnsAddArgs {
     url: Option<String>,
     #[arg(long)]
     server_id: Option<String>,
-    /// 훅 실행 파일(`/etc/opl/acme-hooks/` 아래)
+    /// 훅 실행 파일(`/etc/orbivisor/acme-hooks/` 아래)
     #[arg(long)]
     path: Option<String>,
     /// 이 공급자가 맡는 영역(여러 번)

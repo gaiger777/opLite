@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn op_is_tagged_by_kind() {
         let op = TaskOp::VolumeImport {
-            source: "/var/lib/opl/uploads/x".into(),
+            source: "/var/lib/orbivisor/uploads/x".into(),
             source_format: SourceFormat::Vmdk,
         };
         let json = serde_json::to_value(&op).unwrap();
@@ -820,7 +820,7 @@ mod tests {
             json,
             serde_json::json!({
                 "kind": "volume-import",
-                "source": "/var/lib/opl/uploads/x",
+                "source": "/var/lib/orbivisor/uploads/x",
                 "source_format": "vmdk"
             })
         );

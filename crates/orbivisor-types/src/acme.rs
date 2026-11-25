@@ -29,7 +29,9 @@ pub const DIRECTORY_ALIASES: [(&str, &str); 4] = [
 ];
 
 /// 훅 DNS 공급자의 실행 파일이 있어야 하는 디렉터리
-pub const HOOK_DIR: &str = "/etc/opl/acme-hooks/";
+pub const HOOK_DIR: &str = "/etc/orbivisor/acme-hooks/";
+/// 이름 바꾸기 앞의 훅 디렉터리. 저장된 spec에 들어 있어 계속 받는다(배치 맞추기 뒤 [`HOOK_DIR`]와 같은 곳이다).
+pub const LEGACY_HOOK_DIR: &str = "/etc/opl/acme-hooks/";
 /// 노드마다 펼치는 이름 자리
 pub const NODE_PLACEHOLDER: &str = "{node}";
 pub const NODE_ADDRESS_PLACEHOLDER: &str = "{node_address}";
@@ -338,14 +340,22 @@ impl AcmeDnsSpec {
     }
 }
 
-/// 훅 경로가 [`HOOK_DIR`] 아래 파일인지(`..`·빈 조각 없음). 파일 주인·권한은 실행하는 노드가 본다.
+/// 훅 경로가 [`HOOK_DIR`](또는 [`LEGACY_HOOK_DIR`]) 아래 파일인지(`..`·빈 조각 없음). 파일 주인·권한은 실행하는
+/// 노드가 본다.
 pub fn hook_path_ok(path: &str) -> bool {
-    path.strip_prefix(HOOK_DIR).is_some_and(|rest| {
-        !rest.is_empty()
-            && rest
-                .split('/')
-                .all(|p| !p.is_empty() && p != "." && p != "..")
-    })
+    hook_rest(path).is_some()
+}
+
+/// 훅 경로에서 훅 디렉터리 뒤의 조각(검사를 지난 것만). 새 디렉터리와 옛 디렉터리 둘 다 받는다.
+pub fn hook_rest(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix(HOOK_DIR)
+        .or_else(|| path.strip_prefix(LEGACY_HOOK_DIR))?;
+    (!rest.is_empty()
+        && rest
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != ".."))
+    .then_some(rest)
 }
 
 /// DNS 공급자 스펙 JSON에서 비밀을 뺀다. API 보기·watch 이벤트가 쓴다.
@@ -848,7 +858,7 @@ mod tests {
                     "propagation": { "timeout_s": 60, "check": "skip" }, "zones": ["example.com"] }),
             json!({ "provider": { "kind": "power_dns", "url": "http://pdns:8081", "api_key": "K",
                                   "server_id": "localhost" } }),
-            json!({ "provider": { "kind": "hook", "path": "/etc/opl/acme-hooks/lego.sh" } }),
+            json!({ "provider": { "kind": "hook", "path": "/etc/orbivisor/acme-hooks/lego.sh" } }),
         ];
         for doc in cases {
             let spec: AcmeDnsSpec = serde_json::from_value(doc.clone()).unwrap();
@@ -862,13 +872,18 @@ mod tests {
             assert!(!format!("{spec:?}").contains("c2VjcmV0"));
         }
         let bad: AcmeDnsSpec = serde_json::from_value(
-            json!({ "provider": { "kind": "hook", "path": "/etc/opl/acme-hooks/../../bin/sh" } }),
+            json!({ "provider": { "kind": "hook", "path": "/etc/orbivisor/acme-hooks/../../bin/sh" } }),
         )
         .unwrap();
         assert_eq!(bad.validate(), Err(AcmeSpecError::HookPath));
         assert!(!hook_path_ok("/usr/bin/x"));
-        assert!(!hook_path_ok("/etc/opl/acme-hooks/"));
+        assert!(!hook_path_ok("/etc/orbivisor/acme-hooks/"));
+        assert!(hook_path_ok("/etc/orbivisor/acme-hooks/a/b.sh"));
+        // 이름 바꾸기 앞에 저장된 spec의 옛 디렉터리도 받는다.
         assert!(hook_path_ok("/etc/opl/acme-hooks/a/b.sh"));
+        assert_eq!(hook_rest("/etc/opl/acme-hooks/a/b.sh"), Some("a/b.sh"));
+        assert!(!hook_path_ok("/etc/opl/acme-hooks/../x"));
+        assert!(!hook_path_ok("/etc/opl/"));
     }
 
     #[test]

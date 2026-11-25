@@ -219,7 +219,7 @@ impl Rig {
                 "agree_tos": true, "ca_bundle": self.pebble.wfe_ca })
     }
 
-    /// challtestsrv에 TXT를 넣고 지우는 훅(`/etc/opl/acme-hooks/{name}`)
+    /// challtestsrv에 TXT를 넣고 지우는 훅(`/etc/orbivisor/acme-hooks/{name}`)
     fn hook(&self, name: &str, fail: bool) -> String {
         use std::os::unix::fs::PermissionsExt;
         let m = self.pebble.cts_mgmt;
@@ -236,7 +236,7 @@ impl Rig {
         let path = self.hooks.path().join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        format!("/etc/opl/acme-hooks/{name}")
+        format!("/etc/orbivisor/acme-hooks/{name}")
     }
 }
 

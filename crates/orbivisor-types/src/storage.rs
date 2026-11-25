@@ -592,13 +592,13 @@ mod tests {
     #[test]
     fn dir_pool_deserializes_with_defaults() {
         let spec: StoragePoolSpec = serde_json::from_value(serde_json::json!({
-            "backend": { "kind": "dir", "path": "/var/lib/opl/pools/local" }
+            "backend": { "kind": "dir", "path": "/var/lib/orbivisor/pools/local" }
         }))
         .unwrap();
         assert_eq!(
             spec.backend,
             PoolBackend::Dir {
-                path: "/var/lib/opl/pools/local".into()
+                path: "/var/lib/orbivisor/pools/local".into()
             }
         );
         assert!(spec.nodes.is_empty());

@@ -205,7 +205,7 @@ async fn node_history_says_why_a_node_cannot_answer() {
     let (status, body) = admin.get("/nodes/node1/metrics/history").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "cluster_upgrading");
-    *source.error.lock().unwrap() = Some(HistoryError::Io("/var/lib/opl: EIO".into()));
+    *source.error.lock().unwrap() = Some(HistoryError::Io("/var/lib/orbivisor: EIO".into()));
     let (status, body) = admin.get("/nodes/node1/metrics/history").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(!body.to_string().contains("EIO"), "{body}");

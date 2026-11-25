@@ -32,7 +32,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 /// NFS 풀을 마운트하는 디렉터리
-const MNT: &str = "/var/lib/opl/pools";
+const MNT: &str = "/var/lib/orbivisor/pools";
 
 /// 활성화한 볼륨과 끈 볼륨을 적는 저장소. `fail`이 있으면 활성화가 그 오류로 실패한다.
 /// resolve는 활성화와 (실패했을 때) 끄기만 부른다. 마이그레이션의 공유(`true`)·배타(`false`)

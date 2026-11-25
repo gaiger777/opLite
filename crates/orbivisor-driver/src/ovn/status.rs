@@ -528,12 +528,18 @@ mod tests {
     #[test]
     fn ssl_config() {
         let ssl = parse_ssl(
-            "Private key: /etc/opl/ovn/node.key\nCertificate: /etc/opl/ovn/node.crt\n\
-             CA Certificate: /etc/opl/ovn/ca.crt\nBootstrap: false\n",
+            "Private key: /etc/orbivisor/ovn/node.key\nCertificate: /etc/orbivisor/ovn/node.crt\n\
+             CA Certificate: /etc/orbivisor/ovn/ca.crt\nBootstrap: false\n",
         );
-        assert_eq!(ssl.private_key.as_deref(), Some("/etc/opl/ovn/node.key"));
-        assert_eq!(ssl.certificate.as_deref(), Some("/etc/opl/ovn/node.crt"));
-        assert_eq!(ssl.ca_cert.as_deref(), Some("/etc/opl/ovn/ca.crt"));
+        assert_eq!(
+            ssl.private_key.as_deref(),
+            Some("/etc/orbivisor/ovn/node.key")
+        );
+        assert_eq!(
+            ssl.certificate.as_deref(),
+            Some("/etc/orbivisor/ovn/node.crt")
+        );
+        assert_eq!(ssl.ca_cert.as_deref(), Some("/etc/orbivisor/ovn/ca.crt"));
         assert_eq!(parse_ssl(""), SslConfig::default());
     }
 }

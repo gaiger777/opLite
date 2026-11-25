@@ -383,7 +383,7 @@ pub struct CephView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub last_error: Option<String>,
-    /// 노드가 관리 Ceph에 붙는 클라이언트 설정(`/etc/opl/ceph/ceph.conf`)
+    /// 노드가 관리 Ceph에 붙는 클라이언트 설정(`/etc/orbivisor/ceph/ceph.conf`)
     pub managed_conf: String,
     /// 끝나지 않은 Ceph Task
     pub tasks: Vec<Uuid>,
@@ -788,7 +788,7 @@ mod tests {
         );
         ceph.status.init_node = Some(n);
         let task = Uuid::now_v7();
-        let view = CephView::new(&ceph, "/etc/opl/ceph/ceph.conf".into(), vec![task]);
+        let view = CephView::new(&ceph, "/etc/orbivisor/ceph/ceph.conf".into(), vec![task]);
         let text = serde_json::to_string(&view).unwrap();
         let k = keys();
         for key in [&k.mon, &k.admin, &k.bootstrap_osd, &k.client] {

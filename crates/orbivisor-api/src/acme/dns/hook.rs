@@ -1,5 +1,5 @@
 //! 훅 공급자: `{path} add|remove {fqdn} {value}`를 이 노드에서 부른다(acme.sh·lego의 공급자를 잇는 길). 파일은 훅
-//! 디렉터리 아래(`/etc/opl/acme-hooks/` — 스펙 검증), root(또는 opld를 돌리는 사용자) 소유, 그룹·다른 사용자가 쓸 수
+//! 디렉터리 아래(`/etc/orbivisor/acme-hooks/` — 스펙 검증), root(또는 opld를 돌리는 사용자) 소유, 그룹·다른 사용자가 쓸 수
 //! 없어야 한다. 환경은 비우고(`PATH`만) 60초 한도, 표준 출력·오류는 4 KiB까지만 읽어 이 노드 로그(debug)에만 남긴다.
 //! 실패하면 오류(인증서 status `error` — `cluster.read`가 보고 경보 알림에도 실린다)에는 끝 상태와 표준 오류 첫 줄
 //! 200자까지만 싣는다(lego·acme.sh를 감싼 훅은 실패할 때 API 자격 증명이나 요청 덤프를 찍곤 한다).
@@ -30,10 +30,9 @@ pub struct Hook {
     pub path: PathBuf,
 }
 
-/// 스펙의 경로(`/etc/opl/acme-hooks/x`)를 이 노드의 훅 뿌리 아래 경로로
+/// 스펙의 경로(`/etc/orbivisor/acme-hooks/x`, 옛 `/etc/opl/acme-hooks/x`)를 이 노드의 훅 뿌리 아래 경로로
 pub fn resolve(spec_path: &str, root: &Path) -> Option<PathBuf> {
-    let rest = spec_path.strip_prefix(orbivisor_types::acme::HOOK_DIR)?;
-    orbivisor_types::acme::hook_path_ok(spec_path).then(|| root.join(rest))
+    orbivisor_types::acme::hook_rest(spec_path).map(|rest| root.join(rest))
 }
 
 /// 주인·권한 검사
@@ -128,10 +127,14 @@ mod tests {
     async fn runs_checked_hooks_only() {
         let dir = tempfile::TempDir::new().unwrap();
         assert_eq!(
+            resolve("/etc/orbivisor/acme-hooks/a/b.sh", dir.path()),
+            Some(dir.path().join("a/b.sh"))
+        );
+        assert_eq!(resolve("/etc/orbivisor/acme-hooks/../x", dir.path()), None);
+        assert_eq!(
             resolve("/etc/opl/acme-hooks/a/b.sh", dir.path()),
             Some(dir.path().join("a/b.sh"))
         );
-        assert_eq!(resolve("/etc/opl/acme-hooks/../x", dir.path()), None);
         assert_eq!(resolve("/usr/bin/x", dir.path()), None);
         let path = dir.path().join("h.sh");
         let log = dir.path().join("log");

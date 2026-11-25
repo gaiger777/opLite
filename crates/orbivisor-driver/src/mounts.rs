@@ -51,8 +51,8 @@ mod tests {
     fn finds_nfs_mount_points_in_mountinfo() {
         let info = "\
 22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
-40 22 0:45 / /var/lib/opl/pools/a rw,relatime shared:20 - nfs4 nas:/srv/vm rw,vers=4.2
-41 22 0:46 / /var/lib/opl/pools/b rw,relatime - nfs [fd00::5]:/srv/vm rw,vers=3
+40 22 0:45 / /var/lib/orbivisor/pools/a rw,relatime shared:20 - nfs4 nas:/srv/vm rw,vers=4.2
+41 22 0:46 / /var/lib/orbivisor/pools/b rw,relatime - nfs [fd00::5]:/srv/vm rw,vers=3
 42 22 0:47 / /mnt/with\\040space rw - nfs4 nas:/x rw
 43 22 0:48 / /mnt/tmp rw - tmpfs tmpfs rw
 ";
@@ -60,8 +60,8 @@ mod tests {
         assert_eq!(
             points,
             BTreeSet::from([
-                PathBuf::from("/var/lib/opl/pools/a"),
-                PathBuf::from("/var/lib/opl/pools/b"),
+                PathBuf::from("/var/lib/orbivisor/pools/a"),
+                PathBuf::from("/var/lib/orbivisor/pools/b"),
                 PathBuf::from("/mnt/with space"),
             ])
         );

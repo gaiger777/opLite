@@ -2220,7 +2220,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pool_root_depends_on_backend() {
-        let mnt = Path::new("/var/lib/opl/pools");
+        let mnt = Path::new("/var/lib/orbivisor/pools");
         assert_eq!(
             pool_root(&pool("/pools/local"), mnt),
             PathBuf::from("/pools/local")

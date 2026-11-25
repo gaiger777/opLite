@@ -316,7 +316,7 @@ async fn orbivisord_sets_up_ceph_and_runs_a_vm_on_its_pool() {
     );
     // 키는 응답에 없다.
     assert!(ceph.get("keys").is_none(), "{ceph}");
-    let conf = std::fs::read_to_string("/etc/opl/ceph/ceph.conf").unwrap();
+    let conf = std::fs::read_to_string("/etc/orbivisor/ceph/ceph.conf").unwrap();
     assert!(
         conf.contains("mon_host = [v2:127.0.0.1:3300,v1:127.0.0.1:6789]"),
         "{conf}"
@@ -430,7 +430,7 @@ async fn orbivisord_sets_up_ceph_and_runs_a_vm_on_its_pool() {
     let backend = &pool["spec"]["backend"];
     assert_eq!(backend["kind"], "rbd", "{pool}");
     assert_eq!(backend["user"], "orbivisor", "{pool}");
-    assert_eq!(backend["conf"], "/etc/opl/ceph/ceph.conf", "{pool}");
+    assert_eq!(backend["conf"], "/etc/orbivisor/ceph/ceph.conf", "{pool}");
     wait_for("pool vmpool ready on node1", SLOW_WAIT, || async {
         let node = c.get("/nodes/node1").await.unwrap();
         node["status"]["pools"]["vmpool"]["ready"] == true
@@ -456,7 +456,7 @@ async fn orbivisord_sets_up_ceph_and_runs_a_vm_on_its_pool() {
     let args = cmdline(web["status"]["pid"].as_u64().unwrap());
     assert!(
         args.contains(&format!(
-            "driver=rbd,pool=vmpool,image={image},user=orbivisor,conf=/etc/opl/ceph/ceph.conf"
+            "driver=rbd,pool=vmpool,image={image},user=orbivisor,conf=/etc/orbivisor/ceph/ceph.conf"
         )),
         "{args}"
     );

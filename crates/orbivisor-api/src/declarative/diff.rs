@@ -246,11 +246,11 @@ mod tests {
             json!({ "provider": { "kind": "cloudflare", "api_token": "t" }, "zones": [] });
         overlay(
             &mut base,
-            &json!({ "provider": { "kind": "hook", "path": "/etc/opl/acme-hooks/x" } }),
+            &json!({ "provider": { "kind": "hook", "path": "/etc/orbivisor/acme-hooks/x" } }),
         );
         assert_eq!(
             base["provider"],
-            json!({ "kind": "hook", "path": "/etc/opl/acme-hooks/x" })
+            json!({ "kind": "hook", "path": "/etc/orbivisor/acme-hooks/x" })
         );
         let mut base = json!({ "scope": { "kind": "per_node", "nodes": ["a"] } });
         overlay(&mut base, &json!({ "scope": { "nodes": ["b"] } }));

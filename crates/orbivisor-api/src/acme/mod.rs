@@ -31,7 +31,7 @@ pub struct AcmeNodeConfig {
     /// DNS-01 전파 확인에 쓸 서버(opld `[acme] dns_resolver`). 있으면 이 서버만 권한 서버로 보고 묻는다. 없으면 영역의
     /// NS를 찾아 모두 묻는다.
     pub dns_resolver: Option<SocketAddr>,
-    /// 훅 디렉터리의 실제 자리(기본 `/etc/opl/acme-hooks/` — 시험이 바꾼다)
+    /// 훅 디렉터리의 실제 자리(기본 `/etc/orbivisor/acme-hooks/` — 시험이 바꾼다)
     pub hook_root: PathBuf,
     pub dns_endpoints: dns::DnsEndpoints,
     /// 인가·주문을 기다리는 한도(10분)

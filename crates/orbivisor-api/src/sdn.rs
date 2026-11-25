@@ -799,7 +799,7 @@ pub async fn remove_central(
         let address = target.address.ok_or_else(|| {
             ApiError::bad_request(format!(
                 "cannot tell the OVN central address of node {:?}; kick it out by hand on a central with \
-                 `ovs-appctl -t /run/opl/ovn/nb.ctl cluster/kick OVN_Northbound SERVER` (and sb.ctl OVN_Southbound)",
+                 `ovs-appctl -t /run/orbivisor/ovn/nb.ctl cluster/kick OVN_Northbound SERVER` (and sb.ctl OVN_Southbound)",
                 target.name
             ))
         })?;
@@ -1114,7 +1114,7 @@ pub(crate) async fn kick_departed(state: &AppState, departed: SdnDeparted) -> Ve
     if departed.address.is_unspecified() {
         return vec![format!(
             "node {name:?} held OVN central databases but its address is unknown; on a central run \
-             `ovs-appctl -t /run/opl/ovn/nb.ctl cluster/status OVN_Northbound` and kick its server with \
+             `ovs-appctl -t /run/orbivisor/ovn/nb.ctl cluster/status OVN_Northbound` and kick its server with \
              `cluster/kick` (and the same for sb.ctl OVN_Southbound)"
         )];
     }

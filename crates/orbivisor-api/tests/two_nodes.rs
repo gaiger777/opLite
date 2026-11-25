@@ -229,7 +229,7 @@ impl Node {
             CephPaths {
                 etc_ceph: work.join("etc/ceph"),
                 var_lib_ceph: work.join("var/lib/ceph"),
-                client_dir: work.join("etc/opl/ceph"),
+                client_dir: work.join("etc/orbivisor/ceph"),
                 by_id: work.join("dev/disk/by-id"),
             },
             CephOptions::default(),

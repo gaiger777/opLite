@@ -1,4 +1,5 @@
-//! 로그인 정보(서버 주소, API 토큰)를 담는 파일. 기본 위치는 `~/.config/opl/oplctl.json`이다.
+//! 로그인 정보(서버 주소, API 토큰)를 담는 파일. 기본 위치는 `~/.config/orbivisor/orbivisorctl.json`이다. 그 파일이
+//! 없으면 이름 바꾸기 앞의 `~/.config/opl/oplctl.json`을 읽고, 저장은 새 파일에 한다(옛 파일은 그대로 둔다).
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -19,9 +20,22 @@ pub struct CliConfig {
     pub system_ca: bool,
 }
 
-pub fn default_path() -> PathBuf {
+/// 기본 위치의 (읽을 파일, 저장할 파일)
+pub fn default_paths() -> (PathBuf, PathBuf) {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    Path::new(&home).join(".config/opl/oplctl.json")
+    paths_in(Path::new(&home))
+}
+
+/// 홈 디렉터리 `home`에서의 (읽을 파일, 저장할 파일). 새 파일이 없고 옛 파일이 있으면 옛 파일을 읽는다.
+fn paths_in(home: &Path) -> (PathBuf, PathBuf) {
+    let new = home.join(".config/orbivisor/orbivisorctl.json");
+    let old = home.join(".config/opl/oplctl.json");
+    let read = if !new.exists() && old.exists() {
+        old
+    } else {
+        new.clone()
+    };
+    (read, new)
 }
 
 impl CliConfig {
@@ -61,6 +75,26 @@ impl CliConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_old_file_until_the_new_one_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let new = home.path().join(".config/orbivisor/orbivisorctl.json");
+        let old = home.path().join(".config/opl/oplctl.json");
+        assert_eq!(paths_in(home.path()), (new.clone(), new.clone()));
+        let config = CliConfig {
+            server: Some("https://a:8006".into()),
+            ..CliConfig::default()
+        };
+        config.save(&old).unwrap();
+        let (read, write) = paths_in(home.path());
+        assert_eq!((&read, &write), (&old, &new));
+        assert_eq!(CliConfig::load(&read).unwrap(), config);
+        // 다음 저장은 새 파일에. 옛 파일은 그대로 남고 그 뒤로는 새 파일을 읽는다.
+        CliConfig::default().save(&write).unwrap();
+        assert_eq!(paths_in(home.path()), (new.clone(), new));
+        assert_eq!(CliConfig::load(&old).unwrap(), config);
+    }
 
     #[test]
     fn saves_privately_and_loads_back() {

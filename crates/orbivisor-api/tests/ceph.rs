@@ -82,7 +82,7 @@ impl Ceph {
         let paths = CephPaths {
             etc_ceph: root.join("etc/ceph"),
             var_lib_ceph: root.join("var/lib/ceph"),
-            client_dir: root.join("etc/opl/ceph"),
+            client_dir: root.join("etc/orbivisor/ceph"),
             by_id: root.join("dev/disk/by-id"),
         };
         let options = CephOptions {
@@ -328,7 +328,7 @@ async fn init_creates_the_cluster_and_keeps_the_keys_out_of_responses() {
         view["managed_conf"]
             .as_str()
             .unwrap()
-            .ends_with("etc/opl/ceph/ceph.conf"),
+            .ends_with("etc/orbivisor/ceph/ceph.conf"),
         "{view}"
     );
     let text = view.to_string();
@@ -771,7 +771,7 @@ async fn creating_a_pool_checks_the_size_against_the_hosts() {
         "taken",
         StoragePoolSpec {
             backend: PoolBackend::Dir {
-                path: "/var/lib/opl/taken".into(),
+                path: "/var/lib/orbivisor/taken".into(),
             },
             nodes: vec![],
             shared: false,

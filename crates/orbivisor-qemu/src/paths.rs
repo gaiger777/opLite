@@ -70,8 +70,8 @@ mod tests {
     #[test]
     fn lays_out_files_under_vm_dir() {
         let id = Uuid::nil();
-        let p = RuntimePaths::new(Path::new("/run/opl"), id).unwrap();
-        let dir = "/run/opl/vm/00000000-0000-0000-0000-000000000000";
+        let p = RuntimePaths::new(Path::new("/run/orbivisor"), id).unwrap();
+        let dir = "/run/orbivisor/vm/00000000-0000-0000-0000-000000000000";
         assert_eq!(p.dir, Path::new(dir));
         assert_eq!(p.qmp_socket, Path::new(dir).join("qmp.sock"));
         assert_eq!(p.vnc_socket, Path::new(dir).join("vnc.sock"));

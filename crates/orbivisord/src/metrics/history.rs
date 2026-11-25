@@ -1802,7 +1802,7 @@ mod tests {
             "local",
             StoragePoolSpec {
                 backend: PoolBackend::Dir {
-                    path: "/var/lib/opl/images".into(),
+                    path: "/var/lib/orbivisor/images".into(),
                 },
                 nodes: vec![],
                 shared: false,

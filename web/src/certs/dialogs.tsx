@@ -236,7 +236,11 @@ export function DnsDialog({ onClose }: { onClose(): void }) {
   const [tried, setTried] = useState(false);
   const fields = DNS_FIELDS[kind];
   const missing = fields.filter((f) => !f.optional && !(values[f.key] ?? "").trim());
-  const hookBad = kind === "hook" && !(values.path ?? "").trim().startsWith("/etc/opl/acme-hooks/");
+  // 옛 훅 디렉터리(/etc/opl/acme-hooks/)도 서버가 받는다(이름 바꾸기 앞에 저장된 spec).
+  const hookPath = (values.path ?? "").trim();
+  const hookBad =
+    kind === "hook" &&
+    !["/etc/orbivisor/acme-hooks/", "/etc/opl/acme-hooks/"].some((d) => hookPath.startsWith(d));
   return (
     <FormDialog
       title={t("certs.dns.title")}

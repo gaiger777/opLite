@@ -110,7 +110,7 @@ pub struct CephPaths {
     pub etc_ceph: PathBuf,
     /// 데몬 저장소(`/var/lib/ceph`)
     pub var_lib_ceph: PathBuf,
-    /// 모든 노드의 클라이언트 설정(`/etc/opl/ceph`)
+    /// 모든 노드의 클라이언트 설정(`/etc/orbivisor/ceph`)
     pub client_dir: PathBuf,
     /// 디스크의 이름 링크(`/dev/disk/by-id`)
     pub by_id: PathBuf,
@@ -121,7 +121,7 @@ impl Default for CephPaths {
         Self {
             etc_ceph: "/etc/ceph".into(),
             var_lib_ceph: "/var/lib/ceph".into(),
-            client_dir: "/etc/opl/ceph".into(),
+            client_dir: "/etc/orbivisor/ceph".into(),
             by_id: "/dev/disk/by-id".into(),
         }
     }
@@ -1372,7 +1372,7 @@ mod tests {
             let paths = CephPaths {
                 etc_ceph: root.join("etc/ceph"),
                 var_lib_ceph: root.join("var/lib/ceph"),
-                client_dir: root.join("etc/opl/ceph"),
+                client_dir: root.join("etc/orbivisor/ceph"),
                 by_id: root.join("dev/disk/by-id"),
             };
             let mut options = CephOptions {
@@ -1680,9 +1680,12 @@ mod tests {
         let client = render_client_conf(&spec, &mons, &path_str(&env.host.client_keyring()));
         assert!(env.host.write_client(&client, "AQclient").unwrap());
         assert!(!env.host.write_client(&client, "AQclient").unwrap());
-        assert_eq!(env.host.client_conf(), env.path("etc/opl/ceph/ceph.conf"));
         assert_eq!(
-            std::fs::read_to_string(env.path("etc/opl/ceph/ceph.client.orbivisor.keyring"))
+            env.host.client_conf(),
+            env.path("etc/orbivisor/ceph/ceph.conf")
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.path("etc/orbivisor/ceph/ceph.client.orbivisor.keyring"))
                 .unwrap(),
             "[client.orbivisor]\n\tkey = AQclient\n"
         );
@@ -2015,7 +2018,7 @@ mod tests {
     fn client_tree(env: &Env) -> String {
         format!(
             "ceph --conf {} --id orbivisor --connect-timeout 10 osd tree",
-            env.p("etc/opl/ceph/ceph.conf")
+            env.p("etc/orbivisor/ceph/ceph.conf")
         )
     }
 
@@ -2671,7 +2674,7 @@ mod tests {
     /// 같은 파일을 함께 쓰는 쪽(에이전트와 Task)이 서로의 임시 파일을 덮지 않게 임시 이름은 매번 다르다.
     #[test]
     fn temporary_files_have_unique_names() {
-        let path = Path::new("/etc/opl/ceph/ceph.conf");
+        let path = Path::new("/etc/orbivisor/ceph/ceph.conf");
         let (a, b) = (temp_path(path), temp_path(path));
         assert_ne!(a, b);
         for t in [&a, &b] {

@@ -27,6 +27,7 @@ mod firewall;
 mod guest;
 mod host;
 mod join;
+mod layout;
 mod member;
 mod metrics;
 mod notify;
@@ -72,8 +73,9 @@ use crate::runtime::{Handles, Runtimes};
     about = "Orbivisor node daemon"
 )]
 struct Args {
-    #[arg(long, default_value = "/etc/opl/opld.toml")]
-    config: PathBuf,
+    /// 설정 파일. 없으면 `/etc/orbivisor/orbivisord.toml`, 그것이 없고 옛 `/etc/opl/opld.toml`이 있으면 그것이다.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// 지난 프로세스가 붙인 채 남긴 내장 VIP(`{data_dir}/vips`의 기록)를 떼고 끝낸다(systemd
     /// `ExecStopPost`). 오류가 있어도 0으로 끝난다(재시작을 막지 않게).
     #[arg(long)]
@@ -101,11 +103,33 @@ fn main() -> anyhow::Result<()> {
     if let Some(Command::BackupServe) = args.command {
         return backup_serve::run();
     }
+    let root = Path::new("/");
     if args.release_vips {
-        release_vips_and_exit(&args.config);
+        let (path, _) = layout::config_path(args.config.as_deref(), root);
+        release_vips_and_exit(&path);
         return Ok(());
     }
-    let config = Config::load(&args.config)?;
+    // 배치 맞추기(계획 74 설계 §3.4)는 설정을 읽기 전에 한다 — 옛 설정 파일도 새 자리로 옮긴다.
+    let migrate =
+        layout::should_migrate(rustix::process::geteuid().is_root(), args.config.as_deref());
+    if migrate {
+        log_layout(layout::migrate(root));
+    }
+    let (config_path, warning) = layout::config_path(args.config.as_deref(), root);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    let config = Config::load(&config_path)?;
+    if let Ok(text) = std::fs::read_to_string(&config_path) {
+        let old = layout::legacy_paths_in(&text);
+        if !old.is_empty() {
+            tracing::info!(
+                config = %config_path.display(),
+                paths = old.join(", "),
+                "the configuration names directories by their old names; they still work as links to the orbivisor directories"
+            );
+        }
+    }
     // 실행기 셋(설계 §3.1). 주 루프는 주 스레드에서 `core`의 문맥으로 돌고(제어 소켓도 `core`),
     // 서비스는 `Member::start`가 맞는 실행기에 띄운다.
     let runtimes = Runtimes::new(config.runtime.api_threads(), config.runtime.work_threads())
@@ -117,14 +141,30 @@ fn main() -> anyhow::Result<()> {
     let notifier = Notifier::from_env();
     let liveness = Liveness::spawn(rt.clone(), notifier.clone());
     let probe: Arc<dyn RuntimeProbe> = Arc::new(liveness.last_check());
-    runtimes.core.block_on(run(config, rt, notifier, probe))
+    runtimes
+        .core
+        .block_on(run(config, rt, notifier, probe, migrate.then_some(root)))
 }
 
+/// 배치 맞추기가 한 일을 시작 로그로 낸다.
+fn log_layout(notes: Vec<layout::Note>) {
+    for note in notes {
+        if note.is_warning() {
+            tracing::warn!("{note}");
+        } else {
+            tracing::info!("{note}");
+        }
+    }
+}
+
+/// `layout_root`: 배치를 맞추는 뿌리(맞출 때만). 디렉터리를 만든 뒤 한 번 더 맞춰 새로 만든 디렉터리의 옛 이름
+/// 링크를 둔다(새로 설치한 노드, 부팅마다 비는 `/run`).
 async fn run(
     config: Config,
     rt: Handles,
     notifier: Notifier,
     probe: Arc<dyn RuntimeProbe>,
+    layout_root: Option<&Path>,
 ) -> anyhow::Result<()> {
     if let Some(warning) = config.links_warning() {
         tracing::warn!("{warning}");
@@ -146,6 +186,20 @@ async fn run(
     }));
     let (requests, mut control) = mpsc::channel(4);
     let control_task = control::serve(&config.control_socket(), requests, status.clone()).await?;
+    // 기본 자리의 소켓이면 옛 이름 링크(`opld.sock`)를 둔다(옛 CLI·스크립트). 손으로 준 경로는 그대로.
+    let legacy_socket = match config.control_socket {
+        Some(_) => None,
+        None => match layout::link_legacy_socket(&config.control_socket()) {
+            Ok(link) => Some(link),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot link the old control socket name");
+                None
+            }
+        },
+    };
+    if let Some(root) = layout_root {
+        log_layout(layout::migrate(root));
+    }
     let mut shutdown = pin!(shutdown_signal());
 
     let result = async {
@@ -249,6 +303,9 @@ async fn run(
     .await;
     control_task.abort();
     let _ = std::fs::remove_file(config.control_socket());
+    if let Some(link) = legacy_socket {
+        let _ = std::fs::remove_file(link);
+    }
     result
 }
 
@@ -409,15 +466,22 @@ fn prepare_data_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `{data_dir}/opld.lock`을 배타적으로 잠근다. 같은 데이터 디렉터리로 opld를 둘 띄우지 못하게 한다.
-fn lock_data_dir(dir: &Path) -> anyhow::Result<File> {
-    let path = dir.join("opld.lock");
+/// `{data_dir}/orbivisord.lock`과 옛 이름 `opld.lock`을 배타적으로 잠근다. 같은 데이터 디렉터리로 데몬을 둘
+/// 띄우지 못하게 한다. 옛 이름도 잠가 옛 판의 데몬(`opld.lock`만 잠금)과도 서로 막는다(업그레이드 중).
+fn lock_data_dir(dir: &Path) -> anyhow::Result<[File; 2]> {
+    Ok([
+        lock_file(&dir.join("orbivisord.lock"))?,
+        lock_file(&dir.join("opld.lock"))?,
+    ])
+}
+
+fn lock_file(path: &Path) -> anyhow::Result<File> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(file),
