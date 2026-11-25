@@ -169,7 +169,7 @@ graph LR
 
 ### 2.1 실행 모드
 
-`orbivisord`에는 하위 명령이 없다. 인자는 `--config`(기본 `/etc/opl/opld.toml`)와 `--release-vips`뿐이다
+`orbivisord`에는 하위 명령이 없다. 인자는 `--config`(기본 `/etc/orbivisor/orbivisord.toml`, 없고 옛 `/etc/opl/opld.toml`이 있으면 그것)와 `--release-vips`뿐이다
 (`crates/orbivisord/src/main.rs:66-73`). `--release-vips`는 systemd `ExecStopPost`가 부르는 VIP 떼기 전용이다
 (`main.rs:354-376`). 노드의 성격은 설정과 저장소가 정한다.
 
@@ -199,7 +199,7 @@ API 폭주나 느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦�
 `main`은 `runtimes.core.block_on(run)`으로 돈다(`main.rs:90-101`).
 
 **systemd watchdog.** 유닛은 `Type=notify`, `WatchdogSec=30s`, `WatchdogSignal=SIGKILL`이다
-(`packaging/deb/opld.service`). `orbivisor-notify`가 `WATCHDOG_USEC/3`(1~10초, 기본 10초)마다 세 실행기에 빈 작업을
+(`packaging/deb/orbivisord.service`). `orbivisor-notify`가 `WATCHDOG_USEC/3`(1~10초, 기본 10초)마다 세 실행기에 빈 작업을
 넣고, `core`와 `api`가 2초(간격의 절반이 더 짧으면 그만큼) 안에 돌려야만 `WATCHDOG=1`을 보낸다. `work`만 늦으면
 경고만 남기고 계속 보낸다(`notify.rs:1-39,137-150`). sd_notify 크레이트 없이 `$NOTIFY_SOCKET`에 직접 쓴다
 (`notify.rs:47-77`). `KillMode=process`라 데몬이 죽어도 QEMU는 그대로 돌고, 다시 뜬 데몬이 다시 붙는다(§8.2).
@@ -220,20 +220,20 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 | `listen` | `0.0.0.0:8006` | HTTPS API·웹 |
 | `cluster_listen` | `0.0.0.0:8007` | 노드 간 gRPC(`listen`과 달라야 함, `config.rs:1548`) |
 | `cluster_addresses` | 비면 `address` 하나 | 다중 링크(§6.7) |
-| `data_dir` | `/var/lib/opl` | 영속 데이터(0700으로 만듦, `main.rs:380-391`) |
-| `run_dir` | `/run/opl` | 소켓·pid 파일 |
-| `control_socket` | `{run_dir}/opld.sock` | 로컬 제어 소켓(0600) |
+| `data_dir` | `/var/lib/orbivisor` | 영속 데이터(0700으로 만듦, `main.rs:380-391`) |
+| `run_dir` | `/run/orbivisor` | 소켓·pid 파일 |
+| `control_socket` | `{run_dir}/orbivisord.sock` | 로컬 제어 소켓(0600, 기본 자리면 옆에 옛 이름 링크 `opld.sock`) |
 | `[migration] ports` | `60000-60099` | QEMU 마이그레이션·NBD(`config.rs:1812`) |
 
 설정 절: `[hypervisor] [reconciler] [schedule] [janitor] [backup] [replication] [pools] [migration] [ha] [network]
 [updates] [telemetry] [audit] [remotes] [runtime] [api] [vip] [web] [node] [ceph] [download] [metrics] [sdn]`
-(`config.rs:63-106`). 예시는 `packaging/deb/opld.toml.example`.
+(`config.rs:63-106`). 예시는 `packaging/deb/orbivisord.toml.example`.
 
 `data_dir` 아래:
 
 | 경로 | 내용 | 인용 |
 |---|---|---|
-| `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock | `main.rs:393-411` |
+| `orbivisord.lock`, `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock(옛 이름도 잠가 옛 판 데몬과도 막음) | `main.rs:393-411` |
 | `node-id` | 노드 UUID | `crates/orbivisord/src/bootstrap.rs:27` |
 | `pki/` | `ca.crt`, `node.crt`, `node.key`(0600) | `crates/orbivisor-peer/src/pki.rs:31-35` |
 | `cluster/cluster.redb` | Raft 로그 + 상태 머신 + 스냅샷 | `crates/orbivisor-cluster/src/cluster.rs:46` |
@@ -250,7 +250,7 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 
 `run_dir/vm/<id>/`에는 `qmp.sock`, `vnc.sock`, `qga.sock`, `tpm.sock`, `qemu.pid`, `swtpm.pid`, `cidata.iso`가 있다
 (`crates/orbivisor-qemu/src/paths.rs:35-46`). 파일 복원 세션은 `run_dir/file-restore/<세션 id>/`에 `ctl.sock`(에이전트 채널)·`nbd.sock`(저장소
-백업 원본)·`qemu.pid`를 둔다(계획 69). `/etc/opl/opld.toml`은 유닛의 `ConditionPathExists`다.
+백업 원본)·`qemu.pid`를 둔다(계획 69). `/etc/orbivisor/orbivisord.toml`(또는 옛 `/etc/opl/opld.toml`)이 유닛의 `ConditionPathExists`다. 데몬은 시작할 때 옛 디렉터리(`/etc/opl`·`/var/lib/opl`·`/run/opl`·`/var/log/opl`)를 새 이름으로 맞바꿔 옮기고 옛 이름을 링크로 남긴다(`crates/orbivisord/src/layout.rs`, 계획 74).
 
 ### 2.4 시작 순서
 
@@ -771,7 +771,7 @@ reconciler나 Task 실행기가 한다. `remote_proxy.rs`는 다른 **클러스�
   클러스터 CA로 서명, 없으면 노드 인증서. 모두 연결을 끊지 않고 바꾼다(`crates/orbivisor-api/src/api_cert.rs`, `crates/orbivisor-api/src/acme/install.rs`,
   `crates/orbivisor-peer/src/tls.rs`). `ApiCertAgent::spawn_with_acme`가 설정·인증서 watch와 1시간마다 다시 맞춘다. 노드마다 ACME 키는
   `{data_dir}/pki/acme/{id}.key`(0600)에만, 공유 인증서 키는 Raft status의 비밀이다. 인증서 올리기 API는 없다.
-- **제어 소켓** `opld.sock`(0600, 인증 없음, 루트 전용)은 `GET /v1/status`, `POST /v1/init|join|leave`만 있는 따로 된
+- **제어 소켓** `orbivisord.sock`(0600, 인증 없음, 루트 전용)은 `GET /v1/status`, `POST /v1/init|join|leave`만 있는 따로 된
   axum 라우터다(`crates/orbivisord/src/control.rs:95-132`). `orbivisorctl cluster init|join|leave`가 쓴다.
 
 ### 7.2 REST 구조와 OpenAPI
@@ -1194,7 +1194,7 @@ flowchart LR
     다시 올린다. 안전은 `orbivisor-store`의 모형 proptest가 지킨다.
   - **복원은 NBD 서버**: 보통 복원·옮기기·복사는 opld 안의 NBD 서버(`StoreExport` — 풀린 청크 LRU, 미리 읽기, 0 청크는 구멍)를
     `qemu-img convert`가 읽고, 라이브 복원은 같은 서버를 헬퍼 `orbivisord backup-serve`(표준 입력 설정, Linux systemd면
-    `opl-bkserve-<id>` scope)로 띄워 QEMU가 오버레이의 backing으로 읽는다(`reconnect-delay=300`). Task가 배선 파일
+    `orbivisor-bkserve-<id>` scope)로 띄워 QEMU가 오버레이의 backing으로 읽는다(`reconnect-delay=300`). Task가 배선 파일
     (`live-restore.json`)을 두면 reconciler의 보통 켜기가 드라이버를 거쳐 그 배선의 명령줄로 켜고, Task는 `blockdev-mirror`
     (`write-blocking`, `on-source-error: stop`) → `job-complete`로 대상 볼륨에 갈아탄다. HA 관리자는 `live_restore`가 있는 VM을
     건너뛰고, reconciler는 그 VM의 QEMU가 죽으면 재시작 정책과 관계없이 같은 배선으로 다시 켠다(`Pivoting` 뒤에는 대상으로 보통 켬).
@@ -1210,7 +1210,7 @@ flowchart LR
     `sweep_restore_helpers`): Debian 13 커널 + 우리 initramfs(`orbivisor-restore`의 정적 musl 에이전트가 PID 1, `lvm`·`blkid`, 고른 모듈)를
     `-kernel`·`-initrd`로 직접 부팅, `-nodefaults -no-user-config -net none -display none`, 디스크마다 읽기 전용 원본 + 버리는 qcow2
     덮개(`{data_dir}/file-restore/<id>/ov{i}.qcow2` — 저널 재생은 여기 씀) 위 virtio-blk(`serial=opl-disk{i}`), virtio-serial 포트
-    `org.orbivisor.restore.0`(`{run_dir}/file-restore/<id>/ctl.sock`), virtio-rng, 콘솔은 파일. Linux systemd면 `opl-fr-<id>.scope`
+    `org.orbivisor.restore.0`(`{run_dir}/file-restore/<id>/ctl.sock`), virtio-rng, 콘솔은 파일. Linux systemd면 `orbivisor-fr-<id>.scope`
     (`MemoryMax`·`TasksMax=64`·`CPUQuota`), opld가 root면 `-run-with user=nobody`(또는 `-runas`), seccomp QEMU면 `-sandbox on,…` — QEMU가
     무엇을 받는지는 `<옵션> -version`으로 바이너리마다 한 번 묻는다. 원본은 저장소 백업이면 opld 안 NBD 서버(계획 68 `serve`, 세션
     디렉터리의 `nbd.sock` — 키는 opld를 떠나지 않음, `reconnect-delay` 없음), 옛 풀 백업이면 qcow2 체인 json이다.
@@ -1229,7 +1229,7 @@ flowchart LR
     Windows는 PowerShell `-EncodedCommand`)로 쓴다. 하이퍼바이저 `guest_file(id, &GuestFileOp)` 하나, 다른 노드의 VM이면 `GuestAgent` RPC의
     `file` 갈래. 허락 여부는 `guest-info.supported_commands`로 본다.
   - **치우기**: 세션 끝·실패에 Drop 지킴이가 도우미(Shutdown → SIGTERM → SIGKILL)·scope·두 세션 디렉터리·NBD 서버·세션 자리를 거두고,
-    opld 시작 때 `sweep_restore_helpers`가 제 `{run_dir,data_dir}/file-restore`에 남은 세션의 `opl-fr-<id>`(명령줄을 확인한 pid만)·그
+    opld 시작 때 `sweep_restore_helpers`가 제 `{run_dir,data_dir}/file-restore`에 남은 세션의 `orbivisor-fr-<id>`·옛 `opl-fr-<id>`(명령줄을 확인한 pid만)·그
     세션의 scope·두 디렉터리를 지운다(같은 호스트의 다른 opld 것은 두지 않음). 덮개 지킴이는 부팅 중에도 2초마다 합이 `overlay_max_mib`를
     넘으면 세션을 닫는다.
   - 자세한 것은 [파일 단위 복원 안내](guide/backup.md#파일-단위-복원)와 [설계](superpowers/specs/2026-11-24-file-restore-design.md).
@@ -1306,8 +1306,8 @@ graph LR
   (`crates/orbivisor-types/src/sdn.rs`, `network.rs`). 모두 기능 `sdn` 뒤에 있다(§14).
 - **설치(Task).** `sdn-init`·`sdn-central-add`·`sdn-central-remove`(대상 `Sdn`)와 `sdn-chassis-install`(대상 노드)이 그 노드의
   `OvnHost`(`crates/orbivisor-driver/src/ovn/host.rs`, Ceph의 `CommandRunner`를 같이 씀) 단계를 돈다: 빠진 꾸러미만 apt, TLS 사본
-  `/etc/opl/ovn/`, 배포판 중앙 단위 끄고 가리기, `ovsdb-tool create-cluster`/`join-cluster`(DB `/var/lib/opl/ovn/`), Orbivisor
-  단위 `opl-ovn-nb`·`-sb`·`-northd`(`units.rs` — 노드 주소의 `pssl`만), 리더·멤버 기다리기, chassis 구성(OVS `external_ids`,
+  `/etc/orbivisor/ovn/`, 배포판 중앙 단위 끄고 가리기, `ovsdb-tool create-cluster`/`join-cluster`(DB `/var/lib/orbivisor/ovn/`), Orbivisor
+  단위 `orbivisor-ovn-nb`·`-sb`·`-northd`(옛 이름 `opl-ovn-*`는 별칭 링크로 바꿔 둠, `units.rs` — 노드 주소의 `pssl`만), 리더·멤버 기다리기, chassis 구성(OVS `external_ids`,
   `set-ssl`). 단계마다 지금 상태를 먼저 봐서 다시 하면 잇고, 남의 OVN·모르는 클러스터 id의 DB는 거절한다. `sdn-init`은 DB를
   임시 파일에 만들어 클러스터 id를 Raft에 **먼저** 적고 제자리로 옮긴다 — 그래서 제자리의 DB는 늘 Raft가 아는 id다
   (`crates/orbivisor-api/src/tasks/sdn.rs`).
@@ -1345,7 +1345,7 @@ graph LR
   기다리지 않고(10초 안에 `ovn-installed`가 없으면 로그 경고), 마이그레이션 받는 쪽은 받을 QEMU를 띄우기 전에 30초까지
   기다려 안 되면 받기를 거절한다(`crates/orbivisor-driver/src/qemu.rs:576`). 스케줄러 `has_sdn`은 chassis가 `ready`인 노드만
   (`crates/orbivisor-api/src/scheduler.rs:245`).
-- **TLS.** NB·SB·Raft 포트는 모두 클러스터 CA mTLS(`/etc/opl/ovn/`의 노드 인증서 사본)이고 평문 리스너가 없다(§13).
+- **TLS.** NB·SB·Raft 포트는 모두 클러스터 CA mTLS(`/etc/orbivisor/ovn/`의 노드 인증서 사본)이고 평문 리스너가 없다(§13).
 - **없는 것.** 부하 분산·QoS·단순 → SDN 옮기기·SB RBAC·OVN 알림은 계획 67이다(라우팅·보안 그룹은 §11.5). EVPN/BGP/FRR은
   없다. VXLAN의 정적 head-end 복제는 노드 수에 비례해 BUM 트래픽이 늘므로 노드가 아주 많으면 SDN 네트워크가 낫다.
 
@@ -1487,7 +1487,7 @@ graph LR
   `exclusive_values(kind, spec, status)`). 다리 동안 대상의 라우터 붙이기는 409 `network_migrating`. 다리 노드를 지우면(`DELETE /nodes`)
   옮기기를 `paused`로 두고 다리 기록을 지운다.
 - **OVN 접근 잠금**(`crates/orbivisor-driver/src/ovn/units.rs`·`lockdown.rs`, opld `SdnAgent`, `crates/orbivisor-api/src/tasks/sdn.rs`): 잠긴 중앙의 SB는
-  `--config-file=/etc/opl/ovn/sb.json`(6642 `role=ovn-controller`, 6645 특권, `punix`)으로 뜨고 northd는 잠긴 중앙엔 6645, 아직 아닌 중앙엔
+  `--config-file=/etc/orbivisor/ovn/sb.json`(6642 `role=ovn-controller`, 6645 특권, `punix`)으로 뜨고 northd는 잠긴 중앙엔 6645, 아직 아닌 중앙엔
   6642로 붙는다(`northd_args(centrals, locked)`). **중앙을 바꾸는 것은 각 중앙의 에이전트**다(Task는 한 노드에서만 돌아 다른 중앙의 단위를 쓸 수
   없다): `sdn-lockdown` Task는 `SdnSpec.lockdown`과 `pending`을 쓰고 기다리기만 하며, 각 중앙이 자기 차례(`lockdown_turn` — 다른 중앙이 모두
   온라인·리더/팔로어)에 단위를 쓰고 SB를 다시 띄워 따라잡은 뒤 `applied`에 든다(`ovsdb-server/list-remotes`의 6645로 돌고 있는 모양을 봐 멈췄다
@@ -1628,7 +1628,7 @@ graph LR
 | 할당량 | 폴더마다 vCPU·메모리·디스크·VM 수, Raft 적용에서 최종 판정 | §3.2 |
 | 감사 로그 | 노드마다 `{data_dir}/audit/audit.log`(JSON 줄, 1초마다 fsync, 16 MiB × 8). 쓰기 요청·콘솔 열기·OIDC 콜백. `GET /audit`이 fan-out으로 모음. **Raft에 없다** | `crates/orbivisor-api/src/audit.rs:1-470` |
 | 설정 기록·선언형 적용(계획 73) | 기록은 Raft 상태 머신 안(§3.2), 줄의 `request`가 감사 id. 비밀은 기록에 `$secret` 표시만(평문·해시·지문 없음 — 낮은 엔트로피 비밀번호의 오프라인 대입을 막음), 기록 보기는 지금 읽을 수 있는 리소스만(지운 것은 마지막 폴더). 새 권한 없음 — 적용·되돌리기는 단계마다 그 종류의 지금 처리기·권한을 거친다(`POST /apply`는 어딘가의 `system.read`, 숨은 리소스는 없는 것과 같은 문구) | `crates/orbivisor-api/src/declarative/`, `history.rs` |
-| ACME(계획 73) | 계정 키·EAB HMAC·DNS 공급자 비밀·공유 인증서 키는 Raft에(보기·watch·감사·설정 기록에서 뺌 — `orbivisor_types::acme::redact_*`), 노드마다 인증서 키는 그 노드 디스크에만, 훅은 `/etc/opl/acme-hooks/` 아래 root 소유·그룹/남 쓰기 불가 파일만(환경 비움·60초), 쓰기 루트 `cluster.admin`·읽기 `cluster.read`. RFC 2136 응답의 TSIG는 확인하지 않음 | `crates/orbivisor-api/src/acme/` |
+| ACME(계획 73) | 계정 키·EAB HMAC·DNS 공급자 비밀·공유 인증서 키는 Raft에(보기·watch·감사·설정 기록에서 뺌 — `orbivisor_types::acme::redact_*`), 노드마다 인증서 키는 그 노드 디스크에만, 훅은 `/etc/orbivisor/acme-hooks/`(옛 `/etc/opl/acme-hooks/`도 받음) 아래 root 소유·그룹/남 쓰기 불가 파일만(환경 비움·60초), 쓰기 루트 `cluster.admin`·읽기 `cluster.read`. RFC 2136 응답의 TSIG는 확인하지 않음 | `crates/orbivisor-api/src/acme/` |
 | 제어 소켓 | 0600 유닉스 소켓, 인증 없음(루트 전용) | §7.1 |
 | OVN(계획 65~67) | NB·SB·Raft는 `pssl`만, 클러스터 CA mTLS(노드 인증서 사본), OvnSync는 서버 이름도 확인. 잠금(계획 67, 새 클러스터 기본): SB 역할 포트 `role=ovn-controller`(chassis는 자기 행만), northd 전용 특권 포트 6645, Raft 멤버십을 따르는 nftables 주소 허용 목록(지운 노드는 인증서가 살아 있어도 끊김). `Port_Binding`·`MAC_Binding`·`FDB`는 OVN RBAC가 id를 보지 않음, NB에는 RBAC 없음. SDN NIC의 보안 그룹은 OVN ACL(포트 보안이 IP 위조도 막음), 포트는 Port_Group이 있어야 생김(실패하면 닫힘) | §11.4~§11.6 |
 | swtpm | AppArmor 추가 규칙 | §9.2 |
@@ -1730,16 +1730,16 @@ ACME로 자동 갱신할 수 있다(계획 73).
 | 설치 경로 | 내용 |
 |---|---|
 | `/usr/bin/orbivisord`, `/usr/bin/orbivisorctl` | 바이너리(+ `opld`, `oplctl` 심볼릭 링크) |
-| `/usr/lib/systemd/system/opld.service` | 유닛(+ 별칭 `orbivisord.service`) |
-| `/usr/share/orbivisor/opld.toml.example` | 설정 예시 |
+| `/usr/lib/systemd/system/orbivisord.service` | 유닛(+ 정적 별칭 링크 `opld.service`) |
+| `/usr/share/orbivisor/orbivisord.toml.example` | 설정 예시 |
 | `/etc/apparmor.d/abstractions/orbivisor-swtpm` | swtpm 규칙(conffile) |
-| `/etc/opl/opld.toml` | 노드 설정(설치기나 관리자가 씀) |
-| `/var/lib/opl`, `/run/opl` | 데이터, 런타임(§2.3) |
+| `/etc/orbivisor/orbivisord.toml` | 노드 설정(설치기나 관리자가 씀, 옛 이름 링크 `/etc/opl/opld.toml`) |
+| `/var/lib/orbivisor`, `/run/orbivisor` | 데이터, 런타임(§2.3, 옛 이름 링크 `/var/lib/opl`·`/run/opl`) |
 
-**유닛 `opld.service`**: `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`, `WatchdogSignal=SIGKILL`,
+**유닛 `orbivisord.service`**: `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`, `WatchdogSignal=SIGKILL`,
 `Restart=on-failure`, `RestartSec=2`, `KillMode=process`(VM을 죽이지 않음), `TimeoutStopSec=15min`,
-`LimitNOFILE=1048576`, `ConditionPathExists=/etc/opl/opld.toml`, `StartLimitIntervalSec=60`, `StartLimitBurst=10`,
-`ExecStopPost=… --release-vips`(`packaging/deb/opld.service:6-29`).
+`LimitNOFILE=1048576`, `ConditionPathExists=|/etc/orbivisor/orbivisord.toml`·`|/etc/opl/opld.toml`, `StartLimitIntervalSec=60`, `StartLimitBurst=10`,
+`ExecStopPost=… --release-vips`(`packaging/deb/orbivisord.service`). postinst는 옛 이름의 enable 링크·덮어쓰기(`opld.service.d`)를 새 이름으로 옮긴다.
 
 VM은 `opl-vm-<id>.scope`, swtpm은 `opl-tpm-<id>.scope`로 데몬과 따로 돈다(§8.2).
 
