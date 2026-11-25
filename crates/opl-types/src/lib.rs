@@ -1,6 +1,8 @@
 //! Orbivisor 리소스 모델. 모든 크레이트가 공유하는 타입만 둔다.
 
+pub mod acme;
 pub mod alert;
+pub mod apply_set;
 pub mod audit;
 pub mod auth;
 pub mod authz;
@@ -21,11 +23,13 @@ pub mod floating_ip;
 pub mod folder;
 pub mod guest;
 pub mod ha_check;
+pub mod history;
 pub mod host;
 pub mod hotplug;
 pub mod image_catalog;
 pub mod ipam;
 pub mod load_balancer;
+pub mod manifest;
 pub mod metrics;
 pub mod metrics_math;
 pub mod network;

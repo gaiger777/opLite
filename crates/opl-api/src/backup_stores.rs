@@ -1208,4 +1208,24 @@ mod tests {
         redact_json(&mut raw["spec"]);
         assert_eq!(raw, serde_json::to_value(view(&store).unwrap()).unwrap());
     }
+
+    /// 계획 73: 보기가 빼는 비밀(S3 비밀 키·주 키)은 설정 이력에서도 평문으로 남지 않는다(가림 ⊆ 이력 가림).
+    #[test]
+    fn history_masks_what_views_drop() {
+        let spec = serde_json::json!({
+            "backend": {"s3": {"endpoint": "https://s3.example.com", "bucket": "bk",
+                               "access_key_id": "AKID", "secret_access_key": "SECRET"}},
+            "encryption": {"fingerprint": "00:11", "key": "KEYBYTES"}
+        });
+        let mut redacted = spec.clone();
+        redact_json(&mut redacted);
+        let masked =
+            opl_types::history::history_mask(opl_types::resource::Kind::BackupStore, None, &spec)
+                .to_string();
+        for secret in ["SECRET", "KEYBYTES"] {
+            assert!(spec.to_string().contains(secret) && !redacted.to_string().contains(secret));
+            assert!(!masked.contains(secret), "{masked}");
+        }
+        assert!(masked.contains("AKID"), "{masked}");
+    }
 }

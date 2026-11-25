@@ -148,7 +148,10 @@ use crate::resources as r;
         description = "Orbivisor REST API (`/api/v1`). Every authenticated response carries `Orbivisor-Revision`, \
             the revision the answering node had applied when it answered. An authenticated request with \
             `Orbivisor-Min-Revision: <revision>` is answered once the node has applied that revision (503 \
-            `revision_unavailable` after 5 seconds); pass the `revision` of a resource written elsewhere to read it."
+            `revision_unavailable` after 5 seconds); pass the `revision` of a resource written elsewhere to read it. \
+            Writes may carry `Orbivisor-Client: <tool>/<version>` (`cli`, `terraform`, `web`) and \
+            `Orbivisor-Change-Reason: <text>` (UTF-8, at most 200 characters); both are kept in the configuration \
+            history next to the change."
     ),
     servers((url = "/api/v1")),
     modifiers(&Security),

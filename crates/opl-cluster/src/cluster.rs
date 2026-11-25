@@ -15,8 +15,10 @@ use opl_types::resource::{Kind, Resource, ResourceSpec};
 use redb::Database;
 use uuid::Uuid;
 
+use crate::change::ChangeContext;
 use crate::follow::{self, FollowClient, FollowFrame, NodeRole};
 use crate::health::{ApplyLag, QUORUM_ACK_MAX, RaftHealth};
+use crate::history::HistoryTotals;
 use crate::leader::{self, Forwarder, LeaderCtx};
 use crate::lease::{ConfirmBatch, LeaseTable, Leases};
 use crate::links::{LINK_RETRY, LinkBook};
@@ -24,7 +26,8 @@ use crate::log_store::LogStore;
 use crate::replica::{Replica, read_membership};
 use crate::state_machine::{StateMachine, save_current_snapshot};
 use crate::store::{
-    NodeMode, Store, StoreError, enter_observer_mode, get_object, get_object_by_name, list_objects,
+    NodeMode, Store, StoreError, all_nodes_have, enter_observer_mode, get_object,
+    get_object_by_name, history_of, history_timeline, history_totals, list_objects,
     read_dropped_log, read_node_mode, write_node_mode,
 };
 use crate::types::{Command, LeaderRequest, NodeId, OrbNode, RawResource, Rejection, TypeConfig};
@@ -721,7 +724,51 @@ impl Cluster {
     /// 명령을 리더에 제안하고 커밋·적용될 때까지 기다린다. 성공하면 새 revision을 돌려준다.
     /// 상태 머신은 spec/status JSON이 `kind`와 맞는지 보지 않으므로 타입 있는 메서드로만 부른다.
     pub(crate) async fn write(&self, command: Command) -> Result<u64, ClusterError> {
+        let command = self.attribute(command)?;
         self.request(LeaderRequest::Write { command }).await
+    }
+
+    /// 기록 종류의 spec 쓰기(만들기·바꾸기·지우기)를 출처를 단 명령으로 싼다(계획 73 §7.1). 출처는 작업 지역 값
+    /// [`ChangeContext`]에서(없으면 `System`), 시각은 리더가 찍는다(여기서는 0). 기능 `config-history`가 모든 노드에
+    /// 있을 때만 싼다 — 옛 노드는 이 명령을 풀지 못한다. status 쓰기·기록하지 않는 종류는 그대로다(로그 크기 그대로).
+    fn attribute(&self, command: Command) -> Result<Command, ClusterError> {
+        if matches!(command, Command::Attributed { .. })
+            || !command.changes_spec()
+            || !command.kind().history_tracked()
+            || !all_nodes_have(self.store.db(), opl_types::node::CONFIG_HISTORY)?
+        {
+            return Ok(command);
+        }
+        let mut meta = ChangeContext::current().unwrap_or_default();
+        meta.at_ms = 0;
+        Ok(Command::Attributed {
+            meta,
+            command: Box::new(command),
+        })
+    }
+
+    /// 리소스 하나의 설정 이력(오래된 것부터, 계획 73). 지운 리소스도 id로 찾는다. 이력은 Raft 구성원(투표 멤버·
+    /// learner)의 상태 머신에만 있다 — 관찰 노드는 비어 있다.
+    pub fn history_of(
+        &self,
+        kind: Kind,
+        id: Uuid,
+    ) -> Result<Vec<opl_types::history::HistoryRecord>, ClusterError> {
+        Ok(history_of(self.store.db(), kind, id)?)
+    }
+
+    /// 클러스터 전체 설정 이력을 새것부터 `limit`줄(`before` revision 앞에서 — 쪽 열쇠)
+    pub fn history_timeline(
+        &self,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<opl_types::history::HistoryRecord>, ClusterError> {
+        Ok(history_timeline(self.store.db(), before, limit)?)
+    }
+
+    /// 설정 이력의 줄 수와 압축 뒤 바이트 합
+    pub fn history_totals(&self) -> Result<HistoryTotals, ClusterError> {
+        Ok(history_totals(self.store.db())?)
     }
 
     /// 요청을 리더에서 처리한다. 이 노드가 리더가 아니면 전달자로 리더에 보내고, 리더가 커밋한
@@ -842,7 +889,7 @@ impl Cluster {
         let LeaderRequest::Write { command } = req else {
             return None;
         };
-        match (command, result) {
+        match (command.inner(), result) {
             (
                 Command::Create { kind, resource },
                 Err(ClusterError::Rejected(Rejection::AlreadyExists { id, .. })),

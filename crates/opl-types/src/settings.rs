@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::cpu::CpuSettings;
+use crate::history::HistorySettings;
 use crate::image_catalog::CatalogImage;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::two_factor::TwoFactorPolicy;
@@ -88,6 +89,43 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cpu: Option<CpuSettings>,
+    /// 설정 이력 보존 한도(계획 73). 없으면 기본값(리소스당 100줄·365일·64 MiB)이고 쓰지 않아 옛 노드도 설정을 계속
+    /// 푼다(API는 기능 `config-history`가 모두 있을 때만 받는다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub history: Option<HistorySettings>,
+    /// ACME 동작(계획 73). 없으면 기본값(포트 80 리다이렉트·갱신 시각 흩뜨리기 켬)이고 쓰지 않는다(기능 `acme`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub acme: Option<AcmeSettings>,
+}
+
+/// ACME 동작 설정(계획 73 §11.3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSettings {
+    /// 포트 80 리스너가 도전 밖의 요청을 `https://{Host}:8006`으로 308 보낸다(끄면 404).
+    #[serde(default = "yes")]
+    #[cfg_attr(feature = "openapi", schema(default = true))]
+    pub http_redirect: bool,
+    /// 갱신 시각을 창 안에서 흩뜨린다(노드·인증서가 한꺼번에 주문하지 않게).
+    #[serde(default = "yes")]
+    #[cfg_attr(feature = "openapi", schema(default = true))]
+    pub renew_jitter: bool,
+}
+
+impl Default for AcmeSettings {
+    fn default() -> Self {
+        Self {
+            http_redirect: true,
+            renew_jitter: true,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Prometheus 끝점 설정
@@ -291,6 +329,16 @@ impl SettingsSpec {
     pub fn placement(&self) -> PlacementSettings {
         self.placement.filter(|p| p.valid()).unwrap_or_default()
     }
+
+    /// 설정 이력 보존 한도. 없거나 범위 밖이면 기본값이다(상태 머신도 같은 규칙으로 읽는다).
+    pub fn history(&self) -> HistorySettings {
+        self.history.filter(|h| h.valid()).unwrap_or_default()
+    }
+
+    /// ACME 동작. 없으면 기본값이다.
+    pub fn acme(&self) -> AcmeSettings {
+        self.acme.unwrap_or_default()
+    }
 }
 
 impl ResourceSpec for SettingsSpec {
@@ -435,6 +483,8 @@ mod tests {
             prometheus: None,
             two_factor: None,
             cpu: None,
+            history: None,
+            acme: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -805,5 +855,48 @@ mod tests {
         assert_eq!(off.prometheus, Some(PrometheusSettings { enabled: false }));
         assert!(!off.prometheus_enabled());
         assert!(serde_json::from_str::<SettingsSpec>(r#"{"prometheus":{"port":9100}}"#).is_err());
+    }
+
+    /// 계획 73: 이력 한도·ACME 설정이 없으면 옛 모양 그대로 쓰고, 있으면 함께 쓰고 푼다. 범위 밖 한도는 기본값으로 읽는다.
+    #[test]
+    fn history_and_acme_are_written_only_when_set() {
+        let old = r#"{"updates":{"channel":"stable"}}"#;
+        let spec: SettingsSpec = serde_json::from_str(old).unwrap();
+        assert_eq!((spec.history, spec.acme), (None, None));
+        assert_eq!(spec.history(), HistorySettings::default());
+        assert_eq!(spec.history().max_total_bytes(), 64 * 1024 * 1024);
+        assert!(spec.acme().http_redirect && spec.acme().renew_jitter);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+
+        let spec: SettingsSpec = serde_json::from_str(
+            r#"{"history":{"max_per_resource":10},"acme":{"http_redirect":false}}"#,
+        )
+        .unwrap();
+        let h = spec.history.unwrap();
+        assert_eq!(
+            (h.max_per_resource, h.max_age_days, h.max_total_mib),
+            (10, 365, 64)
+        );
+        assert!(h.valid());
+        assert_eq!(h.max_age_ms(), 365 * 86_400_000);
+        assert!(!spec.acme().http_redirect && spec.acme().renew_jitter);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+
+        for bad in [
+            r#"{"max_per_resource":9}"#,
+            r#"{"max_per_resource":1001}"#,
+            r#"{"max_age_days":6}"#,
+            r#"{"max_total_mib":513}"#,
+        ] {
+            let h: HistorySettings = serde_json::from_str(bad).unwrap();
+            assert!(!h.valid(), "{bad}");
+            let spec = SettingsSpec {
+                history: Some(h),
+                ..SettingsSpec::default()
+            };
+            assert_eq!(spec.history(), HistorySettings::default(), "{bad}");
+        }
+        assert!(serde_json::from_str::<HistorySettings>(r#"{"rows":1}"#).is_err());
     }
 }

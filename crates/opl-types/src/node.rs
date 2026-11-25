@@ -423,6 +423,9 @@ pub const FEATURES: &[&str] = &[
     VM_CHECK,
     VMWARE_MIGRATE,
     VM_EXPORT,
+    DECLARATIVE,
+    CONFIG_HISTORY,
+    ACME,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -531,6 +534,18 @@ pub const VMWARE_MIGRATE: &str = "vmware-migrate";
 /// 내보내기·내려받기 경로. 옛 노드는 새 종류·Task를 풀지 못하고 새 권한 이름을 버려(권한 판단이 노드마다 달라진다) 모든
 /// 노드가 알릴 때만 쓴다.
 pub const VM_EXPORT: &str = "vm-export";
+
+/// 선언형 적용(계획 73): 종류 `ApplySet`, Task `apply`, `/apply`·`/manifests`·`/apply-sets` 경로. 옛 노드는 새 종류·Task를
+/// 풀지 못하고 같은 문서를 노드마다 다르게 계획하지 않게 모든 노드가 알릴 때만 쓴다.
+pub const DECLARATIVE: &str = "declarative";
+
+/// 설정 이력(계획 73): Raft 명령 `attributed`(출처를 단 쓰기)와 상태 머신의 이력 표, 이력·되돌리기 경로, 설정
+/// `history`. 옛 노드는 모르는 명령을 적용하지 못하므로 모든 노드가 알릴 때만 쓰기를 싼다 — 그 전 바뀜은 이력에 없다.
+pub const CONFIG_HISTORY: &str = "config-history";
+
+/// ACME 인증서(계획 73): 종류 `AcmeAccount`·`AcmeDns`·`Certificate`, Task `acme-order`, HTTP-01 리스너, 설정 `acme`,
+/// 경보 조건 `certificate_*`. 옛 노드는 새 종류·Task를 풀지 못하고 도전 값에 답하지 못하므로 모든 노드가 알릴 때만 쓴다.
+pub const ACME: &str = "acme";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1024,7 +1039,10 @@ mod tests {
                 "file-restore",
                 "vm-check",
                 "vmware-migrate",
-                "vm-export"
+                "vm-export",
+                "declarative",
+                "config-history",
+                "acme"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1243,7 +1261,7 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&VM_EXPORT));
+        assert_eq!(FEATURES.last(), Some(&ACME));
     }
 
     /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

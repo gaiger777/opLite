@@ -253,6 +253,11 @@ function conditionOf(form: RuleForm): AlertCondition {
       const ops = splitNames(form.ops);
       return ops.length > 0 ? { kind: "task_failed", ops } : { kind: "task_failed" };
     }
+    // 인증서 조건(계획 73)은 아직 폼에 없다(CONDITION_KINDS 밖). 서버 기본값으로 보낸다.
+    case "certificate_expiring":
+      return { kind: "certificate_expiring", days: 14 };
+    case "certificate_renew_failed":
+      return { kind: "certificate_renew_failed", failures: 3 };
     default:
       return { kind: form.kind };
   }

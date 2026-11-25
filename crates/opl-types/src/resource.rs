@@ -86,11 +86,19 @@ pub enum Kind {
     VmwareVm,
     /// VM의 OVA/OVF 내보내기(계획 72)
     VmExport,
+    /// 선언형 적용 묶음 — 마지막 선언·드리프트(계획 73)
+    ApplySet,
+    /// ACME 계정(계획 73)
+    AcmeAccount,
+    /// ACME DNS-01 공급자(계획 73)
+    AcmeDns,
+    /// ACME로 받는 공개 인증서(계획 73)
+    Certificate,
 }
 
 impl Kind {
     /// 모든 종류(선언 순서). 종류마다 도는 시험과 권한 표가 쓴다.
-    pub const ALL: [Kind; 43] = [
+    pub const ALL: [Kind; 47] = [
         Kind::Vm,
         Kind::StoragePool,
         Kind::Volume,
@@ -134,6 +142,10 @@ impl Kind {
         Kind::VmwareMigration,
         Kind::VmwareVm,
         Kind::VmExport,
+        Kind::ApplySet,
+        Kind::AcmeAccount,
+        Kind::AcmeDns,
+        Kind::Certificate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -181,7 +193,71 @@ impl Kind {
             Kind::VmwareMigration => "vmware-migration",
             Kind::VmwareVm => "vmware-vm",
             Kind::VmExport => "vm-export",
+            Kind::ApplySet => "apply-set",
+            Kind::AcmeAccount => "acme-account",
+            Kind::AcmeDns => "acme-dns",
+            Kind::Certificate => "certificate",
         }
+    }
+
+    /// 설정 이력(계획 73 §7.2)을 남기는 종류인지. 설정 리소스(사람·apply·Terraform이 spec을 고치는 것)만 남기고, 작업 기록
+    /// (자기 status가 이력)·비밀 덩어리·클러스터 설치 상태·노드가 스스로 쓰는 것은 뺀다. 새 종류는 여기서 넣거나 빼야
+    /// 시험(`every_kind_is_classified_for_history`)이 통과한다.
+    pub fn history_tracked(self) -> bool {
+        match self {
+            Kind::Vm
+            | Kind::StoragePool
+            | Kind::Volume
+            | Kind::Network
+            | Kind::SecurityGroup
+            | Kind::BackupJob
+            | Kind::Settings
+            | Kind::Realm
+            | Kind::Remote
+            | Kind::HaGroup
+            | Kind::PlacementRule
+            | Kind::NodeFence
+            | Kind::HaCheck
+            | Kind::AlertRule
+            | Kind::NotificationTarget
+            | Kind::Folder
+            | Kind::Grant
+            | Kind::AccessRole
+            | Kind::Group
+            | Kind::Router
+            | Kind::FloatingIp
+            | Kind::LoadBalancer
+            | Kind::BackupStore
+            | Kind::VmwareSource
+            | Kind::ApplySet
+            | Kind::AcmeAccount
+            | Kind::AcmeDns
+            | Kind::Certificate
+            | Kind::User => true,
+            Kind::Node
+            | Kind::Task
+            | Kind::ApiToken
+            | Kind::Cluster
+            | Kind::JoinToken
+            | Kind::Snapshot
+            | Kind::Backup
+            | Kind::VmImport
+            | Kind::Session
+            | Kind::VipHolder
+            | Kind::Ceph
+            | Kind::TwoFactor
+            | Kind::CpuCatalog
+            | Kind::Sdn
+            | Kind::NetworkMigration
+            | Kind::VmwareMigration
+            | Kind::VmwareVm
+            | Kind::VmExport => false,
+        }
+    }
+
+    /// 이름(`as_str`)으로 찾는다.
+    pub fn parse(name: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.as_str() == name)
     }
 }
 
@@ -253,9 +329,37 @@ mod tests {
         assert_eq!(set.len(), Kind::ALL.len());
         assert_eq!(
             Kind::ALL.last().map(|k| k.as_str()),
-            Some("vm-export"),
+            Some("certificate"),
             "새 종류는 ALL 끝에도 더한다"
         );
+        assert_eq!(Kind::parse("apply-set"), Some(Kind::ApplySet));
+        assert_eq!(Kind::parse("nope"), None);
+    }
+
+    /// 계획 73 §7.2: 모든 종류가 이력에 넣을지 뺄지 정해져 있다(`history_tracked`의 match가 빠짐없음을 컴파일러가 보고, 이
+    /// 시험은 설계 표의 수를 고정한다).
+    #[test]
+    fn every_kind_is_classified_for_history() {
+        let tracked: Vec<&str> = Kind::ALL
+            .into_iter()
+            .filter(|k| k.history_tracked())
+            .map(Kind::as_str)
+            .collect();
+        assert_eq!(tracked.len(), 29, "{tracked:?}");
+        for k in [
+            "task",
+            "session",
+            "node",
+            "cluster",
+            "api-token",
+            "two-factor",
+            "snapshot",
+        ] {
+            assert!(!tracked.contains(&k), "{k}");
+        }
+        for k in ["vm", "user", "apply-set", "certificate", "settings"] {
+            assert!(tracked.contains(&k), "{k}");
+        }
     }
 
     #[test]

@@ -394,4 +394,16 @@ opld 수용 시험·Terraform·웹 데모가 함께 쓰는 실행 파일(`crates
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
 
-(구현하면서 스테이지마다 채운다.)
+### 스테이지 1 — 타입과 변경 기록
+
+- **싸는 쓰기의 범위**: `Cluster::write`는 기록 종류(`Kind::history_tracked`)의 spec 쓰기(`Create`·`UpdateSpec`·`Delete`)만 `Attributed`로 싼다. status 쓰기와 기록하지 않는 종류(Task·세션·노드…)는 옛 명령 그대로라 로그 크기·바이트가 그대로다. 싸는 조건은 "노드 리소스가 하나 이상 있고 모두 `config-history`를 알림" — 노드 리소스가 없는 막 만든 클러스터의 쓰기는 싸지 않는다(빈 목록을 참으로 보면 옛 노드가 합류하기 전 로그에 새 명령이 남는다). 출처 없는 쓰기는 `System`으로 싼다(§7.1 그대로).
+- **토큰 주체**: `ActorAuth::Token { name }`의 이름은 인증 추출기가 저장소의 토큰 리소스 이름으로 채운다(못 찾으면 토큰 id 문자열). 세션이고 `Orbivisor-Client`가 없으면 출처는 `web`, 머리가 있으면 머리를 따른다. 사유 머리는 UTF-8 바이트(obs-text)도 받는다(한글 사유). 감사 줄 id는 요청 시작에 정해 이력 줄 `request`와 같다.
+- **Task 실행기 출처**: Task 실행 전체를 `{actor: REQUESTED_BY 레이블의 사용자(이름은 저장소에서), auth: system, task: id, source: task}`로 감싼다. 스테이지 2의 Task `apply`는 안에서 다시 범위를 열어 `apply`·`terraform` 출처로 덮는다(`ChangeContext::scope`는 겹쳐 열 수 있다). `tokio::spawn`으로 띄운 작업에는 넘어가지 않는다(그 쓰기는 `System`). 범위는 `perform`을 `Box::pin`한 future를 감싼다 — 감싸지 않으면 큰 Task future(VMware 동기화)가 디버그 빌드에서 스택을 넘친다(브라우저 E2E가 잡음).
+- **이력 표 꼴**: `history` (종류, id, revision) → lz4(`compress_prepend_size`) JSON, `history_seq` revision → (종류, id, at_ms, 줄 바이트) — 전역 보존이 줄을 풀지 않고 시각·크기를 본다. 합계는 `meta`의 `history_count`·`history_bytes`. 스냅샷 칸은 `history: [[kind, id, revision, at_ms, base64(lz4)]]`(시각을 실어 설치 때 풀지 않는다), 비면 쓰지 않는다(시험: 기능 전 스냅샷에 칸 없음).
+- **보존**: 리소스당 한도는 가장 새 N줄을 남긴다(지운 리소스의 `Delete`는 가장 새 줄이라 남는다). 나이·전체 바이트는 명령마다 `history_seq` 앞에서 최대 256줄. 한도는 묶음마다 Raft의 설정에서 한 번 읽고 설정 쓰기가 있으면 다시 읽는다(범위 밖이면 기본값 — `SettingsSpec::history()`와 같은 규칙).
+- **관찰 노드**: Follow는 리소스만 싣으므로 관찰 노드(계획 48)에는 이력 표가 없다(설치 때 비움). 스테이지 3의 이력 API는 Raft 구성원에서 읽거나 그쪽으로 넘겨야 한다.
+- **설정 칸**: `SettingsSpec.history`·`acme`는 타입·범위 검증만 있다. 설정 PATCH는 아직 받지 않는다(설정은 `deny_unknown_fields`라 옛 노드가 풀지 못한다 — 스테이지 3·4가 기능 게이트와 함께 연다).
+- **권한·watch**: 새 종류 넷의 `kind_privilege`는 기본(읽기 `cluster.read`, 쓰기 `cluster.admin`) 그대로이고 watch에도 아직 없다. 적용 묶음의 `system.read` 보기·ACME 가린 watch는 API 스테이지(2·4)가 더한다(가림 함수 `acme::redact_*`는 이번에 opl-types에 둠).
+- **Task·경보 자리**: Task `apply`·`acme-order`는 만들기 게이트(409)와 실행 자리("not available yet")만, `apply`는 시간 제한 없는 Task 목록에, 둘 다 대상 줄에 선다. 경보 조건 셋은 기능 확인 뒤 400 "not available yet"(평가는 스테이지 3·4). 웹은 컴파일 맞춤만(대상 링크 자리 — `certificate` → 설정 보안, `apply_set` → 감사, 폼은 새 조건을 아직 보이지 않음).
+- **타입 꼴**: `CertificateScope::PerNode { nodes }`는 빈 목록이 "모든 노드"다(`All | Some` 대신). ACME 시각(`not_after`·`renew_at`·`next_attempt_at`)은 유닉스 초, 이력 시각은 밀리초. `Kind::parse`를 더했다. 매니페스트 머리는 YAML과 같게 `apiVersion`, 비밀 참조는 `secretRef`.
+- **잰 값(이 Mac, 릴리스 빌드)**: 상태 머신에 2 KiB VM spec 바꾸기 1 000번(묶음 하나에 명령 하나, 이력은 리소스당 100줄로 다듬으며) — 파일 저장소(fsync, 실제 노드와 같음) 5.10 s → 5.15 s **+1.0%**, 메모리 저장소(CPU만) 43.6 ms → 68.5 ms +57%(spec 쓰기 하나에 약 25 µs — lz4·두 표 넣기·한도 다듬기). 쓰기 길 전체(노드 하나 클러스터, Raft 로그·적용, `Cluster::update_spec` 300번) 4.53 s → 4.59 s **+1.3%**. 목표(5% 밑)는 디스크에 쓰는 실제 길에서 맞는다. 시험 `state_machine::tests::history_overhead`·`tests/history.rs::write_path_overhead`(`--ignored`).

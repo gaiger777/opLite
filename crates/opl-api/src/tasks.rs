@@ -34,13 +34,14 @@ use std::time::Duration;
 
 use opl_cluster::types::Rejection;
 use opl_cluster::watch::WatchEvent;
-use opl_cluster::{Cluster, ClusterError};
+use opl_cluster::{ChangeContext, Cluster, ClusterError};
 use opl_driver::ceph::CephHost;
 use opl_driver::ovn::OvnHost;
 use opl_driver::{DriverError, Hypervisor, ISO_HEADER_LEN, Storage, is_iso_image};
 use opl_peer::Peers;
 use opl_reconciler::{FirewallGate, FirmwareFetcher, ReconcilerHandle};
 use opl_types::backup::{BackupPhase, BackupSpec};
+use opl_types::history::{Actor, ActorAuth, ChangeMeta, ChangeSource};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec};
@@ -106,6 +107,13 @@ pub(crate) async fn create_task_with_id(
     }
     if op.needs_vm_export() {
         crate::cluster::require_feature(cluster, opl_types::node::VM_EXPORT)?;
+    }
+    // 선언형 적용·ACME 주문 Task도 옛 노드가 풀지 못한다(계획 73).
+    if op.needs_declarative() {
+        crate::cluster::require_feature(cluster, opl_types::node::DECLARATIVE)?;
+    }
+    if op.needs_acme() {
+        crate::cluster::require_feature(cluster, opl_types::node::ACME)?;
     }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.id = id;
@@ -723,6 +731,8 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
         TaskOp::VmImport { import, .. } => return Some(import),
         // 옮기기의 걸음은 그 옮기기의 줄에서 차례로(계획 67)
         TaskOp::NetworkMigrate { .. } => return Some(target),
+        // 인증서 하나에 주문 하나(계획 73 §11.2), 적용 묶음 하나에 적용 하나(대상 — 묶음 또는 계획)
+        TaskOp::AcmeOrder { .. } | TaskOp::Apply { .. } => return Some(target),
         // VMware 이전 Task는 항목(`vmware-vm`)의 줄에서 차례로 — 같은 VM의 회차·정리가 겹치지 않는다(계획 72).
         TaskOp::VmwareSync { .. }
         | TaskOp::VmwareCutover
@@ -883,11 +893,17 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
                 | TaskOp::VmwareCutover
                 | TaskOp::VmwareRevert
                 | TaskOp::VmwareCleanup { .. }
-        );
+        )
+        // 선언형 적용(계획 73)은 단계마다 지금 길의 Task(볼륨 만들기·VM 켜기)를 기다리므로 그 한도를 따른다.
+        || matches!(task.spec.op, TaskOp::Apply { .. });
+    // Task가 쓰는 spec은 Task를 만든 사용자와 이 Task를 출처로 이력에 남는다(계획 73 §7.1). `perform`의 future는 크므로
+    // 상자에 넣어 범위(`TaskLocalFuture`)가 스택에 싣지 않게 한다(넣지 않으면 VMware 동기화에서 스택이 넘친다).
+    let change = task_change(ctx, &task);
+    let run = || change.clone().scope(Box::pin(perform(ctx, &task, resume)));
     let (result, unfinished) = if unlimited {
-        (perform(ctx, &task, resume).await, false)
+        (run().await, false)
     } else {
-        match tokio::time::timeout(ctx.config.timeout, perform(ctx, &task, resume)).await {
+        match tokio::time::timeout(ctx.config.timeout, run()).await {
             Ok(r) => (r, false),
             Err(_) => (
                 Err(format!("timed out after {:?}", ctx.config.timeout)),
@@ -912,6 +928,28 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
         }
         Err(e) => fail(ctx, &task, e, unfinished).await,
     }
+}
+
+/// Task 실행의 출처: Task를 만든 사용자(레이블 [`REQUESTED_BY`] — 없으면 사람 아님)와 Task id, 출처 `task`
+fn task_change(ctx: &Ctx, task: &Task) -> ChangeContext {
+    let user_id: Option<Uuid> = task.labels.get(REQUESTED_BY).and_then(|s| s.parse().ok());
+    let user = user_id.and_then(|id| {
+        ctx.cluster
+            .get::<opl_types::auth::UserSpec>(id)
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+    });
+    ChangeContext::new(ChangeMeta {
+        actor: Actor {
+            user,
+            user_id,
+            auth: ActorAuth::System,
+            task: Some(task.id),
+        },
+        source: ChangeSource::Task,
+        ..ChangeMeta::default()
+    })
 }
 
 /// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기나 예약 정리의 삭제였으면
@@ -1300,6 +1338,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::VmwareRevert => return Box::pin(vmware::revert(ctx, task)).await,
         TaskOp::VmExport { export } => return export::export(ctx, task, *export).await,
         TaskOp::VmExportDelete => return export::delete(ctx, id).await,
+        // 선언형 적용(계획 73 스테이지 2)·ACME 주문(스테이지 4)은 그 스테이지가 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::Apply { .. } => Err("apply tasks are not available yet".into()),
+        TaskOp::AcmeOrder { .. } => Err("ACME order tasks are not available yet".into()),
     };
     done.map(|()| None)
 }

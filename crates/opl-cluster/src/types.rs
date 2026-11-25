@@ -3,6 +3,7 @@ use std::fmt;
 use std::io::Cursor;
 
 use opl_types::ha_check::CheckReport;
+use opl_types::history::ChangeMeta;
 use opl_types::numa::HostResource;
 use opl_types::placement::LoadSummary;
 use opl_types::quota::QuotaDimension;
@@ -66,6 +67,43 @@ pub enum Command {
         id: Uuid,
         expected_revision: Option<u64>,
     },
+    /// 출처를 단 명령(계획 73 §7): 안의 명령을 그대로 적용하고, 기록 종류의 spec이 바뀌면 상태 머신 이력 표에 줄을
+    /// 남긴다. `meta.at_ms`는 리더가 제안 직전에 찍는다. 옛 노드는 이 명령을 풀지 못하므로 기능 `config-history`가 모든
+    /// 노드에 있을 때만 쓴다(`Cluster::write`).
+    Attributed {
+        meta: ChangeMeta,
+        command: Box<Command>,
+    },
+}
+
+impl Command {
+    /// 출처를 벗긴 명령
+    pub fn inner(&self) -> &Command {
+        match self {
+            Command::Attributed { command, .. } => command.inner(),
+            other => other,
+        }
+    }
+
+    /// 명령이 다루는 종류
+    pub fn kind(&self) -> Kind {
+        match self.inner() {
+            Command::Create { kind, .. }
+            | Command::UpdateSpec { kind, .. }
+            | Command::UpdateStatus { kind, .. }
+            | Command::UpdateStatusIf { kind, .. }
+            | Command::Delete { kind, .. } => *kind,
+            Command::Attributed { .. } => unreachable!("inner() unwraps attributed commands"),
+        }
+    }
+
+    /// spec을 만들거나 바꾸거나 지우는 명령(이력이 남을 수 있는 것)인지
+    pub fn changes_spec(&self) -> bool {
+        matches!(
+            self.inner(),
+            Command::Create { .. } | Command::UpdateSpec { .. } | Command::Delete { .. }
+        )
+    }
 }
 
 /// 상태 머신이 명령을 거부한 이유. 모든 노드에서 똑같이 결정된다.
@@ -647,6 +685,56 @@ mod tests {
             r.to_string(),
             "storage-pool 00000000-0000-0000-0000-000000000001 not found"
         );
+    }
+
+    /// 계획 73: 출처를 단 명령은 새 태그 `attributed`이고 안의 명령은 옛 형식 그대로다(옛 명령의 바이트는 바뀌지 않는다).
+    #[test]
+    fn attributed_storage_format() {
+        use opl_types::history::{Actor, ActorAuth, ChangeSource};
+        let id = Uuid::from_u128(1);
+        let inner = Command::Delete {
+            kind: Kind::Vm,
+            id,
+            expected_revision: None,
+        };
+        let old = serde_json::to_value(&inner).unwrap();
+        assert_eq!(
+            old,
+            json!({"op": "delete", "kind": "vm", "id": id.to_string(), "expected_revision": null})
+        );
+        let cmd = Command::Attributed {
+            meta: ChangeMeta {
+                at_ms: 7,
+                actor: Actor {
+                    user: Some("admin".into()),
+                    user_id: None,
+                    auth: ActorAuth::Session,
+                    task: None,
+                },
+                source: ChangeSource::Web,
+                ..ChangeMeta::default()
+            },
+            command: Box::new(inner.clone()),
+        };
+        let value = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            value,
+            json!({"op": "attributed",
+                   "meta": {"at_ms": 7, "actor": {"user": "admin", "auth": {"kind": "session"}},
+                            "source": "web"},
+                   "command": old})
+        );
+        assert_eq!(serde_json::from_value::<Command>(value).unwrap(), cmd);
+        assert_eq!(cmd.inner(), &inner);
+        assert_eq!(cmd.kind(), Kind::Vm);
+        assert!(cmd.changes_spec());
+        let status = Command::UpdateStatus {
+            kind: Kind::Task,
+            id,
+            status: json!(null),
+        };
+        assert!(!status.changes_spec());
+        assert_eq!(status.kind(), Kind::Task);
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub(crate) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta
 pub(crate) const OBJECTS: TableDefinition<(&str, u128), &[u8]> = TableDefinition::new("objects");
 /// 이름 색인: (종류, 이름) → id
 pub(crate) const NAMES: TableDefinition<(&str, &str), u128> = TableDefinition::new("names");
+/// 설정 이력(계획 73): (종류, id, revision) → lz4로 줄인 `HistoryRecord` JSON
+pub(crate) const HISTORY: TableDefinition<(&str, u128, u64), &[u8]> =
+    TableDefinition::new("history");
+/// 이력의 시간 차례: revision → (종류, id, 시각 ms, 줄 바이트). 타임라인·전역 보존 한도가 쓴다.
+pub(crate) const HISTORY_SEQ: TableDefinition<u64, (&str, u128, u64, u64)> =
+    TableDefinition::new("history_seq");
 
 pub(crate) const KEY_SCHEMA_VERSION: &str = "schema_version";
 pub(crate) const KEY_VOTE: &str = "vote";
@@ -41,6 +47,9 @@ pub(crate) const KEY_NODE_MODE: &str = "node_mode";
 /// 관찰 노드가 되며 지운 Raft 로그의 마지막 인덱스(지금까지 가장 큰 것). 다시 Raft를 띄우기 전에 여기까지 적용한다
 /// ([`enter_observer_mode`]).
 pub(crate) const KEY_DROPPED_LOG: &str = "dropped_log";
+/// 이력 줄 수와 압축 뒤 바이트 합(계획 73)
+pub(crate) const KEY_HISTORY_COUNT: &str = "history_count";
+pub(crate) const KEY_HISTORY_BYTES: &str = "history_bytes";
 
 /// 저장소를 어떤 백엔드로 여는지(설계 §6)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -115,6 +124,9 @@ impl Store {
             txn.open_table(LOG)?;
             txn.open_table(OBJECTS)?;
             txn.open_table(NAMES)?;
+            // 계획 73의 이력 표는 없으면 만든다(스키마 판은 그대로 — 없던 표는 빈 이력이다).
+            txn.open_table(HISTORY)?;
+            txn.open_table(HISTORY_SEQ)?;
             let mut meta = txn.open_table(META)?;
             let found: Option<u32> = get_json(&meta, KEY_SCHEMA_VERSION)?;
             match found {
@@ -275,6 +287,87 @@ pub(crate) fn list_objects(
         out.push(serde_json::from_slice(v.value())?);
     }
     Ok((applied.map_or(0, |l| l.index), out))
+}
+
+/// 모든 노드(위트니스 포함)가 기능 `feature`를 알린다. 노드가 하나도 없으면(클러스터를 막 만듦) 거짓이다.
+pub(crate) fn all_nodes_have(db: &Database, feature: &str) -> Result<bool, StoreError> {
+    #[derive(Deserialize)]
+    struct Status {
+        #[serde(default)]
+        features: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct Node {
+        #[serde(default)]
+        status: Option<Status>,
+    }
+    let txn = db.begin_read()?;
+    let objects = txn.open_table(OBJECTS)?;
+    let kind = Kind::Node.as_str();
+    let mut any = false;
+    for item in objects.range((kind, 0u128)..=(kind, u128::MAX))? {
+        let (_, v) = item?;
+        let node: Node = serde_json::from_slice(v.value())?;
+        if !node
+            .status
+            .is_some_and(|s| s.features.iter().any(|f| f == feature))
+        {
+            return Ok(false);
+        }
+        any = true;
+    }
+    Ok(any)
+}
+
+/// 리소스 하나의 이력(revision 차례). 지운 리소스도 id로 찾는다.
+pub(crate) fn history_of(
+    db: &Database,
+    kind: Kind,
+    id: Uuid,
+) -> Result<Vec<opl_types::history::HistoryRecord>, StoreError> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(HISTORY)?;
+    let key = (kind.as_str(), id.as_u128());
+    let mut out = Vec::new();
+    for item in table.range((key.0, key.1, 0)..=(key.0, key.1, u64::MAX))? {
+        let (_, v) = item?;
+        out.push(crate::history::decode(v.value())?);
+    }
+    Ok(out)
+}
+
+/// 클러스터 전체 이력을 새것부터: `before`(revision, 그 줄은 빼고) 앞의 줄을 `limit`개까지
+pub(crate) fn history_timeline(
+    db: &Database,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<Vec<opl_types::history::HistoryRecord>, StoreError> {
+    let txn = db.begin_read()?;
+    let seq = txn.open_table(HISTORY_SEQ)?;
+    let history = txn.open_table(HISTORY)?;
+    let end = before.unwrap_or(u64::MAX);
+    let mut out = Vec::new();
+    for item in seq.range(..end)?.rev() {
+        if out.len() >= limit {
+            break;
+        }
+        let (rev, v) = item?;
+        let (kind, id, _, _) = v.value();
+        if let Some(bytes) = history.get((kind, id, rev.value()))? {
+            out.push(crate::history::decode(bytes.value())?);
+        }
+    }
+    Ok(out)
+}
+
+/// 이력 줄 수와 압축 뒤 바이트 합
+pub(crate) fn history_totals(db: &Database) -> Result<crate::history::HistoryTotals, StoreError> {
+    let txn = db.begin_read()?;
+    let meta = txn.open_table(META)?;
+    Ok(crate::history::HistoryTotals {
+        count: get_json(&meta, KEY_HISTORY_COUNT)?.unwrap_or(0),
+        bytes: get_json(&meta, KEY_HISTORY_BYTES)?.unwrap_or(0),
+    })
 }
 
 #[cfg(test)]

@@ -19,12 +19,14 @@ use async_trait::async_trait;
 use axum::extract::{FromRequestParts, MatchedPath, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Method};
+use axum::http::{HeaderMap, HeaderName, Method};
 use axum::middleware::Next;
 use axum::response::Response;
+use opl_cluster::ChangeContext;
 use opl_cluster::types::NodeId;
 use opl_peer::AuditSource;
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditResponse, AuditTarget};
+use opl_types::history::{Actor, ActorAuth, ChangeMeta, ChangeSource, clean_reason};
 use opl_types::node::NodeSpec;
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -400,13 +402,75 @@ struct SlotData {
     principal: Option<Principal>,
     auth: Option<AuditAuth>,
     detail: Option<String>,
+    /// 이 요청이 쓰는 것의 출처(계획 73 — 설정 이력). 주체를 알면 사용자를 채운다.
+    change: Option<ChangeContext>,
+    /// `Orbivisor-Client`가 있었다(없고 세션이면 출처는 웹)
+    client_header: bool,
 }
 
 impl AuditSlot {
     fn set_principal(&self, principal: Principal, auth: AuditAuth) {
         let mut data = self.0.lock().unwrap();
+        if let Some(change) = &data.change {
+            let session = auth == AuditAuth::Session;
+            let client_header = data.client_header;
+            change.update(|m| {
+                m.actor = Actor {
+                    user: Some(principal.name.clone()),
+                    user_id: Some(principal.user),
+                    auth: match principal.token {
+                        Some(token) => ActorAuth::Token {
+                            name: token.to_string(),
+                        },
+                        None => ActorAuth::Session,
+                    },
+                    task: None,
+                };
+                if session && !client_header {
+                    m.source = ChangeSource::Web;
+                }
+            });
+        }
         data.principal = Some(principal);
         data.auth = Some(auth);
+    }
+}
+
+/// 쓰기를 한 도구(`cli/0.1.0`·`terraform/0.1.0`·`web` — 설정 이력의 출처, 계획 73)
+pub const CLIENT_HEADER: HeaderName = HeaderName::from_static("orbivisor-client");
+/// 바꾸는 까닭(설정 이력에 남는다, 200자 — 계획 73)
+pub const REASON_HEADER: HeaderName = HeaderName::from_static("orbivisor-change-reason");
+
+/// 요청 머리에서 출처를 만든다(주체는 인증 뒤 [`AuditSlot::set_principal`]이 채운다).
+fn change_meta(headers: &HeaderMap, request: Uuid) -> (ChangeMeta, bool) {
+    let client = headers
+        .get(&CLIENT_HEADER)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    let reason = headers
+        .get(&REASON_HEADER)
+        .and_then(|v| clean_reason(&String::from_utf8_lossy(v.as_bytes())));
+    let meta = ChangeMeta {
+        source: client
+            .as_deref()
+            .map_or(ChangeSource::Api, ChangeSource::from_client),
+        reason,
+        request: Some(request),
+        ..ChangeMeta::default()
+    };
+    (meta, client.is_some())
+}
+
+/// API 토큰으로 온 요청이면 이력의 주체 칸에 토큰 이름을 적는다(인증 추출기가 저장소에서 찾아 부른다).
+pub(crate) fn note_token_name(parts: &Parts, name: &str) {
+    let Some(slot) = parts.extensions.get::<AuditSlot>() else {
+        return;
+    };
+    if let Some(change) = &slot.0.lock().unwrap().change {
+        change.update(|m| {
+            if let ActorAuth::Token { name: n } = &mut m.actor.auth {
+                *n = name.to_string();
+            }
+        });
     }
 }
 
@@ -485,17 +549,27 @@ pub(crate) async fn layer(
         return next.run(req).await;
     }
     let path = api_path(req.uri().path()).to_string();
-    let slot = AuditSlot::default();
+    // 감사 줄 id를 먼저 정해 같은 요청의 설정 이력 줄과 잇는다(계획 73 §7.1).
+    let id = Uuid::now_v7();
+    let (meta, client_header) = change_meta(req.headers(), id);
+    let change = ChangeContext::new(meta);
+    let slot = AuditSlot(Arc::new(Mutex::new(SlotData {
+        change: Some(change.clone()),
+        client_header,
+        ..SlotData::default()
+    })));
     req.extensions_mut().insert(slot.clone());
     let start = Instant::now();
-    let response = REQUEST.scope(slot.clone(), next.run(req)).await;
+    let response = REQUEST
+        .scope(slot.clone(), change.scope(next.run(req)))
+        .await;
     if template == QUIET_CHECK {
         return response;
     }
     let data = std::mem::take(&mut *slot.0.lock().unwrap());
     let principal = data.principal;
     state.audit.record(AuditEntry {
-        id: Uuid::now_v7(),
+        id,
         time: now_ms(),
         // record가 이 노드의 이름으로 채운다.
         node: String::new(),

@@ -1,10 +1,12 @@
 //! Raft로 복제되는 Orbivisor 리소스 저장소.
 
+pub mod change;
 mod cluster;
 mod exclusive;
 mod folders;
 mod follow;
 mod health;
+mod history;
 mod hosts;
 mod leader;
 mod lease;
@@ -21,9 +23,11 @@ mod voters;
 pub mod watch;
 mod writer;
 
+pub use change::ChangeContext;
 pub use cluster::{Cluster, ClusterConfig, ClusterError, DB_FILE, Members, Typed};
 pub use follow::{FollowClient, FollowFrame, FollowGate, NodeRole, PROGRESS_INTERVAL};
 pub use health::{QUORUM_ACK_MAX, RaftHealth};
+pub use history::HistoryTotals;
 pub use leader::{CATCH_UP_TIMEOUT, Forwarder, LeaderError};
 pub use lease::{Leases, LoadReport, MAX_LEASE_CHECKS};
 pub use links::{Failure, LINK_DEAD_AFTER, LINK_RETRY, LinkBook, LinkSelector, Pick};

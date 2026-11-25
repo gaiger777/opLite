@@ -941,7 +941,10 @@ pub(crate) mod tests {
                 "file-restore",
                 "vm-check",
                 "vmware-migrate",
-                "vm-export"
+                "vm-export",
+                "declarative",
+                "config-history",
+                "acme"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -992,7 +995,10 @@ pub(crate) mod tests {
                 "file-restore",
                 "vm-check",
                 "vmware-migrate",
-                "vm-export"
+                "vm-export",
+                "declarative",
+                "config-history",
+                "acme"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1062,7 +1068,10 @@ pub(crate) mod tests {
                 "file-restore",
                 "vm-check",
                 "vmware-migrate",
-                "vm-export"
+                "vm-export",
+                "declarative",
+                "config-history",
+                "acme"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1307,6 +1316,9 @@ pub(crate) mod tests {
                     "vm-check".into(),
                     "vmware-migrate".into(),
                     "vm-export".into(),
+                    "declarative".into(),
+                    "config-history".into(),
+                    "acme".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

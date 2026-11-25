@@ -121,5 +121,10 @@ export function alertHref(subject: AlertSubject): string {
       return `/backups?q=${enc(subject.name)}`;
     case "backup_store":
       return `/backup-stores?open=${enc(subject.id)}`;
+    // 인증서·적용 묶음(계획 73): 화면은 스테이지 6이 더한다. 그때까지는 그 영역의 지금 화면
+    case "certificate":
+      return "/settings/security";
+    case "apply_set":
+      return "/audit";
   }
 }

@@ -372,6 +372,22 @@ pub enum TaskOp {
     },
     /// 대상 내보내기(`vm-export`)의 디렉터리를 지운다(계획 72 §12.1).
     VmExportDelete,
+    /// 저장한 계획 `plan`을 실행한다(계획 73 §8.3 — 받은 노드에서, 이어 가지 않음: 끊기면 실패로 끝나고 다시 적용하면
+    /// 남은 것만 한다). `set`은 적용 묶음(`apply-set` id)이고, 대상도 묶음(없으면 계획 id)이다.
+    Apply {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        set: Option<Uuid>,
+        plan: Uuid,
+    },
+    /// 인증서 `certificate`의 ACME 주문 하나(계획 73 §11.2). 노드마다 인증서면 `node`의 것을 그 노드에서, 공유면 리더가
+    /// 고른 노드에서 받는다. 대상은 인증서이고 그 줄에 선다(인증서 하나에 주문 하나).
+    AcmeOrder {
+        certificate: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        node: Option<Uuid>,
+    },
 }
 
 impl TaskOp {
@@ -460,6 +476,16 @@ impl TaskOp {
     /// VM 내보내기 기능(계획 72, `node::VM_EXPORT`)을 모르는 노드가 풀지 못하는 Task인지
     pub fn needs_vm_export(&self) -> bool {
         matches!(self, TaskOp::VmExport { .. } | TaskOp::VmExportDelete)
+    }
+
+    /// 선언형 적용 기능(계획 73, `node::DECLARATIVE`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_declarative(&self) -> bool {
+        matches!(self, TaskOp::Apply { .. })
+    }
+
+    /// ACME 기능(계획 73, `node::ACME`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_acme(&self) -> bool {
+        matches!(self, TaskOp::AcmeOrder { .. })
     }
 
     /// SDN 서비스 기능(계획 67, `node::SDN_SERVICES`)을 모르는 노드가 풀지 못하는 Task인지
@@ -729,6 +755,58 @@ mod tests {
         let op: TaskOp = serde_json::from_value(old.clone()).unwrap();
         assert!(!op.needs_vmware_migrate() && !op.needs_vm_export());
         assert_eq!(serde_json::to_value(&op).unwrap(), old);
+    }
+
+    /// 계획 73의 Task 둘: 태그와 칸(빈 칸은 쓰지 않음), 기능 판단.
+    #[test]
+    fn declarative_and_acme_ops_are_tagged() {
+        let (set, plan, cert, node) = (
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            Uuid::from_u128(4),
+        );
+        let cases = [
+            (
+                TaskOp::Apply {
+                    set: Some(set),
+                    plan,
+                },
+                serde_json::json!({ "kind": "apply", "set": set, "plan": plan }),
+            ),
+            (
+                TaskOp::Apply { set: None, plan },
+                serde_json::json!({ "kind": "apply", "plan": plan }),
+            ),
+            (
+                TaskOp::AcmeOrder {
+                    certificate: cert,
+                    node: Some(node),
+                },
+                serde_json::json!({ "kind": "acme-order", "certificate": cert, "node": node }),
+            ),
+            (
+                TaskOp::AcmeOrder {
+                    certificate: cert,
+                    node: None,
+                },
+                serde_json::json!({ "kind": "acme-order", "certificate": cert }),
+            ),
+        ];
+        for (op, json) in cases {
+            let apply = matches!(op, TaskOp::Apply { .. });
+            assert_eq!(op.needs_declarative(), apply, "{json}");
+            assert_eq!(op.needs_acme(), !apply, "{json}");
+            assert!(
+                !op.needs_vm_export() && !op.needs_vmware_migrate(),
+                "{json}"
+            );
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        }
+        let old = serde_json::json!({ "kind": "vm-export-delete" });
+        let op: TaskOp = serde_json::from_value(old).unwrap();
+        assert!(!op.needs_declarative() && !op.needs_acme());
     }
 
     #[test]

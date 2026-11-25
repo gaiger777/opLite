@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::exclusive::{SHARED_IP_KINDS, exclusive_values};
+use crate::history::{Prev, Recorder, SnapshotRow, Tables};
 use crate::store::{
-    KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA, KEY_SNAPSHOT_META, META, NAMES,
-    OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
+    HISTORY, HISTORY_SEQ, KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA,
+    KEY_SNAPSHOT_META, META, NAMES, OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
 };
 use crate::types::{Command, NodeId, OrbNode, RawResource, Rejection, Response, TypeConfig};
 use crate::watch::{FeedBatch, WatchEvent, WatchHub};
@@ -33,11 +34,15 @@ struct SnapshotHeader {
     schema_version: u32,
 }
 
-/// 스냅샷 본문. 상태 머신의 리소스 전체를 담는다.
+/// 스냅샷 본문. 상태 머신의 리소스 전체와 설정 이력(계획 73)을 담는다.
 #[derive(Serialize, Deserialize)]
 struct SnapshotData {
     schema_version: u32,
     objects: Vec<(Kind, RawResource)>,
+    /// 이력 줄(revision 차례). 기능 `config-history` 전에는 비어 쓰지 않으므로 옛 노드의 스냅샷과 바이트까지 같고, 옛
+    /// 노드는 이 칸을 모른 채 버린다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    history: Vec<SnapshotRow>,
 }
 
 /// 리소스 상태 머신. 엔트리 묶음 하나를 redb 트랜잭션 하나로 적용하므로
@@ -90,6 +95,9 @@ impl StateMachine {
             let mut meta = txn.open_table(META)?;
             let mut objects = txn.open_table(OBJECTS)?;
             let mut names = txn.open_table(NAMES)?;
+            let mut history = txn.open_table(HISTORY)?;
+            let mut seq = txn.open_table(HISTORY_SEQ)?;
+            let mut recorder = Recorder::new();
             for entry in entries {
                 let index = entry.log_id.index;
                 let result = match entry.payload {
@@ -100,8 +108,47 @@ impl StateMachine {
                         membership = Some(m);
                         Ok(index)
                     }
+                    EntryPayload::Normal(Command::Attributed {
+                        meta: change,
+                        command,
+                    }) => {
+                        let command = *command;
+                        let kind = command.kind();
+                        let tracked = command.changes_spec() && kind.history_tracked();
+                        // 바꾸기는 앞 값과 견준다(같은 값 쓰기는 줄 없음, 비밀은 바뀜/같음만).
+                        let mut prev = None;
+                        let result = apply_command_keeping(
+                            &mut objects,
+                            &mut names,
+                            command,
+                            index,
+                            tracked.then_some(&mut prev),
+                        )?;
+                        if let (true, Ok(event)) = (tracked, &result) {
+                            let mut tables = Tables {
+                                objects: &objects,
+                                names: &names,
+                                meta: &meta,
+                                history: &mut history,
+                                seq: &mut seq,
+                            };
+                            recorder.record(&mut tables, &change, index, event, prev.as_ref())?;
+                        }
+                        if kind == Kind::Settings {
+                            recorder.settings_changed();
+                        }
+                        result.map(|event| {
+                            events.push(event);
+                            index
+                        })
+                    }
                     EntryPayload::Normal(cmd) => {
-                        apply_command(&mut objects, &mut names, cmd, index)?.map(|event| {
+                        let settings = cmd.kind() == Kind::Settings;
+                        let result = apply_command(&mut objects, &mut names, cmd, index)?;
+                        if settings {
+                            recorder.settings_changed();
+                        }
+                        result.map(|event| {
                             events.push(event);
                             index
                         })
@@ -111,6 +158,7 @@ impl StateMachine {
                 applied = Some(entry.log_id);
                 responses.push(Response(result));
             }
+            recorder.finish(&mut meta)?;
         }
         txn.commit()?;
         // 이벤트가 없는 묶음도 적용 위치를 알린다.
@@ -124,10 +172,14 @@ impl StateMachine {
 
     /// 한 읽기 트랜잭션에서 상태 전체를 떠서 스냅샷 본문을 만든다. 저장은 부른 쪽이 한다.
     fn snapshot_data(db: &Database) -> Result<(Meta, Vec<u8>), StoreError> {
-        let (last_log_id, last_membership, objects) = snapshot_objects(db)?;
+        let txn = db.begin_read()?;
+        let (last_log_id, last_membership, objects) = snapshot_in(&txn)?;
+        let history = crate::history::snapshot_rows(&txn)?;
+        drop(txn);
         let data = serde_json::to_vec(&SnapshotData {
             schema_version: SCHEMA_VERSION,
             objects,
+            history,
         })?;
         let meta = Meta {
             snapshot_id: format!(
@@ -202,6 +254,12 @@ impl StateMachine {
                 )?;
             }
             let mut table = txn.open_table(META)?;
+            crate::history::install_rows(
+                &mut txn.open_table(HISTORY)?,
+                &mut txn.open_table(HISTORY_SEQ)?,
+                &mut table,
+                &snapshot.history,
+            )?;
             put_json(&mut table, KEY_LAST_APPLIED, &meta.last_log_id)?;
             put_json(&mut table, KEY_LAST_MEMBERSHIP, &meta.last_membership)?;
             put_json(&mut table, KEY_SNAPSHOT_META, meta)?;
@@ -216,7 +274,13 @@ impl StateMachine {
 pub(crate) fn snapshot_objects(
     db: &Database,
 ) -> Result<(Option<LogId<NodeId>>, Membership, Objects), StoreError> {
-    let txn = db.begin_read()?;
+    snapshot_in(&db.begin_read()?)
+}
+
+/// [`snapshot_objects`]를 주어진 읽기 거래에서(이력과 같은 시점을 뜨려고)
+fn snapshot_in(
+    txn: &redb::ReadTransaction,
+) -> Result<(Option<LogId<NodeId>>, Membership, Objects), StoreError> {
     let meta_table = txn.open_table(META)?;
     let last_log_id: Option<LogId<NodeId>> = get_json(&meta_table, KEY_LAST_APPLIED)?;
     let last_membership: Membership =
@@ -244,9 +308,11 @@ pub(crate) fn install_objects(
     membership: Membership,
     objects: Objects,
 ) -> Result<(), StoreError> {
+    // 관찰 노드는 이력 표를 갖지 않는다(Follow는 리소스만 싣는다 — 이력은 투표 멤버·learner에서 읽는다).
     let data = serde_json::to_vec(&SnapshotData {
         schema_version: SCHEMA_VERSION,
         objects,
+        history: Vec::new(),
     })?;
     let meta = Meta {
         snapshot_id: format!(
@@ -312,6 +378,17 @@ pub(crate) fn apply_command(
     names: &mut Table<(&'static str, &'static str), u128>,
     cmd: Command,
     index: u64,
+) -> Result<Result<WatchEvent, Rejection>, StoreError> {
+    apply_command_keeping(objects, names, cmd, index, None)
+}
+
+/// [`apply_command`]와 같되 `keep`이 있으면 바꾸기(`UpdateSpec`) 전 spec·labels를 거기 둔다(이력이 앞 값과 견준다).
+fn apply_command_keeping(
+    objects: &mut Table<(&'static str, u128), &'static [u8]>,
+    names: &mut Table<(&'static str, &'static str), u128>,
+    cmd: Command,
+    index: u64,
+    keep: Option<&mut Option<Prev>>,
 ) -> Result<Result<WatchEvent, Rejection>, StoreError> {
     let load = |objects: &Table<(&'static str, u128), &'static [u8]>,
                 kind: Kind,
@@ -437,8 +514,14 @@ pub(crate) fn apply_command(
             {
                 return Ok(Err(r));
             }
-            resource.labels = labels;
-            resource.spec = spec;
+            let old_labels = std::mem::replace(&mut resource.labels, labels);
+            let old_spec = std::mem::replace(&mut resource.spec, spec);
+            if let Some(keep) = keep {
+                *keep = Some(Prev {
+                    spec: old_spec,
+                    labels: old_labels,
+                });
+            }
             resource.revision = index;
             (kind, resource)
         }
@@ -465,6 +548,10 @@ pub(crate) fn apply_command(
             resource.status = status;
             resource.revision = index;
             (kind, resource)
+        }
+        // 겹쳐 싼 명령은 안의 것을 적용한다(이력은 바깥 `apply_entries`가 남긴다).
+        Command::Attributed { command, .. } => {
+            return apply_command_keeping(objects, names, *command, index, keep);
         }
         Command::Delete {
             kind,
@@ -708,5 +795,470 @@ mod tests {
             StateMachine::install(&sm.db, &meta_at(3), data),
             Err(StoreError::UnsupportedSchema { found: 99 })
         ));
+    }
+    // ---- 설정 이력(계획 73) ----
+
+    use crate::store::{HISTORY, HISTORY_SEQ, KEY_HISTORY_BYTES, KEY_HISTORY_COUNT, history_of};
+    use opl_types::history::{Actor, ActorAuth, ChangeMeta, ChangeSource, HistoryOp};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    fn entry(index: u64, cmd: Command) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, NodeId::from(1)), index),
+            payload: EntryPayload::Normal(cmd),
+        }
+    }
+
+    fn meta(at_ms: u64) -> ChangeMeta {
+        ChangeMeta {
+            at_ms,
+            actor: Actor {
+                user: Some("admin".into()),
+                user_id: Some(Uuid::from_u128(77)),
+                auth: ActorAuth::Session,
+                task: None,
+            },
+            source: ChangeSource::Web,
+            reason: Some("ticket 1".into()),
+            ..ChangeMeta::default()
+        }
+    }
+
+    fn wrap(at_ms: u64, cmd: Command) -> Command {
+        Command::Attributed {
+            meta: meta(at_ms),
+            command: Box::new(cmd),
+        }
+    }
+
+    fn create(kind: Kind, id: u128, name: &str, spec: Value) -> Command {
+        let mut resource: RawResource = opl_types::resource::Resource::new(name, spec);
+        resource.id = Uuid::from_u128(id);
+        resource.status = json!({});
+        Command::Create { kind, resource }
+    }
+
+    fn update(kind: Kind, id: u128, spec: Value) -> Command {
+        Command::UpdateSpec {
+            kind,
+            id: Uuid::from_u128(id),
+            expected_revision: None,
+            labels: BTreeMap::new(),
+            spec,
+        }
+    }
+
+    fn delete(kind: Kind, id: u128) -> Command {
+        Command::Delete {
+            kind,
+            id: Uuid::from_u128(id),
+            expected_revision: None,
+        }
+    }
+
+    /// 명령들을 1부터 차례로 한 묶음씩 적용한다(실제 쓰기처럼 묶음 하나에 명령 하나).
+    fn apply_all(db: &Database, cmds: Vec<Command>) -> Vec<Response> {
+        let start = StateMachine::read_applied_index(db);
+        cmds.into_iter()
+            .enumerate()
+            .flat_map(|(i, c)| {
+                StateMachine::apply_entries(db, vec![entry(start + i as u64 + 1, c)])
+                    .unwrap()
+                    .0
+            })
+            .collect()
+    }
+
+    fn open() -> Store {
+        Store::open_in_memory().unwrap()
+    }
+
+    /// 이력 표 둘과 합계를 바이트로(결정성 비교)
+    fn dump(db: &Database) -> Vec<u8> {
+        let txn = db.begin_read().unwrap();
+        let mut out = Vec::new();
+        for item in txn.open_table(HISTORY).unwrap().iter().unwrap() {
+            let (k, v) = item.unwrap();
+            let (kind, id, rev) = k.value();
+            out.extend(format!("{kind}/{id}/{rev}=").bytes());
+            out.extend(v.value());
+        }
+        for item in txn.open_table(HISTORY_SEQ).unwrap().iter().unwrap() {
+            let (k, v) = item.unwrap();
+            out.extend(format!("{}={:?};", k.value(), v.value()).bytes());
+        }
+        let meta = txn.open_table(META).unwrap();
+        for key in [KEY_HISTORY_COUNT, KEY_HISTORY_BYTES] {
+            out.extend(
+                get_json::<u64>(&meta, key)
+                    .unwrap()
+                    .unwrap_or(0)
+                    .to_le_bytes(),
+            );
+        }
+        out
+    }
+
+    impl StateMachine {
+        fn read_applied_index(db: &Database) -> u64 {
+            let txn = db.begin_read().unwrap();
+            let meta = txn.open_table(META).unwrap();
+            get_json::<LogId<NodeId>>(&meta, KEY_LAST_APPLIED)
+                .unwrap()
+                .map_or(0, |l| l.index)
+        }
+    }
+
+    #[test]
+    fn attributed_writes_leave_history_rows() {
+        let store = open();
+        let db = store.db();
+        let id = Uuid::from_u128(1);
+        let r = apply_all(
+            db,
+            vec![
+                wrap(
+                    1000,
+                    create(Kind::Volume, 1, "disk", json!({ "size_bytes": 1 })),
+                ),
+                // 같은 값 쓰기는 줄이 없다.
+                wrap(1001, update(Kind::Volume, 1, json!({ "size_bytes": 1 }))),
+                wrap(1002, update(Kind::Volume, 1, json!({ "size_bytes": 2 }))),
+                // status 쓰기·출처 없는 쓰기·기록하지 않는 종류는 줄이 없다.
+                Command::UpdateStatus {
+                    kind: Kind::Volume,
+                    id,
+                    status: json!({ "phase": "ready" }),
+                },
+                update(Kind::Volume, 1, json!({ "size_bytes": 3 })),
+                wrap(1005, create(Kind::Task, 2, "t", json!({}))),
+                // 거부된 쓰기도 줄이 없다.
+                wrap(1006, update(Kind::Volume, 9, json!({}))),
+                wrap(1007, delete(Kind::Volume, 1)),
+            ],
+        );
+        assert!(r[6].0.is_err());
+        let rows = history_of(db, Kind::Volume, id).unwrap();
+        let ops: Vec<_> = rows.iter().map(|r| (r.revision, r.op, r.at_ms)).collect();
+        assert_eq!(
+            ops,
+            vec![
+                (1, HistoryOp::Create, 1000),
+                (3, HistoryOp::Update, 1002),
+                (8, HistoryOp::Delete, 1007)
+            ]
+        );
+        assert_eq!(rows[0].name, "disk");
+        assert_eq!(rows[1].spec, json!({ "size_bytes": 2 }));
+        // 지우기 줄은 지우기 직전 spec(출처 없이 바꾼 3)을 담는다.
+        assert_eq!(rows[2].spec, json!({ "size_bytes": 3 }));
+        assert_eq!(rows[0].actor.user.as_deref(), Some("admin"));
+        assert_eq!(rows[0].source, ChangeSource::Web);
+        assert_eq!(rows[0].reason.as_deref(), Some("ticket 1"));
+        assert!(
+            history_of(db, Kind::Task, Uuid::from_u128(2))
+                .unwrap()
+                .is_empty()
+        );
+        let totals = crate::store::history_totals(db).unwrap();
+        assert_eq!(totals.count, 3);
+        assert!(totals.bytes > 0);
+        // 타임라인은 새것부터, 쪽 열쇠는 revision이다.
+        let tl = crate::store::history_timeline(db, None, 2).unwrap();
+        assert_eq!(
+            tl.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            vec![8, 3]
+        );
+        let tl = crate::store::history_timeline(db, Some(3), 10).unwrap();
+        assert_eq!(tl.iter().map(|r| r.revision).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// 라벨만 바꿔도 줄이고, 비밀은 표시만 남는다(평문·해시 없음).
+    #[test]
+    fn labels_count_and_secrets_never_reach_history() {
+        let store = open();
+        let db = store.db();
+        let spec =
+            |pw: &str| json!({ "host": "vc", "user": "u", "password": pw, "fingerprint": "f" });
+        let mut relabel = update(Kind::VmwareSource, 1, spec("hunter2"));
+        if let Command::UpdateSpec { labels, .. } = &mut relabel {
+            labels.insert("team".into(), "a".into());
+        }
+        apply_all(
+            db,
+            vec![
+                wrap(1, create(Kind::VmwareSource, 1, "vc", spec("hunter2"))),
+                wrap(2, relabel),
+                wrap(3, update(Kind::VmwareSource, 1, spec("s3cret-NEW"))),
+                wrap(4, delete(Kind::VmwareSource, 1)),
+            ],
+        );
+        let rows = history_of(db, Kind::VmwareSource, Uuid::from_u128(1)).unwrap();
+        let marks: Vec<&Value> = rows.iter().map(|r| &r.spec["password"]).collect();
+        assert_eq!(
+            marks,
+            vec![
+                &json!({ "$secret": "set" }),
+                &json!({ "$secret": "same" }),
+                &json!({ "$secret": "changed" }),
+                &json!({ "$secret": "set" })
+            ]
+        );
+        assert_eq!(rows[1].labels.get("team").map(String::as_str), Some("a"));
+        let raw = dump(db);
+        let text: Vec<u8> = rows
+            .iter()
+            .flat_map(|r| serde_json::to_vec(r).unwrap())
+            .collect();
+        for secret in ["hunter2", "s3cret-NEW"] {
+            assert!(!String::from_utf8_lossy(&text).contains(secret));
+            assert!(!raw.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        }
+    }
+
+    fn settings(history: Value) -> Command {
+        create(
+            Kind::Settings,
+            100,
+            "cluster",
+            json!({ "updates": { "channel": "stable" }, "history": history }),
+        )
+    }
+
+    #[test]
+    fn retention_per_resource_keeps_the_newest_rows() {
+        let store = open();
+        let db = store.db();
+        let mut cmds = vec![
+            settings(json!({ "max_per_resource": 10 })),
+            wrap(1, create(Kind::Network, 1, "n", json!({ "v": 0 }))),
+        ];
+        for i in 1..=20 {
+            cmds.push(wrap(1 + i, update(Kind::Network, 1, json!({ "v": i }))));
+        }
+        cmds.push(wrap(100, delete(Kind::Network, 1)));
+        apply_all(db, cmds);
+        let rows = history_of(db, Kind::Network, Uuid::from_u128(1)).unwrap();
+        assert_eq!(rows.len(), 10);
+        // 지운 리소스의 마지막 줄(살리기에 씀)은 남는다.
+        assert_eq!(rows.last().unwrap().op, HistoryOp::Delete);
+        assert_eq!(rows.first().unwrap().spec, json!({ "v": 12 }));
+        assert_eq!(crate::store::history_totals(db).unwrap().count, 10);
+        let seq = crate::store::history_timeline(db, None, 100).unwrap();
+        assert_eq!(seq.len(), 10);
+    }
+
+    #[test]
+    fn retention_by_age_uses_the_command_time() {
+        let store = open();
+        let db = store.db();
+        let day = 86_400_000;
+        let mut cmds = vec![settings(json!({ "max_age_days": 7 }))];
+        for i in 0..5u128 {
+            cmds.push(wrap(
+                day,
+                create(Kind::Folder, 10 + i, &format!("f{i}"), json!({})),
+            ));
+        }
+        // 8일 뒤의 쓰기가 오래된 줄을 지운다(노드 시계가 아니라 명령의 시각).
+        cmds.push(wrap(9 * day, create(Kind::Folder, 20, "late", json!({}))));
+        apply_all(db, cmds);
+        let tl = crate::store::history_timeline(db, None, 100).unwrap();
+        assert_eq!(tl.len(), 1, "{tl:?}");
+        assert_eq!(tl[0].name, "late");
+        assert_eq!(crate::store::history_totals(db).unwrap().count, 1);
+    }
+
+    #[test]
+    fn retention_by_total_bytes_drops_the_oldest() {
+        let store = open();
+        let db = store.db();
+        // 줄지 않는 값(lz4가 거의 못 줄임) 64 KiB씩 200줄 ≈ 12.5 MiB > 8 MiB
+        let noise = |seed: u64| -> String {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..65_536)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    char::from(b'!' + (x % 90) as u8)
+                })
+                .collect()
+        };
+        let mut cmds = vec![settings(json!({ "max_total_mib": 8 }))];
+        for i in 0..200u128 {
+            cmds.push(wrap(
+                1,
+                create(
+                    Kind::AlertRule,
+                    1000 + i,
+                    &format!("r{i}"),
+                    json!({ "x": noise(i as u64) }),
+                ),
+            ));
+        }
+        apply_all(db, cmds);
+        let totals = crate::store::history_totals(db).unwrap();
+        assert!(totals.bytes <= 8 * 1024 * 1024, "{totals:?}");
+        assert!(totals.count < 200 && totals.count > 100, "{totals:?}");
+        let tl = crate::store::history_timeline(db, None, 1000).unwrap();
+        assert_eq!(tl.len() as u64, totals.count);
+        assert_eq!(tl[0].name, "r199");
+    }
+
+    /// 같은 로그를 적용한 두 상태 머신의 이력 표는 바이트까지 같다. 묶음 나누기가 달라도 같다.
+    #[test]
+    fn history_is_deterministic() {
+        let log = || {
+            let mut cmds = vec![settings(json!({ "max_per_resource": 10 }))];
+            for i in 0..30u64 {
+                let id = 1 + u128::from(i % 3);
+                cmds.push(if i < 3 {
+                    wrap(
+                        i,
+                        create(Kind::Network, id, &format!("n{id}"), json!({ "v": i })),
+                    )
+                } else {
+                    wrap(
+                        i,
+                        update(Kind::Network, id, json!({ "v": i, "password": "x" })),
+                    )
+                });
+            }
+            cmds.push(wrap(99, delete(Kind::Network, 2)));
+            cmds
+        };
+        let (a, b) = (open(), open());
+        apply_all(a.db(), log());
+        // b는 한 묶음에 모두
+        let entries: Vec<_> = log()
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| entry(i as u64 + 1, c))
+            .collect();
+        StateMachine::apply_entries(b.db(), entries).unwrap();
+        assert_eq!(dump(a.db()), dump(b.db()));
+        assert!(!dump(a.db()).is_empty());
+    }
+
+    #[test]
+    fn snapshot_carries_history_and_is_unchanged_without_it() {
+        let (a, b) = (open(), open());
+        apply_all(a.db(), vec![create(Kind::Volume, 1, "plain", json!({}))]);
+        let (_, data) = StateMachine::snapshot_data(a.db()).unwrap();
+        let v: Value = serde_json::from_slice(&data).unwrap();
+        // 기능 전(출처 없는 쓰기만)의 스냅샷에는 칸이 없다(옛 노드와 같은 바이트).
+        assert!(v.get("history").is_none(), "{v}");
+
+        apply_all(
+            a.db(),
+            vec![
+                wrap(5, update(Kind::Volume, 1, json!({ "size_bytes": 9 }))),
+                wrap(6, create(Kind::Folder, 2, "f", json!({}))),
+                wrap(7, delete(Kind::Folder, 2)),
+            ],
+        );
+        let (meta, data) = StateMachine::snapshot_data(a.db()).unwrap();
+        let v: Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["history"].as_array().unwrap().len(), 3);
+        // b에 이력이 먼저 있어도 스냅샷으로 바뀐다.
+        apply_all(
+            b.db(),
+            vec![wrap(1, create(Kind::Folder, 9, "x", json!({})))],
+        );
+        StateMachine::install(b.db(), &meta, data).unwrap();
+        assert_eq!(dump(a.db()), dump(b.db()));
+        assert_eq!(
+            history_of(b.db(), Kind::Folder, Uuid::from_u128(9)).unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            history_of(b.db(), Kind::Folder, Uuid::from_u128(2))
+                .unwrap()
+                .len(),
+            2
+        );
+        // 관찰 노드 설치(Follow)는 이력을 싣지 않는다.
+        let (applied, membership, objects) = snapshot_objects(a.db()).unwrap();
+        install_objects(b.db(), applied, membership, objects).unwrap();
+        assert_eq!(crate::store::history_totals(b.db()).unwrap().count, 0);
+    }
+
+    /// 이력을 남기는 적용 비용(설계 §7.3 목표: 1 000번 바꾸기에 5% 밑). 기본으로 돌지 않는다:
+    /// `cargo test --release -p opl-cluster --lib -- --ignored history_overhead --nocapture`
+    #[test]
+    #[ignore]
+    fn history_overhead() {
+        // 2 KiB쯤의 VM 비슷한 spec
+        let vm_spec = |i: u64| {
+            json!({
+                "vcpus": 4, "memory_mib": 8192 + i, "arch": "x86_64", "machine": "q35",
+                "power": "running",
+                "disks": (0..4).map(|d| json!({ "volume": format!("web01-disk-{d}"), "bus": "virtio-blk",
+                    "cache": "none", "discard": true, "iops": 1000 })).collect::<Vec<_>>(),
+                "nics": (0..3).map(|n| json!({ "network": format!("net-{n}"), "model": "virtio",
+                    "mac": format!("52:54:00:00:00:0{n}"), "security_groups": ["web-sg", "ssh"] }))
+                    .collect::<Vec<_>>(),
+                "cloud_init": { "user": "rocky", "ssh_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI"
+                    .repeat(6)], "password": "$6$rounds=4096$abc$def" },
+                "labels": { "tier": "web", "owner": "platform-team", "cost-center": "cc-1234" },
+                "description": "x".repeat(900),
+            })
+        };
+        assert!(serde_json::to_vec(&vm_spec(0)).unwrap().len() > 1800);
+        const N: u64 = 1000;
+        let run = |db: &Database, attributed: bool| -> std::time::Duration {
+            let start = StateMachine::read_applied_index(db);
+            let first = if start == 0 {
+                StateMachine::apply_entries(
+                    db,
+                    vec![entry(1, create(Kind::Vm, 1, "web01", vm_spec(0)))],
+                )
+                .unwrap();
+                1
+            } else {
+                start
+            };
+            let t = std::time::Instant::now();
+            for i in 1..=N {
+                let cmd = update(Kind::Vm, 1, vm_spec(first + i));
+                let cmd = if attributed { wrap(i, cmd) } else { cmd };
+                let (r, _) = StateMachine::apply_entries(db, vec![entry(first + i, cmd)]).unwrap();
+                assert!(r[0].0.is_ok(), "{:?}", r[0]);
+            }
+            t.elapsed()
+        };
+        for (label, file) in [("in-memory", false), ("file (fsync)", true)] {
+            let mut plain = Vec::new();
+            let mut attributed = Vec::new();
+            for round in 0..5 {
+                for a in [false, true] {
+                    let dir = tempfile::TempDir::new().unwrap();
+                    let store = if file {
+                        Store::open(&dir.path().join("db")).unwrap()
+                    } else {
+                        open()
+                    };
+                    let d = run(store.db(), a);
+                    let rows = crate::store::history_totals(store.db()).unwrap().count;
+                    assert_eq!(
+                        rows,
+                        if a { 100 } else { 0 },
+                        "rows kept (limit 100 per resource)"
+                    );
+                    if round > 0 {
+                        if a { attributed.push(d) } else { plain.push(d) }
+                    }
+                }
+            }
+            plain.sort();
+            attributed.sort();
+            let (p, a) = (plain[plain.len() / 2], attributed[attributed.len() / 2]);
+            println!(
+                "{label}: {N} updates plain {p:?}, with history {a:?}, overhead {:+.1}%",
+                (a.as_secs_f64() / p.as_secs_f64() - 1.0) * 100.0
+            );
+        }
     }
 }

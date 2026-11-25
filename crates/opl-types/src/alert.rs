@@ -305,6 +305,29 @@ pub enum AlertCondition {
     BackupVerifyFailed,
     /// 백업 저장소에 닿지 않음(계획 68, 리더가 노드 보고 `backup_stores`로 평가, 대상 저장소)
     BackupStoreUnavailable,
+    /// 이 노드 공개 리스너의 인증서(출처가 무엇이든)나 내부 노드 인증서가 `days`일 안에 만료됨(계획 73, 노드가 평가,
+    /// 대상 노드)
+    CertificateExpiring {
+        #[serde(default = "default_expiring_days")]
+        #[cfg_attr(feature = "openapi", schema(default = 14, minimum = 1, maximum = 365))]
+        days: u16,
+    },
+    /// ACME 주문이 `failures`번 넘게 이어 실패함(계획 73, 리더, 대상 인증서)
+    CertificateRenewFailed {
+        #[serde(default = "default_renew_failures")]
+        #[cfg_attr(feature = "openapi", schema(default = 3, minimum = 1, maximum = 100))]
+        failures: u32,
+    },
+    /// 적용 묶음의 선언과 실제가 다름(계획 73, 리더, 대상 묶음)
+    ApplySetDrift,
+}
+
+fn default_expiring_days() -> u16 {
+    14
+}
+
+fn default_renew_failures() -> u32 {
+    3
 }
 
 /// 누가 평가하나
@@ -338,6 +361,9 @@ impl AlertCondition {
             Self::SdnLbMemberDown => "sdn_lb_member_down",
             Self::BackupVerifyFailed => "backup_verify_failed",
             Self::BackupStoreUnavailable => "backup_store_unavailable",
+            Self::CertificateExpiring { .. } => "certificate_expiring",
+            Self::CertificateRenewFailed { .. } => "certificate_renew_failed",
+            Self::ApplySetDrift => "apply_set_drift",
         }
     }
 
@@ -375,9 +401,23 @@ impl AlertCondition {
         )
     }
 
+    /// 인증서 조건(계획 73 — 기능 `acme`)인지
+    pub fn is_acme(&self) -> bool {
+        matches!(
+            self,
+            Self::CertificateExpiring { .. } | Self::CertificateRenewFailed { .. }
+        )
+    }
+
+    /// 선언형 적용 조건(계획 73 — 기능 `declarative`)인지
+    pub fn is_declarative(&self) -> bool {
+        matches!(self, Self::ApplySetDrift)
+    }
+
     pub fn evaluator(&self) -> Evaluator {
         match self {
             Self::NodeOffline | Self::BackupJobFailed => Evaluator::Leader,
+            Self::CertificateRenewFailed { .. } | Self::ApplySetDrift => Evaluator::Leader,
             c if c.is_sdn() || c.is_backup_store() => Evaluator::Leader,
             _ => Evaluator::Node,
         }
@@ -388,6 +428,7 @@ impl AlertCondition {
         match self {
             Self::NodeMetric { .. }
             | Self::NodeOffline
+            | Self::CertificateExpiring { .. }
             | Self::SdnCentralDown
             | Self::SdnChassisDown
             | Self::SdnPhysnetNotReady => SubjectKind::Node,
@@ -400,6 +441,8 @@ impl AlertCondition {
             Self::BackupJobFailed => SubjectKind::BackupJob,
             Self::BackupVerifyFailed => SubjectKind::Backup,
             Self::BackupStoreUnavailable => SubjectKind::BackupStore,
+            Self::CertificateRenewFailed { .. } => SubjectKind::Certificate,
+            Self::ApplySetDrift => SubjectKind::ApplySet,
         }
     }
 
@@ -483,6 +526,8 @@ pub enum AlertRuleError {
     TooManyOps,
     #[error("invalid task op {0:?}: use a task kind like vm-start")]
     Op(String),
+    #[error("{0} is out of range: {1}")]
+    Range(&'static str, &'static str),
 }
 
 impl AlertRuleSpec {
@@ -526,6 +571,14 @@ impl AlertRuleSpec {
                     return Err(AlertRuleError::Op(op.clone()));
                 }
             }
+            AlertCondition::CertificateExpiring { days } if !(1..=365).contains(days) => {
+                return Err(AlertRuleError::Range("days", "use 1-365"));
+            }
+            AlertCondition::CertificateRenewFailed { failures }
+                if !(1..=100).contains(failures) =>
+            {
+                return Err(AlertRuleError::Range("failures", "use 1-100"));
+            }
             _ => {}
         }
         if !self.vms.is_empty() && !c.about_vms() {
@@ -535,6 +588,8 @@ impl AlertRuleSpec {
         if !self.nodes.is_empty()
             && (matches!(c, AlertCondition::BackupJobFailed)
                 || c.is_backup_store()
+                || c.is_declarative()
+                || matches!(c, AlertCondition::CertificateRenewFailed { .. })
                 || (c.is_sdn() && c.subject_kind() != SubjectKind::Node))
         {
             return Err(AlertRuleError::NodesFilter(c.kind()));
@@ -589,6 +644,10 @@ pub enum SubjectKind {
     Backup,
     /// 백업 저장소(계획 68)
     BackupStore,
+    /// ACME 인증서(계획 73)
+    Certificate,
+    /// 적용 묶음(계획 73)
+    ApplySet,
 }
 
 impl SubjectKind {
@@ -604,6 +663,8 @@ impl SubjectKind {
             Self::LoadBalancer => "load_balancer",
             Self::Backup => "backup",
             Self::BackupStore => "backup_store",
+            Self::Certificate => "certificate",
+            Self::ApplySet => "apply_set",
         }
     }
 }
@@ -1613,6 +1674,64 @@ mod tests {
             assert_eq!(k.as_str(), s);
             assert_eq!(serde_json::to_value(k).unwrap(), s);
             assert_eq!(serde_json::from_value::<SubjectKind>(json!(s)).unwrap(), k);
+        }
+    }
+
+    /// 계획 73: 인증서 조건 둘과 드리프트 조건. 만료는 노드가(대상 노드 — 노드 거르기를 받음), 나머지는 리더가 평가한다.
+    #[test]
+    fn certificate_and_drift_conditions() {
+        let cases = [
+            (
+                json!({ "kind": "certificate_expiring" }),
+                AlertCondition::CertificateExpiring { days: 14 },
+                json!({ "kind": "certificate_expiring", "days": 14 }),
+                Evaluator::Node,
+                SubjectKind::Node,
+            ),
+            (
+                json!({ "kind": "certificate_renew_failed" }),
+                AlertCondition::CertificateRenewFailed { failures: 3 },
+                json!({ "kind": "certificate_renew_failed", "failures": 3 }),
+                Evaluator::Leader,
+                SubjectKind::Certificate,
+            ),
+            (
+                json!({ "kind": "apply_set_drift" }),
+                AlertCondition::ApplySetDrift,
+                json!({ "kind": "apply_set_drift" }),
+                Evaluator::Leader,
+                SubjectKind::ApplySet,
+            ),
+        ];
+        for (short, c, full, evaluator, subject) in cases {
+            assert_eq!(serde_json::from_value::<AlertCondition>(short).unwrap(), c);
+            assert_eq!(serde_json::to_value(&c).unwrap(), full);
+            assert_eq!(c.evaluator(), evaluator);
+            assert_eq!(c.subject_kind(), subject);
+            assert!(!c.is_event() && !c.is_sdn() && !c.is_backup_store());
+            assert_eq!(c.is_acme(), subject != SubjectKind::ApplySet);
+            assert_eq!(c.is_declarative(), subject == SubjectKind::ApplySet);
+            let mut r = rule(c.clone());
+            assert_eq!(r.validate(), Ok(()));
+            r.nodes = vec!["n1".into()];
+            assert_eq!(r.validate().is_ok(), subject == SubjectKind::Node, "{c:?}");
+        }
+        let r = rule(AlertCondition::CertificateExpiring { days: 0 });
+        assert!(matches!(
+            r.validate(),
+            Err(AlertRuleError::Range("days", _))
+        ));
+        let r = rule(AlertCondition::CertificateRenewFailed { failures: 0 });
+        assert!(matches!(
+            r.validate(),
+            Err(AlertRuleError::Range("failures", _))
+        ));
+        for (k, s) in [
+            (SubjectKind::Certificate, "certificate"),
+            (SubjectKind::ApplySet, "apply_set"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(serde_json::to_value(k).unwrap(), s);
         }
     }
 

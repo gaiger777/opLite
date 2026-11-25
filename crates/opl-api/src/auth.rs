@@ -790,6 +790,14 @@ impl FromRequestParts<Arc<AppState>> for Principal {
             principal = state.authenticate(parts).await;
         }
         crate::audit::note_auth(parts, principal.as_ref().ok());
+        // 설정 이력(계획 73)의 주체 칸에 토큰 이름(없으면 id 그대로)
+        if let Ok(Principal {
+            token: Some(token), ..
+        }) = &principal
+            && let Ok(Some(t)) = state.cluster.get::<opl_types::auth::ApiTokenSpec>(*token)
+        {
+            crate::audit::note_token_name(parts, &t.name);
+        }
         let principal = principal?;
         crate::revision::authenticated(parts);
         waited?;

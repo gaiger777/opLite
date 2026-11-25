@@ -4753,6 +4753,19 @@ export interface components {
              */
             revision: number;
         };
+        /** @description ACME 동작 설정(계획 73 §11.3) */
+        AcmeSettings: {
+            /**
+             * @description 포트 80 리스너가 도전 밖의 요청을 `https://{Host}:8006`으로 308 보낸다(끄면 404).
+             * @default true
+             */
+            http_redirect: boolean;
+            /**
+             * @description 갱신 시각을 창 안에서 흩뜨린다(노드·인증서가 한꺼번에 주문하지 않게).
+             * @default true
+             */
+            renew_jitter: boolean;
+        };
         /** @enum {string} */
         Action: "accept" | "drop";
         /** @description 활성 경보 하나 */
@@ -4858,6 +4871,25 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "backup_store_unavailable";
+        } | {
+            /**
+             * Format: int32
+             * @default 14
+             */
+            days: number;
+            /** @enum {string} */
+            kind: "certificate_expiring";
+        } | {
+            /**
+             * Format: int32
+             * @default 3
+             */
+            failures: number;
+            /** @enum {string} */
+            kind: "certificate_renew_failed";
+        } | {
+            /** @enum {string} */
+            kind: "apply_set_drift";
         };
         /**
          * @description 비교
@@ -7728,6 +7760,27 @@ export interface components {
             /** @description `Digest`의 범위 평균 CPU 상위 VM(내림차순) */
             top?: components["schemas"]["TopVm"][];
         };
+        /** @description 이력 보존 한도(설정 `history` — 계획 73 §7.3). 상태 머신이 적용 때 Raft의 설정에서 읽는다. */
+        HistorySettings: {
+            /**
+             * Format: int32
+             * @description 이보다 오래된 줄은 지운다(일, 7~3650)
+             * @default 365
+             */
+            max_age_days: number;
+            /**
+             * Format: int32
+             * @description 리소스 하나에 남기는 줄 수(10~1000)
+             * @default 100
+             */
+            max_per_resource: number;
+            /**
+             * Format: int32
+             * @description 이력 전체(압축 뒤) 한도(MiB, 8~512). 스냅샷에 실리므로 크게 잡으면 새 노드 합류가 느려진다.
+             * @default 64
+             */
+            max_total_mib: number;
+        };
         /** @description 호스트 NUMA 노드 하나 */
         HostNode: {
             /**
@@ -8310,7 +8363,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store" | "vmware-source" | "vmware-migration" | "vmware-vm" | "vm-export";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store" | "vmware-source" | "vmware-migration" | "vmware-vm" | "vm-export" | "apply-set" | "acme-account" | "acme-dns" | "certificate";
         /** @description 바깥 VIP */
         LbExternal: {
             /**
@@ -13241,6 +13294,8 @@ export interface components {
              */
             revision: number;
             spec: {
+                /** @description ACME 동작(계획 73). 없으면 기본값(포트 80 리다이렉트·갱신 시각 흩뜨리기 켬)이고 쓰지 않는다(기능 `acme`). */
+                acme?: components["schemas"]["AcmeSettings"];
                 /**
                  * @description 앞단·VIP에서 API를 부르는 이름(DNS 이름·IP). 각 노드가 자기 API 인증서에 더한다(피어 인증서는 그대로).
                  *     비어 있으면 쓰지 않는다.
@@ -13258,6 +13313,11 @@ export interface components {
                  * @description 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
                  */
                 ha_start_concurrency?: number;
+                /**
+                 * @description 설정 이력 보존 한도(계획 73). 없으면 기본값(리소스당 100줄·365일·64 MiB)이고 쓰지 않아 옛 노드도 설정을 계속
+                 *     푼다(API는 기능 `config-history`가 모두 있을 때만 받는다).
+                 */
+                history?: components["schemas"]["HistorySettings"];
                 /**
                  * @description 이미지 라이브러리의 관리자 항목(계획 58, 200개까지, 내장 id와 겹치지 않게). 비어 있으면 쓰지 않아 옛 노드도
                  *     설정을 계속 푼다.
@@ -14502,6 +14562,8 @@ export interface components {
             affected_running_vms?: number;
         };
         SettingsSpec: {
+            /** @description ACME 동작(계획 73). 없으면 기본값(포트 80 리다이렉트·갱신 시각 흩뜨리기 켬)이고 쓰지 않는다(기능 `acme`). */
+            acme?: components["schemas"]["AcmeSettings"];
             /**
              * @description 앞단·VIP에서 API를 부르는 이름(DNS 이름·IP). 각 노드가 자기 API 인증서에 더한다(피어 인증서는 그대로).
              *     비어 있으면 쓰지 않는다.
@@ -14519,6 +14581,11 @@ export interface components {
              * @description 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
              */
             ha_start_concurrency?: number;
+            /**
+             * @description 설정 이력 보존 한도(계획 73). 없으면 기본값(리소스당 100줄·365일·64 MiB)이고 쓰지 않아 옛 노드도 설정을 계속
+             *     푼다(API는 기능 `config-history`가 모두 있을 때만 받는다).
+             */
+            history?: components["schemas"]["HistorySettings"];
             /**
              * @description 이미지 라이브러리의 관리자 항목(계획 58, 200개까지, 내장 id와 겹치지 않게). 비어 있으면 쓰지 않아 옛 노드도
              *     설정을 계속 푼다.
@@ -14948,7 +15015,7 @@ export interface components {
          * @description 경보 대상의 종류
          * @enum {string}
          */
-        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer" | "backup" | "backup_store";
+        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer" | "backup" | "backup_store" | "certificate" | "apply_set";
         /** @description SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다. */
         Subnet: {
             /**
@@ -15362,6 +15429,20 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "vm-export-delete";
+        } | {
+            /** @enum {string} */
+            kind: "apply";
+            /** Format: uuid */
+            plan: string;
+            /** Format: uuid */
+            set?: string;
+        } | {
+            /** Format: uuid */
+            certificate: string;
+            /** @enum {string} */
+            kind: "acme-order";
+            /** Format: uuid */
+            node?: string;
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

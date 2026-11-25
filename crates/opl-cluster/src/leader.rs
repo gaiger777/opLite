@@ -26,6 +26,13 @@ pub const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(60);
 /// 앞선 멤버십 변경이 아직 커밋 중일 때 다시 시도하는 간격
 const IN_PROGRESS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 리더 시계(유닉스 밀리초)
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// 팔로워가 받은 요청을 리더에게 보낸다. 노드 간 네트워크가 구현한다.
 #[async_trait]
 pub trait Forwarder: Send + Sync + 'static {
@@ -137,7 +144,12 @@ pub(crate) async fn execute(
                 Err(e) => Err(ClusterError::Raft(e.to_string())),
             }
         }
-        LeaderRequest::Write { command } => {
+        LeaderRequest::Write { mut command } => {
+            // 출처를 단 쓰기의 시각은 리더가 제안 직전에 찍는다(따르미가 보낸 값은 쓰지 않는다) — 상태 머신의 보존
+            // 한도가 노드 시계가 아니라 이 값을 본다(계획 73 §7.3).
+            if let Command::Attributed { meta, .. } = &mut command {
+                meta.at_ms = now_ms();
+            }
             let resp = tokio::time::timeout(timeout, raft.client_write(command))
                 .await
                 .map_err(|_| ClusterError::Timeout)??;
