@@ -597,6 +597,11 @@ pub struct CertificateStatus {
     /// 노드의 성공이 그 실패를 지우지 않게 따로 센다.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub node_failures: BTreeMap<Uuid, SlotFailure>,
+    /// 칸(노드 id 또는 `shared`)마다 지금 주문하는 Task(리뷰 2). 지금 갱신·리더 루프·Task가 revision을 보고 잡으므로 한 칸에
+    /// 주문은 하나뿐이다 — 끝난(또는 없는) Task의 것은 비었다고 본다. 안쪽 장부라 API 문서에는 없다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub running: BTreeMap<String, Uuid>,
 }
 
 /// 노드 하나의 이어진 주문 실패
@@ -677,6 +682,27 @@ impl CertificateStatus {
         if self.node_failures.len() != before {
             self.summarize_nodes();
         }
+    }
+
+    /// 범위(공유 ↔ 노드마다)가 바뀐 뒤 남은 실패를 지운다(리뷰 2). 공유인데 노드마다 실패가 있거나, 노드마다인데 노드별
+    /// 실패 없이 위 칸(공유의 실패·물러서기)이 남았으면 실패 수·물러서기·오류와 다른 범위의 진행 중 주문을 모두 지운다.
+    /// 지웠으면 true.
+    pub fn fit_scope(&mut self, shared: bool) -> bool {
+        let stale = if shared {
+            !self.node_failures.is_empty()
+        } else {
+            self.node_failures.is_empty()
+                && (self.failures > 0 || self.next_attempt_at.is_some() || self.error.is_some())
+        };
+        if !stale {
+            return false;
+        }
+        self.node_failures.clear();
+        self.failures = 0;
+        self.next_attempt_at = None;
+        self.error = None;
+        self.orders.retain(|k, _| (k == "shared") == shared);
+        true
     }
 
     /// 노드마다의 요약(`failures`·`error` — 가장 많이 실패한 노드)
@@ -951,5 +977,32 @@ mod tests {
         assert!(s.backing_off(None, 5));
         s.record_success(None);
         assert_eq!(serde_json::to_value(&s).unwrap(), json!({}));
+    }
+
+    /// 리뷰 2: 범위가 바뀌면 다른 범위의 실패가 남지 않는다.
+    #[test]
+    fn scope_change_resets_failures() {
+        let a = Uuid::from_u128(1);
+        // 노드마다 → 공유: 노드별 실패와 요약을 지운다.
+        let mut s = CertificateStatus::default();
+        for _ in 0..4 {
+            s.record_failure(Some(a), "n1: x".into(), 0, |_| 10);
+        }
+        s.orders.insert(a.to_string(), "https://ca/order/1".into());
+        assert!(
+            !s.fit_scope(false),
+            "per-node state fits a per-node certificate"
+        );
+        assert!(s.fit_scope(true));
+        assert_eq!(s, CertificateStatus::default());
+        s.record_failure(None, "shared".into(), 0, i64::from);
+        assert_eq!(s.failures, 1, "the first shared failure starts from one");
+        // 공유 → 노드마다: 공유의 실패·물러서기를 지운다.
+        s.orders
+            .insert("shared".into(), "https://ca/order/2".into());
+        assert!(!s.fit_scope(true));
+        assert!(s.fit_scope(false));
+        assert_eq!(s, CertificateStatus::default());
+        assert!(!s.fit_scope(false));
     }
 }

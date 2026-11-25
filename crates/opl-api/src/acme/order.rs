@@ -3,7 +3,8 @@
 //! 아직 등록되지 않았으면 등록한다. 진행 중 주문 URL을 status `orders`에 적어 Task가 다시 떠도 그 주문을 이어 본다.
 //! 실패는 공유면 status `failures`·`next_attempt_at`(물러서기)·`error`에, 노드마다면 그 노드의 `node_failures`에 적고 Task도
 //! 실패한다. 노드마다 키 파일은 일련번호를 이름에 넣어(`{id}.{serial}.key`) 새 사슬을 status에 적은 뒤에야 옛 키를 지운다 —
-//! 적기가 실패해도 지금 끼운 사슬과 키의 짝이 깨지지 않는다.
+//! 적기가 실패해도 지금 끼운 사슬과 키의 짝이 깨지지 않는다. 지울 때는 status를 다시 읽어 그것이 가리키는 키를 남긴다.
+//! 칸(노드 또는 `shared`)마다 주문은 하나다: status `running`을 revision을 보고 잡는다(리뷰 2).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -581,11 +582,141 @@ pub fn random_unit() -> f64 {
     f64::from(u32::from_be_bytes(b)) / f64::from(u32::MAX)
 }
 
-/// Task `acme-order`. 성공하면 받은 인증서(일련번호·만료)를 Task 경고로 남긴다.
+/// 칸을 잡았지만 아직 Task가 없는(지금 갱신·리더 루프는 Task를 만들기 전에 잡는다) 표시를 살아 있다고 보는 동안(초)
+const CLAIM_GRACE: i64 = 120;
+
+/// 칸을 잡은 Task `task`가 아직 살아 있나: 끝나지 않은 Task이거나, Task가 아직 없지만 잡은 지 [`CLAIM_GRACE`]가 안 됐다
+/// (id는 UUIDv7이라 만든 때를 담는다). 읽지 못하면 살아 있다고 본다.
+pub fn claim_live(cluster: &Cluster, task: Uuid, now: i64) -> bool {
+    match cluster.get::<opl_types::task::TaskSpec>(task) {
+        Ok(Some(t)) => !t.status.state.is_finished(),
+        Ok(None) => task
+            .get_timestamp()
+            .is_some_and(|ts| ts.to_unix().0 as i64 + CLAIM_GRACE > now),
+        Err(_) => true,
+    }
+}
+
+/// 칸들(`(칸, Task id)`)을 한 번의 revision 확인 쓰기로 잡는다(리뷰 2 — 지금 갱신 두 번, 지금 갱신과 리더 루프가 함께 잡아도
+/// 하나만 된다). 다른 살아 있는 Task가 칸 하나라도 잡았으면 아무것도 쓰지 않고 그 Task id를 준다. 잡을 때 `also`도 같은
+/// 쓰기에 넣는다(지금 갱신의 물러서기 지우기).
+pub async fn claim(
+    cluster: &Cluster,
+    certificate: Uuid,
+    slots: &[(String, Uuid)],
+    also: impl Fn(&mut CertificateStatus),
+) -> Result<Option<Uuid>, String> {
+    let mut held = None;
+    modify_status(cluster, certificate, |s| {
+        let t = now();
+        held = slots.iter().find_map(|(slot, task)| {
+            s.running
+                .get(slot)
+                .filter(|other| *other != task && claim_live(cluster, **other, t))
+                .copied()
+        });
+        if held.is_none() {
+            for (slot, task) in slots {
+                s.running.insert(slot.clone(), *task);
+            }
+            also(s);
+        }
+    })
+    .await?;
+    Ok(held)
+}
+
+/// 칸에 지금 적힌 인증서의 일련번호
+fn slot_serial(s: &CertificateStatus, node: Option<Uuid>) -> Option<&str> {
+    match node {
+        Some(n) => s.nodes.get(&n),
+        None => s.shared.as_ref(),
+    }
+    .map(|i| i.serial.as_str())
+}
+
+/// [`record_failure`]의 status 고치기: 이 Task의 칸을 놓고, 받은 것(`issued`)이 이미 적혔으면 그대로, 아니면 실패와
+/// 물러서기(`wait` — CA의 Retry-After, 없으면 [`backoff`])를 적는다.
+#[allow(clippy::too_many_arguments)]
+fn note_failure(
+    s: &mut CertificateStatus,
+    node: Option<Uuid>,
+    task: Uuid,
+    message: &str,
+    now: i64,
+    wait: Option<i64>,
+    keep_order: bool,
+    issued: Option<&str>,
+) {
+    let key_slot = slot(node);
+    if s.running.get(&key_slot) == Some(&task) {
+        s.running.remove(&key_slot);
+    }
+    if issued.is_some() && slot_serial(s, node) == issued {
+        return;
+    }
+    s.record_failure(node, message.to_string(), now, |n| {
+        wait.unwrap_or_else(|| backoff(n))
+    });
+    if !keep_order {
+        s.orders.remove(&key_slot);
+    }
+}
+
+/// 받은 뒤 남길 키의 일련번호: 다시 읽은 status가 가리키는 것. 적기가 실패했고 status가 받은 것(`issued`)을 가리키지
+/// 않으면 None — 아무것도 지우지 않는다(늦게 적힐 수 있다).
+fn keep_after_commit<'a>(
+    committed: bool,
+    now_status: Option<&'a CertificateStatus>,
+    node: Option<Uuid>,
+    issued: &str,
+) -> Option<&'a str> {
+    let current = slot_serial(now_status?, node)?;
+    (committed || current == issued).then_some(current)
+}
+
+/// 주문 실패를 적고(물러서기·오류, 칸 놓기) 보일 오류를 준다. `issued`는 받은 뒤의 실패(키 쓰기·적기)에서 받은 일련번호 —
+/// 그 사이 status에 적혔으면(시간 초과 뒤 적힌 쓰기) 실패로 적지 않는다.
+async fn record_failure(
+    state: &AppState,
+    certificate: Uuid,
+    node: Option<Uuid>,
+    task: Uuid,
+    e: AcmeError,
+    issued: Option<&str>,
+) -> String {
+    let cluster = &state.cluster;
+    // 노드마다면 어느 노드의 실패인지 붙인다(요약 `error`·경보 알림에 보인다).
+    let message = match node {
+        Some(n) => {
+            let name = cluster
+                .get::<NodeSpec>(n)
+                .ok()
+                .flatten()
+                .map_or_else(|| n.to_string(), |n| n.name);
+            format!("{name}: {e}")
+        }
+        None => e.to_string(),
+    };
+    let wait = e.retry_after().map(|s| s as i64);
+    let keep_order = issued.is_none() && matches!(e, AcmeError::Http(_));
+    let failed = modify_status(cluster, certificate, |s| {
+        note_failure(s, node, task, &message, now(), wait, keep_order, issued);
+    })
+    .await;
+    if let Err(w) = failed {
+        tracing::warn!(error = %w, "cannot record the ACME failure");
+    }
+    message
+}
+
+/// Task `acme-order`. 성공하면 받은 인증서(일련번호·만료)를 Task 경고로 남긴다. 먼저 칸을 이 Task(`task`)로 잡는다 — 다른
+/// 살아 있는 Task가 잡았으면 주문하지 않고 성공으로 끝난다(그 주문에 맡긴다).
 pub async fn run(
     state: &AppState,
     certificate: Uuid,
     node: Option<Uuid>,
+    task: Uuid,
 ) -> Result<Option<String>, String> {
     let cluster = &state.cluster;
     let cert = cluster
@@ -594,6 +725,23 @@ pub async fn run(
         .ok_or("the certificate was deleted")?;
     let target = target(cluster, &cert, node, state.node).map_err(|e| e.to_string())?;
     let key_slot = slot(target.node);
+    if let Some(other) = claim(cluster, certificate, &[(key_slot.clone(), task)], |_| {}).await? {
+        return Ok(Some(format!(
+            "another acme-order ({other}) for this certificate is already running; left the order to it"
+        )));
+    }
+    // 잡은 뒤의 모습(그 사이 끝난 주문이 받은 것을 `replaces`·이어 볼 주문에 쓴다)
+    let cert = cluster
+        .get::<CertificateSpec>(certificate)
+        .map_err(|e| e.to_string())?
+        .ok_or("the certificate was deleted")?;
+    let target = Target {
+        current: match target.node {
+            Some(n) => cert.status.nodes.get(&n).cloned(),
+            None => cert.status.shared.clone(),
+        },
+        ..target
+    };
     let result = if target.node.is_some() && state.acme.key_dir.is_none() {
         Err(AcmeError::Invalid(
             "this node keeps no ACME keys (no data directory)".into(),
@@ -601,94 +749,98 @@ pub async fn run(
     } else {
         issue(state, &cert, &target).await
     };
-    match result {
-        Ok((issued, key_pem)) => {
-            let key_pem = key_pem.unwrap_or_default();
-            // 노드마다: 키를 먼저 디스크에 — 새 일련번호의 파일이라 지금 끼운 사슬(옛 일련번호)의 키는 그대로다. 끼우는 쪽은
-            // status 사슬의 일련번호로 키 파일을 고른다.
-            let key_dir = target.node.and(state.acme.key_dir.as_deref());
-            if let Some(dir) = key_dir {
-                write_key(&key_path(dir, certificate, &issued.serial), &key_pem)
-                    .map_err(|e| e.to_string())?;
-            }
-            let summary = format!(
-                "issued serial {} for {} (valid until {})",
-                issued.serial,
-                issued.names.join(", "),
-                super::fmt_time(issued.not_after)
-            );
-            let shared = target.node.is_none();
-            let committed = modify_status(cluster, certificate, |s| {
-                match target.node {
-                    Some(n) => {
-                        s.nodes.insert(n, issued.clone());
-                    }
-                    None => {
-                        s.shared = Some(issued.clone());
-                        s.shared_key = Secret::new(key_pem.clone());
-                    }
-                }
-                s.orders.remove(&key_slot);
-                s.record_success(target.node);
-            })
-            .await;
-            match (committed, key_dir) {
-                (Ok(()), Some(dir)) => remove_keys(dir, certificate, Some(&issued.serial)),
-                (Err(e), dir) => {
-                    // 적지 못했다: 새 키는 쓸 데가 없다(다음 주문이 새로 받는다).
-                    if let Some(dir) = dir {
-                        let _ = std::fs::remove_file(key_path(dir, certificate, &issued.serial));
-                    }
-                    return Err(e);
-                }
-                _ => {}
-            }
-            state.audit.record(crate::audit::system_entry(
-                "acme.order",
-                opl_types::audit::AuditTarget {
-                    kind: "certificate".into(),
-                    key: cert.name.clone(),
-                },
-                format!(
-                    "acme-order {} issued (serial {}, until {}{})",
-                    cert.name,
-                    issued.serial,
-                    super::fmt_time(issued.not_after),
-                    if shared { ", shared" } else { "" }
-                ),
-            ));
-            Ok(Some(summary))
-        }
+    let (issued, key_pem) = match result {
+        Ok(r) => r,
         Err(e) => {
-            // 노드마다면 어느 노드의 실패인지 붙인다(요약 `error`·경보 알림에 보인다).
-            let message = match target.node {
-                Some(n) => {
-                    let name = cluster
-                        .get::<NodeSpec>(n)
-                        .ok()
-                        .flatten()
-                        .map_or_else(|| n.to_string(), |n| n.name);
-                    format!("{name}: {e}")
-                }
-                None => e.to_string(),
-            };
-            let wait = e.retry_after().map(|s| s as i64);
-            let keep_order = matches!(e, AcmeError::Http(_));
-            let failed = modify_status(cluster, certificate, |s| {
-                s.record_failure(target.node, message.clone(), now(), |n| {
-                    wait.unwrap_or_else(|| backoff(n))
-                });
-                if !keep_order {
-                    s.orders.remove(&key_slot);
-                }
-            })
-            .await;
-            if let Err(w) = failed {
-                tracing::warn!(error = %w, "cannot record the ACME failure");
-            }
-            Err(message)
+            return Err(record_failure(state, certificate, target.node, task, e, None).await);
         }
+    };
+    let key_pem = key_pem.unwrap_or_default();
+    // 노드마다: 키를 먼저 디스크에 — 새 일련번호의 파일이라 지금 끼운 사슬(옛 일련번호)의 키는 그대로다. 끼우는 쪽은
+    // status 사슬의 일련번호로 키 파일을 고른다. 받은 뒤의 실패도 물러서기와 함께 적는다(리뷰 2 — 다음 틱에 또 받지 않게).
+    let key_dir = target.node.and(state.acme.key_dir.as_deref());
+    if let Some(dir) = key_dir
+        && let Err(e) = write_key(&key_path(dir, certificate, &issued.serial), &key_pem)
+    {
+        let e = AcmeError::Invalid(format!("issued serial {} but {e}", issued.serial));
+        return Err(record_failure(state, certificate, target.node, task, e, None).await);
     }
+    let summary = format!(
+        "issued serial {} for {} (valid until {})",
+        issued.serial,
+        issued.names.join(", "),
+        super::fmt_time(issued.not_after)
+    );
+    let shared = target.node.is_none();
+    let committed = modify_status(cluster, certificate, |s| {
+        match target.node {
+            Some(n) => {
+                s.nodes.insert(n, issued.clone());
+            }
+            None => {
+                s.shared = Some(issued.clone());
+                s.shared_key = Secret::new(key_pem.clone());
+            }
+        }
+        s.orders.remove(&key_slot);
+        if s.running.get(&key_slot) == Some(&task) {
+            s.running.remove(&key_slot);
+        }
+        s.record_success(target.node);
+    })
+    .await;
+    // 적기의 결과와 상관없이 다시 읽는다(리뷰 2 — 시간 초과로 끝난 쓰기도 적혔을 수 있다). 지금 status가 가리키는 키는
+    // 지우지 않는다. 적기가 실패했고 아직 적히지 않았으면 아무것도 지우지 않는다(늦게 적힐 수 있다 — 다음 주문이 치운다).
+    let now_status = cluster
+        .get::<CertificateSpec>(certificate)
+        .ok()
+        .flatten()
+        .map(|c| c.status);
+    let landed = now_status
+        .as_ref()
+        .is_some_and(|s| slot_serial(s, target.node) == Some(issued.serial.as_str()));
+    if let Some(dir) = key_dir
+        && let Some(keep) = keep_after_commit(
+            committed.is_ok(),
+            now_status.as_ref(),
+            target.node,
+            &issued.serial,
+        )
+    {
+        remove_keys(dir, certificate, Some(keep));
+    }
+    if let Err(e) = committed
+        && !landed
+    {
+        let e = AcmeError::Invalid(format!(
+            "issued serial {} but cannot store it: {e}",
+            issued.serial
+        ));
+        return Err(record_failure(
+            state,
+            certificate,
+            target.node,
+            task,
+            e,
+            Some(&issued.serial),
+        )
+        .await);
+    }
+    state.audit.record(crate::audit::system_entry(
+        "acme.order",
+        opl_types::audit::AuditTarget {
+            kind: "certificate".into(),
+            key: cert.name.clone(),
+        },
+        format!(
+            "acme-order {} issued (serial {}, until {}{})",
+            cert.name,
+            issued.serial,
+            super::fmt_time(issued.not_after),
+            if shared { ", shared" } else { "" }
+        ),
+    ));
+    Ok(Some(summary))
 }
 
 #[cfg(test)]
@@ -724,5 +876,103 @@ mod tests {
         assert!(key_path(dir.path(), other, "aa").exists());
         remove_keys(dir.path(), other, None);
         assert!(!key_path(dir.path(), other, "aa").exists());
+    }
+
+    fn issued(serial: &str) -> IssuedCert {
+        IssuedCert {
+            serial: serial.into(),
+            not_before: 0,
+            not_after: 1000,
+            names: vec!["a.example.com".into()],
+            chain_pem: String::new(),
+            ari: None,
+            renew_at: 500,
+            key: CertificateKey::EcdsaP256,
+            error: None,
+            ari_checked_at: None,
+        }
+    }
+
+    /// 리뷰 2: 적기의 결과와 상관없이 다시 읽은 status가 가리키는 키는 지우지 않는다.
+    #[test]
+    fn keys_kept_after_commit_follow_the_reread_status() {
+        let n = Uuid::from_u128(7);
+        let mut s = CertificateStatus::default();
+        s.nodes.insert(n, issued("new"));
+        // 적기가 오류(시간 초과)였지만 적혔다: 새 키를 남기고 나머지를 지운다.
+        assert_eq!(
+            keep_after_commit(false, Some(&s), Some(n), "new"),
+            Some("new")
+        );
+        // 적기가 오류였고 아직 옛 것: 아무것도 지우지 않는다.
+        s.nodes.insert(n, issued("old"));
+        assert_eq!(keep_after_commit(false, Some(&s), Some(n), "new"), None);
+        // 적었다: 지금 status가 가리키는 것을 남긴다(그것이 다른 일련번호여도).
+        assert_eq!(
+            keep_after_commit(true, Some(&s), Some(n), "new"),
+            Some("old")
+        );
+        // 다시 읽지 못했거나 칸이 비었으면 지우지 않는다.
+        assert_eq!(keep_after_commit(true, None, Some(n), "new"), None);
+        assert_eq!(
+            keep_after_commit(true, Some(&CertificateStatus::default()), Some(n), "new"),
+            None
+        );
+        // 실제 파일로: status가 가리키는 키는 남는다.
+        let dir = tempfile::TempDir::new().unwrap();
+        let c = Uuid::from_u128(1);
+        for serial in ["old", "new", "stray"] {
+            write_key(&key_path(dir.path(), c, serial), serial).unwrap();
+        }
+        s.nodes.insert(n, issued("new"));
+        let keep = keep_after_commit(false, Some(&s), Some(n), "new");
+        remove_keys(dir.path(), c, keep);
+        assert!(key_path(dir.path(), c, "new").exists());
+        assert!(!key_path(dir.path(), c, "old").exists());
+        assert!(!key_path(dir.path(), c, "stray").exists());
+    }
+
+    /// 리뷰 2: 받은 뒤의 실패(키 쓰기·적기)도 물러서기와 함께 적고, 그 사이 적혔으면 실패로 적지 않는다. 칸은 놓는다.
+    #[test]
+    fn failures_after_issuance_back_off() {
+        let (n, task) = (Uuid::from_u128(7), Uuid::from_u128(9));
+        let mut s = CertificateStatus::default();
+        s.running.insert(n.to_string(), task);
+        s.orders.insert(n.to_string(), "https://ca/order/1".into());
+        note_failure(
+            &mut s,
+            Some(n),
+            task,
+            "n7: disk full",
+            100,
+            None,
+            false,
+            None,
+        );
+        assert!(s.running.is_empty());
+        assert!(s.orders.is_empty());
+        assert_eq!(s.node_failures[&n].next_attempt_at, Some(100 + backoff(1)));
+        assert_eq!(s.failures, 1);
+        // 시간 초과로 끝난 적기가 실제로 적혔다: 실패를 더하지 않는다.
+        s.nodes.insert(n, issued("new"));
+        s.running.insert(n.to_string(), task);
+        note_failure(&mut s, Some(n), task, "x", 200, None, false, Some("new"));
+        assert_eq!(s.failures, 1);
+        assert!(s.running.is_empty());
+        // 다른 Task가 잡은 칸은 놓지 않는다.
+        let other = Uuid::from_u128(10);
+        s.running.insert("shared".into(), other);
+        note_failure(
+            &mut s,
+            None,
+            task,
+            "shared: x",
+            300,
+            Some(60),
+            false,
+            Some("zz"),
+        );
+        assert_eq!(s.running.get("shared"), Some(&other));
+        assert_eq!(s.next_attempt_at, Some(360));
     }
 }

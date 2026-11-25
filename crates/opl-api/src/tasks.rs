@@ -1352,7 +1352,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         // ACME 주문(계획 73 §11.2): 받은 인증서(일련번호·만료)를 경고로 남긴다.
         TaskOp::AcmeOrder { certificate, node } => {
             let api = ctx.config.api.clone().ok_or("this node runs no API")?;
-            return Box::pin(crate::acme::order::run(&api, *certificate, *node)).await;
+            return Box::pin(crate::acme::order::run(&api, *certificate, *node, task.id)).await;
         }
     };
     done.map(|()| None)

@@ -408,7 +408,7 @@ orbivisorctl cert list
 # NAME   SCOPE     CHALLENGE    NODE        SERIAL  EXPIRES           RENEW             ERROR
 # nodes  per-node  http-01      0193a7c2-…  04a1…   2027-02-23 10:00  2027-01-24 08:12
 # vip    shared    dns-01 cf    shared      03ff…   2027-02-23 10:02  2027-01-24 11:40
-orbivisorctl cert renew vip --wait                  # 곧 주문한다(물러서기를 지움, 돌고 있으면 409 acme_order_running)
+orbivisorctl cert renew vip --wait                  # 곧 주문한다(물러서기를 지움, 그 인증서·노드의 주문이 돌고 있으면 409 acme_order_running)
 orbivisorctl cert get vip                           # 가린 JSON(노드마다 발급·다음 갱신·실패 수·오류)
 orbivisorctl cert delete vip
 ```
@@ -489,7 +489,9 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
   와일드카드와 기본 이름처럼 같은 TXT 이름의 값 둘은 한 번에 넣는다. Route 53·PowerDNS는 지금 TXT rrset을 읽어 **우리 값만** 더하고
   빼므로(다 비면 rrset을 지움) 같은 이름의 다른 TXT(다른 주문·다른 ACME 클라이언트·SPF)는 남는다. Route 53은 읽은 rrset을 그대로
   DELETE하고 고친 것을 CREATE하는 한 묶음이라 그 사이 바뀌면 거절되어 다시 읽는다. PowerDNS API에는 조건부 쓰기가 없어 읽기와 쓰기
-  사이에 다른 쪽이 쓴 값은 잃을 수 있다.
+  사이에 다른 쪽이 쓴 값은 잃을 수 있다. 그래서 리더는 같은 DNS 공급자의 같은 TXT 이름을 쓰는 주문을 한 번에 하나만 만든다(노드마다
+  인증서에 모든 노드가 같은 이름을 넣은 경우). `cert renew`는 노드마다 Task를 한꺼번에 만들므로 이 경우 한 노드의 검증이 실패할 수
+  있다 — 5분 물러서기 뒤 리더가 하나씩 다시 한다. 클러스터 밖의 다른 ACME 클라이언트와의 겹침은 막지 못한다.
 - **훅.** `{path} add|remove {fqdn} {value}`(예: `add _acme-challenge.example.com Abc…`)를 **주문을 도는 노드에서** 부른다(노드마다
   인증서는 각 노드, 공유는 고른 노드 — 그러니 모든 노드에 같은 파일을 둔다). 경로는 `/etc/opl/acme-hooks/` 아래 파일만(`..` 없음 —
   만들 때 검사), 주인은 root(또는 orbivisord를 돌리는 사용자), 그룹·다른 사용자가 쓸 수 없고 실행할 수 있어야 한다(부를 때마다 검사).

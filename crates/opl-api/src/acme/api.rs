@@ -28,7 +28,7 @@ use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, if_match, lookup};
 use crate::state::AppState;
-use crate::tasks::create_task;
+use crate::tasks::create_task_with_id;
 
 /// CA와 이야기하다 실패함 → API 오류
 pub fn acme_api_error(e: AcmeError) -> ApiError {
@@ -780,7 +780,7 @@ pub struct RenewStarted {
 }
 
 /// 지금 주문한다(물러서기를 지우고 받을 것마다 `acme-order` Task — 노드마다면 온라인인 덮는 노드마다). 주문 Task가 이미
-/// 돌면 409 `acme_order_running`.
+/// 돌면(칸 하나라도 다른 주문이 잡았으면) 409 `acme_order_running`.
 #[utoipa::path(post, path = "/certificates/{key}/actions/renew", tag = "acme",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 202, body = RenewStarted), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -834,23 +834,53 @@ pub async fn renew_certificate(
             "no online node can order this certificate",
         ));
     }
-    super::order::modify_status(&state.cluster, cert.id, |s| s.clear_backoff())
+    // 칸들을 Task id로 먼저 잡는다(리뷰 2 — revision을 보고 쓰므로 두 번 누른 지금 갱신이나 리더 루프와 겹쳐도 하나만
+    // 된다). 물러서기 지우기도 같은 쓰기에.
+    let ids: Vec<(String, uuid::Uuid)> = targets
+        .iter()
+        .map(|(node, _)| (super::slot(*node), uuid::Uuid::now_v7()))
+        .collect();
+    let held = super::order::claim(&state.cluster, cert.id, &ids, |s| s.clear_backoff())
         .await
         .map_err(ApiError::internal)?;
+    if let Some(other) = held {
+        return Err(ApiError::conflict(
+            "acme_order_running",
+            format!(
+                "an ACME order for certificate {:?} is already running (task {other})",
+                cert.name
+            ),
+        ));
+    }
     let mut created = Vec::new();
-    for (node, run_on) in targets {
-        created.push(
-            create_task(
-                &state.cluster,
-                TaskOp::AcmeOrder {
-                    certificate: cert.id,
-                    node,
-                },
-                cert.id,
-                run_on,
-            )
-            .await?,
-        );
+    for (i, (node, run_on)) in targets.into_iter().enumerate() {
+        let task = create_task_with_id(
+            &state.cluster,
+            ids[i].1,
+            TaskOp::AcmeOrder {
+                certificate: cert.id,
+                node,
+            },
+            cert.id,
+            run_on,
+        )
+        .await;
+        match task {
+            Ok(t) => created.push(t),
+            Err(e) => {
+                // 만들지 못한 칸들은 놓는다(만든 것은 그대로 돈다).
+                let unmade = &ids[i..];
+                let _ = super::order::modify_status(&state.cluster, cert.id, |s| {
+                    for (key_slot, id) in unmade {
+                        if s.running.get(key_slot) == Some(id) {
+                            s.running.remove(key_slot);
+                        }
+                    }
+                })
+                .await;
+                return Err(e);
+            }
+        }
     }
     Ok((StatusCode::ACCEPTED, Json(RenewStarted { tasks: created })))
 }

@@ -1357,7 +1357,7 @@ export interface paths {
         put?: never;
         /**
          * 지금 주문한다(물러서기를 지우고 받을 것마다 `acme-order` Task — 노드마다면 온라인인 덮는 노드마다). 주문 Task가 이미
-         *     돌면 409 `acme_order_running`.
+         *     돌면(칸 하나라도 다른 주문이 잡았으면) 409 `acme_order_running`.
          */
         post: operations["renew_certificate"];
         delete?: never;

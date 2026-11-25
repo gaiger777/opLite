@@ -49,8 +49,14 @@ pub fn installable(
                     continue;
                 }
                 let path = super::order::key_path(dir, c.id, &issued.serial);
-                let Ok(key_pem) = std::fs::read_to_string(path) else {
-                    continue;
+                let key_pem = match std::fs::read_to_string(&path) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        // status가 이 노드의 인증서를 가리키는데 키가 없다(리뷰 2 — 조용히 내부 CA로 돌아가지 않게 알린다).
+                        tracing::warn!(certificate = %c.name, serial = %issued.serial, file = %path.display(), error = %e,
+                            "the key of this node's ACME certificate is missing; serving the next certificate (renew it to fix)");
+                        continue;
+                    }
                 };
                 out.push(Installable {
                     certificate: c.id,

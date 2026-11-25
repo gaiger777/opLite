@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use opl_cluster::ClusterError;
 use opl_types::acme::{
-    AcmeAccountSpec, Certificate, CertificateScope, CertificateSpec, IssuedCert, RenewPolicy,
+    AcmeAccountSpec, Certificate, CertificateScope, CertificateSpec, ChallengeKind, IssuedCert,
+    RenewPolicy,
 };
 use opl_types::node::{ACME, Node, NodeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec};
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use super::{ari, covered_nodes, node_address, order};
 use crate::cluster::missing_feature;
 use crate::state::AppState;
-use crate::tasks::create_task;
+use crate::tasks::create_task_with_id;
 
 /// ARI 창을 다시 묻는 간격
 const ARI_EVERY: i64 = 86_400;
@@ -119,7 +120,36 @@ pub fn shared_runner(nodes: &[Node], leader: Uuid) -> Option<Uuid> {
         .map(|n| n.id)
 }
 
-/// 만들 Task들: (인증서, 대상 노드, 돌 노드)
+/// 주문이 쓸 DNS-01 TXT 이름(`_acme-challenge.` 앞의 이름 — 와일드카드는 기본 이름과 같다)과 DNS 공급자. HTTP-01이면
+/// None. CNAME은 따라가지 않는다(리더는 DNS를 묻지 않는 값싼 어림이다).
+fn txt_names<'a>(
+    cert: &'a Certificate,
+    node: Option<Uuid>,
+    nodes: &[Node],
+) -> Option<(&'a str, Vec<String>)> {
+    let ChallengeKind::Dns01 { dns } = &cert.spec.challenge else {
+        return None;
+    };
+    let names = match node {
+        None => cert.spec.names.clone(),
+        Some(id) => {
+            let n = nodes.iter().find(|n| n.id == id)?;
+            cert.spec.names_for(&n.name, &node_address(n))
+        }
+    };
+    let names = names
+        .iter()
+        .map(|n| {
+            n.trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        })
+        .collect();
+    Some((dns.as_str(), names))
+}
+
+/// 만들 Task들: (인증서, 대상 노드, 돌 노드). 같은 DNS 공급자의 같은 TXT 이름을 쓰는 주문은 함께 돌리지 않는다(리뷰 2 —
+/// PowerDNS의 읽고 고쳐 쓰기는 노드 사이에서 원자적이지 않아 한 값을 잃는다). 지금 갱신이 만든 Task끼리는 막지 않는다.
 pub fn plan(
     certs: &[Certificate],
     nodes: &[Node],
@@ -137,6 +167,11 @@ pub fn plan(
         })
         .collect();
     let mut budget = max_orders.saturating_sub(open.len());
+    // 돌고 있는(또는 이번에 만들) 주문의 TXT 이름
+    let mut busy: Vec<(&str, Vec<String>)> = open
+        .iter()
+        .filter_map(|(c, n)| txt_names(certs.iter().find(|x| x.id == *c)?, *n, nodes))
+        .collect();
     let mut out = Vec::new();
     for cert in certs {
         for d in due(cert, nodes, now) {
@@ -145,6 +180,14 @@ pub fn plan(
             }
             // 같은 인증서의 Task가 돌면(다른 노드라도 — 공유는 하나뿐) 그 노드 것은 다음 틱
             if open.iter().any(|(c, n)| *c == cert.id && *n == d.node) {
+                continue;
+            }
+            let txt = txt_names(cert, d.node, nodes);
+            if let Some((dns, names)) = &txt
+                && busy
+                    .iter()
+                    .any(|(d2, n2)| d2 == dns && n2.iter().any(|n| names.contains(n)))
+            {
                 continue;
             }
             let run_on = match d.node {
@@ -156,6 +199,7 @@ pub fn plan(
             };
             tracing::info!(certificate = %cert.name, node = ?d.node, reason = d.reason, "ordering an ACME certificate");
             out.push((cert.id, d.node, run_on));
+            busy.extend(txt);
             budget -= 1;
         }
     }
@@ -233,16 +277,29 @@ pub async fn tick(state: &AppState, config: &AcmeRenewerConfig) {
         {
             tracing::debug!(error = %e, "cannot drop expired HTTP-01 answers");
         }
-        // 뺀 노드·더는 덮지 않는 노드의 실패를 지운다(요약·경보에 남지 않게).
+        // 범위가 바뀌었으면 다른 범위의 실패를 지운다(리뷰 2 — 요약·물러서기·경보가 이어지지 않게).
+        let shared = cert.spec.scope == CertificateScope::Shared;
+        if cert.status.clone().fit_scope(shared) {
+            if let Err(e) = order::modify_status(cluster, cert.id, |s| {
+                s.fit_scope(shared);
+            })
+            .await
+            {
+                tracing::debug!(error = %e, "cannot reset the failures of the old scope");
+            }
+            continue;
+        }
+        // 뺀 노드·더는 덮지 않는 노드의 실패를 지운다(요약·경보에 남지 않게). 노드마다 인증서만(공유의 물러서기는 그대로).
         let covered: Vec<Uuid> = covered_nodes(&cert.spec, &nodes)
             .iter()
             .map(|n| n.id)
             .collect();
-        if cert
-            .status
-            .node_failures
-            .keys()
-            .any(|n| !covered.contains(n))
+        if !shared
+            && cert
+                .status
+                .node_failures
+                .keys()
+                .any(|n| !covered.contains(n))
             && let Err(e) = order::modify_status(cluster, cert.id, |s| {
                 s.retain_nodes(|n| covered.contains(n))
             })
@@ -259,8 +316,20 @@ pub async fn tick(state: &AppState, config: &AcmeRenewerConfig) {
         config.max_orders,
         now,
     ) {
-        if let Err(e) = create_task(
+        // 칸을 먼저 잡는다(리뷰 2 — 그 사이 지금 갱신이 잡았으면 그것에 맡긴다).
+        let id = Uuid::now_v7();
+        let key_slot = super::slot(node);
+        match order::claim(cluster, certificate, &[(key_slot.clone(), id)], |_| {}).await {
+            Ok(None) => {}
+            Ok(Some(_)) => continue,
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot claim the ACME order slot");
+                continue;
+            }
+        }
+        if let Err(e) = create_task_with_id(
             cluster,
+            id,
             TaskOp::AcmeOrder { certificate, node },
             certificate,
             run_on,
@@ -268,6 +337,12 @@ pub async fn tick(state: &AppState, config: &AcmeRenewerConfig) {
         .await
         {
             tracing::warn!(error = %e.message, "cannot create the ACME order task");
+            let _ = order::modify_status(cluster, certificate, |s| {
+                if s.running.get(&key_slot) == Some(&id) {
+                    s.running.remove(&key_slot);
+                }
+            })
+            .await;
         }
     }
     // ARI 창 다시 묻기는 주문을 만든 뒤에(CA가 늦거나 멈춰도 주문이 밀리지 않게)
@@ -389,9 +464,10 @@ async fn refresh_ari(state: &AppState, cert: &Certificate, now: i64) {
     mark_asked(state, cert, asked).await;
 }
 
-/// 다시 물어야 하나: 창이 있으면 그 `checked_at`, 없으면 `ari_checked_at`에서 하루가 지났나
+/// 다시 물어야 하나: 창의 `checked_at`과 `ari_checked_at`(창 없이·실패로 물은 때) 가운데 늦은 것에서 하루가 지났나
+/// (리뷰 2 — 오래된 창이 있어도 다시 묻기 표시를 지킨다)
 fn ari_stale(i: &IssuedCert, now: i64) -> bool {
-    let checked = i.ari.map(|w| w.checked_at).or(i.ari_checked_at);
+    let checked = i.ari.map(|w| w.checked_at).max(i.ari_checked_at);
     checked.is_none_or(|t| t + ARI_EVERY <= now)
 }
 
@@ -620,6 +696,79 @@ mod tests {
             checked_at: 1000,
         });
         assert!(!ari_stale(&i, 1000 + ARI_EVERY - 1));
+        // 리뷰 2: 오래된 창이 있어도 실패·창 없음으로 적은 다시 묻기 표시를 지킨다.
+        i.ari_checked_at = Some(5000);
+        assert!(!ari_stale(&i, 1000 + ARI_EVERY));
+        assert!(ari_stale(&i, 5000 + ARI_EVERY));
+    }
+
+    /// 리뷰 2: 같은 DNS 공급자의 같은 TXT 이름을 쓰는 주문은 함께 돌리지 않는다.
+    #[test]
+    fn orders_sharing_a_txt_name_run_one_at_a_time() {
+        let nodes = [node(1, true), node(2, true)];
+        let mut c = cert(CertificateScope::PerNode { nodes: vec![] });
+        c.spec.challenge = ChallengeKind::Dns01 { dns: "pdns".into() };
+        c.spec.names = vec!["{node}.example.com".into(), "*.pve.example.com".into()];
+        let ids: Vec<_> = plan(
+            std::slice::from_ref(&c),
+            &nodes,
+            &[],
+            Uuid::from_u128(1),
+            2,
+            0,
+        )
+        .into_iter()
+        .map(|(_, n, _)| n)
+        .collect();
+        assert_eq!(ids, [Some(Uuid::from_u128(1))], "the shared name waits");
+        // 돌고 있는 주문이 이름을 쓰면 다음 틱에
+        let t: Task = Resource::new(
+            "t",
+            TaskSpec {
+                op: TaskOp::AcmeOrder {
+                    certificate: c.id,
+                    node: Some(Uuid::from_u128(1)),
+                },
+                target: c.id,
+                node: Uuid::from_u128(1),
+            },
+        );
+        assert!(
+            plan(
+                std::slice::from_ref(&c),
+                &nodes,
+                &[t],
+                Uuid::from_u128(1),
+                3,
+                0
+            )
+            .is_empty()
+        );
+        // 노드 이름만 다르면 함께
+        c.spec.names = vec!["{node}.example.com".into()];
+        assert_eq!(
+            plan(
+                std::slice::from_ref(&c),
+                &nodes,
+                &[],
+                Uuid::from_u128(1),
+                2,
+                0
+            )
+            .len(),
+            2
+        );
+        // 다른 공급자면 막지 않는다.
+        let mut other = cert(CertificateScope::Shared);
+        other.id = Uuid::from_u128(101);
+        other.spec.challenge = ChallengeKind::Dns01 { dns: "r53".into() };
+        other.spec.names = vec!["n1.example.com".into()];
+        c.spec.names = vec!["n1.example.com".into()];
+        c.spec.scope = CertificateScope::Shared;
+        assert_eq!(
+            plan(&[c, other], &nodes, &[], Uuid::from_u128(1), 4, 0).len(),
+            2
+        );
     }
 
     /// 리뷰 1: 한 노드의 물러서기는 다른 노드(새 노드·갱신할 노드)를 막지 않는다.

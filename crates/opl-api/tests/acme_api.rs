@@ -221,6 +221,93 @@ async fn accounts_dns_and_certificates_are_redacted_and_checked() {
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
+/// 리뷰 2: 인증서·노드(칸)마다 주문은 하나 — 함께 잡으면 하나만 되고, 진 Task는 주문하지 않고 맡긴다. 지금 갱신은 살아
+/// 있는 칸을 409로 거절하고, 끝난(없는) Task의 칸은 넘겨받는다.
+#[tokio::test]
+async fn one_order_per_certificate_and_node() {
+    use opl_api::acme::order;
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    seed_account(&env.cluster, "le", "https://127.0.0.1:1/dir").await;
+    add_feature(&env.cluster, env.node, HTTP01).await;
+    let (status, body) = admin
+        .post(
+            "/certificates",
+            json!({ "name": "a", "account": "le", "names": ["{node}.example.com"],
+                    "challenge": { "kind": "http01" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let slot = env.node.to_string();
+
+    // 둘이 함께 잡는다: 하나만 된다.
+    let (x, y) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let (sx, sy) = ([(slot.clone(), x)], [(slot.clone(), y)]);
+    let (a, b) = tokio::join!(
+        order::claim(&env.cluster, id, &sx, |_| {}),
+        order::claim(&env.cluster, id, &sy, |_| {}),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(
+        (a.is_none() && b == Some(x)) || (b.is_none() && a == Some(y)),
+        "{a:?} {b:?}"
+    );
+    let (winner, loser) = if a.is_none() { (x, y) } else { (y, x) };
+    let c = env.cluster.get::<CertificateSpec>(id).unwrap().unwrap();
+    assert_eq!(c.status.running.get(&slot), Some(&winner));
+
+    // 진 Task는 주문하지 않고 성공으로 끝난다(실패도 적지 않는다).
+    let done = order::run(&env.state, id, Some(env.node), loser)
+        .await
+        .unwrap();
+    assert!(
+        done.as_deref()
+            .is_some_and(|w| w.contains("already running")),
+        "{done:?}"
+    );
+    let c = env.cluster.get::<CertificateSpec>(id).unwrap().unwrap();
+    assert_eq!(c.status.failures, 0);
+    assert_eq!(c.status.running.get(&slot), Some(&winner));
+
+    // 지금 갱신: 살아 있는 칸이면 409(두 번 누름·리더 루프와 겹침)
+    let (status, body) = admin.post("/certificates/a/actions/renew", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "acme_order_running");
+
+    // 끝난(없는) Task의 칸은 넘겨받는다: Task 없이 잡은 지 오래된 표시
+    let stale = uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        (opl_api_now() - 3600) as u64,
+        0,
+    ));
+    order::modify_status(&env.cluster, id, |s| {
+        s.running.insert(slot.clone(), stale);
+    })
+    .await
+    .unwrap();
+    let (status, body) = admin.post("/certificates/a/actions/renew", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let task: uuid::Uuid = body["tasks"][0]["id"].as_str().unwrap().parse().unwrap();
+    let c = env.cluster.get::<CertificateSpec>(id).unwrap().unwrap();
+    // 잡은 표시는 만든 Task의 id(그 Task가 끝나면 놓는다 — CA가 없어 곧 실패)
+    assert!(
+        c.status.running.get(&slot) == Some(&task) || c.status.running.is_empty(),
+        "{:?}",
+        c.status.running
+    );
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let c = env.cluster.get::<CertificateSpec>(id).unwrap().unwrap();
+        if c.status.failures >= 1 {
+            assert!(c.status.running.is_empty(), "{:?}", c.status.running);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the order never failed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// HTTP-01 리스너: Raft의 답(살아 있는 것만), 그 밖은 https로 308(끄면 404).
 #[tokio::test]
 async fn http01_listener_answers_from_raft_and_redirects() {
