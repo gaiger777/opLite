@@ -269,7 +269,7 @@ async fn record_node(
                 .updates
                 .enabled()
                 .then(|| status.updates.take().unwrap_or_default()),
-            features: features(),
+            features: node_features(config),
             cluster_addresses: announced_links(config),
             // 다시 시작했으니 지난 호스트 종료 표시는 지운다(얼린 노드가 풀린다).
             shutdown: None,
@@ -326,6 +326,15 @@ pub async fn mark_shutdown(cluster: &Cluster, shutdown: NodeShutdown) -> anyhow:
 /// 이 빌드가 아는 기능([`FEATURES`]). 위트니스도 적는다(새 기능의 API는 모든 노드를 본다).
 fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
+}
+
+/// 이 노드가 알릴 기능: 빌드의 기능과, 포트 80 HTTP-01 리스너를 켰으면 `http01`(계획 73 §11.3 — 노드 설정이다)
+fn node_features(config: &Config) -> Vec<String> {
+    let mut f = features();
+    if config.api.http_listen.is_some() && !config.witness {
+        f.push(opl_types::node::HTTP01.to_string());
+    }
+    f
 }
 
 /// 알릴 클러스터 링크: 설정의 링크 가운데 호스트가 지금 노드 인증서의 이름에 있는 것. 다시 서명하지 못해 이름이
@@ -407,7 +416,7 @@ pub async fn refresh_bridges(cluster: &Cluster, host: &Host) -> anyhow::Result<(
 /// 노드의 status를 다시 쓰면(모르는 `features`·`cluster_addresses`를 빼고) 지워지므로 주기적으로 되살린다. 같으면
 /// 쓰지 않는다.
 pub async fn refresh_features(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
-    let features = features();
+    let features = node_features(config);
     let links = announced_links(config);
     update_node_status(cluster, |status| {
         if status.features == features && status.cluster_addresses == links {

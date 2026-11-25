@@ -7,8 +7,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::resource::{Kind, ResourceSpec};
+use crate::resource::{Kind, Resource, ResourceSpec};
 pub use crate::vmware::Secret;
+
+pub type AcmeAccount = Resource<AcmeAccountSpec, AcmeAccountStatus>;
+pub type AcmeDns = Resource<AcmeDnsSpec, AcmeDnsStatus>;
+pub type Certificate = Resource<CertificateSpec, CertificateStatus>;
 
 /// 디렉터리 별명
 pub const DIRECTORY_ALIASES: [(&str, &str); 4] = [
@@ -387,6 +391,19 @@ pub struct CertificateSpec {
     #[serde(default, skip_serializing_if = "CertificateInstall::is_api")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub install: CertificateInstall,
+    /// HTTP-01 주문 전에 우리 쪽에서 각 이름의 도전 URL을 불러 본다(실패하면 CA에 묻지 않음 — 검증 실패 속도 한도를
+    /// 아낀다). 끄면 곧바로 CA에 묻는다.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    #[cfg_attr(feature = "openapi", schema(default = true))]
+    pub precheck: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// 인증서를 노드마다 받나, 한 번 받아 나누나
@@ -427,6 +444,12 @@ pub enum CertificateKey {
     EcdsaP256,
     EcdsaP384,
     Rsa2048,
+}
+
+impl CertificateKey {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -556,6 +579,9 @@ pub struct CertificateStatus {
     /// HTTP-01 답(짧게 산다 — 모든 노드의 포트 80 리스너가 읽는다)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub challenges: Vec<Http01Answer>,
+    /// 진행 중 주문 URL(열쇠 = 노드 id 또는 `shared` — Task가 다시 떠도 새 주문 대신 이어 본다)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub orders: BTreeMap<String, String>,
     /// 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
@@ -597,10 +623,10 @@ pub struct IssuedCert {
     pub ari: Option<AriWindow>,
     /// 갱신할 때
     pub renew_at: i64,
-    /// 진행 중 주문 URL(Task가 다시 떠도 이어 본다)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub order: Option<String>,
+    /// 키 종류(스펙의 `key`가 바뀌면 다시 받는다)
+    #[serde(default, skip_serializing_if = "CertificateKey::is_default")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub key: CertificateKey,
     /// 끼우지 못한 까닭(이름 빠짐·키 맞지 않음)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
@@ -768,7 +794,7 @@ mod tests {
                 chain_pem: "-----BEGIN CERTIFICATE-----".into(),
                 ari: None,
                 renew_at: 2,
-                order: None,
+                key: CertificateKey::EcdsaP256,
                 error: None,
             }),
             shared_key: Secret::new("-----BEGIN PRIVATE KEY-----"),

@@ -111,6 +111,8 @@ pub struct Config {
     pub file_restore: FileRestoreSection,
     #[serde(default)]
     pub vmware: VmwareSection,
+    #[serde(default)]
+    pub acme: AcmeSection,
     /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`·`metrics-it`)에만 있다. 배포 빌드는 `[test]`를 모르는
     /// 키로 거부한다.
     #[cfg(any(
@@ -899,6 +901,10 @@ pub struct ApiSection {
     /// 리스너가 이것을 쓰며 클러스터 CA로 API 인증서를 다시 발급하지 않는다(`api_names`를 따르지 않음).
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// ACME HTTP-01 리스너(계획 73 §11.3, 예 `"0.0.0.0:80"`). `/.well-known/acme-challenge/*`에만 답하고(Raft의 도전 값 —
+    /// 이름이 어느 노드를 가리켜도 답한다) 나머지는 https로 308 보낸다(설정 `acme.http_redirect`). 없으면 열지 않는다.
+    #[serde(default)]
+    pub http_listen: Option<SocketAddr>,
 }
 
 impl ApiSection {
@@ -1095,6 +1101,16 @@ impl VmwareSection {
         }
         Ok(())
     }
+}
+
+/// ACME 인증서(계획 73 §11)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSection {
+    /// DNS-01 전파 확인에 쓸 DNS 서버(`ip:port`). 있으면 이 서버만 권한 서버로 보고 묻는다(사내 DNS·분리 DNS). 없으면
+    /// 영역의 NS를 찾아 모두 묻는다.
+    #[serde(default)]
+    pub dns_resolver: Option<SocketAddr>,
 }
 
 /// 지표 기록(계획 60 §6). 위트니스는 쓰지 않는다.
@@ -1897,6 +1913,11 @@ impl Config {
         self.validate_vip(linux)?;
         self.file_restore.validate()?;
         self.vmware.validate()?;
+        if let Some(a) = self.api.http_listen
+            && (a.port() == self.listen.port() || a.port() == self.cluster_listen.port())
+        {
+            anyhow::bail!("api.http_listen must use a port other than listen and cluster_listen");
+        }
         if self.node.zone.as_ref().is_some_and(|z| z.trim().is_empty()) {
             anyhow::bail!("node.zone must not be empty");
         }

@@ -894,6 +894,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
                 | TaskOp::VmwareRevert
                 | TaskOp::VmwareCleanup { .. }
         )
+        // ACME 주문(계획 73)은 걸음마다 한도가 있다(인가·주문 기다림 10분, DNS 전파 `timeout_s`, 요청 30초).
+        || matches!(task.spec.op, TaskOp::AcmeOrder { .. })
         // 선언형 적용(계획 73)은 단계마다 지금 길의 Task(볼륨 만들기·VM 켜기)를 기다리므로 그 한도를 따른다.
         || matches!(task.spec.op, TaskOp::Apply { .. });
     // Task가 쓰는 spec은 Task를 만든 사용자와 이 Task를 출처로 이력에 남는다(계획 73 §7.1). `perform`의 future는 크므로
@@ -1347,8 +1349,11 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             ))
             .await;
         }
-        // ACME 주문(스테이지 4)은 그 스테이지가 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::AcmeOrder { .. } => Err("ACME order tasks are not available yet".into()),
+        // ACME 주문(계획 73 §11.2): 받은 인증서(일련번호·만료)를 경고로 남긴다.
+        TaskOp::AcmeOrder { certificate, node } => {
+            let api = ctx.config.api.clone().ok_or("this node runs no API")?;
+            return Box::pin(crate::acme::order::run(&api, *certificate, *node)).await;
+        }
     };
     done.map(|()| None)
 }

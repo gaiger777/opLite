@@ -200,6 +200,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: crate::vmware::VmwareCmd,
     },
+    /// ACME 인증서(계획 73): 계정·DNS-01 공급자·인증서(노드마다·공유), 지금 갱신
+    Cert {
+        #[command(subcommand)]
+        cmd: crate::cert::CertCmd,
+    },
     /// 하위 명령 없이: 지금 클러스터를 매니페스트 YAML로 내보낸다(계획 73). 하위 명령은 VM 내보내기(OVA/OVF, 계획 72):
     /// 목록·보기·내려받기·지우기(만들기는 `vm export`)
     #[command(args_conflicts_with_subcommands = true)]
@@ -6645,6 +6650,7 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         }
         Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
         Cmd::Vmware { cmd } => Box::pin(crate::vmware::vmware(&client, cmd, json_out, out)).await?,
+        Cmd::Cert { cmd } => Box::pin(crate::cert::cert(&client, cmd, json_out, out)).await?,
         Cmd::Export { cmd: Some(cmd), .. } => {
             Box::pin(crate::vm_export::export(
                 &client,

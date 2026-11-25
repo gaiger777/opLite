@@ -1515,3 +1515,66 @@ async fn backup_verify_and_store_alerts_follow_backup_and_node_state() {
     }
     panic!("backup alerts did not resolve");
 }
+
+/// 인증서 경보(계획 73 §11.6·§11.2): 노드가 내부 노드 인증서의 남은 날로 `certificate_expiring`을, 리더가 이어진 주문
+/// 실패로 `certificate_renew_failed`를 알린다.
+#[tokio::test]
+async fn certificate_alerts_follow_expiry_and_renew_failures() {
+    use opl_types::acme::{Certificate, CertificateSpec};
+
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    rig.rule(
+        "expiring",
+        json!({"condition": {"kind": "certificate_expiring", "days": 45}, "severity": "warning", "targets": ["ops"]}),
+    )
+    .await;
+    rig.rule(
+        "renewal",
+        json!({"condition": {"kind": "certificate_renew_failed", "failures": 2}, "severity": "critical", "targets": ["ops"]}),
+    )
+    .await;
+    common::acme::seed_account(&rig.env.cluster, "le", "https://127.0.0.1:1/dir").await;
+    let spec: CertificateSpec =
+        serde_json::from_value(json!({ "account": "le", "names": ["api.example.com"],
+        "scope": { "kind": "shared" }, "challenge": { "kind": "http01" } }))
+        .unwrap();
+    let mut cert: Certificate = Resource::new("api", spec);
+    cert.status.failures = 3;
+    cert.status.error = Some("the CA could not connect: refused".into());
+    rig.env.cluster.create(&cert).await.unwrap();
+    // 30일 남은 내부 노드 인증서
+    let (node_pem, _) = common::acme::TestCa::new("node CA").issue(&["node1"]);
+    let hv: Arc<dyn Hypervisor> = rig.env.hv.clone();
+    let mut state = AppState::new(
+        rig.env.cluster.clone(),
+        rig.env.node,
+        hv,
+        rig.env.dir.path().join("uploads"),
+    );
+    state.alerts = Some(rig.book.clone());
+    state.acme.node_cert_pem = Some(node_pem);
+    let _engine = AlertEngine::spawn(
+        Arc::new(state),
+        AlertEngineConfig {
+            tick: Duration::from_millis(20),
+            resolve_after_ms: RESOLVE_AFTER_MS,
+            clock: rig.clock.clone(),
+            sender: fast_sender(),
+        },
+    );
+    let hits = rig.hook.wait(2).await;
+    let texts: Vec<String> = hits.iter().map(|h| h.json().to_string()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("\"rule\":\"renewal\"") && t.contains("failed 3 ACME orders")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("\"rule\":\"expiring\"") && t.contains("node1")),
+        "{texts:?}"
+    );
+}

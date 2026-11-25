@@ -25,9 +25,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 연결이 몰려도 파일 디스크립터를 다 쓰지 않는다.
 const MAX_HANDSHAKES: usize = 256;
 
-/// 외부 API가 내보이는 인증서. 바꿔 끼우면 다음 핸드셰이크부터 새 인증서를 쓴다(열린 연결은 그대로).
+/// 외부 API가 내보이는 인증서. 바꿔 끼우면 다음 핸드셰이크부터 새 인증서를 쓴다(열린 연결은 그대로). 이름 붙은
+/// 인증서(ACME — 계획 73 §11.5)가 있으면 클라이언트가 보낸 SNI 이름이 맞는 것을 먼저 고르고, 없으면 기본 인증서다.
 pub struct ApiCert {
     current: RwLock<Arc<CertifiedKey>>,
+    named: RwLock<Vec<(Vec<String>, Arc<CertifiedKey>)>>,
 }
 
 impl fmt::Debug for ApiCert {
@@ -41,7 +43,52 @@ impl ApiCert {
     pub fn new(cert_pem: &str, key_pem: &str) -> Result<Arc<Self>, PkiError> {
         Ok(Arc::new(Self {
             current: RwLock::new(certified_key(cert_pem, key_pem)?),
+            named: RwLock::new(Vec::new()),
         }))
+    }
+
+    /// SNI로 고를 인증서들(이름들, 사슬 PEM, 키 PEM)을 통째로 바꾼다. 하나라도 읽지 못하면 바꾸지 않는다.
+    pub fn set_named(&self, certs: &[(Vec<String>, String, String)]) -> Result<(), PkiError> {
+        let mut out = Vec::with_capacity(certs.len());
+        for (names, cert_pem, key_pem) in certs {
+            let names = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            out.push((names, certified_key(cert_pem, key_pem)?));
+        }
+        *self.named.write().unwrap() = out;
+        Ok(())
+    }
+
+    /// 내보일 수 있는 모든 인증서의 잎(DER — 기본이 먼저). 만료 경보가 본다.
+    pub fn leaf_ders(&self) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = self
+            .current
+            .read()
+            .unwrap()
+            .cert
+            .first()
+            .map(|c| c.to_vec())
+            .into_iter()
+            .collect();
+        for (_, k) in self.named.read().unwrap().iter() {
+            out.extend(k.cert.first().map(|c| c.to_vec()));
+        }
+        out
+    }
+
+    /// SNI 이름에 맞는 이름 붙은 인증서(정확히 같거나 `*.` 와일드카드가 한 레이블을 덮음)
+    fn pick(&self, server_name: &str) -> Option<Arc<CertifiedKey>> {
+        let name = server_name.trim_end_matches('.').to_ascii_lowercase();
+        let named = self.named.read().unwrap();
+        named
+            .iter()
+            .find(|(names, _)| names.contains(&name))
+            .or_else(|| {
+                let parent = name.split_once('.')?.1;
+                named
+                    .iter()
+                    .find(|(names, _)| names.iter().any(|n| n.strip_prefix("*.") == Some(parent)))
+            })
+            .map(|(_, k)| k.clone())
     }
 
     /// 인증서와 키(PEM)를 바꾼다. 읽지 못하거나 짝이 맞지 않으면 바꾸지 않는다.
@@ -53,9 +100,17 @@ impl ApiCert {
 }
 
 impl ResolvesServerCert for ApiCert {
-    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if let Some(k) = hello.server_name().and_then(|n| self.pick(n)) {
+            return Some(k);
+        }
         Some(self.current.read().unwrap().clone())
     }
+}
+
+/// 사슬과 키(PEM)를 읽을 수 있고 짝이 맞는지
+pub fn check_pair(cert_pem: &str, key_pem: &str) -> Result<(), PkiError> {
+    certified_key(cert_pem, key_pem).map(drop)
 }
 
 fn certified_key(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, PkiError> {
@@ -268,5 +323,51 @@ mod tests {
         let mut response = String::new();
         before.read_to_string(&mut response).await.unwrap();
         assert!(response.ends_with("hello"), "{response}");
+    }
+
+    /// 이름 붙은 인증서는 SNI 이름이 맞을 때만 쓰고(와일드카드 한 레이블), 그 밖은 기본 인증서다.
+    #[tokio::test]
+    async fn named_certs_are_picked_by_sni() {
+        let ca = ClusterCa::generate("test").unwrap();
+        let (key_pem, csr) = node_key_and_csr().unwrap();
+        let cert_pem = ca
+            .sign_node(&csr, uuid::Uuid::now_v7(), &["127.0.0.1".into()])
+            .unwrap();
+        let cert = ApiCert::new(&cert_pem, &key_pem).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let listener =
+            TlsListener::new(tcp, api_server_config_with(cert.clone()).unwrap()).unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "hello" }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(
+            handshake(&ca.cert_pem, addr, "vip.example.com")
+                .await
+                .is_err()
+        );
+        let names = vec!["vip.example.com".to_string(), "*.w.example.com".to_string()];
+        let (pem, key) = api_cert(&ca, &cert_pem, &names).unwrap();
+        cert.set_named(&[(names, pem, key)]).unwrap();
+        handshake(&ca.cert_pem, addr, "vip.example.com")
+            .await
+            .unwrap();
+        handshake(&ca.cert_pem, addr, "x.w.example.com")
+            .await
+            .unwrap();
+        assert!(
+            handshake(&ca.cert_pem, addr, "y.x.w.example.com")
+                .await
+                .is_err()
+        );
+        // 이름이 없는(IP) 손맞춤은 기본 인증서
+        handshake(&ca.cert_pem, addr, "127.0.0.1").await.unwrap();
+        assert_eq!(cert.leaf_ders().len(), 2);
+        // 짝이 맞지 않으면 바꾸지 않는다.
+        let (other, _) = node_key_and_csr().unwrap();
+        assert!(
+            cert.set_named(&[(vec!["z.example.com".into()], cert_pem.clone(), other)])
+                .is_err()
+        );
+        assert_eq!(cert.leaf_ders().len(), 2);
     }
 }

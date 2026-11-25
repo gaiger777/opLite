@@ -802,6 +802,47 @@ jobs:
         if: failure()
         run: tail -n 200 "$RUNNER_TEMP/vcsim.log"
 
+  # 계획 73 스테이지 4: 실제 ACME 흐름 — Pebble(-strict, 무작위 badNonce)·pebble-challtestsrv(핀한 판, SHA-256)와 BIND 9(우분투
+  # 꾸러미, RFC 2136 + TSIG)
+  acme:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PEBBLE_VERSION: v2.10.1
+      PEBBLE_SHA256: 4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed
+      CHALLTESTSRV_SHA256: e93a5aa25ecdf3af2f9fbb2de32b0173e64a2eae81002a4ccfe35fa6f4f60b92
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL headers (native-tls), BIND 9 and dig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config bind9 dnsutils
+          sudo systemctl stop named || true
+      - name: Pebble and pebble-challtestsrv (pinned release, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/pebble" && cd "$RUNNER_TEMP/pebble"
+          base="https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION"
+          curl -fsSL -o pebble.tar.gz "$base/pebble-linux-amd64.tar.gz"
+          curl -fsSL -o cts.tar.gz "$base/pebble-challtestsrv-linux-amd64.tar.gz"
+          echo "$PEBBLE_SHA256  pebble.tar.gz" | sha256sum -c -
+          echo "$CHALLTESTSRV_SHA256  cts.tar.gz" | sha256sum -c -
+          tar xzf pebble.tar.gz && tar xzf cts.tar.gz
+          install -m 0755 pebble-linux-amd64/linux/amd64/pebble pebble
+          install -m 0755 pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv pebble-challtestsrv
+          ./pebble -version
+          echo "OPL_TEST_PEBBLE_DIR=$RUNNER_TEMP/pebble" >> "$GITHUB_ENV"
+      - name: Start BIND (TSIG zone bind.test)
+        run: |
+          # AppArmor의 named 프로필은 /etc/bind 밖을 막으므로 복사한 실행 파일로 띄운다.
+          cp /usr/sbin/named "$RUNNER_TEMP/named"
+          .github/scripts/acme-bind.sh "$RUNNER_TEMP/named" "$RUNNER_TEMP/bind" 15353 >> "$GITHUB_ENV"
+      - run: cargo test -p opl-api --features acme-it --test acme -- --nocapture
+      - name: BIND log
+        if: failure()
+        run: tail -n 100 "$RUNNER_TEMP/bind/named.log" || true
+
   deny:
     runs-on: ubuntu-24.04
     steps:

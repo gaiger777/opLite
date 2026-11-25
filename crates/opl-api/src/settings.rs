@@ -100,6 +100,23 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub cpu: Option<crate::cpu::CpuSettingsPatch>,
+    /// ACME(계획 73 §11.3): 포트 80 리스너의 https 리다이렉트·갱신 시각 흩뜨리기. 준 칸만 바꾼다. 모든 노드가 `acme`를
+    /// 알아야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub acme: Option<AcmeSettingsPatch>,
+}
+
+/// ACME 동작에서 바꿀 값
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSettingsPatch {
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub http_redirect: Option<bool>,
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub renew_jitter: Option<bool>,
 }
 
 /// `PATCH /settings`의 응답: 저장한 설정과, `cpu`를 바꿨으면 다음 전원 껐다 켜기에 CPU가 바뀌는 실행 중 VM 수
@@ -420,10 +437,15 @@ pub async fn patch_settings(
         && req.prometheus.is_none()
         && req.two_factor.is_none()
         && req.cpu.is_none()
+        && req.acme.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor or cpu",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor, cpu or acme",
         ));
+    }
+    // 옛 노드는 설정 `acme`를 풀지 못한다(계획 73).
+    if req.acme.is_some() {
+        crate::cluster::require_feature(&state.cluster, opl_types::node::ACME)?;
     }
     // 옛 노드는 설정 `cpu`를 풀지 못한다(계획 63, 검증보다 먼저). 검증·별칭 고정은 쓰기 안에서 지금 설정에 합쳐 한다.
     let cpu_inv = match &req.cpu {
@@ -567,6 +589,17 @@ pub async fn patch_settings(
             *affected.lock().unwrap() = Some(crate::cpu::affected_running_vms(inv, &next));
             *cpu_notes.lock().unwrap() = notes;
             spec.cpu = (next != opl_types::cpu::CpuSettings::default()).then_some(next);
+        }
+        // 모두 기본값이면 쓰지 않는다.
+        if let Some(patch) = req.acme {
+            let mut acme = spec.acme();
+            if let Some(v) = patch.http_redirect {
+                acme.http_redirect = v;
+            }
+            if let Some(v) = patch.renew_jitter {
+                acme.renew_jitter = v;
+            }
+            spec.acme = (acme != opl_types::settings::AcmeSettings::default()).then_some(acme);
         }
         Ok(())
     })

@@ -213,6 +213,10 @@ struct Services {
     replication: ReplicationScheduler,
     /// 리더가 VMware 이전의 동기화·정리 Task를 만든다(계획 72).
     vmware: VmwareScheduler,
+    /// 리더가 ACME 인증서를 주문한다(계획 73).
+    acme: opl_api::acme::AcmeRenewer,
+    /// ACME HTTP-01 리스너(`[api] http_listen`이 없으면 없다)
+    http01: Option<opl_api::acme::http01::Http01Server>,
     /// 리더가 SDN 네트워크를 OVN NB에 맞추고 지운 노드의 SB chassis를 지운다(계획 65).
     ovn_sync: OvnSync,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
@@ -286,6 +290,10 @@ impl Services {
         self.backups.shutdown().await;
         self.replication.shutdown().await;
         self.vmware.shutdown().await;
+        self.acme.shutdown().await;
+        if let Some(h) = self.http01 {
+            h.shutdown().await;
+        }
         self.ovn_sync.shutdown().await;
         self.telemetry.shutdown().await;
         self.alerts.shutdown().await;
@@ -436,9 +444,18 @@ impl Member {
             let peer = TcpListener::bind(config.cluster_listen)
                 .await
                 .with_context(|| format!("cannot listen on {}", config.cluster_listen))?;
-            anyhow::Ok((api, peer))
+            // ACME HTTP-01 리스너(계획 73 §11.3 — 선택)
+            let http01 = match config.api.http_listen {
+                Some(a) => Some(
+                    TcpListener::bind(a)
+                        .await
+                        .with_context(|| format!("cannot listen on {a} (api.http_listen)"))?,
+                ),
+                None => None,
+            };
+            anyhow::Ok((api, peer, http01))
         };
-        let (api_listener, peer_listener) = match ports.await {
+        let (api_listener, peer_listener, http01_listener) = match ports.await {
             Ok(listeners) => listeners,
             Err(e) => {
                 let _ = cluster.shutdown().await;
@@ -968,6 +985,14 @@ impl Member {
         runner_config.sdn = Some(ovn.clone());
         state.ceph = Some(ceph.clone());
         state.vmware = config.vmware();
+        // ACME(계획 73): 노드마다 인증서의 키 자리, DNS-01 확인 서버, 만료 경보가 볼 인증서
+        state.acme = opl_api::acme::AcmeNodeConfig {
+            key_dir: Some(pki_dir(config).join("acme")),
+            dns_resolver: config.acme.dns_resolver,
+            api_cert: Some(api_cert.clone()),
+            node_cert_pem: Some(tls.cert_pem.clone()),
+            ..Default::default()
+        };
         // 네트워크 주소 목록이 논리 포트 상태를 OvnSync와 같은 TLS로 읽는다(계획 65).
         state.ovn = Some(ovn_sync_config.clone());
         state.ceph_status_ttl = config.ceph.status_cache();
@@ -1049,9 +1074,24 @@ impl Member {
 
         let api_cert = config.api.tls_cert.is_none().then(|| {
             on(&rt.work, || {
-                ApiCertAgent::spawn(cluster.clone(), tls.clone(), api_cert)
+                ApiCertAgent::spawn_with_acme(
+                    cluster.clone(),
+                    tls.clone(),
+                    api_cert,
+                    Some(pki_dir(config).join("acme")),
+                )
             })
         });
+        // ACME: 리더가 인증서를 주문하고(Task `acme-order`), 포트 80이 도전에 답한다(계획 73 §11.2·§11.3).
+        let acme = on(&rt.work, || {
+            opl_api::acme::AcmeRenewer::spawn(state.clone(), Default::default())
+        });
+        let http01 = match http01_listener {
+            Some(l) => Some(on(&rt.api, || {
+                opl_api::acme::http01::Http01Server::spawn(l, cluster.clone(), config.listen.port())
+            })?),
+            None => None,
+        };
         // TLS 핸드셰이크 작업이 `api`에 생긴다.
         let listener = on(&rt.api, || TlsListener::new(api_listener, api_tls))?;
         tracing::info!(
@@ -1141,6 +1181,8 @@ impl Member {
                 backups,
                 replication,
                 vmware,
+                acme,
+                http01,
                 ovn_sync,
                 telemetry,
                 alerts,

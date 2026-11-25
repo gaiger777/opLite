@@ -3,6 +3,7 @@
 //! API는 원하는 상태(spec)를 Raft에 기록하고 Task를 만들기만 한다. VM을 실제로 움직이는 것은
 //! 각 노드의 reconciler이고, Task의 진행은 대상 노드의 [`TaskRunner`]가 기록한다.
 
+pub mod acme;
 pub mod alerts;
 mod api_cert;
 pub mod audit;
@@ -464,6 +465,30 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(vmware_sources::check_source))
         .routes(routes!(vmware_sources::source_inventory))
+        // ACME 인증서(계획 73 §13)
+        .routes(routes!(acme::api::list_accounts, acme::api::create_account))
+        .routes(routes!(
+            acme::api::get_account,
+            acme::api::patch_account,
+            acme::api::delete_account
+        ))
+        .routes(routes!(acme::api::check_account))
+        .routes(routes!(acme::api::list_dns, acme::api::create_dns))
+        .routes(routes!(
+            acme::api::get_dns,
+            acme::api::patch_dns,
+            acme::api::delete_dns
+        ))
+        .routes(routes!(
+            acme::api::list_certificates,
+            acme::api::create_certificate
+        ))
+        .routes(routes!(
+            acme::api::get_certificate,
+            acme::api::patch_certificate,
+            acme::api::delete_certificate
+        ))
+        .routes(routes!(acme::api::renew_certificate))
         .routes(routes!(
             r::list_vmware_migrations,
             vmware_migrations::create_migration

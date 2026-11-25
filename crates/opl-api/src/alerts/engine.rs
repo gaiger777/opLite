@@ -594,6 +594,24 @@ impl Engine {
                 }
             }
         }
+        // 인증서 만료(계획 73 §11.6): 이 노드 공개 리스너가 낼 수 있는 인증서와 내부 노드 인증서 가운데 가장 먼저 끝나는 것.
+        // 값은 남은 날이다. 읽을 인증서가 없으면(시험·위트니스) 값을 모른다.
+        let soonest = crate::acme::soonest_expiry(&self.state.acme);
+        for r in &rules {
+            if let AlertCondition::CertificateExpiring { days } = r.spec.condition {
+                let subject = AlertSubject {
+                    kind: SubjectKind::Node,
+                    id: me.id,
+                    name: me.name.clone(),
+                    node: Some(me.name.clone()),
+                };
+                let seen = soonest.map(|not_after| {
+                    let left = (not_after - crate::backups::now() as i64) as f64 / 86_400.0;
+                    Observation::new(left < f64::from(days), Some(left.max(0.0).floor()))
+                });
+                out.push((r, subject, seen));
+            }
+        }
         complete
     }
 
@@ -668,6 +686,13 @@ impl Engine {
                     Some(f) => self.subject_rule(now, &rule, f, "The backup store was deleted."),
                     None => continue,
                 },
+                // ACME 주문이 이어 실패함(계획 73 §11.2): 목록을 읽지 못하면 그대로 둔다.
+                AlertCondition::CertificateRenewFailed { failures } => {
+                    match self.renew_findings(failures) {
+                        Some(f) => self.subject_rule(now, &rule, f, "The certificate was deleted."),
+                        None => continue,
+                    }
+                }
                 ref c if c.is_sdn() => {
                     // 입력을 읽지 못했으면 그대로 둔다(빈 입력으로 보면 경보를 알림 없이 뺀다).
                     let Some(world) = &sdn else { continue };
@@ -892,6 +917,37 @@ impl Engine {
                         node: None,
                     };
                     (subject, failed, detail)
+                })
+                .collect(),
+        )
+    }
+
+    /// 인증서마다: 이어진 주문 실패가 `failures`번 이상이면 참(마지막 오류를 자세히)
+    fn renew_findings(&self, failures: u32) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
+        let (_, certs) = self
+            .cluster()
+            .list::<opl_types::acme::CertificateSpec>()
+            .ok()?;
+        Some(
+            certs
+                .iter()
+                .map(|c| {
+                    let failing = c.status.failures >= failures;
+                    let subject = AlertSubject {
+                        kind: SubjectKind::Certificate,
+                        id: c.id,
+                        name: c.name.clone(),
+                        node: None,
+                    };
+                    let detail = failing.then(|| {
+                        format!(
+                            "Certificate {} failed {} ACME orders in a row: {}",
+                            c.name,
+                            c.status.failures,
+                            c.status.error.as_deref().unwrap_or("unknown error")
+                        )
+                    });
+                    (subject, failing, detail)
                 })
                 .collect(),
         )

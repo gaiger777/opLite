@@ -37,6 +37,95 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/acme-accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_accounts"];
+        put?: never;
+        /**
+         * ACME 계정을 만든다(201): 계정 키(ES256)를 서버가 만들고 CA에 등록한다(EAB가 있으면 묶는다). 약관에 동의해야 한다.
+         *     CA가 거절하면 400 `acme_rejected`, 닿지 않으면 502 `acme_unreachable`. 계정 키·EAB HMAC 키는 응답·watch·감사에 없다.
+         */
+        post: operations["create_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/acme-accounts/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_account"];
+        put?: never;
+        post?: never;
+        /** 계정을 지운다(204). 쓰는 인증서가 있으면 409 `account_in_use`. CA 쪽 계정은 그대로 둔다. */
+        delete: operations["delete_account"];
+        options?: never;
+        head?: never;
+        /** 계정의 연락처·루트를 바꾼다. 바꾸면 CA에 다시 등록해 본다(같은 계정 — 연락처를 맞춘다). */
+        patch: operations["patch_account"];
+        trace?: never;
+    };
+    "/acme-accounts/{key}/actions/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** CA에 다시 묻는다(디렉터리·등록 — 같은 계정). 결과를 status에 적고, 실패면 `status.error`에 적은 뒤 그 오류를 돌려준다. */
+        post: operations["check_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/acme-dns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_dns"];
+        put?: never;
+        /** DNS-01 공급자를 만든다(201). 비밀(API 토큰·키·TSIG 비밀)은 응답·watch·감사에 없다. */
+        post: operations["create_dns"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/acme-dns/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_dns"];
+        put?: never;
+        post?: never;
+        /** DNS 공급자를 지운다(204). 쓰는 인증서가 있으면 409 `dns_in_use`. */
+        delete: operations["delete_dns"];
+        options?: never;
+        head?: never;
+        patch: operations["patch_dns"];
+        trace?: never;
+    };
     "/alert-rules": {
         parameters: {
             query?: never;
@@ -1192,6 +1281,63 @@ export interface paths {
         get: operations["get_ceph_status"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/certificates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_certificates"];
+        put?: never;
+        /**
+         * 인증서를 만든다(201). 리더 `AcmeRenewer`가 다음 틱(60초)에 주문한다(`actions/renew`로 곧바로). HTTP-01이면 대상
+         *     노드가 모두 `[api] http_listen`을 켜야 한다(400 `http01_unavailable`). `rsa2048`은 이 빌드가 키를 만들지 못한다(400).
+         */
+        post: operations["create_certificate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/certificates/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_certificate"];
+        put?: never;
+        post?: never;
+        /** 인증서를 지운다(204). 끼워 둔 노드는 다음 차례(다른 ACME 인증서·내부 CA)로 돌아간다. CA 쪽 인증서는 취소하지 않는다. */
+        delete: operations["delete_certificate"];
+        options?: never;
+        head?: never;
+        patch: operations["patch_certificate"];
+        trace?: never;
+    };
+    "/certificates/{key}/actions/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 지금 주문한다(물러서기를 지우고 받을 것마다 `acme-order` Task — 노드마다면 온라인인 덮는 노드마다). 주문 Task가 이미
+         *     돌면 409 `acme_order_running`.
+         */
+        post: operations["renew_certificate"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4857,6 +5003,56 @@ export interface components {
              */
             revision: number;
         };
+        /** @description 계정에서 바꿀 값(디렉터리·EAB는 바꿀 수 없다 — 새 계정을 만든다) */
+        AccountPatch: {
+            /** @description `null`이면 시스템 루트를 믿는다. */
+            ca_bundle?: string | null;
+            /** @description `null`이면 연락처를 지운다. */
+            email?: string | null;
+        };
+        AcmeAccountSpec: {
+            /** @description CA 약관에 동의함(참이어야 등록한다) */
+            agree_tos?: boolean;
+            /** @description 사내 ACME(step-ca·Pebble)의 루트(PEM). 있으면 이 루트만 믿는다. */
+            ca_bundle?: string;
+            /** @description 디렉터리 URL 또는 별명(`letsencrypt`·`letsencrypt-staging`·`zerossl`·`google`). 만든 뒤 바꿀 수 없다. */
+            directory: string;
+            /** @description 외부 계정 묶기(ZeroSSL·Google·사내 CA) */
+            eab?: components["schemas"]["ExternalAccountBinding"];
+            email?: string;
+        };
+        AcmeAccountStatus: {
+            /** @default null */
+            error: string;
+            /**
+             * @description 디렉터리 `meta.profiles`의 이름
+             * @default []
+             */
+            profiles: string[];
+            /**
+             * Format: int64
+             * @description 등록한 때(유닉스 초)
+             * @default null
+             */
+            registered_at: number;
+            /**
+             * @description 동의한 약관 URL
+             * @default null
+             */
+            terms: string;
+            /**
+             * @description 등록한 계정 URL(`kid`)
+             * @default null
+             */
+            url: string;
+        };
+        AcmeDnsSpec: {
+            propagation?: components["schemas"]["Propagation"];
+            provider: components["schemas"]["DnsProvider"];
+            /** @description 이 공급자가 맡는 영역(`example.com`). 인증서가 이름으로 공급자를 고를 때 쓴다. */
+            zones?: string[];
+        };
+        AcmeDnsStatus: Record<string, never>;
         /** @description ACME 동작 설정(계획 73 §11.3) */
         AcmeSettings: {
             /**
@@ -4869,6 +5065,11 @@ export interface components {
              * @default true
              */
             renew_jitter: boolean;
+        };
+        /** @description ACME 동작에서 바꿀 값 */
+        AcmeSettingsPatch: {
+            http_redirect?: boolean;
+            renew_jitter?: boolean;
         };
         /** @enum {string} */
         Action: "accept" | "drop";
@@ -5216,6 +5417,15 @@ export interface components {
          * @enum {string}
          */
         Arch: "x86_64" | "aarch64";
+        /** @description CA가 알려 준 갱신 창(ARI) */
+        AriWindow: {
+            /** Format: int64 */
+            checked_at: number;
+            /** Format: int64 */
+            end: number;
+            /** Format: int64 */
+            start: number;
+        };
         AssertionCredential: {
             /** @description 자격 증명 id(base64url) */
             id: string;
@@ -5954,6 +6164,96 @@ export interface components {
             /** @description 끝나지 않은 Ceph Task */
             tasks: string[];
         };
+        /** @enum {string} */
+        CertificateInstall: "api" | "none";
+        /** @enum {string} */
+        CertificateKey: "ecdsa-p256" | "ecdsa-p384" | "rsa2048";
+        /** @description 인증서에서 바꿀 값(주어진 것만). 이름·범위·도전·키가 바뀌면 리더가 다음 틱에 다시 받는다. */
+        CertificatePatch: {
+            account?: string;
+            challenge?: components["schemas"]["ChallengeKind"];
+            install?: components["schemas"]["CertificateInstall"];
+            key?: components["schemas"]["CertificateKey"];
+            names?: string[];
+            precheck?: boolean;
+            /** @description `null`이면 지운다. */
+            preferred_chain?: string | null;
+            /** @description `null`이면 지운다. */
+            profile?: string | null;
+            renew?: components["schemas"]["RenewPolicy"];
+            scope?: components["schemas"]["CertificateScope"];
+        };
+        /** @description 인증서를 노드마다 받나, 한 번 받아 나누나 */
+        CertificateScope: {
+            /** @enum {string} */
+            kind: "per_node";
+            nodes?: string[];
+        } | {
+            /** @enum {string} */
+            kind: "shared";
+        };
+        CertificateSpec: {
+            /** @description ACME 계정 이름 */
+            account: string;
+            challenge: components["schemas"]["ChallengeKind"];
+            install?: components["schemas"]["CertificateInstall"];
+            key?: components["schemas"]["CertificateKey"];
+            /** @description 인증서 이름들. `{node}`·`{node_address}`(노드마다만)와 `*.`(DNS-01만)를 받는다. */
+            names: string[];
+            /**
+             * @description HTTP-01 주문 전에 우리 쪽에서 각 이름의 도전 URL을 불러 본다(실패하면 CA에 묻지 않음 — 검증 실패 속도 한도를
+             *     아낀다). 끄면 곧바로 CA에 묻는다.
+             * @default true
+             */
+            precheck: boolean;
+            /** @description 고를 사슬의 루트 CN */
+            preferred_chain?: string;
+            /** @description ACME 프로필(`classic`·`tlsserver`·`shortlived`). 디렉터리에 프로필이 없으면 보내지 않는다. */
+            profile?: string;
+            renew?: components["schemas"]["RenewPolicy"];
+            scope?: components["schemas"]["CertificateScope"];
+        };
+        /** @description 받은 인증서와 갱신 상태 */
+        CertificateStatus: {
+            /**
+             * @description HTTP-01 답(짧게 산다 — 모든 노드의 포트 80 리스너가 읽는다)
+             * @default []
+             */
+            challenges: components["schemas"]["Http01Answer"][];
+            /** @default null */
+            error: string;
+            /**
+             * Format: int32
+             * @description 이어진 실패 수
+             * @default 0
+             */
+            failures: number;
+            /**
+             * Format: int64
+             * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+             * @default null
+             */
+            next_attempt_at: number;
+            /**
+             * @description 노드마다 받은 인증서(노드 id → 인증서)
+             * @default {}
+             */
+            nodes: {
+                [key: string]: components["schemas"]["IssuedCert"];
+            };
+            /**
+             * @description 진행 중 주문 URL(열쇠 = 노드 id 또는 `shared` — Task가 다시 떠도 새 주문 대신 이어 본다)
+             * @default {}
+             */
+            orders: {
+                [key: string]: string;
+            };
+            /**
+             * @description 공유 인증서
+             * @default null
+             */
+            shared: components["schemas"]["IssuedCert"];
+        };
         /**
          * @description 열 하나의 AVG·MAX·MIN. 모르는 칸(NaN)은 `null`이다. `Raw5s`는 세 열이 같고, `Digest`는 AVG만 있다(MAX·MIN은
          *     비어 있고 쓰지 않는다).
@@ -5962,6 +6262,14 @@ export interface components {
             avg: (number | null)[];
             max?: (number | null)[];
             min?: (number | null)[];
+        };
+        ChallengeKind: {
+            /** @enum {string} */
+            kind: "http01";
+        } | {
+            dns: string;
+            /** @enum {string} */
+            kind: "dns01";
         };
         /** @description 칸 하나의 바뀜 */
         Change: {
@@ -6466,6 +6774,21 @@ export interface components {
             name: string;
             privileges: string[];
         };
+        /** @description ACME 계정 만들기 본문 */
+        CreateAccountRequest: {
+            /** @description CA 약관에 동의함(참이어야 한다) */
+            agree_tos: boolean;
+            /** @description 사내 ACME·Pebble의 루트(PEM) */
+            ca_bundle?: string;
+            /** @description 디렉터리 URL 또는 별명(`letsencrypt`·`letsencrypt-staging`·`zerossl`·`google`) */
+            directory: string;
+            eab?: components["schemas"]["EabRequest"];
+            email?: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+        };
         CreateBackupRequest: {
             /**
              * @description 할 수 있으면 증분으로(같은 풀의 바로 앞 백업을 부모로 바뀐 블록만) 백업한다. 할 수 없으면
@@ -6478,6 +6801,23 @@ export interface components {
             pool?: string;
             /** @description 백업 저장소(계획 68). `pool`과 둘 중 하나다. */
             store?: string;
+        };
+        /** @description 인증서 만들기 본문: `name`·`labels`와 인증서 스펙 칸(모르는 칸은 거절한다) */
+        CreateCertificateRequest: components["schemas"]["CertificateSpec"] & {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+        };
+        /** @description DNS 공급자 만들기 본문(비밀은 저장 뒤 다시 보이지 않는다) */
+        CreateDnsRequest: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            propagation?: components["schemas"]["Propagation"];
+            provider: components["schemas"]["DnsProvider"];
+            zones?: string[];
         };
         /** @description `POST /floating-ips` */
         CreateFloatingIp: {
@@ -7040,6 +7380,49 @@ export interface components {
             /** @enum {string} */
             state: "in-use";
         };
+        /** @description DNS 공급자에서 바꿀 값. `provider`는 통째로(비밀도 다시) 준다. */
+        DnsPatch: {
+            propagation?: components["schemas"]["Propagation"];
+            provider?: components["schemas"]["DnsProvider"];
+            zones?: string[];
+        };
+        /** @description DNS-01 TXT를 쓰는 길 */
+        DnsProvider: {
+            api_token: string;
+            /** @enum {string} */
+            kind: "cloudflare";
+            zone_id?: string;
+        } | {
+            access_key_id: string;
+            hosted_zone_id?: string;
+            /** @enum {string} */
+            kind: "route53";
+            /** @default us-east-1 */
+            region: string;
+            secret_access_key: string;
+        } | {
+            algorithm?: components["schemas"]["TsigAlgorithm"];
+            key_name: string;
+            /** @enum {string} */
+            kind: "rfc2136";
+            /** @description TSIG 비밀(base64) */
+            secret: string;
+            /** @description `ip:53` */
+            server: string;
+            zone?: string;
+        } | {
+            api_key: string;
+            /** @enum {string} */
+            kind: "power_dns";
+            /** @default localhost */
+            server_id: string;
+            url: string;
+        } | {
+            /** @enum {string} */
+            kind: "hook";
+            /** @description [`HOOK_DIR`] 아래 절대 경로 */
+            path: string;
+        };
         /**
          * @description 내려받기 형식
          * @enum {string}
@@ -7091,6 +7474,11 @@ export interface components {
         };
         /** @enum {string} */
         DriftState: "modified" | "missing" | "unmanaged";
+        EabRequest: {
+            /** @description base64url HMAC 키. 저장한다(Raft) — 응답·watch·감사에는 없다. */
+            hmac_key: string;
+            kid: string;
+        };
         /** @description 유효 권한과 그 근거 */
         EffectivePermissions: {
             /** @description 이 대상에 닿는 그 사용자(와 그 그룹)의 grant */
@@ -7249,6 +7637,12 @@ export interface components {
             name?: string;
             /** @description 파일을 둘 풀(dir·NFS) */
             pool: string;
+        };
+        ExternalAccountBinding: {
+            /** @description EAB HMAC 키(base64url). 보기·watch·감사·이력에서 뺀다. */
+            hmac_key: string;
+            /** @description EAB 키 id */
+            kid: string;
         };
         /** @description 영역의 디렉터리 그룹(LDAP 그룹 DN 또는 OIDC `groups` 클레임 값) */
         ExternalGroup: {
@@ -8131,6 +8525,15 @@ export interface components {
              */
             vcpus: number;
         };
+        Http01Answer: {
+            key_authorization: string;
+            token: string;
+            /**
+             * Format: int64
+             * @description 이때(유닉스 초)가 지나면 답하지 않는다
+             */
+            until: number;
+        };
         /** @description 호스트 노드의 hugepages 풀 하나 */
         HugepagePool: {
             /** Format: int32 */
@@ -8492,6 +8895,28 @@ export interface components {
             /** @description 타깃 이름(`iqn.`·`eui.`·`naa.`로 시작) */
             target: string;
         };
+        /** @description 받은 인증서 하나. 시각은 유닉스 초다. */
+        IssuedCert: {
+            ari?: components["schemas"]["AriWindow"];
+            /** @description 사슬(PEM, 공개) */
+            chain_pem: string;
+            /** @description 끼우지 못한 까닭(이름 빠짐·키 맞지 않음) */
+            error?: string;
+            /** @description 키 종류(스펙의 `key`가 바뀌면 다시 받는다) */
+            key?: components["schemas"]["CertificateKey"];
+            names: string[];
+            /** Format: int64 */
+            not_after: number;
+            /** Format: int64 */
+            not_before: number;
+            /**
+             * Format: int64
+             * @description 갱신할 때
+             */
+            renew_at: number;
+            /** @description 일련번호(16진수) */
+            serial: string;
+        };
         /** @description 항목 동작(`retry`·`cancel`·`cutover`·`revert`·`finalize`)의 답: 바뀐 항목과 만든 Task */
         ItemAction: {
             item: components["schemas"]["Resource_VmwareVmSpec_VmwareVmStatus"];
@@ -8848,6 +9273,85 @@ export interface components {
                  */
                 token_id: string | null;
                 url: string;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_AcmeAccountSpec_AcmeAccountStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /** @description CA 약관에 동의함(참이어야 등록한다) */
+                    agree_tos?: boolean;
+                    /** @description 사내 ACME(step-ca·Pebble)의 루트(PEM). 있으면 이 루트만 믿는다. */
+                    ca_bundle?: string;
+                    /** @description 디렉터리 URL 또는 별명(`letsencrypt`·`letsencrypt-staging`·`zerossl`·`google`). 만든 뒤 바꿀 수 없다. */
+                    directory: string;
+                    /** @description 외부 계정 묶기(ZeroSSL·Google·사내 CA) */
+                    eab?: components["schemas"]["ExternalAccountBinding"];
+                    email?: string;
+                };
+                status: {
+                    /** @default null */
+                    error: string;
+                    /**
+                     * @description 디렉터리 `meta.profiles`의 이름
+                     * @default []
+                     */
+                    profiles: string[];
+                    /**
+                     * Format: int64
+                     * @description 등록한 때(유닉스 초)
+                     * @default null
+                     */
+                    registered_at: number;
+                    /**
+                     * @description 동의한 약관 URL
+                     * @default null
+                     */
+                    terms: string;
+                    /**
+                     * @description 등록한 계정 URL(`kid`)
+                     * @default null
+                     */
+                    url: string;
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_AcmeDnsSpec_AcmeDnsStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    propagation?: components["schemas"]["Propagation"];
+                    provider: components["schemas"]["DnsProvider"];
+                    /** @description 이 공급자가 맡는 영역(`example.com`). 인증서가 이름으로 공급자를 고를 때 쓴다. */
+                    zones?: string[];
+                };
+                status: Record<string, never>;
             }[];
             /** Format: int64 */
             revision: number;
@@ -9222,6 +9726,86 @@ export interface components {
                     sweeping?: boolean;
                     /** @description 마지막 GC가 센 사용량 */
                     usage?: components["schemas"]["StoreUsage"];
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_CertificateSpec_CertificateStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /** @description ACME 계정 이름 */
+                    account: string;
+                    challenge: components["schemas"]["ChallengeKind"];
+                    install?: components["schemas"]["CertificateInstall"];
+                    key?: components["schemas"]["CertificateKey"];
+                    /** @description 인증서 이름들. `{node}`·`{node_address}`(노드마다만)와 `*.`(DNS-01만)를 받는다. */
+                    names: string[];
+                    /**
+                     * @description HTTP-01 주문 전에 우리 쪽에서 각 이름의 도전 URL을 불러 본다(실패하면 CA에 묻지 않음 — 검증 실패 속도 한도를
+                     *     아낀다). 끄면 곧바로 CA에 묻는다.
+                     * @default true
+                     */
+                    precheck: boolean;
+                    /** @description 고를 사슬의 루트 CN */
+                    preferred_chain?: string;
+                    /** @description ACME 프로필(`classic`·`tlsserver`·`shortlived`). 디렉터리에 프로필이 없으면 보내지 않는다. */
+                    profile?: string;
+                    renew?: components["schemas"]["RenewPolicy"];
+                    scope?: components["schemas"]["CertificateScope"];
+                };
+                /** @description 받은 인증서와 갱신 상태 */
+                status: {
+                    /**
+                     * @description HTTP-01 답(짧게 산다 — 모든 노드의 포트 80 리스너가 읽는다)
+                     * @default []
+                     */
+                    challenges: components["schemas"]["Http01Answer"][];
+                    /** @default null */
+                    error: string;
+                    /**
+                     * Format: int32
+                     * @description 이어진 실패 수
+                     * @default 0
+                     */
+                    failures: number;
+                    /**
+                     * Format: int64
+                     * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+                     * @default null
+                     */
+                    next_attempt_at: number;
+                    /**
+                     * @description 노드마다 받은 인증서(노드 id → 인증서)
+                     * @default {}
+                     */
+                    nodes: {
+                        [key: string]: components["schemas"]["IssuedCert"];
+                    };
+                    /**
+                     * @description 진행 중 주문 URL(열쇠 = 노드 id 또는 `shared` — Task가 다시 떠도 새 주문 대신 이어 본다)
+                     * @default {}
+                     */
+                    orders: {
+                        [key: string]: string;
+                    };
+                    /**
+                     * @description 공유 인증서
+                     * @default null
+                     */
+                    shared: components["schemas"]["IssuedCert"];
                 };
             }[];
             /** Format: int64 */
@@ -12389,6 +12973,17 @@ export interface components {
             code?: string;
             password?: string;
         };
+        /** @description TXT가 퍼졌는지 확인하는 방법 */
+        Propagation: {
+            check?: components["schemas"]["PropagationCheck"];
+            /**
+             * Format: int32
+             * @default 180
+             */
+            timeout_s: number;
+        };
+        /** @enum {string} */
+        PropagationCheck: "authoritative" | "skip";
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         /** @description 공급자 네트워크가 붙는 물리 망(계획 66 §8) */
@@ -12665,6 +13260,19 @@ export interface components {
             /** Format: int64 */
             total: number;
         };
+        RenewPolicy: {
+            /** @enum {string} */
+            kind: "ari";
+        } | {
+            /** Format: int32 */
+            days: number;
+            /** @enum {string} */
+            kind: "days_before";
+        };
+        /** @description 만든 주문 Task들 */
+        RenewStarted: {
+            tasks: components["schemas"]["Resource"][];
+        };
         /** @description HA가 VM을 복제본으로 다시 켠 마지막 복구(VM `status.last_recovery`). 다음 복구가 덮고, 그 뒤 복제가 성공해도 남는다. */
         ReplicaRecovery: {
             /**
@@ -12849,6 +13457,77 @@ export interface components {
             revision: number;
             spec: components["schemas"]["GrantSpec"];
             status: components["schemas"]["GrantStatus"];
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_AcmeAccountSpec_AcmeAccountStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description CA 약관에 동의함(참이어야 등록한다) */
+                agree_tos?: boolean;
+                /** @description 사내 ACME(step-ca·Pebble)의 루트(PEM). 있으면 이 루트만 믿는다. */
+                ca_bundle?: string;
+                /** @description 디렉터리 URL 또는 별명(`letsencrypt`·`letsencrypt-staging`·`zerossl`·`google`). 만든 뒤 바꿀 수 없다. */
+                directory: string;
+                /** @description 외부 계정 묶기(ZeroSSL·Google·사내 CA) */
+                eab?: components["schemas"]["ExternalAccountBinding"];
+                email?: string;
+            };
+            status: {
+                /** @default null */
+                error: string;
+                /**
+                 * @description 디렉터리 `meta.profiles`의 이름
+                 * @default []
+                 */
+                profiles: string[];
+                /**
+                 * Format: int64
+                 * @description 등록한 때(유닉스 초)
+                 * @default null
+                 */
+                registered_at: number;
+                /**
+                 * @description 동의한 약관 URL
+                 * @default null
+                 */
+                terms: string;
+                /**
+                 * @description 등록한 계정 URL(`kid`)
+                 * @default null
+                 */
+                url: string;
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_AcmeDnsSpec_AcmeDnsStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                propagation?: components["schemas"]["Propagation"];
+                provider: components["schemas"]["DnsProvider"];
+                /** @description 이 공급자가 맡는 영역(`example.com`). 인증서가 이름으로 공급자를 고를 때 쓴다. */
+                zones?: string[];
+            };
+            status: Record<string, never>;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_AlertRuleSpec_AlertRuleStatus: {
@@ -13203,6 +13882,82 @@ export interface components {
                 sweeping?: boolean;
                 /** @description 마지막 GC가 센 사용량 */
                 usage?: components["schemas"]["StoreUsage"];
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_CertificateSpec_CertificateStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description ACME 계정 이름 */
+                account: string;
+                challenge: components["schemas"]["ChallengeKind"];
+                install?: components["schemas"]["CertificateInstall"];
+                key?: components["schemas"]["CertificateKey"];
+                /** @description 인증서 이름들. `{node}`·`{node_address}`(노드마다만)와 `*.`(DNS-01만)를 받는다. */
+                names: string[];
+                /**
+                 * @description HTTP-01 주문 전에 우리 쪽에서 각 이름의 도전 URL을 불러 본다(실패하면 CA에 묻지 않음 — 검증 실패 속도 한도를
+                 *     아낀다). 끄면 곧바로 CA에 묻는다.
+                 * @default true
+                 */
+                precheck: boolean;
+                /** @description 고를 사슬의 루트 CN */
+                preferred_chain?: string;
+                /** @description ACME 프로필(`classic`·`tlsserver`·`shortlived`). 디렉터리에 프로필이 없으면 보내지 않는다. */
+                profile?: string;
+                renew?: components["schemas"]["RenewPolicy"];
+                scope?: components["schemas"]["CertificateScope"];
+            };
+            /** @description 받은 인증서와 갱신 상태 */
+            status: {
+                /**
+                 * @description HTTP-01 답(짧게 산다 — 모든 노드의 포트 80 리스너가 읽는다)
+                 * @default []
+                 */
+                challenges: components["schemas"]["Http01Answer"][];
+                /** @default null */
+                error: string;
+                /**
+                 * Format: int32
+                 * @description 이어진 실패 수
+                 * @default 0
+                 */
+                failures: number;
+                /**
+                 * Format: int64
+                 * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+                 * @default null
+                 */
+                next_attempt_at: number;
+                /**
+                 * @description 노드마다 받은 인증서(노드 id → 인증서)
+                 * @default {}
+                 */
+                nodes: {
+                    [key: string]: components["schemas"]["IssuedCert"];
+                };
+                /**
+                 * @description 진행 중 주문 URL(열쇠 = 노드 id 또는 `shared` — Task가 다시 떠도 새 주문 대신 이어 본다)
+                 * @default {}
+                 */
+                orders: {
+                    [key: string]: string;
+                };
+                /**
+                 * @description 공유 인증서
+                 * @default null
+                 */
+                shared: components["schemas"]["IssuedCert"];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -14994,6 +15749,11 @@ export interface components {
         SessionPhase: "booting" | "ready" | "failed" | "closed";
         /** @description 설정에서 바꿀 값. 주어진 필드만 바꾼다. */
         SettingsPatch: {
+            /**
+             * @description ACME(계획 73 §11.3): 포트 80 리스너의 https 리다이렉트·갱신 시각 흩뜨리기. 준 칸만 바꾼다. 모든 노드가 `acme`를
+             *     알아야 한다.
+             */
+            acme?: components["schemas"]["AcmeSettingsPatch"];
             /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
             api_names?: string[];
             /**
@@ -16322,6 +17082,8 @@ export interface components {
             secret: string;
             uri: string;
         };
+        /** @enum {string} */
+        TsigAlgorithm: "hmac-sha256" | "hmac-sha512";
         /** @description 2단계 인증 정책(`SettingsSpec.two_factor`) */
         TwoFactorPolicy: {
             /** @description 이 영역의 사용자에게 요구한다. 로컬 사용자는 `local`이다. OIDC 영역은 받지 않는다(IdP가 MFA를 맡는다). */
@@ -17998,6 +18760,370 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_accounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_AcmeAccountSpec_AcmeAccountStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAccountRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeAccountSpec_AcmeAccountStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeAccountSpec_AcmeAccountStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_account: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_account: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeAccountSpec_AcmeAccountStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    check_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeAccountSpec_AcmeAccountStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_dns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_AcmeDnsSpec_AcmeDnsStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_dns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDnsRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeDnsSpec_AcmeDnsStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_dns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeDnsSpec_AcmeDnsStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_dns: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_dns: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DnsPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AcmeDnsSpec_AcmeDnsStatus"];
+                };
             };
             "4XX": {
                 headers: {
@@ -20192,6 +21318,191 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_certificates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_CertificateSpec_CertificateStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_certificate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateCertificateRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_CertificateSpec_CertificateStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_certificate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_CertificateSpec_CertificateStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_certificate: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_certificate: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CertificatePatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_CertificateSpec_CertificateStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    renew_certificate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RenewStarted"];
                 };
             };
             "4XX": {

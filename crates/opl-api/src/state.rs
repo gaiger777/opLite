@@ -101,6 +101,8 @@ pub struct AppState {
     pub vmware_cache: Arc<crate::vmware_sources::VsphereCache>,
     /// 이 노드가 세운 선언형 적용 계획(계획 73 §8.3 — 30분, 적용 Task가 가져간다)
     pub(crate) plans: crate::declarative::Plans,
+    /// 이 노드의 ACME 설정(계획 73 — 키 디렉터리·DNS 확인 서버·만료 경보가 볼 인증서)
+    pub acme: crate::acme::AcmeNodeConfig,
 }
 
 impl AppState {
@@ -149,6 +151,7 @@ impl AppState {
             vmware: Default::default(),
             vmware_cache: Default::default(),
             plans: Default::default(),
+            acme: Default::default(),
         }
     }
 }

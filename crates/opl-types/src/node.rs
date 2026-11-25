@@ -546,6 +546,9 @@ pub const CONFIG_HISTORY: &str = "config-history";
 /// ACME 인증서(계획 73): 종류 `AcmeAccount`·`AcmeDns`·`Certificate`, Task `acme-order`, HTTP-01 리스너, 설정 `acme`,
 /// 경보 조건 `certificate_*`. 옛 노드는 새 종류·Task를 풀지 못하고 도전 값에 답하지 못하므로 모든 노드가 알릴 때만 쓴다.
 pub const ACME: &str = "acme";
+/// 노드가 포트 80 HTTP-01 리스너(`[api] http_listen`)를 연다(계획 73 §11.3). 빌드 기능이 아니라 노드 설정이라 `FEATURES`에
+/// 없고, 리스너를 켠 노드만 `features`에 더해 알린다.
+pub const HTTP01: &str = "http01";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

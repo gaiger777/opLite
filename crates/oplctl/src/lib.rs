@@ -4,6 +4,7 @@ mod access;
 mod alerts;
 mod backup_store;
 mod ceph;
+mod cert;
 mod cli;
 mod client;
 mod config;

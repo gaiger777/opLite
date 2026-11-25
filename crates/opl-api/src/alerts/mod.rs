@@ -65,26 +65,16 @@ fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     if spec.condition.is_backup_store() {
         require_feature(&state.cluster, opl_types::node::BACKUP_STORE)?;
     }
-    // 인증서·드리프트 조건(계획 73)은 옛 노드가 풀지 못하고, 평가는 ACME(스테이지 4)·드리프트(스테이지 3)가 더한다. 그 전에는
-    // 받지 않는다.
-    for (yes, feature, what) in [
-        (
-            spec.condition.is_acme(),
-            opl_types::node::ACME,
-            "certificate alert conditions",
-        ),
-        (
-            spec.condition.is_declarative(),
-            opl_types::node::DECLARATIVE,
-            "apply set alert conditions",
-        ),
-    ] {
-        if yes {
-            require_feature(&state.cluster, feature)?;
-            return Err(ApiError::bad_request(format!(
-                "{what} are not available yet"
-            )));
-        }
+    // 인증서 조건(계획 73 §11.6)은 옛 노드가 풀지 못한다.
+    if spec.condition.is_acme() {
+        require_feature(&state.cluster, opl_types::node::ACME)?;
+    }
+    // 드리프트 조건(계획 73)도 옛 노드가 풀지 못하고, 평가는 드리프트(스테이지 3)가 더한다. 그 전에는 받지 않는다.
+    if spec.condition.is_declarative() {
+        require_feature(&state.cluster, opl_types::node::DECLARATIVE)?;
+        return Err(ApiError::bad_request(
+            "apply set alert conditions are not available yet",
+        ));
     }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
