@@ -1,5 +1,5 @@
 //! `orbivisorctl vmware source …`·`vmware migration …`·`vmware vm …`(계획 72 §13): 저장한 vCenter·ESXi 연결(지문 확인 흐름,
-//! 비밀번호는 파일·`OPL_VMWARE_PASSWORD`·터미널에서), 인벤토리 찾아보기, 이전 계획 만들기·미리 확인·시작·멈춤·이어 가기·
+//! 비밀번호는 파일·`ORBIVISOR_VMWARE_PASSWORD`·터미널에서), 인벤토리 찾아보기, 이전 계획 만들기·미리 확인·시작·멈춤·이어 가기·
 //! 취소·지우기, 계획 안 VM 하나의 다시 하기·취소·전환·되돌리기·마무리.
 
 use std::io::Write;
@@ -72,7 +72,7 @@ pub(crate) enum VmCmd {
 /// 비밀번호를 받는 곳(인자로는 받지 않는다)
 #[derive(Args, Clone, Default)]
 pub(crate) struct PasswordArgs {
-    /// 비밀번호가 든 파일. 없으면 `OPL_VMWARE_PASSWORD`, 그것도 없으면 터미널에서 묻는다.
+    /// 비밀번호가 든 파일. 없으면 `ORBIVISOR_VMWARE_PASSWORD`, 그것도 없으면 터미널에서 묻는다.
     #[arg(long, value_name = "FILE")]
     password_file: Option<PathBuf>,
 }
@@ -117,7 +117,7 @@ pub(crate) enum SourceCmd {
         port: Option<u16>,
         #[arg(long)]
         user: Option<String>,
-        /// 새 비밀번호를 받는다(`--password-file`·`OPL_VMWARE_PASSWORD`·터미널).
+        /// 새 비밀번호를 받는다(`--password-file`·`ORBIVISOR_VMWARE_PASSWORD`·터미널).
         #[arg(long)]
         password: bool,
         #[command(flatten)]
@@ -299,7 +299,7 @@ fn parse_time(s: &str) -> Result<u64, String> {
     u64::try_from(t.unix_timestamp()).map_err(|_| format!("time {s:?} is before 1970"))
 }
 
-/// 비밀번호: `--password-file`, `OPL_VMWARE_PASSWORD`, 터미널 순서
+/// 비밀번호: `--password-file`, `ORBIVISOR_VMWARE_PASSWORD`, 터미널 순서
 fn password(args: &PasswordArgs, prompt: &str) -> anyhow::Result<String> {
     if let Some(file) = &args.password_file {
         return Ok(std::fs::read_to_string(file)
@@ -307,9 +307,9 @@ fn password(args: &PasswordArgs, prompt: &str) -> anyhow::Result<String> {
             .trim_end_matches(['\r', '\n'])
             .to_string());
     }
-    match std::env::var("OPL_VMWARE_PASSWORD") {
-        Ok(p) => Ok(p),
-        Err(_) => Ok(rpassword::prompt_password(prompt)?),
+    match orbivisor_types::legacy::env("VMWARE_PASSWORD") {
+        Some(p) => Ok(p),
+        None => Ok(rpassword::prompt_password(prompt)?),
     }
 }
 

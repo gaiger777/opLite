@@ -6,21 +6,21 @@ import { expect, type Page, test } from "@playwright/test";
 // web01 고르기·네트워크 둘·기본 풀·켜지 않기·미리 확인) → 시작 → 동기화 중 → 전환 → 끝남·실제 내린 시간 → VM 링크. 그 VM을 메뉴의
 // "OVA로 내보내기…"로 내보내 내려받은 파일이 ustar(OVA)인지 본다. 가짜 vSphere·클러스터·풀은 Rust 테스트
 // (`crates/orbivisord/tests/web.rs`)가 준비하고 끝난 뒤 원본·대상을 확인한다.
-const user = process.env.OPL_USER ?? "admin";
-const password = process.env.OPL_PASSWORD ?? "";
-const pool = process.env.OPL_POOL ?? "";
+const user = process.env.ORBIVISOR_USER ?? "admin";
+const password = process.env.ORBIVISOR_PASSWORD ?? "";
+const pool = process.env.ORBIVISOR_POOL ?? "";
 /** VMware 네트워크 둘을 잇는 우리 네트워크(브리지 — VM은 켜지 않는다) */
-const network = process.env.OPL_NETWORK ?? "";
+const network = process.env.ORBIVISOR_NETWORK ?? "";
 const vsphere = {
-  host: process.env.OPL_VSPHERE_HOST ?? "",
-  port: process.env.OPL_VSPHERE_PORT ?? "",
-  user: process.env.OPL_VSPHERE_USER ?? "",
-  password: process.env.OPL_VSPHERE_PASSWORD ?? "",
-  fingerprint: process.env.OPL_VSPHERE_FINGERPRINT ?? "",
+  host: process.env.ORBIVISOR_VSPHERE_HOST ?? "",
+  port: process.env.ORBIVISOR_VSPHERE_PORT ?? "",
+  user: process.env.ORBIVISOR_VSPHERE_USER ?? "",
+  password: process.env.ORBIVISOR_VSPHERE_PASSWORD ?? "",
+  fingerprint: process.env.ORBIVISOR_VSPHERE_FINGERPRINT ?? "",
 };
 if (!password || !pool || !network || !vsphere.host || !vsphere.fingerprint) {
   throw new Error(
-    "Set OPL_PASSWORD, OPL_POOL, OPL_NETWORK and OPL_VSPHERE_* (the Rust test sets them).",
+    "Set ORBIVISOR_PASSWORD, ORBIVISOR_POOL, ORBIVISOR_NETWORK and ORBIVISOR_VSPHERE_* (the Rust test sets them).",
   );
 }
 

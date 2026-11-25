@@ -710,7 +710,7 @@ pub struct UpdatesSection {
         deserialize_with = "deserialize_duration"
     )]
     pub first_check: Duration,
-    /// Orbivisor APT 저장소 주소. 비면 빌드 값(`OPL_APT_URL`), 그것도 비면 소스 파일을 쓰지 않는다.
+    /// Orbivisor APT 저장소 주소. 비면 빌드 값(`ORBIVISOR_APT_URL`), 그것도 비면 소스 파일을 쓰지 않는다.
     #[serde(default)]
     pub apt_url: String,
     /// opld가 관리하는 deb822 소스 파일

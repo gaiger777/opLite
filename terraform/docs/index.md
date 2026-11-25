@@ -20,7 +20,7 @@ terraform {
   }
 }
 
-# endpoint, api_token and ca_pem can also come from OPL_SERVER, OPL_TOKEN and OPL_CA_PEM.
+# endpoint, api_token and ca_pem can also come from ORBIVISOR_SERVER, ORBIVISOR_TOKEN and ORBIVISOR_CA_PEM.
 provider "orbivisor" {
   endpoint       = "https://node1.example.net:8006"
   api_token      = var.orbivisor_token
@@ -38,9 +38,9 @@ variable "orbivisor_token" {
 
 ### Optional
 
-- `api_token` (String, Sensitive) API token (or `OPL_TOKEN`). Make one with `orbivisorctl token create`.
-- `ca_fingerprint` (String) Pin the cluster CA by its fingerprint `sha256:<hex>` (or `OPL_CA_FINGERPRINT`): without `ca_pem` the CA is read from the server and accepted only with this fingerprint. The CA (read or `ca_pem`) must then be exactly one certificate.
-- `ca_pem` (String) Cluster CA certificate (PEM) the API certificate is checked against (or `OPL_CA_PEM`). Empty: the system roots (an ACME certificate).
-- `endpoint` (String) API URL, e.g. `https://node1:8006` (or `OPL_SERVER`).
+- `api_token` (String, Sensitive) API token (or `ORBIVISOR_TOKEN`). Make one with `orbivisorctl token create`.
+- `ca_fingerprint` (String) Pin the cluster CA by its fingerprint `sha256:<hex>` (or `ORBIVISOR_CA_FINGERPRINT`): without `ca_pem` the CA is read from the server and accepted only with this fingerprint. The CA (read or `ca_pem`) must then be exactly one certificate.
+- `ca_pem` (String) Cluster CA certificate (PEM) the API certificate is checked against (or `ORBIVISOR_CA_PEM`). Empty: the system roots (an ACME certificate).
+- `endpoint` (String) API URL, e.g. `https://node1:8006` (or `ORBIVISOR_SERVER`).
 - `force_conflicts` (Boolean) Take over objects an apply set (`orbivisorctl apply --set`) manages instead of failing with `managed_elsewhere`.
 - `timeout` (String) How long one apply or delete may take, waiting for its Task (Go duration, default `20m`).

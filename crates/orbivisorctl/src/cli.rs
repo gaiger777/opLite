@@ -49,10 +49,10 @@ use crate::two_factor::{TwoFactorCmd, ask_terminal, second_step, two_factor};
 )]
 struct Cli {
     /// 로그인 정보 파일 (기본: ~/.config/opl/oplctl.json)
-    #[arg(long, global = true, env = "OPL_CONFIG")]
+    #[arg(long, global = true, env = "ORBIVISOR_CONFIG")]
     config: Option<PathBuf>,
     /// API 주소. 로그인할 때 저장한 주소 대신 쓴다.
-    #[arg(long, global = true, env = "OPL_SERVER")]
+    #[arg(long, global = true, env = "ORBIVISOR_SERVER")]
     server: Option<String>,
     #[arg(short, long, global = true, value_enum, default_value = "table")]
     output: Output,
@@ -353,7 +353,7 @@ struct LoginArgs {
 #[derive(Args)]
 struct LocalArgs {
     /// orbivisord 제어 소켓
-    #[arg(long, env = "OPL_SOCKET", default_value = "/run/opl/opld.sock")]
+    #[arg(long, env = "ORBIVISOR_SOCKET", default_value = "/run/opl/opld.sock")]
     socket: PathBuf,
 }
 
@@ -3750,7 +3750,7 @@ enum ImportCmd {
         name: String,
     },
     /// ESXi·vCenter의 데이터스토어에 있는 VM을 보인다. 비밀번호는 `--password-file`이나
-    /// `OPL_ESXI_PASSWORD`에서, 없으면 터미널에서 묻는다. 지문을 주지 않으면 서버 인증서의 지문을 알려 준다.
+    /// `ORBIVISOR_ESXI_PASSWORD`에서, 없으면 터미널에서 묻는다. 지문을 주지 않으면 서버 인증서의 지문을 알려 준다.
     EsxiBrowse {
         #[command(flatten)]
         conn: EsxiArgs,
@@ -3803,19 +3803,19 @@ struct EsxiArgs {
     /// vCenter면 데이터센터 이름
     #[arg(long, default_value = "ha-datacenter")]
     datacenter: String,
-    /// 비밀번호가 든 파일. 없으면 `OPL_ESXI_PASSWORD`, 그것도 없으면 터미널에서 묻는다.
+    /// 비밀번호가 든 파일. 없으면 `ORBIVISOR_ESXI_PASSWORD`, 그것도 없으면 터미널에서 묻는다.
     #[arg(long)]
     password_file: Option<PathBuf>,
 }
 
-/// ESXi 비밀번호. `--password-file`, `OPL_ESXI_PASSWORD` 순서로 보고, 둘 다 없으면 터미널에서 묻는다.
+/// ESXi 비밀번호. `--password-file`, `ORBIVISOR_ESXI_PASSWORD` 순서로 보고, 둘 다 없으면 터미널에서 묻는다.
 fn esxi_password(conn: &EsxiArgs) -> anyhow::Result<String> {
     if let Some(file) = &conn.password_file {
         return read_password(Some(file), "");
     }
-    match std::env::var("OPL_ESXI_PASSWORD") {
-        Ok(password) => Ok(password),
-        Err(_) => Ok(rpassword::prompt_password(format!(
+    match orbivisor_types::legacy::env("ESXI_PASSWORD") {
+        Some(password) => Ok(password),
+        None => Ok(rpassword::prompt_password(format!(
             "password for {}@{}: ",
             conn.user, conn.host
         ))?),

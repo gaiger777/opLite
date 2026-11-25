@@ -5,8 +5,8 @@
 //! `cargo test -p orbivisord --features qemu-it --test install_media` (이 Mac·svc01·linux-kvm)
 //!
 //! `install-media-it`를 함께 켜면 실제 게스트를 띄운다(KVM이 있는 x86_64 Linux, CI `install-media` 작업): 설치 ISO
-//! (`OPL_TEST_INSTALL_ISO`, Alpine virt)를 시험의 127.0.0.1 HTTP 서버에서 `iso download`로 받아 BIOS·UEFI VM이 CD에서
-//! 부트로더·커널을 읽는지, 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04)를 `volume download`로 받아 cloud-init이
+//! (`ORBIVISOR_TEST_INSTALL_ISO`, Alpine virt)를 시험의 127.0.0.1 HTTP 서버에서 `iso download`로 받아 BIOS·UEFI VM이 CD에서
+//! 부트로더·커널을 읽는지, 클라우드 이미지(`ORBIVISOR_TEST_CLOUD_IMAGE`, Ubuntu 24.04)를 `volume download`로 받아 cloud-init이
 //! 호스트 이름·사용자·비밀번호 해시·SSH 키·고정 IPv4를 적용하고 vendor-data의 runcmd가 그 결과를 시험 서버에 보내는지,
 //! 호스트 이름을 바꾸고 다시 켜면 새 instance-id로 다시 적용하는지 본다. 계획 63: 러너 CPU에 있는 플래그를
 //! `vm create --cpu-flags=-FLAG`로 숨기면 게스트의 `/proc/cpuinfo`에 없고, 실행 중에 지우면 보류로 남다가 `vm reboot`(전원
@@ -408,7 +408,7 @@ mod guest {
     /// 설치 ISO를 받아 빈 디스크와 그 CD로 BIOS·UEFI VM을 켜고, 펌웨어가 CD에서 부트로더와 커널을 읽는지 본다.
     #[tokio::test]
     async fn boots_an_installer_iso_with_bios_and_uefi() {
-        let iso = env_path("OPL_TEST_INSTALL_ISO");
+        let iso = env_path("ORBIVISOR_TEST_INSTALL_ISO");
         let server = serve(&[("alpine.iso", &iso)]).await;
         let (mut d, _pool) = daemon("installer").await;
         let url = format!("http://127.0.0.1:{}/files/alpine.iso", server.port);
@@ -554,7 +554,7 @@ urllib.request.urlopen(request, timeout=30)
     /// 게스트가 보낸 결과를 본다. 호스트 이름을 바꾸고 다시 켜면 새 instance-id로 다시 적용한다.
     #[tokio::test]
     async fn cloud_init_configures_a_cloud_image() {
-        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let image = env_path("ORBIVISOR_TEST_CLOUD_IMAGE");
         let server = serve(&[("noble.img", &image)]).await;
         let (mut d, _pool) = daemon("cloud").await;
         let url = format!("http://127.0.0.1:{}/files/noble.img", server.port);
@@ -717,7 +717,7 @@ urllib.request.urlopen(request, timeout=30)
     /// 부팅에서 보인다.
     #[tokio::test]
     async fn a_hidden_cpu_flag_is_absent_in_a_real_guest() {
-        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let image = env_path("ORBIVISOR_TEST_CLOUD_IMAGE");
         let server = serve(&[("noble.img", &image)]).await;
         let (mut d, _pool) = daemon("cpu-flags").await;
         // 플래그 이름은 노드가 올린 CPU 카탈로그로 본다(첫 검사 회차가 올린다).
@@ -863,7 +863,7 @@ urllib.request.urlopen(request, timeout=30)
     /// 메모리 반씩을 가진다. 기록 `numa`에 모양이 남는다.
     #[tokio::test]
     async fn a_guest_sees_its_numa_nodes() {
-        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let image = env_path("ORBIVISOR_TEST_CLOUD_IMAGE");
         let server = serve(&[("noble.img", &image)]).await;
         let (mut d, _pool) = daemon("numa").await;
         let url = format!("http://127.0.0.1:{}/files/noble.img", server.port);

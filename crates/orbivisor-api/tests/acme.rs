@@ -1,7 +1,7 @@
 //! 실제 ACME 흐름(계획 73 §14, 기능 `acme-it`): Pebble(Let's Encrypt 시험 CA, `-strict`, 무작위 badNonce 그대로)과
 //! pebble-challtestsrv(DNS — 모든 이름이 127.0.0.1, TXT는 관리 API)를 띄우고 우리 클라이언트·HTTP-01 리스너·DNS-01 훅·
-//! 끼우기를 본다. 실행 파일 자리는 `OPL_TEST_PEBBLE_DIR`(`pebble`·`pebble-challtestsrv`), RFC 2136은 `OPL_TEST_BIND`
-//! (`ip:port` — TSIG 키 `OPL_TEST_BIND_KEY`(base64, hmac-sha256, 키 이름 `acme-key`), 영역 `bind.test`)가 있을 때만.
+//! 끼우기를 본다. 실행 파일 자리는 `ORBIVISOR_TEST_PEBBLE_DIR`(`pebble`·`pebble-challtestsrv`), RFC 2136은 `ORBIVISOR_TEST_BIND`
+//! (`ip:port` — TSIG 키 `ORBIVISOR_TEST_BIND_KEY`(base64, hmac-sha256, 키 이름 `acme-key`), 영역 `bind.test`)가 있을 때만.
 
 mod common;
 
@@ -42,9 +42,9 @@ fn free_udp_port() -> u16 {
     }
 }
 
-/// `OPL_TEST_PEBBLE_LOG`가 있으면 Pebble·challtestsrv의 출력을 그대로 보인다.
+/// `ORBIVISOR_TEST_PEBBLE_LOG`가 있으면 Pebble·challtestsrv의 출력을 그대로 보인다.
 fn log() -> Stdio {
-    if std::env::var_os("OPL_TEST_PEBBLE_LOG").is_some() {
+    if std::env::var_os("ORBIVISOR_TEST_PEBBLE_LOG").is_some() {
         Stdio::inherit()
     } else {
         Stdio::null()
@@ -52,8 +52,8 @@ fn log() -> Stdio {
 }
 
 fn bin(name: &str) -> PathBuf {
-    let dir = std::env::var("OPL_TEST_PEBBLE_DIR")
-        .expect("set OPL_TEST_PEBBLE_DIR to the Pebble binaries");
+    let dir = std::env::var("ORBIVISOR_TEST_PEBBLE_DIR")
+        .expect("set ORBIVISOR_TEST_PEBBLE_DIR to the Pebble binaries");
     Path::new(&dir).join(name)
 }
 
@@ -551,14 +551,14 @@ async fn failures_back_off() {
     );
 }
 
-/// RFC 2136(BIND + TSIG): `OPL_TEST_BIND`가 있을 때만(GitHub `acme` 작업). Pebble의 DNS를 BIND로 둔 두 번째 벌.
+/// RFC 2136(BIND + TSIG): `ORBIVISOR_TEST_BIND`가 있을 때만(GitHub `acme` 작업). Pebble의 DNS를 BIND로 둔 두 번째 벌.
 #[tokio::test]
 async fn rfc2136_with_bind() {
     let (Ok(server), Ok(secret)) = (
-        std::env::var("OPL_TEST_BIND"),
-        std::env::var("OPL_TEST_BIND_KEY"),
+        std::env::var("ORBIVISOR_TEST_BIND"),
+        std::env::var("ORBIVISOR_TEST_BIND_KEY"),
     ) else {
-        eprintln!("skipped: OPL_TEST_BIND is not set");
+        eprintln!("skipped: ORBIVISOR_TEST_BIND is not set");
         return;
     };
     let bind: SocketAddr = server.parse().unwrap();

@@ -2,30 +2,30 @@
 # CI `ldap` 작업의 시험 디렉터리: Ubuntu의 slapd(OpenLDAP)를 debconf로 설정하고, 시험 CA가 서명한
 # 서버 인증서로 LDAPS(636)와 StartTLS(389)를 켜고, memberOf 오버레이 아래 사용자 둘과 그룹 하나를
 # 넣는다. orbivisor-api의 `ldap-it` 시험(tests/ldap_it.rs)이 이 디렉터리를 쓴다.
-# 값은 시험과 같은 OPL_TEST_LDAP_* 환경 변수에서 읽는다(없으면 아래 기본값).
+# 값은 시험과 같은 ORBIVISOR_TEST_LDAP_* 환경 변수에서 읽는다(없으면 아래 기본값).
 # 경고: 이 기계의 slapd 설정과 디렉터리(데이터베이스)를 지우고 새로 만든다. 그래서 CI(CI=true)가
-# 아니면 OPL_LDAP_SETUP_WIPE=1을 주어야 돈다.
-# 쓰는 법(root): sudo -E sh .github/scripts/ldap-setup.sh  (CI 밖: sudo -E OPL_LDAP_SETUP_WIPE=1 sh …)
+# 아니면 ORBIVISOR_LDAP_SETUP_WIPE=1을 주어야 돈다.
+# 쓰는 법(root): sudo -E sh .github/scripts/ldap-setup.sh  (CI 밖: sudo -E ORBIVISOR_LDAP_SETUP_WIPE=1 sh …)
 # 다시 돌려도 된다: 늘 debconf 값으로 slapd를 다시 설정해 새 데이터베이스에서 시작한다.
 set -eu
 
-if [ "${CI:-}" != true ] && [ "${OPL_LDAP_SETUP_WIPE:-}" != 1 ]; then
+if [ "${CI:-}" != true ] && [ "${ORBIVISOR_LDAP_SETUP_WIPE:-}" != 1 ]; then
 	cat >&2 <<'MSG'
 ldap-setup: this wipes the slapd configuration and directory on this machine and makes a new test
-directory. Run it only on a throwaway machine: set OPL_LDAP_SETUP_WIPE=1 (CI=true also allows it).
+directory. Run it only on a throwaway machine: set ORBIVISOR_LDAP_SETUP_WIPE=1 (CI=true also allows it).
 MSG
 	exit 1
 fi
 
-BASE_DN=${OPL_TEST_LDAP_BASE_DN:-dc=example,dc=com}
-BIND_DN=${OPL_TEST_LDAP_BIND_DN:-cn=admin,$BASE_DN}
-BIND_PASSWORD=${OPL_TEST_LDAP_BIND_PASSWORD:-opl-admin-pw}
-CA_OUT=${OPL_TEST_LDAP_CA:-/tmp/opl-test-ldap-ca.pem}
-USER_NAME=${OPL_TEST_LDAP_USER:-alice}
-USER_PASSWORD=${OPL_TEST_LDAP_USER_PASSWORD:-alice-pw}
-OTHER_NAME=${OPL_TEST_LDAP_OTHER_USER:-bob}
-OTHER_PASSWORD=${OPL_TEST_LDAP_OTHER_PASSWORD:-bob-pw}
-GROUP_DN=${OPL_TEST_LDAP_GROUP:-cn=admins,ou=groups,$BASE_DN}
+BASE_DN=${ORBIVISOR_TEST_LDAP_BASE_DN:-dc=example,dc=com}
+BIND_DN=${ORBIVISOR_TEST_LDAP_BIND_DN:-cn=admin,$BASE_DN}
+BIND_PASSWORD=${ORBIVISOR_TEST_LDAP_BIND_PASSWORD:-opl-admin-pw}
+CA_OUT=${ORBIVISOR_TEST_LDAP_CA:-/tmp/opl-test-ldap-ca.pem}
+USER_NAME=${ORBIVISOR_TEST_LDAP_USER:-alice}
+USER_PASSWORD=${ORBIVISOR_TEST_LDAP_USER_PASSWORD:-alice-pw}
+OTHER_NAME=${ORBIVISOR_TEST_LDAP_OTHER_USER:-bob}
+OTHER_PASSWORD=${ORBIVISOR_TEST_LDAP_OTHER_PASSWORD:-bob-pw}
+GROUP_DN=${ORBIVISOR_TEST_LDAP_GROUP:-cn=admins,ou=groups,$BASE_DN}
 
 # slapd가 읽을 TLS 파일. Ubuntu의 slapd AppArmor 프로필이 /etc/ldap 아래를 읽게 한다.
 TLS_CA=/etc/ldap/opl-test-ca.pem
@@ -42,13 +42,13 @@ die() {
 # dc=example,dc=com → example.com (debconf가 이 도메인으로 기준 DN을 만든다)
 DOMAIN=$(printf '%s\n' "$BASE_DN" | sed -e 's/^dc=//' -e 's/,dc=/./g')
 [ "$(printf '%s\n' "$DOMAIN" | sed -e 's/^/dc=/' -e 's/\./,dc=/g')" = "$BASE_DN" ] ||
-	die "OPL_TEST_LDAP_BASE_DN must be dc=…,dc=… (got $BASE_DN)"
+	die "ORBIVISOR_TEST_LDAP_BASE_DN must be dc=…,dc=… (got $BASE_DN)"
 # debconf는 관리자를 cn=admin,<기준 DN>(rootDN)으로 만든다.
-[ "$BIND_DN" = "cn=admin,$BASE_DN" ] || die "OPL_TEST_LDAP_BIND_DN must be cn=admin,$BASE_DN"
+[ "$BIND_DN" = "cn=admin,$BASE_DN" ] || die "ORBIVISOR_TEST_LDAP_BIND_DN must be cn=admin,$BASE_DN"
 GROUP_CN=${GROUP_DN%%,*}
 GROUP_CN=${GROUP_CN#cn=}
 [ "$GROUP_DN" = "cn=$GROUP_CN,ou=groups,$BASE_DN" ] ||
-	die "OPL_TEST_LDAP_GROUP must be cn=<name>,ou=groups,$BASE_DN"
+	die "ORBIVISOR_TEST_LDAP_GROUP must be cn=<name>,ou=groups,$BASE_DN"
 
 export DEBIAN_FRONTEND=noninteractive
 

@@ -2,9 +2,9 @@
 //! 이미지)을 QEMU `rbd` 블록 드라이버로 붙인 VM을 띄운다. 실행 중에 디스크 스냅샷(RBD 스냅샷)을 찍고,
 //! 멈춘 뒤 더 최근 스냅샷이 있어도 앞 스냅샷으로 되돌리고, 스냅샷에서 디렉터리 풀로 복제하고, 모두 지운다.
 //! 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 꺼진 VM의 이미지를 `qemu-io`로 본다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_RBD=rbd cargo test -p orbivisord --features rbd-it --test rbd`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_RBD=rbd cargo test -p orbivisord --features rbd-it --test rbd`
 //! Linux에서 root, ceph-common, qemu-block-extra, QEMU(`qemu-it`와 같다), qemu-img, qemu-io와
-//! `client.admin`으로 접속할 수 있는 `/etc/ceph/ceph.conf`·키링이 필요하다. `OPL_TEST_RBD`는 테스트가
+//! `client.admin`으로 접속할 수 있는 `/etc/ceph/ceph.conf`·키링이 필요하다. `ORBIVISOR_TEST_RBD`는 테스트가
 //! 이미지를 만들고 지워도 되는 Ceph 풀(`rbd pool init`을 마친 것)이다.
 #![cfg(all(feature = "rbd-it", target_os = "linux"))]
 
@@ -95,7 +95,8 @@ fn cmdline(pid: u64) -> String {
 
 #[tokio::test]
 async fn rbd_pool_runs_snapshots_reverts_and_clones_a_vm() {
-    let pool = std::env::var("OPL_TEST_RBD").expect("OPL_TEST_RBD must name a Ceph pool");
+    let pool =
+        std::env::var("ORBIVISOR_TEST_RBD").expect("ORBIVISOR_TEST_RBD must name a Ceph pool");
     // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다.
     let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
     d.start().await;

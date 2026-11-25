@@ -22,8 +22,8 @@ use uuid::Uuid;
 const READ_WAIT: Duration = Duration::from_secs(120);
 
 fn host() -> HostProfile {
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     HostProfile::native(Path::new(&share))
 }
 

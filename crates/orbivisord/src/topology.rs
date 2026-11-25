@@ -1174,7 +1174,7 @@ mod tests {
 }
 
 /// 실제 Linux 호스트에서(CI `linux-kvm`, root): 이 호스트를 읽고(고정물로 옮길 수 있게 찍는다), 2M hugepages를 실행 중
-/// 예약했다가 되돌리고, 다른 프로세스의 스레드 친화를 건다. `/sys`에 쓰므로 `OPL_TEST_NUMA_SYS=1`일 때만 돈다(배포 서버의
+/// 예약했다가 되돌리고, 다른 프로세스의 스레드 친화를 건다. `/sys`에 쓰므로 `ORBIVISOR_TEST_NUMA_SYS=1`일 때만 돈다(배포 서버의
 /// 호스트 설정을 바꾸지 않게).
 #[cfg(all(test, feature = "numa-it", target_os = "linux"))]
 mod real {
@@ -1182,10 +1182,10 @@ mod real {
     use orbivisor_types::numa::PageKind;
 
     fn enabled() -> bool {
-        let on = std::env::var("OPL_TEST_NUMA_SYS").as_deref() == Ok("1")
+        let on = std::env::var("ORBIVISOR_TEST_NUMA_SYS").as_deref() == Ok("1")
             && unsafe { libc::geteuid() } == 0;
         if !on {
-            eprintln!("skipped: needs root and OPL_TEST_NUMA_SYS=1");
+            eprintln!("skipped: needs root and ORBIVISOR_TEST_NUMA_SYS=1");
         }
         on
     }

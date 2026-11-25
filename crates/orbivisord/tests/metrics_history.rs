@@ -2,7 +2,7 @@
 //! 1. 재시작 뒤 기록: `[test] metrics_flush_secs = 1`로 띄운 노드를 SIGKILL로 끝내고 다시 띄워도
 //!    `node stats NODE --range hour -o json`에 재시작 전 점이 그대로 있고, 꺼져 있던 동안은 `null`이다.
 //! 2. Prometheus 긁기: 꺼져 있으면 404, 토큰이 없으면 401, `prometheus enable` 뒤 viewer 토큰으로 받은 본문이 엄격한
-//!    텍스트 형식 파서(`orbivisor-api/tests/common/promtext.rs`)로 풀린다. `qemu-it`면 VM 줄도 본다. `OPL_TEST_PROMTOOL`이
+//!    텍스트 형식 파서(`orbivisor-api/tests/common/promtext.rs`)로 풀린다. `qemu-it`면 VM 줄도 본다. `ORBIVISOR_TEST_PROMTOOL`이
 //!    있으면(GitHub `linux-kvm`) 그 `promtool check metrics`로도 본다.
 //! 3. (`qemu-it`) 마이그레이션 뒤 기록: 노드 1에서 켠 디스크 없는 VM을 끄고 정해진 노드를 노드 2로 바꿔 켜면, 짧게 둔
 //!    `[test] metrics_push_secs` 뒤 노드 2의 `vm/{id}.rrd`에 노드 1 시절 점이 있고 노드 1의 파일은 없어진다.
@@ -283,7 +283,7 @@ async fn prometheus_scrapes_parse_with_the_strict_parser() {
     );
 
     // GitHub linux-kvm: promtool의 형식·이름 검사(`promtool check metrics`는 표준 입력을 본다)
-    if let Some(promtool) = std::env::var_os("OPL_TEST_PROMTOOL") {
+    if let Some(promtool) = std::env::var_os("ORBIVISOR_TEST_PROMTOOL") {
         use std::io::Write;
         let mut child = std::process::Command::new(promtool)
             .args(["check", "metrics"])

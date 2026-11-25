@@ -174,7 +174,7 @@ jobs:
       - name: orbivisorctl login, node list, node get
         timeout-minutes: 8
         env:
-          OPL_CONFIG: ${{ runner.temp }}/oplctl.json
+          ORBIVISOR_CONFIG: ${{ runner.temp }}/oplctl.json
         run: |
           oplctl=target/release/orbivisorctl
           # init 직후 API가 HTTPS로 다시 열릴 때까지 잠깐 걸릴 수 있다.
@@ -194,14 +194,14 @@ jobs:
             sleep 5
           done
           $oplctl node list
-          # 설치한 노드의 VERSION 열이 이 빌드의 버전(build-deb가 남긴 OPL_VERSION)인지 본다.
-          $oplctl node list | awk -v want="$OPL_VERSION" '
+          # 설치한 노드의 VERSION 열이 이 빌드의 버전(build-deb가 남긴 ORBIVISOR_VERSION)인지 본다.
+          $oplctl node list | awk -v want="$ORBIVISOR_VERSION" '
             NR == 1 { for (i = 1; i <= NF; i++) if ($i == "VERSION") col = i; next }
             $1 == "opl-ci" { found = 1; got = col ? $col : "" }
             END {
               if (!found || got != want) { print "opl-ci VERSION: \"" got "\", 기대: \"" want "\"" > "/dev/stderr"; exit 1 }
             }'
-          $oplctl node get opl-ci | jq -e --arg v "$OPL_VERSION" '.status.version == $v'
+          $oplctl node get opl-ci | jq -e --arg v "$ORBIVISOR_VERSION" '.status.version == $v'
           $oplctl node get opl-ci | jq -e '.status.bridges[] | select(.name == "vmbr0")'
           $oplctl network list
       - name: Stop the node

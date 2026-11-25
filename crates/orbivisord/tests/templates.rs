@@ -6,7 +6,7 @@
 //! `cargo test -p orbivisord --features qemu-it --test templates` (이 Mac·svc01·linux-kvm). qemu-img·qemu-io가 필요하다.
 //!
 //! `templates-it`를 함께 켜면 실제 게스트를 띄운다(KVM이 있는 x86_64 Linux, CI `install-media` 작업): 받아 둔 Ubuntu
-//! 24.04 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`)와 그 `SHA256SUMS`(`OPL_TEST_CLOUD_SUMS`, 없으면 시험이 만든다)를 시험의
+//! 24.04 클라우드 이미지(`ORBIVISOR_TEST_CLOUD_IMAGE`)와 그 `SHA256SUMS`(`ORBIVISOR_TEST_CLOUD_SUMS`, 없으면 시험이 만든다)를 시험의
 //! HTTP 서버로 내놓고 관리자 카탈로그 항목(`checksum: sums`)으로 받아 템플릿을 만든 뒤, 디스크를 늘린 연결 복제 둘을
 //! cloud-init과 함께 켜 두 게스트가 보고하는지(호스트 이름·사용자·늘어난 루트 파일 시스템), 기반 파일이 그대로인지,
 //! 평탄화한 VM이 다시 켜져 보고하는지, 복제를 지운 뒤 템플릿을 되돌릴 수 있는지 본다.
@@ -600,10 +600,10 @@ urllib.request.urlopen(request, timeout=30)
     /// `ci-1`을 끄고 평탄화한 뒤 다시 켜면 새 부팅으로 보고한다. 복제를 지우면 템플릿을 되돌린다.
     #[tokio::test]
     async fn linked_clones_of_a_cloud_image_template_boot_and_flatten() {
-        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let image = env_path("ORBIVISOR_TEST_CLOUD_IMAGE");
         let file_name = image.file_name().unwrap().to_str().unwrap().to_string();
         let bytes = Bytes::from(std::fs::read(&image).unwrap());
-        let sums = match std::env::var_os("OPL_TEST_CLOUD_SUMS") {
+        let sums = match std::env::var_os("ORBIVISOR_TEST_CLOUD_SUMS") {
             Some(path) => Bytes::from(std::fs::read(path).unwrap()),
             None => Bytes::from(format!("{} *{file_name}\n", sha256(&bytes))),
         };

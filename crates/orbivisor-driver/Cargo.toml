@@ -17,22 +17,22 @@ net-it = []
 # 실제 swtpm으로 TPM VM을 띄우는 통합 테스트(계획 59). qemu-it에 더해 swtpm·swtpm-tools가 필요하다(macOS Homebrew에는 없다).
 vtpm-it = ["qemu-it"]
 # 실제 LVM-thin 풀의 통합 테스트. Linux에서 root, lvm2, qemu-img, qemu-io와 테스트가 LV를 만들고 지워도
-# 되는 VG/thin pool(`OPL_TEST_LVM=VG/THINPOOL`)이 필요하다.
+# 되는 VG/thin pool(`ORBIVISOR_TEST_LVM=VG/THINPOOL`)이 필요하다.
 lvm-it = []
 # 실제 ZFS 풀의 통합 테스트. Linux에서 root, zfsutils-linux, qemu-img, qemu-io와 테스트가 zvol을 만들고
-# 지워도 되는 데이터셋(`OPL_TEST_ZFS=POOL/DATASET`)이 필요하다.
+# 지워도 되는 데이터셋(`ORBIVISOR_TEST_ZFS=POOL/DATASET`)이 필요하다.
 zfs-it = []
 # 실제 Ceph RBD 풀의 통합 테스트. Linux에서 root, ceph-common, qemu-block-extra, qemu-img, qemu-io,
 # `client.admin`으로 접속할 수 있는 ceph.conf·키링과 테스트가 이미지를 만들고 지워도 되는 Ceph 풀
-# (`OPL_TEST_RBD=POOL`)이 필요하다. 제한된 사용자 시험은 `OPL_TEST_RBD_USER`·`OPL_TEST_RBD_NAMESPACE`·
-# `OPL_TEST_RBD_CONF`가 있을 때만 돈다.
+# (`ORBIVISOR_TEST_RBD=POOL`)이 필요하다. 제한된 사용자 시험은 `ORBIVISOR_TEST_RBD_USER`·`ORBIVISOR_TEST_RBD_NAMESPACE`·
+# `ORBIVISOR_TEST_RBD_CONF`가 있을 때만 돈다.
 rbd-it = []
 # 실제 공유 LVM 풀(lvmlockd 공유 VG)의 통합 테스트. Linux에서 root, lvm2-lockd와 sanlock(또는 dlm),
-# qemu-img, qemu-io와 잠금을 시작한 공유 VG(`OPL_TEST_LVM_SHARED=VG`, 테스트가 LV를 만들고 지워도 된다)가
+# qemu-img, qemu-io와 잠금을 시작한 공유 VG(`ORBIVISOR_TEST_LVM_SHARED=VG`, 테스트가 LV를 만들고 지워도 된다)가
 # 필요하다.
 lvm-shared-it = []
-# 실제 도우미 이미지로 파일 복원 도우미 VM을 띄우는 시험(계획 69). qemu-it에 더해 `OPL_RESTORE_IMAGE_DIR`(이미지 디렉터리 —
-# packaging/restore-image/build.sh)와 `OPL_RESTORE_FIXTURES`(고정물 디스크 — crates/orbivisor-restore/tests/fixtures/make-disks.sh)가
+# 실제 도우미 이미지로 파일 복원 도우미 VM을 띄우는 시험(계획 69). qemu-it에 더해 `ORBIVISOR_RESTORE_IMAGE_DIR`(이미지 디렉터리 —
+# packaging/restore-image/build.sh)와 `ORBIVISOR_RESTORE_FIXTURES`(고정물 디스크 — crates/orbivisor-restore/tests/fixtures/make-disks.sh)가
 # 필요하다. 권한 내림·sandbox는 root로 돌릴 때만 본다.
 restore-it = ["qemu-it"]
 

@@ -1,15 +1,15 @@
 import { expect, type Page, test } from "@playwright/test";
 
-const user = process.env.OPL_USER ?? "admin";
-const password = process.env.OPL_PASSWORD ?? "";
+const user = process.env.ORBIVISOR_USER ?? "admin";
+const password = process.env.ORBIVISOR_PASSWORD ?? "";
 /** 노드에 미리 만든 빈 디렉터리(풀)와 올릴 디스크 이미지. Rust 테스트가 준비한다. */
-const poolPath = process.env.OPL_POOL_PATH ?? "";
-const image = process.env.OPL_IMAGE ?? "";
+const poolPath = process.env.ORBIVISOR_POOL_PATH ?? "";
+const image = process.env.ORBIVISOR_IMAGE ?? "";
 /** 백업 저장소 줄기(계획 68)의 백업 풀 디렉터리. 저장소를 지워도 데이터가 남으므로 위 풀과 따로 둔다. */
-const backupPoolPath = process.env.OPL_BACKUP_POOL_PATH ?? "";
+const backupPoolPath = process.env.ORBIVISOR_BACKUP_POOL_PATH ?? "";
 if (!password || !poolPath || !image || !backupPoolPath) {
   throw new Error(
-    "Set OPL_PASSWORD, OPL_POOL_PATH, OPL_IMAGE and OPL_BACKUP_POOL_PATH (the Rust test sets them).",
+    "Set ORBIVISOR_PASSWORD, ORBIVISOR_POOL_PATH, ORBIVISOR_IMAGE and ORBIVISOR_BACKUP_POOL_PATH (the Rust test sets them).",
   );
 }
 

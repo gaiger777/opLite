@@ -1,12 +1,14 @@
-//! `orbivisord --version`이 빌드 버전을 보이는지 본다. 기대값은 이 시험을 빌드할 때의 `OPL_VERSION`(비었으면
-//! 크레이트 버전)으로 따로 구해, clap 기본 `version`(크레이트 버전)으로 되돌리면 OPL_VERSION을 준 시험이 실패한다.
+//! `orbivisord --version`이 빌드 버전을 보이는지 본다. 기대값은 이 시험을 빌드할 때의 `ORBIVISOR_VERSION`
+//! (없거나 비었으면 옛 이름 `OPL_VERSION`, 그것도 비었으면 크레이트 버전)으로 따로 구해, clap 기본 `version`
+//! (크레이트 버전)으로 되돌리면 ORBIVISOR_VERSION을 준 시험이 실패한다.
 
 use std::process::Command;
 
 #[test]
 fn version_flag_prints_build_version() {
-    let want = match option_env!("OPL_VERSION") {
-        Some(v) if !v.is_empty() => v,
+    let want = match (option_env!("ORBIVISOR_VERSION"), option_env!("OPL_VERSION")) {
+        (Some(v), _) if !v.is_empty() => v,
+        (_, Some(v)) if !v.is_empty() => v,
         _ => env!("CARGO_PKG_VERSION"),
     };
     let out = Command::new(env!("CARGO_BIN_EXE_orbivisord"))

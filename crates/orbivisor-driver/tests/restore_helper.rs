@@ -1,10 +1,10 @@
 //! 실제 도우미 이미지로 파일 복원 도우미 VM을 띄우는 시험(계획 69 설계 §14, 스테이지 4 탐침).
-//! `OPL_RESTORE_IMAGE_DIR=<이미지 디렉터리> OPL_RESTORE_FIXTURES=<고정물> cargo test -p orbivisor-driver --features restore-it
+//! `ORBIVISOR_RESTORE_IMAGE_DIR=<이미지 디렉터리> ORBIVISOR_RESTORE_FIXTURES=<고정물> cargo test -p orbivisor-driver --features restore-it
 //! --test restore_helper -- --nocapture --test-threads 1` (탐침 값은 "PROBE" 줄). 이미지는 `packaging/restore-image/build.sh`,
-//! 고정물은 `crates/orbivisor-restore/tests/fixtures/make-disks.sh`(LVM은 root). 고르는 것: `OPL_RESTORE_QEMU`·
-//! `OPL_RESTORE_QEMU_IMG`(바이너리), `OPL_RESTORE_ACCEL=tcg`(가속 강제), `OPL_RESTORE_BIG_MIB`(흘리기 크기, 기본 256 —
+//! 고정물은 `crates/orbivisor-restore/tests/fixtures/make-disks.sh`(LVM은 root). 고르는 것: `ORBIVISOR_RESTORE_QEMU`·
+//! `ORBIVISOR_RESTORE_QEMU_IMG`(바이너리), `ORBIVISOR_RESTORE_ACCEL=tcg`(가속 강제), `ORBIVISOR_RESTORE_BIG_MIB`(흘리기 크기, 기본 256 —
 //! 이미지는 고정물 디렉터리에 `big-<MiB>.img`로 남겨 다시 쓴다. mke2fs가 없는 macOS는 Linux에서 만든 것을 옮겨 쓴다).
-//! 권한 내림(`-run-with user=nobody`)·sandbox는 Linux에서 root로 돌릴 때만 본다(`OPL_RESTORE_SCOPE=1`이면 systemd scope도).
+//! 권한 내림(`-run-with user=nobody`)·sandbox는 Linux에서 root로 돌릴 때만 본다(`ORBIVISOR_RESTORE_SCOPE=1`이면 systemd scope도).
 //! - 고정물: 탐지 결과, 파일마다 SHA-256(NBD 원본 ext4·qcow2 원본 나머지), 더러운 ext4 저널이 덮개 위에서 재생됨, 같은 UUID
 //!   XFS 둘(`nouuid`), MBR 논리·GPT, LUKS는 "not supported", LVM 선형·씬, 있으면 XFS 더러운 로그(`xfs-dirty.img`)
 //! - 흘리기 MB/s, 덮개 한도, QEMU `kill -9`, opld가 다시 뜬 것처럼 남은 것 치우기
@@ -51,13 +51,13 @@ struct Env {
 }
 
 fn host() -> HostProfile {
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     let mut host = HostProfile::native(Path::new(&share));
-    if let Some(q) = env_path("OPL_RESTORE_QEMU") {
+    if let Some(q) = env_path("ORBIVISOR_RESTORE_QEMU") {
         host.qemu_binary = q;
     }
-    if std::env::var("OPL_RESTORE_ACCEL").as_deref() == Ok("tcg") {
+    if std::env::var("ORBIVISOR_RESTORE_ACCEL").as_deref() == Ok("tcg") {
         host.accel = Accel::Tcg;
     }
     host
@@ -65,10 +65,10 @@ fn host() -> HostProfile {
 
 async fn env() -> Option<Env> {
     let (Some(images), Some(fixtures)) = (
-        env_path("OPL_RESTORE_IMAGE_DIR"),
-        env_path("OPL_RESTORE_FIXTURES"),
+        env_path("ORBIVISOR_RESTORE_IMAGE_DIR"),
+        env_path("ORBIVISOR_RESTORE_FIXTURES"),
     ) else {
-        eprintln!("skipping: set OPL_RESTORE_IMAGE_DIR and OPL_RESTORE_FIXTURES");
+        eprintln!("skipping: set ORBIVISOR_RESTORE_IMAGE_DIR and ORBIVISOR_RESTORE_FIXTURES");
         return None;
     };
     let host = host();
@@ -80,12 +80,12 @@ async fn env() -> Option<Env> {
         run_dir: root.join("run"),
         state_dir: root.join("state"),
         net: None,
-        // `OPL_RESTORE_SCOPE=1`(Linux root·systemd): `opl-fr-<id>.scope`로 감싼다
-        systemd_scope: std::env::var_os("OPL_RESTORE_SCOPE").is_some(),
+        // `ORBIVISOR_RESTORE_SCOPE=1`(Linux root·systemd): `opl-fr-<id>.scope`로 감싼다
+        systemd_scope: std::env::var_os("ORBIVISOR_RESTORE_SCOPE").is_some(),
         swtpm: Default::default(),
     };
     let hv = QemuHypervisor::new(config.clone()).await.unwrap();
-    let qemu_img = env_path("OPL_RESTORE_QEMU_IMG").unwrap_or_else(|| "qemu-img".into());
+    let qemu_img = env_path("ORBIVISOR_RESTORE_QEMU_IMG").unwrap_or_else(|| "qemu-img".into());
     Some(Env {
         _dir: dir,
         root,
@@ -448,7 +448,7 @@ async fn fixtures_are_browsed_through_the_helper() {
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_throughput() {
     let Some(env) = env().await else { return };
-    let mib: u64 = std::env::var("OPL_RESTORE_BIG_MIB")
+    let mib: u64 = std::env::var("ORBIVISOR_RESTORE_BIG_MIB")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);

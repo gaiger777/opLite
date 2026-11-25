@@ -1,10 +1,10 @@
-//! 실제 Ceph 풀의 저장소 통합 테스트. 관리자가 만든 Ceph 풀(`OPL_TEST_RBD=POOL`, `rbd pool init`을
+//! 실제 Ceph 풀의 저장소 통합 테스트. 관리자가 만든 Ceph 풀(`ORBIVISOR_TEST_RBD=POOL`, `rbd pool init`을
 //! 마친 것)에 볼륨 이미지를 만들고 가져오고, RBD 스냅샷을 찍어 되돌리고, 복사하고 지운다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_RBD=rbd cargo test -p orbivisor-driver --features rbd-it --test rbd_storage`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_RBD=rbd cargo test -p orbivisor-driver --features rbd-it --test rbd_storage`
 //! Linux에서 root, ceph-common(`rbd`, `ceph`), qemu-block-extra(rbd 블록 드라이버), qemu-img, qemu-io와
 //! `client.admin`으로 접속할 수 있는 `/etc/ceph/ceph.conf`·키링이 필요하다. 제한된 사용자 시험은
-//! `OPL_TEST_RBD_USER`(caps `profile rbd`), `OPL_TEST_RBD_NAMESPACE`(그 풀의 네임스페이스),
-//! `OPL_TEST_RBD_CONF`(그 사용자의 키링을 가리키는 ceph.conf)가 있을 때만 돈다.
+//! `ORBIVISOR_TEST_RBD_USER`(caps `profile rbd`), `ORBIVISOR_TEST_RBD_NAMESPACE`(그 풀의 네임스페이스),
+//! `ORBIVISOR_TEST_RBD_CONF`(그 사용자의 키링을 가리키는 ceph.conf)가 있을 때만 돈다.
 #![cfg(all(feature = "rbd-it", target_os = "linux"))]
 
 use std::path::Path;
@@ -27,9 +27,9 @@ const MNT: &str = "/nonexistent/opl-pools";
 
 const RAW: ImageFormat = ImageFormat::Raw;
 
-/// `OPL_TEST_RBD`의 Ceph 풀
+/// `ORBIVISOR_TEST_RBD`의 Ceph 풀
 fn ceph_pool() -> String {
-    std::env::var("OPL_TEST_RBD").expect("OPL_TEST_RBD must name a Ceph pool")
+    std::env::var("ORBIVISOR_TEST_RBD").expect("ORBIVISOR_TEST_RBD must name a Ceph pool")
 }
 
 fn rbd_pool() -> StoragePool {
@@ -473,12 +473,12 @@ async fn copies_snapshots_within_and_across_backends() {
 async fn restricted_user_in_a_namespace_with_its_conf() {
     let var = |name| std::env::var(name).ok();
     let (Some(user), Some(namespace), Some(conf)) = (
-        var("OPL_TEST_RBD_USER"),
-        var("OPL_TEST_RBD_NAMESPACE"),
-        var("OPL_TEST_RBD_CONF"),
+        var("ORBIVISOR_TEST_RBD_USER"),
+        var("ORBIVISOR_TEST_RBD_NAMESPACE"),
+        var("ORBIVISOR_TEST_RBD_CONF"),
     ) else {
         eprintln!(
-            "skipped: OPL_TEST_RBD_USER, OPL_TEST_RBD_NAMESPACE and OPL_TEST_RBD_CONF are not set"
+            "skipped: ORBIVISOR_TEST_RBD_USER, ORBIVISOR_TEST_RBD_NAMESPACE and ORBIVISOR_TEST_RBD_CONF are not set"
         );
         return;
     };

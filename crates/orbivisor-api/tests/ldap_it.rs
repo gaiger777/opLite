@@ -33,24 +33,24 @@ struct Directory {
 
 impl Directory {
     fn from_env() -> Self {
-        let ca = var("OPL_TEST_LDAP_CA");
+        let ca = var("ORBIVISOR_TEST_LDAP_CA");
         Self {
-            ldaps_url: var("OPL_TEST_LDAP_URL"),
-            starttls_url: var("OPL_TEST_LDAP_STARTTLS_URL"),
+            ldaps_url: var("ORBIVISOR_TEST_LDAP_URL"),
+            starttls_url: var("ORBIVISOR_TEST_LDAP_STARTTLS_URL"),
             ca_pem: std::fs::read_to_string(&ca)
-                .unwrap_or_else(|e| panic!("cannot read OPL_TEST_LDAP_CA {ca}: {e}")),
-            bind_dn: var("OPL_TEST_LDAP_BIND_DN"),
-            bind_password: var("OPL_TEST_LDAP_BIND_PASSWORD"),
-            base_dn: var("OPL_TEST_LDAP_BASE_DN"),
+                .unwrap_or_else(|e| panic!("cannot read ORBIVISOR_TEST_LDAP_CA {ca}: {e}")),
+            bind_dn: var("ORBIVISOR_TEST_LDAP_BIND_DN"),
+            bind_password: var("ORBIVISOR_TEST_LDAP_BIND_PASSWORD"),
+            base_dn: var("ORBIVISOR_TEST_LDAP_BASE_DN"),
             user: (
-                var("OPL_TEST_LDAP_USER"),
-                var("OPL_TEST_LDAP_USER_PASSWORD"),
+                var("ORBIVISOR_TEST_LDAP_USER"),
+                var("ORBIVISOR_TEST_LDAP_USER_PASSWORD"),
             ),
             other: (
-                var("OPL_TEST_LDAP_OTHER_USER"),
-                var("OPL_TEST_LDAP_OTHER_PASSWORD"),
+                var("ORBIVISOR_TEST_LDAP_OTHER_USER"),
+                var("ORBIVISOR_TEST_LDAP_OTHER_PASSWORD"),
             ),
-            group: var("OPL_TEST_LDAP_GROUP"),
+            group: var("ORBIVISOR_TEST_LDAP_GROUP"),
         }
     }
 

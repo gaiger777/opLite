@@ -1,7 +1,7 @@
 # A small web tier: folder with a quota, SDN network, security group, volume and a running VM.
 # Try it against the dev server:
 #   cargo run -p orbivisord --features devserver --bin orbivisor-devserver   (prints url, token, ca_pem)
-#   export OPL_SERVER=… OPL_TOKEN=… OPL_CA_PEM="$(…)"; terraform init && terraform apply
+#   export ORBIVISOR_SERVER=… ORBIVISOR_TOKEN=… ORBIVISOR_CA_PEM="$(…)"; terraform init && terraform apply
 terraform {
   required_providers {
     orbivisor = { source = "gaiger777/orbivisor" }

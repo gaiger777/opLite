@@ -45,8 +45,8 @@ fn short_tempdir() -> tempfile::TempDir {
 }
 
 fn config(root: &Path) -> QemuConfig {
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     QemuConfig {
         host: HostProfile::native(Path::new(&share)),
         run_dir: root.join("run"),

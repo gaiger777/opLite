@@ -18,9 +18,9 @@ import (
 )
 
 // Acceptance tests (TF_ACC=1) run real terraform — or tofu with TF_ACC_TERRAFORM_PATH and
-// TF_ACC_PROVIDER_HOST=registry.opentofu.org — against orbivisor-devserver (OPL_DEVSERVER = its path:
+// TF_ACC_PROVIDER_HOST=registry.opentofu.org — against orbivisor-devserver (ORBIVISOR_DEVSERVER = its path:
 // `cargo build -p orbivisord --features devserver --bin orbivisor-devserver`), which TestMain starts once. With
-// OPL_SERVER/OPL_TOKEN/OPL_CA_PEM already set the tests use that server instead.
+// ORBIVISOR_SERVER/ORBIVISOR_TOKEN/ORBIVISOR_CA_PEM already set the tests use that server instead.
 
 var factories = map[string]func() (tfprotov6.ProviderServer, error){
 	"orbivisor": providerserver.NewProtocol6WithError(New("test")()),
@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 	stop := func() {}
-	if os.Getenv("OPL_SERVER") == "" {
+	if os.Getenv("ORBIVISOR_SERVER") == "" {
 		var err error
 		if stop, err = startDevserver(); err != nil {
 			fmt.Fprintln(os.Stderr, "orbivisor-devserver:", err)
@@ -42,9 +42,9 @@ func TestMain(m *testing.M) {
 		}
 	}
 	c, err := client.New(client.Config{
-		Endpoint: os.Getenv("OPL_SERVER"),
-		Token:    os.Getenv("OPL_TOKEN"),
-		CAPEM:    os.Getenv("OPL_CA_PEM"),
+		Endpoint: os.Getenv("ORBIVISOR_SERVER"),
+		Token:    os.Getenv("ORBIVISOR_TOKEN"),
+		CAPEM:    os.Getenv("ORBIVISOR_CA_PEM"),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -56,12 +56,12 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// startDevserver runs OPL_DEVSERVER, reads its connection line and exports it as the provider's
+// startDevserver runs ORBIVISOR_DEVSERVER, reads its connection line and exports it as the provider's
 // environment. The server ends when its standard input closes (also when this process dies).
 func startDevserver() (func(), error) {
-	bin := os.Getenv("OPL_DEVSERVER")
+	bin := os.Getenv("ORBIVISOR_DEVSERVER")
 	if bin == "" {
-		return nil, fmt.Errorf("set OPL_DEVSERVER to the orbivisor-devserver binary (cargo build -p orbivisord --features devserver --bin orbivisor-devserver)")
+		return nil, fmt.Errorf("set ORBIVISOR_DEVSERVER to the orbivisor-devserver binary (cargo build -p orbivisord --features devserver --bin orbivisor-devserver)")
 	}
 	cmd := exec.Command(bin, "--exit-on-stdin-eof")
 	stdin, err := cmd.StdinPipe()
@@ -72,7 +72,7 @@ func startDevserver() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	if os.Getenv("OPL_DEVSERVER_LOG") != "" {
+	if os.Getenv("ORBIVISOR_DEVSERVER_LOG") != "" {
 		cmd.Stderr = os.Stderr
 	}
 	if err := cmd.Start(); err != nil {
@@ -100,7 +100,7 @@ func startDevserver() (func(), error) {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("no connection line after 2 minutes")
 	}
-	for k, v := range map[string]string{"OPL_SERVER": info.URL, "OPL_TOKEN": info.Token, "OPL_CA_PEM": info.CA} {
+	for k, v := range map[string]string{"ORBIVISOR_SERVER": info.URL, "ORBIVISOR_TOKEN": info.Token, "ORBIVISOR_CA_PEM": info.CA} {
 		if err := os.Setenv(k, v); err != nil {
 			return nil, err
 		}

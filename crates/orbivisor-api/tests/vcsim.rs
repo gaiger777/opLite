@@ -3,9 +3,9 @@
 //! 가짜 vSphere가 같은 꼴(요소 이름·`xsi:type`)을 내는지 견준다. 디스크 내용·CBT 의미는 vcsim이 얕게 흉내 내므로
 //! 가짜 vSphere 시험(`tests/vsphere.rs`)이 맡는다.
 //!
-//! vcsim은 미리 띄운다: `vcsim -l 127.0.0.1:8989 -username user -password pass`. 주소는 `OPL_TEST_VCSIM`
-//! (`127.0.0.1:8989`), 사용자·비밀번호는 `OPL_TEST_VCSIM_USER`·`OPL_TEST_VCSIM_PASSWORD`(기본 user·pass)다.
-//! `OPL_TEST_NBDKIT`(nbdkit 경로)가 있으면 nbdkit `file` 플러그인을 vddk 자리에 두고 [`NbdkitReader`] 배선도 본다.
+//! vcsim은 미리 띄운다: `vcsim -l 127.0.0.1:8989 -username user -password pass`. 주소는 `ORBIVISOR_TEST_VCSIM`
+//! (`127.0.0.1:8989`), 사용자·비밀번호는 `ORBIVISOR_TEST_VCSIM_USER`·`ORBIVISOR_TEST_VCSIM_PASSWORD`(기본 user·pass)다.
+//! `ORBIVISOR_TEST_NBDKIT`(nbdkit 경로)가 있으면 nbdkit `file` 플러그인을 vddk 자리에 두고 [`NbdkitReader`] 배선도 본다.
 //! `cargo test -p orbivisor-api --features vcsim-it --test vcsim -- --nocapture`
 #![cfg(feature = "vcsim-it")]
 
@@ -30,10 +30,10 @@ use orbivisor_api::vmware::soap::{MoRef, Node};
 use orbivisor_types::vmware::{Secret, VmwareApiKind, VmwarePower};
 
 fn vcsim() -> (String, u16, String, String) {
-    let addr = std::env::var("OPL_TEST_VCSIM").unwrap_or_else(|_| "127.0.0.1:8989".into());
+    let addr = std::env::var("ORBIVISOR_TEST_VCSIM").unwrap_or_else(|_| "127.0.0.1:8989".into());
     let (host, port) = split_host_port(&addr, 8989);
-    let user = std::env::var("OPL_TEST_VCSIM_USER").unwrap_or_else(|_| "user".into());
-    let password = std::env::var("OPL_TEST_VCSIM_PASSWORD").unwrap_or_else(|_| "pass".into());
+    let user = std::env::var("ORBIVISOR_TEST_VCSIM_USER").unwrap_or_else(|_| "user".into());
+    let password = std::env::var("ORBIVISOR_TEST_VCSIM_PASSWORD").unwrap_or_else(|_| "pass".into());
     (host, port, user, password)
 }
 
@@ -346,8 +346,8 @@ fn shape_of_about(a: &orbivisor_api::vmware::client::About) -> BTreeSet<&'static
 
 #[tokio::test]
 async fn nbdkit_file_plugin_in_place_of_vddk() {
-    let Ok(nbdkit) = std::env::var("OPL_TEST_NBDKIT") else {
-        println!("OPL_TEST_NBDKIT is not set; skipping the nbdkit wiring test");
+    let Ok(nbdkit) = std::env::var("ORBIVISOR_TEST_NBDKIT") else {
+        println!("ORBIVISOR_TEST_NBDKIT is not set; skipping the nbdkit wiring test");
         return;
     };
     let dir = tempfile::tempdir().unwrap();

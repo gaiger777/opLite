@@ -58,7 +58,7 @@ pub(crate) enum AccountCmd {
         /// 외부 계정 묶기 키 id(ZeroSSL·Google·사내 CA)
         #[arg(long, requires = "eab_hmac_file")]
         eab_kid: Option<String>,
-        /// EAB HMAC 키(base64url)가 든 파일(`-`이면 `OPL_ACME_EAB_HMAC`)
+        /// EAB HMAC 키(base64url)가 든 파일(`-`이면 `ORBIVISOR_ACME_EAB_HMAC`)
         #[arg(long, value_name = "FILE", requires = "eab_kid")]
         eab_hmac_file: Option<PathBuf>,
         /// 사내 ACME의 루트(PEM 파일)
@@ -100,7 +100,7 @@ pub(crate) struct DnsAddArgs {
     #[arg(long, value_enum)]
     provider: ProviderKind,
     /// 비밀(Cloudflare API 토큰·Route 53 비밀 키·TSIG 비밀(base64)·PowerDNS API 키)이 든 파일. 없으면
-    /// `OPL_ACME_DNS_SECRET`, 그것도 없으면 터미널에서 묻는다(훅은 비밀이 없다).
+    /// `ORBIVISOR_ACME_DNS_SECRET`, 그것도 없으면 터미널에서 묻는다(훅은 비밀이 없다).
     #[arg(long, value_name = "FILE")]
     secret_file: Option<PathBuf>,
     /// Cloudflare 영역 id(없으면 이름으로 찾는다)
@@ -201,7 +201,7 @@ pub(crate) struct AddArgs {
     no_precheck: bool,
 }
 
-/// 비밀: 파일 > 환경 변수 > 터미널
+/// 비밀: 파일 > 환경 변수(`ORBIVISOR_{env}`, 옛 이름 `OPL_{env}`) > 터미널
 fn secret(file: Option<&PathBuf>, env: &str, prompt: &str) -> anyhow::Result<String> {
     if let Some(f) = file.filter(|f| f.as_os_str() != "-") {
         return Ok(std::fs::read_to_string(f)
@@ -209,9 +209,9 @@ fn secret(file: Option<&PathBuf>, env: &str, prompt: &str) -> anyhow::Result<Str
             .trim()
             .to_string());
     }
-    match std::env::var(env) {
-        Ok(v) => Ok(v),
-        Err(_) => Ok(rpassword::prompt_password(prompt)?),
+    match orbivisor_types::legacy::env(env) {
+        Some(v) => Ok(v),
+        None => Ok(rpassword::prompt_password(prompt)?),
     }
 }
 
@@ -525,11 +525,7 @@ async fn account(
                 body["email"] = json!(e);
             }
             if let Some(kid) = eab_kid {
-                let hmac = secret(
-                    eab_hmac_file.as_ref(),
-                    "OPL_ACME_EAB_HMAC",
-                    "EAB HMAC key: ",
-                )?;
+                let hmac = secret(eab_hmac_file.as_ref(), "ACME_EAB_HMAC", "EAB HMAC key: ")?;
                 body["eab"] = json!({ "kid": kid, "hmac_key": hmac });
             }
             if let Some(f) = ca_bundle {
@@ -608,7 +604,7 @@ async fn dns(
             let body = provider_body(&a, || {
                 secret(
                     a.secret_file.as_ref(),
-                    "OPL_ACME_DNS_SECRET",
+                    "ACME_DNS_SECRET",
                     "DNS provider secret: ",
                 )
             })?;

@@ -22,7 +22,7 @@ const ASSETS: &str = "assets/";
 
 #[cfg(feature = "web-ui")]
 #[derive(RustEmbed)]
-#[folder = "$OPL_WEB_DIST"]
+#[folder = "$ORBIVISOR_WEB_DIST"]
 // 디버그 빌드(테스트, clippy)는 UI를 빌드하지 않아도 되고 안내 페이지를 준다. 릴리스 빌드에서
 // 빠뜨리면 컴파일 오류다. 디버그 빌드는 파일을 실행 중에 디스크에서 읽으므로, 나중에 만든 dist도
 // 보인다. 경로는 build.rs가 `..` 없이 넘긴다.

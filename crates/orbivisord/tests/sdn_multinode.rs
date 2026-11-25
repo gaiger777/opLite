@@ -13,7 +13,7 @@
 //! 통째)의 넘김 시간과 되돌아감, 노드를 잃은 뒤 Orbivisor Raft·OVN 정족수로 새 유동 IP가 닿는지, **죽은 중앙 내쫓기**(`sdn
 //! central remove` → 살아 있는 중앙의 실제 `cluster/kick`, 서버 둘).
 //!
-//! `sudo -E env "PATH=$PATH" OPL_MULTINODE_IMAGE=opl-sdn-node cargo test -p orbivisord --features sdn-multinode-it --test sdn_multinode -- --nocapture`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_MULTINODE_IMAGE=opl-sdn-node cargo test -p orbivisord --features sdn-multinode-it --test sdn_multinode -- --nocapture`
 //! Linux(Ubuntu 24.04)에서 root, docker, 컨테이너 이미지(`docker build -t opl-sdn-node ci/sdn-node`), 커널 모듈 `openvswitch`·
 //! `geneve`(호스트가 `modprobe`), tcpdump, 컨테이너가 apt에 닿는 네트워크가 필요하다. 호스트에 도커 망 `oplmgmt`
 //! (172.30.66.0/24)·브리지 `oplext0`·이름공간 `ext`를 만들고 끝에 지운다(CI `sdn-multinode` 작업).
@@ -806,7 +806,8 @@ fn fdb_port(mac: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn three_container_nodes_run_ovn() {
-    let image = std::env::var("OPL_MULTINODE_IMAGE").unwrap_or_else(|_| "opl-sdn-node".into());
+    let image =
+        std::env::var("ORBIVISOR_MULTINODE_IMAGE").unwrap_or_else(|_| "opl-sdn-node".into());
     for m in ["openvswitch", "geneve", "vxlan"] {
         assert!(
             std::path::Path::new(&format!("/sys/module/{m}")).exists(),

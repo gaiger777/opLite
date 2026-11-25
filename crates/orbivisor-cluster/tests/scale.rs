@@ -1,4 +1,4 @@
-//! 규모 시험(설계 §5·§6): 한 프로세스에 노드 여럿(기본 300, `OPL_SCALE_NODES`)을 memnet으로 띄운다. 투표 멤버
+//! 규모 시험(설계 §5·§6): 한 프로세스에 노드 여럿(기본 300, `ORBIVISOR_SCALE_NODES`)을 memnet으로 띄운다. 투표 멤버
 //! 다섯과 대기 learner 둘이 Raft 구성원이고 나머지는 관찰 노드다(투표 멤버 하나를 Follow로 따름). 모든 노드가
 //! 2초마다 리스를 갱신하고 `VoterKeeper`·`RoleKeeper`를 띄운 채로 리더의 초당 RPC 수, 쓰기 지연 p99, 관찰 노드의
 //! 뒤처짐 p99, 노드 하나 추가, 투표 멤버 장애 뒤 관찰 노드가 다시 붙기까지, 리더 장애 뒤 새 리더까지를 재고
@@ -68,11 +68,11 @@ const REATTACH_MAX: Duration = Duration::from_secs(5);
 /// 리더 장애 뒤 새 리더가 자기 임기의 항목을 적용하기까지. 설계는 3초였지만 openraft 0.9.25는 리더가 있던
 /// 팔로워가 마지막 하트비트 뒤 리더 리스(`election_timeout_max` 2초)와 선거 제한 시간(1~2초)을 더 기다린 뒤
 /// 선거를 시작해 노드 수와 관계없이 3~4초다(노드 여섯에서도 같다). 그 위에 투표·빈 항목 확정과 바쁜 CI의
-/// 여유로 1초를 둔다(설계 §14). `OPL_SCALE_FAILOVER_MS`로 바꾼다.
+/// 여유로 1초를 둔다(설계 §14). `ORBIVISOR_SCALE_FAILOVER_MS`로 바꾼다.
 const FAILOVER_MAX_MS: u64 = 5000;
 /// 리더 장애 뒤 새 리더를 기다리는 한도. 넘으면 기준과 관계없이 그 자리에서 실패한다.
 const FAILOVER_GIVE_UP: Duration = Duration::from_secs(10);
-/// 쓰기 지연 p99 기준(ms). 코어가 적은 CI 러너는 `OPL_SCALE_P99_MS`로 바꾼다(설계 §14, docs/guide/cluster.md).
+/// 쓰기 지연 p99 기준(ms). 코어가 적은 CI 러너는 `ORBIVISOR_SCALE_P99_MS`로 바꾼다(설계 §14, docs/guide/cluster.md).
 const WRITE_P99_MAX_MS: u64 = 50;
 const ADD_NODE_MAX: Duration = Duration::from_secs(2);
 /// 리더가 비투표 구성원(대기 learner 둘)에게 보내는 초당 Raft RPC 상한: 하트비트 5(200 ms) × 둘 = 10에 쓰기
@@ -510,31 +510,32 @@ fn unbatched_to_voters(forwarded: f64) -> f64 {
     followers / HEARTBEAT.as_secs_f64() + renewals * 2.0 * VOTERS as f64
 }
 
-/// 쓰기 지연 p99 기준. 기본 50 ms, `OPL_SCALE_P99_MS`로 바꾼다.
+/// 쓰기 지연 p99 기준. 기본 50 ms, `ORBIVISOR_SCALE_P99_MS`로 바꾼다.
 fn write_p99_max() -> Duration {
-    let ms = std::env::var("OPL_SCALE_P99_MS")
+    let ms = std::env::var("ORBIVISOR_SCALE_P99_MS")
         .ok()
         .map_or(WRITE_P99_MAX_MS, |v| {
-            v.parse().expect("OPL_SCALE_P99_MS must be a number")
+            v.parse().expect("ORBIVISOR_SCALE_P99_MS must be a number")
         });
     Duration::from_millis(ms)
 }
 
-/// 리더 장애 뒤 새 리더까지의 기준. 기본 5초, `OPL_SCALE_FAILOVER_MS`로 바꾼다.
+/// 리더 장애 뒤 새 리더까지의 기준. 기본 5초, `ORBIVISOR_SCALE_FAILOVER_MS`로 바꾼다.
 fn failover_max() -> Duration {
-    let ms = std::env::var("OPL_SCALE_FAILOVER_MS")
+    let ms = std::env::var("ORBIVISOR_SCALE_FAILOVER_MS")
         .ok()
         .map_or(FAILOVER_MAX_MS, |v| {
-            v.parse().expect("OPL_SCALE_FAILOVER_MS must be a number")
+            v.parse()
+                .expect("ORBIVISOR_SCALE_FAILOVER_MS must be a number")
         });
     Duration::from_millis(ms)
 }
 
-/// 노드 수. 기본 300, CI는 `OPL_SCALE_NODES=100`.
+/// 노드 수. 기본 300, CI는 `ORBIVISOR_SCALE_NODES=100`.
 fn node_count() -> u64 {
-    std::env::var("OPL_SCALE_NODES")
+    std::env::var("ORBIVISOR_SCALE_NODES")
         .ok()
-        .map(|v| v.parse().expect("OPL_SCALE_NODES must be a number"))
+        .map(|v| v.parse().expect("ORBIVISOR_SCALE_NODES must be a number"))
         .unwrap_or(300)
 }
 
@@ -596,7 +597,7 @@ async fn hundreds_of_nodes_do_not_slow_the_leader() {
     let n = node_count();
     assert!(
         n >= MIN_NODES,
-        "OPL_SCALE_NODES must be at least {MIN_NODES}"
+        "ORBIVISOR_SCALE_NODES must be at least {MIN_NODES}"
     );
     // 나중에 추가할 노드(n + 1)까지 센다.
     let counters: Counters = Arc::new(

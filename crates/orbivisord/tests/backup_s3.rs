@@ -3,9 +3,9 @@
 //! 복원(그사이 헬퍼 `kill -9`·opld 다시 시작), 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·라이브 복원·넘겨받기).
 //! `cargo test -p orbivisord --features s3-it --test backup_s3 -- --nocapture --test-threads=1`
 //!
-//! 환경 변수(CI가 S3 호환 저장소(SeaweedFS) 컨테이너 둘을 띄워 준다): `OPL_S3_ENDPOINT`(http), `OPL_S3_TLS_ENDPOINT`(https), `OPL_S3_CA`(https
-//! 끝점을 서명한 CA PEM 파일), `OPL_S3_ACCESS_KEY`, `OPL_S3_SECRET_KEY`, `OPL_S3_BUCKET`(두 끝점에 있는 버킷),
-//! `OPL_S3_CONTAINER`(http 끝점 S3 저장소의 docker 컨테이너 이름 — 멈춤 시험).
+//! 환경 변수(CI가 S3 호환 저장소(SeaweedFS) 컨테이너 둘을 띄워 준다): `ORBIVISOR_S3_ENDPOINT`(http), `ORBIVISOR_S3_TLS_ENDPOINT`(https), `ORBIVISOR_S3_CA`(https
+//! 끝점을 서명한 CA PEM 파일), `ORBIVISOR_S3_ACCESS_KEY`, `ORBIVISOR_S3_SECRET_KEY`, `ORBIVISOR_S3_BUCKET`(두 끝점에 있는 버킷),
+//! `ORBIVISOR_S3_CONTAINER`(http 끝점 S3 저장소의 docker 컨테이너 이름 — 멈춤 시험).
 #![cfg(feature = "s3-it")]
 
 mod common;
@@ -97,17 +97,17 @@ fn same_as(d: &Daemon, v: &Value, root: &Path, root_format: &str) -> bool {
 /// `backup-store create`의 S3 인자(http 끝점이면 `--insecure-http`)
 fn s3_args(d: &Daemon, endpoint: &str, prefix: &str) -> Vec<String> {
     let secret = d.path("s3-secret");
-    std::fs::write(&secret, env("OPL_S3_SECRET_KEY")).unwrap();
+    std::fs::write(&secret, env("ORBIVISOR_S3_SECRET_KEY")).unwrap();
     let mut a: Vec<String> = [
         "--s3-endpoint",
         endpoint,
         "--bucket",
-        &env("OPL_S3_BUCKET"),
+        &env("ORBIVISOR_S3_BUCKET"),
         "--prefix",
         prefix,
         "--path-style",
         "--access-key-id",
-        &env("OPL_S3_ACCESS_KEY"),
+        &env("ORBIVISOR_S3_ACCESS_KEY"),
         "--secret-key-file",
         secret.to_str().unwrap(),
     ]
@@ -185,7 +185,7 @@ async fn s3_store_backups_survive_concurrent_gc() {
             "--escrow-passphrase-file",
             pass.to_str().unwrap(),
         ],
-        &s3_args(&d, &env("OPL_S3_ENDPOINT"), &p),
+        &s3_args(&d, &env("ORBIVISOR_S3_ENDPOINT"), &p),
     )
     .await
     .unwrap();
@@ -242,9 +242,9 @@ async fn s3_store_backups_survive_concurrent_gc() {
     // 평문 표식이 저장소 객체에 없다.
     let target: orbivisor_types::backup_store::S3Target =
         serde_json::from_value(serde_json::json!({
-            "endpoint": env("OPL_S3_ENDPOINT"), "bucket": env("OPL_S3_BUCKET"), "prefix": p,
-            "path_style": true, "access_key_id": env("OPL_S3_ACCESS_KEY"),
-            "secret_access_key": env("OPL_S3_SECRET_KEY"), "insecure_http": true
+            "endpoint": env("ORBIVISOR_S3_ENDPOINT"), "bucket": env("ORBIVISOR_S3_BUCKET"), "prefix": p,
+            "path_style": true, "access_key_id": env("ORBIVISOR_S3_ACCESS_KEY"),
+            "secret_access_key": env("ORBIVISOR_S3_SECRET_KEY"), "insecure_http": true
         }))
         .unwrap();
     let backend = orbivisor_store::backend::s3::S3Backend::new(&target, 8).unwrap();
@@ -283,7 +283,7 @@ async fn s3_https_with_a_user_ca() {
     d.ctl(&["vm", "create", "web", "--memory", "256", "--disk", "root"])
         .await
         .unwrap();
-    let endpoint = env("OPL_S3_TLS_ENDPOINT");
+    let endpoint = env("ORBIVISOR_S3_TLS_ENDPOINT");
     let e = ctl(
         &d,
         &["backup-store", "create", "nocab"],
@@ -293,7 +293,7 @@ async fn s3_https_with_a_user_ca() {
     .unwrap_err()
     .to_string();
     assert!(e.contains("not initialized"), "{e}");
-    let ca = env("OPL_S3_CA");
+    let ca = env("ORBIVISOR_S3_CA");
     ctl(
         &d,
         &["backup-store", "create", "tls", "--ca-file", &ca],
@@ -320,7 +320,7 @@ struct Paused(String);
 
 impl Paused {
     fn new() -> Self {
-        let c = env("OPL_S3_CONTAINER");
+        let c = env("ORBIVISOR_S3_CONTAINER");
         docker(&["pause", &c]);
         Paused(c)
     }
@@ -354,7 +354,7 @@ async fn s3_pauses_and_kills_during_backup_and_live_restore() {
     ctl(
         &d,
         &["backup-store", "create", "s3"],
-        &s3_args(&d, &env("OPL_S3_ENDPOINT"), &prefix("pause")),
+        &s3_args(&d, &env("ORBIVISOR_S3_ENDPOINT"), &prefix("pause")),
     )
     .await
     .unwrap();
@@ -498,7 +498,7 @@ async fn s3_two_cluster_disaster_recovery() {
             "--escrow-passphrase-file",
             pass.to_str().unwrap(),
         ],
-        &s3_args(&prod, &env("OPL_S3_ENDPOINT"), &p),
+        &s3_args(&prod, &env("ORBIVISOR_S3_ENDPOINT"), &p),
     )
     .await
     .unwrap();
@@ -522,7 +522,7 @@ async fn s3_two_cluster_disaster_recovery() {
             "--escrow-unlock-file",
             dpass.to_str().unwrap(),
         ],
-        &s3_args(&dr, &env("OPL_S3_ENDPOINT"), &p),
+        &s3_args(&dr, &env("ORBIVISOR_S3_ENDPOINT"), &p),
     )
     .await
     .unwrap();

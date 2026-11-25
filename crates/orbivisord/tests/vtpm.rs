@@ -11,7 +11,7 @@
 //! `cargo test -p orbivisord --features vtpm-it --test vtpm`
 //!
 //! `vtpm-it`과 `install-media-it`를 함께 켜면 실제 게스트를 띄운다(KVM이 있는 x86_64 Linux, Secure Boot 키를 넣은
-//! ovmf, CI `install-media` 작업): 받아 둔 Ubuntu 24.04 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`)를 q35·Secure Boot·TPM·
+//! ovmf, CI `install-media` 작업): 받아 둔 Ubuntu 24.04 클라우드 이미지(`ORBIVISOR_TEST_CLOUD_IMAGE`)를 q35·Secure Boot·TPM·
 //! 게스트 에이전트로 켜고 cloud-init이 qemu-guest-agent·tpm2-tools를 설치한 뒤 게스트가 `/dev/tpm0`, Secure Boot 상태,
 //! EK 공개 키 해시를 보고하는지, `vm guest`가 OS·호스트 이름·IP를 보이는지, 실행 중 디스크 스냅샷에 freeze 경고가
 //! 없는지, 에이전트로 끈 뒤 다시 켜도 EK가 같은지, 복제한 VM은 EK가 다른지 본다.
@@ -536,7 +536,7 @@ urllib.request.urlopen(request, timeout=30)
     /// 켜기의 같은 EK·복제의 다른 EK를 본다.
     #[tokio::test]
     async fn a_cloud_image_boots_with_secure_boot_a_tpm_and_the_guest_agent() {
-        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let image = env_path("ORBIVISOR_TEST_CLOUD_IMAGE");
         let bytes = Bytes::from(std::fs::read(&image).unwrap());
         let sha = hex::encode(Sha256::digest(&bytes));
         let server = serve("noble.img", bytes).await;

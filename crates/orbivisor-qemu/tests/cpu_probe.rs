@@ -1,7 +1,7 @@
 //! 실제 QEMU에 CPU 모델·플래그를 묻는 탐침(계획 63 §6) 통합 테스트.
 //! `cargo test -p orbivisor-qemu --features qemu-it --test cpu_probe -- --nocapture`
 //!
-//! 이 호스트의 기본 가속기와 TCG(x86_64·aarch64 QEMU가 있으면 둘 다)로 묻는다. `OPL_RECORD_CPU_FIXTURES=DIR`이면 받은
+//! 이 호스트의 기본 가속기와 TCG(x86_64·aarch64 QEMU가 있으면 둘 다)로 묻는다. `ORBIVISOR_RECORD_CPU_FIXTURES=DIR`이면 받은
 //! 응답을 `DIR/{arch}-{accel}.json`으로 남긴다(`tests/fixtures/cpu/`의 고정물을 이렇게 만들었다). KVM이면 응답을 로그에도
 //! 찍는다(GitHub `linux-kvm`의 KVM 고정물을 옮기려고).
 #![cfg(feature = "qemu-it")]
@@ -20,8 +20,8 @@ fn short_tempdir() -> tempfile::TempDir {
 }
 
 fn host() -> HostProfile {
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     HostProfile::native(Path::new(&share))
 }
 
@@ -56,7 +56,7 @@ async fn probes_the_local_qemu() {
             Arch::Aarch64 => "aarch64",
         };
         let name = format!("{arch_name}-{}.json", accel.as_str());
-        if let Some(dir) = std::env::var_os("OPL_RECORD_CPU_FIXTURES") {
+        if let Some(dir) = std::env::var_os("ORBIVISOR_RECORD_CPU_FIXTURES") {
             let json = serde_json::to_string(&replies.to_json()).unwrap();
             std::fs::write(Path::new(&dir).join(&name), json + "\n").unwrap();
         }

@@ -2,9 +2,9 @@
 //! (thin LV)을 블록 장치로 붙인 VM을 띄운다. 실행 중에 디스크 스냅샷(thin 스냅샷 LV)을 찍고, 멈춘 뒤
 //! 되돌리고, 스냅샷에서 디렉터리 풀로 복제하고, 모두 지운다.
 //! 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 꺼진 VM의 LV 장치를 `qemu-io`로 본다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_LVM=opltest/tp cargo test -p orbivisord --features lvm-it --test lvm`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_LVM=opltest/tp cargo test -p orbivisord --features lvm-it --test lvm`
 //! Linux에서 root, lvm2(thin-provisioning-tools), QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다.
-//! `OPL_TEST_LVM`은 테스트가 LV를 만들고 지워도 되는 VG와 thin pool이다.
+//! `ORBIVISOR_TEST_LVM`은 테스트가 LV를 만들고 지워도 되는 VG와 thin pool이다.
 #![cfg(all(feature = "lvm-it", target_os = "linux"))]
 
 mod common;
@@ -75,10 +75,11 @@ fn cmdline(pid: u64) -> String {
 
 #[tokio::test]
 async fn lvm_pool_runs_snapshots_reverts_and_clones_a_vm() {
-    let target = std::env::var("OPL_TEST_LVM").expect("OPL_TEST_LVM must name VG/THINPOOL");
+    let target =
+        std::env::var("ORBIVISOR_TEST_LVM").expect("ORBIVISOR_TEST_LVM must name VG/THINPOOL");
     let (vg, thinpool) = target
         .split_once('/')
-        .expect("OPL_TEST_LVM must look like VG/THINPOOL");
+        .expect("ORBIVISOR_TEST_LVM must look like VG/THINPOOL");
     // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다.
     let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
     d.start().await;

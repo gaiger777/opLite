@@ -12,8 +12,8 @@
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
 //! 공유 풀 시험은 그 풀의 기능을 함께 켜고 그 시험과 같은 환경 변수가 있어야 한다(Linux, root):
-//! `nfs-it`(`OPL_TEST_NFS_EXPORT`), `rbd-it`(`OPL_TEST_RBD`, `client.admin`), `lvm-shared-it`
-//! (`OPL_TEST_LVM_SHARED`, 있으면 `OPL_TEST_ISCSI`). `lvm-it`(`OPL_TEST_LVM`)·`zfs-it`(`OPL_TEST_ZFS`)를 함께
+//! `nfs-it`(`ORBIVISOR_TEST_NFS_EXPORT`), `rbd-it`(`ORBIVISOR_TEST_RBD`, `client.admin`), `lvm-shared-it`
+//! (`ORBIVISOR_TEST_LVM_SHARED`, 있으면 `ORBIVISOR_TEST_ISCSI`). `lvm-it`(`ORBIVISOR_TEST_LVM`)·`zfs-it`(`ORBIVISOR_TEST_ZFS`)를 함께
 //! 켜면 로컬 디스크를 디렉터리 풀 → 그 블록 풀(노드 2만) → 디렉터리 풀로 옮긴다(qcow2 → raw → raw).
 //!
 //! 한 호스트의 두 노드는 systemd 스코프 이름(`opl-vm-{id}.scope`)과 브리지 NIC의 탭 이름이 겹치므로
@@ -335,8 +335,8 @@ async fn migrates_a_running_vm_between_two_nodes() {
 
     // 원본의 UEFI 변수 파일(템플릿 복사본) 끝에 표식을 남기고 띄운다. 대상은 템플릿으로 시작하므로,
     // 옮긴 뒤 대상 파일에 표식이 있으면 QEMU가 pflash 내용을 옮겨 쓴 것이다.
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     let template = orbivisor_qemu::HostProfile::native(Path::new(&share)).uefi_vars_template;
     let src_vars = orbivisor_driver::uefi_vars_path(&p.d[0].data_dir(), uuid);
     let dst_vars = orbivisor_driver::uefi_vars_path(&p.d[1].data_dir(), uuid);
@@ -1404,8 +1404,8 @@ async fn the_balancer_moves_a_vm_off_a_node_its_rules_forbid() {
 #[cfg(all(feature = "nfs-it", target_os = "linux"))]
 #[tokio::test]
 async fn migrates_a_vm_on_an_nfs_pool() {
-    let export = std::env::var("OPL_TEST_NFS_EXPORT")
-        .expect("OPL_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1");
+    let export = std::env::var("ORBIVISOR_TEST_NFS_EXPORT")
+        .expect("ORBIVISOR_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1");
     let p = Pair::new("mig-nfs", ["60120-60129", "60130-60139"]).await;
     let d = &p.d[0];
     let source = format!("127.0.0.1:{export}");
@@ -1428,7 +1428,8 @@ async fn migrates_a_vm_on_an_nfs_pool() {
 #[cfg(all(feature = "rbd-it", target_os = "linux"))]
 #[tokio::test]
 async fn migrates_a_vm_on_an_rbd_pool() {
-    let pool = std::env::var("OPL_TEST_RBD").expect("OPL_TEST_RBD must name a Ceph pool");
+    let pool =
+        std::env::var("ORBIVISOR_TEST_RBD").expect("ORBIVISOR_TEST_RBD must name a Ceph pool");
     let p = Pair::new("mig-rbd", ["60140-60149", "60150-60159"]).await;
     let (c, d) = (&p.c[0], &p.d[0]);
     c.post(
@@ -1454,8 +1455,8 @@ async fn migrates_a_vm_on_an_rbd_pool() {
 #[cfg(all(feature = "lvm-shared-it", target_os = "linux"))]
 #[tokio::test]
 async fn migrates_a_vm_on_a_shared_lvm_pool() {
-    let vg =
-        std::env::var("OPL_TEST_LVM_SHARED").expect("OPL_TEST_LVM_SHARED must name a shared VG");
+    let vg = std::env::var("ORBIVISOR_TEST_LVM_SHARED")
+        .expect("ORBIVISOR_TEST_LVM_SHARED must name a shared VG");
     let must = |program: &str, args: &[&str]| {
         let out = Command::new(program)
             .args(args)
@@ -1467,10 +1468,10 @@ async fn migrates_a_vm_on_a_shared_lvm_pool() {
     };
     // 두 opld가 한 호스트에서 함께 로그인하고 잠금을 시작하지 않도록, 타깃 로그인과 잠금 시작은 시험이
     // 먼저 하고 풀에는 iSCSI를 적지 않는다(opld는 잠금 시작만 다시 한다 — 이미 했으면 곧바로 끝난다).
-    if let Ok(iscsi) = std::env::var("OPL_TEST_ISCSI") {
+    if let Ok(iscsi) = std::env::var("ORBIVISOR_TEST_ISCSI") {
         let (portal, target) = iscsi
             .split_once(',')
-            .expect("OPL_TEST_ISCSI must look like PORTAL,TARGET");
+            .expect("ORBIVISOR_TEST_ISCSI must look like PORTAL,TARGET");
         let sessions = Command::new("iscsiadm")
             .args(["-m", "session"])
             .output()
@@ -1612,14 +1613,15 @@ async fn local_round_trip(
     d.ctl(&["pool", "delete", "blk"]).await.unwrap();
 }
 
-/// 디렉터리 풀 → LVM-thin 풀(`OPL_TEST_LVM`) → 디렉터리 풀
+/// 디렉터리 풀 → LVM-thin 풀(`ORBIVISOR_TEST_LVM`) → 디렉터리 풀
 #[cfg(all(feature = "lvm-it", target_os = "linux"))]
 #[tokio::test]
 async fn migrates_local_disks_through_an_lvm_thin_pool() {
-    let target = std::env::var("OPL_TEST_LVM").expect("OPL_TEST_LVM must name VG/THINPOOL");
+    let target =
+        std::env::var("ORBIVISOR_TEST_LVM").expect("ORBIVISOR_TEST_LVM must name VG/THINPOOL");
     let (vg, thinpool) = target
         .split_once('/')
-        .expect("OPL_TEST_LVM must look like VG/THINPOOL");
+        .expect("ORBIVISOR_TEST_LVM must look like VG/THINPOOL");
     local_round_trip(
         "mig-lvm-thin",
         ["60260-60269", "60270-60279"],
@@ -1629,11 +1631,12 @@ async fn migrates_local_disks_through_an_lvm_thin_pool() {
     .await;
 }
 
-/// 디렉터리 풀 → ZFS 풀(`OPL_TEST_ZFS`) → 디렉터리 풀
+/// 디렉터리 풀 → ZFS 풀(`ORBIVISOR_TEST_ZFS`) → 디렉터리 풀
 #[cfg(all(feature = "zfs-it", target_os = "linux"))]
 #[tokio::test]
 async fn migrates_local_disks_through_a_zfs_pool() {
-    let dataset = std::env::var("OPL_TEST_ZFS").expect("OPL_TEST_ZFS must name POOL/DATASET");
+    let dataset =
+        std::env::var("ORBIVISOR_TEST_ZFS").expect("ORBIVISOR_TEST_ZFS must name POOL/DATASET");
     local_round_trip(
         "mig-zfs",
         ["60280-60289", "60290-60299"],
@@ -1760,8 +1763,8 @@ async fn a_linked_clone_migrates_to_a_local_pool_of_another_node() {
 #[cfg(all(feature = "nfs-it", target_os = "linux"))]
 #[tokio::test]
 async fn a_linked_clone_on_an_nfs_pool_migrates_with_its_chain() {
-    let export = std::env::var("OPL_TEST_NFS_EXPORT")
-        .expect("OPL_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1");
+    let export = std::env::var("ORBIVISOR_TEST_NFS_EXPORT")
+        .expect("ORBIVISOR_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1");
     let p = Pair::new("mig-nfs-linked", ["60380-60389", "60390-60399"]).await;
     let d = &p.d[0];
     let source = format!("127.0.0.1:{export}");

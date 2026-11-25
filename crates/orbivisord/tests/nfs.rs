@@ -1,7 +1,7 @@
 //! 실제 NFS 풀: opld가 `mount -t nfs`로 localhost의 내보내기를 마운트하고, 그 풀에 볼륨을 만들고
 //! qcow2 스냅샷을 찍고 지운 뒤, 풀을 지우면 언마운트한다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_NFS_EXPORT=/srv/opl-nfs cargo test -p orbivisord --features nfs-it --test nfs`
-//! Linux에서 root, NFS 클라이언트(`mount.nfs`), qemu-img가 필요하다. `OPL_TEST_NFS_EXPORT`는
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_NFS_EXPORT=/srv/opl-nfs cargo test -p orbivisord --features nfs-it --test nfs`
+//! Linux에서 root, NFS 클라이언트(`mount.nfs`), qemu-img가 필요하다. `ORBIVISOR_TEST_NFS_EXPORT`는
 //! 127.0.0.1에 `rw,no_root_squash`로 내보낸 디렉터리다(서버 쪽 경로로 파일을 확인한다).
 #![cfg(all(feature = "nfs-it", target_os = "linux"))]
 
@@ -111,8 +111,8 @@ fn tags(file: &Path) -> Vec<String> {
 #[tokio::test]
 async fn nfs_pool_mounts_holds_volumes_and_unmounts() {
     let export = PathBuf::from(
-        std::env::var("OPL_TEST_NFS_EXPORT")
-            .expect("OPL_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1"),
+        std::env::var("ORBIVISOR_TEST_NFS_EXPORT")
+            .expect("ORBIVISOR_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1"),
     );
     let mut d = Unmounting(Daemon::new("node1", ""));
     d.start().await;

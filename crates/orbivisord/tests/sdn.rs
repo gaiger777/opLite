@@ -7,7 +7,7 @@
 //! `ovs-vsctl` JSON)을 찍고 orbivisor-driver 해석기로 읽는다(시험 고정물과 견주기). 리더 OvnSync(스테이지 3)와 IPAM·DHCP
 //! (스테이지 4 — 이름공간의 OVS 내부 포트가 busybox udhcpc로 IPAM 주소를 받고, 포트 보안이 위조 주소를 막는지)도 본다. Task와 SDN
 //! 네트워크는 `/sdn`·`/networks` API와 orbivisorctl로 만든다(스테이지 6). 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM tap이 br-int에 붙어 이 chassis에 바인딩되는지, 클라우드
-//! 이미지(`OPL_TEST_CLOUD_IMAGE`, 있으면)의 게스트가 OVN DHCP로 IPAM 주소를 받는지 본다. 러너 하나는 OVS 하나라 두 chassis
+//! 이미지(`ORBIVISOR_TEST_CLOUD_IMAGE`, 있으면)의 게스트가 OVN DHCP로 IPAM 주소를 받는지 본다. 러너 하나는 OVS 하나라 두 chassis
 //! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험). 계획 66 스테이지 2: 노드 physnet(관리자 Linux 브리지
 //! `oplext0`에 veth·OVS 브리지·`ovn-bridge-mappings`, 게이트웨이 표시)과 그 localnet 데이터 길, 빼기 청소를 본다. 계획 66
 //! 스테이지 3: OvnSync가 쓴 공급자 네트워크의 localnet 포트, 라우터(동서 라우팅·DHCP 기본 경로), 게이트웨이 chassis의 SNAT·
@@ -1664,7 +1664,7 @@ async fn binding_section(d: &Daemon, tag: &str, node: &str) {
     sdn_network(d, "tenant-q", &["--subnet", "10.78.0.0/24"]).await;
     // 클라우드 이미지(CI `ovn` 작업이 받아 둔다)가 있으면 게스트 OS로 켜 DHCP까지 본다. 없으면 디스크 없는 VM(펌웨어만 돈다)으로
     // 바인딩만 본다.
-    let image = std::env::var_os("OPL_TEST_CLOUD_IMAGE").map(PathBuf::from);
+    let image = std::env::var_os("ORBIVISOR_TEST_CLOUD_IMAGE").map(PathBuf::from);
     let mut create = vec!["vm", "create", "sdn-guest", "--nic", "tenant-q"];
     if let Some(image) = &image {
         let pool = d.path("pool");
@@ -2213,7 +2213,7 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
     .await;
     // 클라우드 이미지 게스트의 SLAAC(설계 §10 탐침): cloud-init v1 `ipv6_slaac`로 켠 Ubuntu 24.04 게스트가 RA에서 MAC의
     // EUI-64 주소를 만드는지. 포트 보안이 IPAM 주소(EUI-64)만 보내므로 그 주소로 ping6이 닿으면 게스트가 EUI-64를 쓴다.
-    if let Some(image) = std::env::var_os("OPL_TEST_CLOUD_IMAGE").map(PathBuf::from) {
+    if let Some(image) = std::env::var_os("ORBIVISOR_TEST_CLOUD_IMAGE").map(PathBuf::from) {
         Box::pin(guest_slaac(d, &image, ns6)).await;
     }
 

@@ -2,9 +2,9 @@
 //! 블록 장치로 붙인 VM을 띄운다. 실행 중에 디스크 스냅샷(ZFS 스냅샷)을 찍고, 멈춘 뒤 가장 최근
 //! 스냅샷으로만 되돌리고, 스냅샷에서 디렉터리 풀로 복제하고, 모두 지운다.
 //! 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 꺼진 VM의 zvol 장치를 `qemu-io`로 본다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_ZFS=opltestz/opl cargo test -p orbivisord --features zfs-it --test zfs`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_ZFS=opltestz/opl cargo test -p orbivisord --features zfs-it --test zfs`
 //! Linux에서 root, zfsutils-linux, QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다.
-//! `OPL_TEST_ZFS`는 테스트가 zvol을 만들고 지워도 되는 데이터셋이다.
+//! `ORBIVISOR_TEST_ZFS`는 테스트가 zvol을 만들고 지워도 되는 데이터셋이다.
 #![cfg(all(feature = "zfs-it", target_os = "linux"))]
 
 mod common;
@@ -77,7 +77,8 @@ fn cmdline(pid: u64) -> String {
 
 #[tokio::test]
 async fn zfs_pool_runs_snapshots_reverts_and_clones_a_vm() {
-    let dataset = std::env::var("OPL_TEST_ZFS").expect("OPL_TEST_ZFS must name POOL/DATASET");
+    let dataset =
+        std::env::var("ORBIVISOR_TEST_ZFS").expect("ORBIVISOR_TEST_ZFS must name POOL/DATASET");
     // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다.
     let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
     d.start().await;

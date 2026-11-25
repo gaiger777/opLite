@@ -34,8 +34,8 @@ fn short_tempdir() -> tempfile::TempDir {
 }
 
 fn config(root: &Path) -> QemuConfig {
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     let mut host = HostProfile::native(Path::new(&share));
     // HVF(macOS)에서는 보내는 QEMU가 메모리 변경 추적을 켜다 가끔 죽는다(QEMU 11.1, `assert_hvf_ok`
     // in `memory_global_dirty_log_start`). macOS 노드는 마이그레이션을 하지 않으므로(API가 거절)

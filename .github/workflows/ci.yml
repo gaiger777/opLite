@@ -49,9 +49,9 @@ jobs:
         run: cargo test -p orbivisor-cluster --features scale-it --test scale -- --nocapture
         timeout-minutes: 10
         env:
-          OPL_SCALE_NODES: 100
+          ORBIVISOR_SCALE_NODES: 100
           # 코어 3~4개 러너에서 노드 100개의 쓰기가 CPU에 묶여 흔들린다. 쓰기 p99 기준만 늦춘다(README, 설계 §14).
-          OPL_SCALE_P99_MS: 200
+          ORBIVISOR_SCALE_P99_MS: 200
       - name: Storage integration tests (qemu-img)
         if: runner.os == 'Linux'
         run: |
@@ -155,9 +155,9 @@ jobs:
         run: |
           sudo apt-get install -y libarchive-tools zstd
           rustup target add x86_64-unknown-linux-musl
-          packaging/restore-image/build.sh --arch x86_64 --version "$OPL_VERSION" --out dist/restore-image/x86_64
-          OPL_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 packaging/deb/build-deb.sh "$OPL_VERSION" dist
-          echo "deb=dist/orbivisor-restore-image_${OPL_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+          packaging/restore-image/build.sh --arch x86_64 --version "$ORBIVISOR_VERSION" --out dist/restore-image/x86_64
+          OPL_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 packaging/deb/build-deb.sh "$ORBIVISOR_VERSION" dist
+          echo "deb=dist/orbivisor-restore-image_${ORBIVISOR_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
       - name: Package info and contents
         env:
           DEB: ${{ steps.build.outputs.deb }}
@@ -184,16 +184,16 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
             bash /work/packaging/tests/repo-test.sh "/work/$DEB" "/work/$TRANS_DEB" "/work/$IMAGE_DEB"
-      # 빌드 버전 시험을 OPL_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
-      - name: Version tests with OPL_VERSION
-        run: OPL_VERSION=9.9.9~t cargo test -p orbivisor-types -p orbivisord -p orbivisorctl --lib --test version
+      # 빌드 버전 시험을 ORBIVISOR_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
+      - name: Version tests with ORBIVISOR_VERSION
+        run: ORBIVISOR_VERSION=9.9.9~t cargo test -p orbivisor-types -p orbivisord -p orbivisorctl --lib --test version
       - uses: actions/upload-artifact@v4
         with:
           name: orbivisor-deb
           path: dist/*_amd64.deb
 
   # M7: 실제 KVM으로 VM을 띄우고 NIC를 브리지에 잇는다. tap과 브리지를 만들려면 root가 필요하고,
-  # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.
+  # QEMU는 systemd 스코프로 감싼다(ORBIVISOR_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.
   # 라이브 마이그레이션 E2E는 한 호스트의 opld 둘로 공유 디렉터리·NFS·RBD·공유 LVM 풀 위의 VM을 옮긴다
   # (두 노드의 스코프 이름이 겹치므로 그 시험만 스코프를 끈다).
   # vTPM(계획 59, vtpm-it): 실제 swtpm으로 TPM VM의 상태 만들기·해시·초기화, 두 노드 사이 옮기기·받아 오기, 사본 노드로의
@@ -218,7 +218,7 @@ jobs:
           ls -l /dev/kvm
           swtpm --version
           ls /usr/share/qemu/firmware
-      # 계획 60 Prometheus 긁기 시험이 받은 본문을 `promtool check metrics`로도 본다(OPL_TEST_PROMTOOL). 꾸러미가 띄우는
+      # 계획 60 Prometheus 긁기 시험이 받은 본문을 `promtool check metrics`로도 본다(ORBIVISOR_TEST_PROMTOOL). 꾸러미가 띄우는
       # prometheus 서비스는 쓰지 않으므로 멈춘다.
       - name: promtool
         run: |
@@ -405,22 +405,22 @@ jobs:
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
       - name: QEMU, bridge and E2E tests as root
         run: |
-          sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+          sudo -E env "PATH=$PATH" ORBIVISOR_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p orbivisor-qemu -p orbivisor-driver -p orbivisor-reconciler -p orbivisord
         env:
           FEATURES: orbivisor-qemu/qemu-it,orbivisor-driver/qemu-it,orbivisor-driver/net-it,orbivisor-reconciler/qemu-it,orbivisord/qemu-it,orbivisord/net-it,orbivisord/web-it,orbivisord/nfs-it,orbivisor-driver/lvm-it,orbivisord/lvm-it,orbivisor-driver/zfs-it,orbivisord/zfs-it,orbivisor-driver/rbd-it,orbivisord/rbd-it,orbivisor-driver/lvm-shared-it,orbivisord/lvm-shared-it,orbivisord/migration-it,orbivisord/ha-it,orbivisor-driver/vtpm-it,orbivisord/vtpm-it,orbivisord/cpu-it,orbivisord/numa-it,orbivisord/backup-it,orbivisord/fake-vsphere
-          OPL_TEST_NFS_EXPORT: /srv/opl-nfs
-          OPL_TEST_LVM: opltest/tp
-          OPL_TEST_ZFS: opltestz/opl
-          OPL_TEST_RBD: rbd
-          OPL_TEST_RBD_USER: opltest
-          OPL_TEST_RBD_NAMESPACE: opl
-          OPL_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
-          OPL_TEST_LVM_SHARED: oplshared
-          OPL_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
-          OPL_TEST_PROMTOOL: promtool
+          ORBIVISOR_TEST_NFS_EXPORT: /srv/opl-nfs
+          ORBIVISOR_TEST_LVM: opltest/tp
+          ORBIVISOR_TEST_ZFS: opltestz/opl
+          ORBIVISOR_TEST_RBD: rbd
+          ORBIVISOR_TEST_RBD_USER: opltest
+          ORBIVISOR_TEST_RBD_NAMESPACE: opl
+          ORBIVISOR_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
+          ORBIVISOR_TEST_LVM_SHARED: oplshared
+          ORBIVISOR_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
+          ORBIVISOR_TEST_PROMTOOL: promtool
           # 계획 64: NUMA 탐침 시험이 2M hugepages를 실행 중 예약했다가 되돌린다(`/sys` 쓰기).
-          OPL_TEST_NUMA_SYS: "1"
+          ORBIVISOR_TEST_NUMA_SYS: "1"
 
   # 파일 단위 복원(계획 69 설계 §14): 도우미 이미지 빌드(x86_64를 두 번 — 바이트가 같아야 한다, aarch64는 빌드만 — 부팅은
   # svc01)와 시험 게스트(--test-guest, Debian qemu-guest-agent), 고정물 디스크 전체(btrfs·ntfs 포함, LVM은 root, XFS 더러운
@@ -430,9 +430,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      OPL_RESTORE_IMAGE_DIR: ${{ github.workspace }}/../fr/img
-      OPL_RESTORE_FIXTURES: ${{ github.workspace }}/../fr/fx
-      OPL_RESTORE_TEST_GUEST: ${{ github.workspace }}/../fr/guest
+      ORBIVISOR_RESTORE_IMAGE_DIR: ${{ github.workspace }}/../fr/img
+      ORBIVISOR_RESTORE_FIXTURES: ${{ github.workspace }}/../fr/fx
+      ORBIVISOR_RESTORE_TEST_GUEST: ${{ github.workspace }}/../fr/guest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -450,46 +450,46 @@ jobs:
             thin-provisioning-tools unzip
           ls -l /dev/kvm
           qemu-system-x86_64 --version
-          mkdir -p "$OPL_RESTORE_IMAGE_DIR" "$OPL_RESTORE_FIXTURES" "$OPL_RESTORE_TEST_GUEST"
+          mkdir -p "$ORBIVISOR_RESTORE_IMAGE_DIR" "$ORBIVISOR_RESTORE_FIXTURES" "$ORBIVISOR_RESTORE_TEST_GUEST"
       # 같은 입력(잠금 파일의 deb, 같은 에이전트)이면 같은 바이트다(설계 §8.2) — 두 번 빌드해 견준다.
       - name: Helper images (x86_64 twice, aarch64) and the test guest
         env:
           CACHE: ${{ runner.temp }}/debs
         run: |
-          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$OPL_RESTORE_IMAGE_DIR/x86_64"
+          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$ORBIVISOR_RESTORE_IMAGE_DIR/x86_64"
           # 둘째 빌드는 새 CARGO_TARGET_DIR로 — 에이전트 빌드까지 재현되는지 본다(설계 §8.2).
           CARGO_TARGET_DIR="$RUNNER_TEMP/again-target" \
             packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$RUNNER_TEMP/again/x86_64"
-          (cd "$OPL_RESTORE_IMAGE_DIR/x86_64" && sha256sum vmlinuz initrd.img manifest.json) | tee "$RUNNER_TEMP/first.sum"
+          (cd "$ORBIVISOR_RESTORE_IMAGE_DIR/x86_64" && sha256sum vmlinuz initrd.img manifest.json) | tee "$RUNNER_TEMP/first.sum"
           (cd "$RUNNER_TEMP/again/x86_64" && sha256sum vmlinuz initrd.img manifest.json) >"$RUNNER_TEMP/second.sum"
           diff "$RUNNER_TEMP/first.sum" "$RUNNER_TEMP/second.sum"
           packaging/restore-image/build.sh --arch aarch64 --cache "$CACHE" --out "$RUNNER_TEMP/arm/aarch64"
-          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --test-guest --out "$OPL_RESTORE_TEST_GUEST"
-          ls -l "$OPL_RESTORE_IMAGE_DIR/x86_64" "$RUNNER_TEMP/arm/aarch64" "$OPL_RESTORE_TEST_GUEST"
+          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --test-guest --out "$ORBIVISOR_RESTORE_TEST_GUEST"
+          ls -l "$ORBIVISOR_RESTORE_IMAGE_DIR/x86_64" "$RUNNER_TEMP/arm/aarch64" "$ORBIVISOR_RESTORE_TEST_GUEST"
       # LVM(VG oplfixvg)은 root가 만든다. XFS 더러운 로그: 복사본을 붙여 쓰고 fsync한 뒤 로그를 남긴 채 내린다.
       - name: Fixture disks
         run: |
-          sudo crates/orbivisor-restore/tests/fixtures/make-disks.sh "$OPL_RESTORE_FIXTURES"
-          cat "$OPL_RESTORE_FIXTURES/disks.txt"
-          sudo cp --sparse=always "$OPL_RESTORE_FIXTURES/xfs.img" "$OPL_RESTORE_FIXTURES/xfs-dirty.img"
+          sudo crates/orbivisor-restore/tests/fixtures/make-disks.sh "$ORBIVISOR_RESTORE_FIXTURES"
+          cat "$ORBIVISOR_RESTORE_FIXTURES/disks.txt"
+          sudo cp --sparse=always "$ORBIVISOR_RESTORE_FIXTURES/xfs.img" "$ORBIVISOR_RESTORE_FIXTURES/xfs-dirty.img"
           sudo mkdir -p /mnt/oplxfs
-          sudo mount -o loop "$OPL_RESTORE_FIXTURES/xfs-dirty.img" /mnt/oplxfs
+          sudo mount -o loop "$ORBIVISOR_RESTORE_FIXTURES/xfs-dirty.img" /mnt/oplxfs
           printf 'replayed\n' | sudo tee /mnt/oplxfs/replay.txt >/dev/null
           sudo xfs_io -c fsync /mnt/oplxfs/replay.txt
           sudo xfs_io -x -c shutdown /mnt/oplxfs
           sudo umount /mnt/oplxfs
-          sudo chown -R "$(id -u):$(id -g)" "$OPL_RESTORE_FIXTURES"
-          ls -l "$OPL_RESTORE_FIXTURES"
+          sudo chown -R "$(id -u):$(id -g)" "$ORBIVISOR_RESTORE_FIXTURES"
+          ls -l "$ORBIVISOR_RESTORE_FIXTURES"
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다(linux-kvm과 같음).
       - name: Real helper VM (KVM) and opld E2E (1)-(5)
         run: |
-          sudo -E env "PATH=$PATH" OPL_RESTORE_SCOPE=1 OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+          sudo -E env "PATH=$PATH" ORBIVISOR_RESTORE_SCOPE=1 ORBIVISOR_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test -p orbivisor-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
-          sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+          sudo -E env "PATH=$PATH" ORBIVISOR_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test -p orbivisord --features restore-it --test file_restore -- --nocapture
       - name: Real helper VM with forced TCG
         run: |
-          sudo -E env "PATH=$PATH" OPL_RESTORE_ACCEL=tcg CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+          sudo -E env "PATH=$PATH" ORBIVISOR_RESTORE_ACCEL=tcg CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test -p orbivisor-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
 
   # Ceph 자동 구성(계획 56): Ceph가 없는 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 mon·mgr, 루프 장치
@@ -553,7 +553,7 @@ jobs:
       - name: OVN setup E2E as root
         run: |
           sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
-            OPL_TEST_CLOUD_IMAGE="$RUNNER_TEMP/ubuntu-24.04-server-cloudimg-amd64.img" \
+            ORBIVISOR_TEST_CLOUD_IMAGE="$RUNNER_TEMP/ubuntu-24.04-server-cloudimg-amd64.img" \
             cargo test --features orbivisord/sdn-it -p orbivisord --test sdn -- --nocapture
 
   # 여러 노드 SDN(계획 66 스테이지 6): 러너 하나에 privileged systemd 컨테이너 셋(ci/sdn-node/Dockerfile — OVN·OVS는 넣지 않음)을
@@ -582,7 +582,7 @@ jobs:
       # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
       - name: Multinode SDN E2E as root
         run: |
-          sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" OPL_MULTINODE_IMAGE=opl-sdn-node \
+          sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" ORBIVISOR_MULTINODE_IMAGE=opl-sdn-node \
             cargo test --features orbivisord/sdn-multinode-it -p orbivisord --test sdn_multinode -- --nocapture
 
   # 설치 매체와 cloud-init(계획 57)의 실제 게스트: 받아 둔 Alpine virt ISO로 BIOS·UEFI VM이 CD에서 부팅하는지, Ubuntu
@@ -633,17 +633,17 @@ jobs:
       - name: Installer ISO boot and cloud-init in real guests
         run: cargo test --features orbivisord/install-media-it,orbivisord/qemu-it -p orbivisord --test install_media -- --nocapture
         env:
-          OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
-          OPL_TEST_INSTALL_ISO: ${{ runner.temp }}/alpine-virt-3.20.3-x86_64.iso
+          ORBIVISOR_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
+          ORBIVISOR_TEST_INSTALL_ISO: ${{ runner.temp }}/alpine-virt-3.20.3-x86_64.iso
       - name: Templates and linked clones in real guests
         run: cargo test --features orbivisord/templates-it,orbivisord/qemu-it -p orbivisord --test templates -- --nocapture
         env:
-          OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
-          OPL_TEST_CLOUD_SUMS: ${{ runner.temp }}/SHA256SUMS
+          ORBIVISOR_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
+          ORBIVISOR_TEST_CLOUD_SUMS: ${{ runner.temp }}/SHA256SUMS
       - name: vTPM, Secure Boot and the guest agent in a real guest
         run: cargo test --features orbivisord/vtpm-it,orbivisord/install-media-it,orbivisord/qemu-it -p orbivisord --test vtpm -- --nocapture
         env:
-          OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
+          ORBIVISOR_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
 
   # 백업 저장소를 실제 S3 호환 저장소(SeaweedFS)로(계획 68 §14): HTTP 끝점과 사용자 CA로 서명한 HTTPS 끝점(SeaweedFS 컨테이너 둘,
   # 태그를 못 박음), GC와 백업 동시·평문 표식 없음, S3 저장소 멈춤(`docker pause`) 도중의 백업·라이브 복원(헬퍼 kill -9·opld 다시
@@ -654,13 +654,13 @@ jobs:
     env:
       # MinIO는 2025년 가을부터 이미지·바이너리를 내지 않아(quay 401, dl.min.io 410) SeaweedFS S3로 시험한다.
       S3_IMAGE: chrislusf/seaweedfs:4.50
-      OPL_S3_ENDPOINT: http://127.0.0.1:9000
-      OPL_S3_TLS_ENDPOINT: https://127.0.0.1:9443
-      OPL_S3_CA: /tmp/opl-s3-certs/ca.pem
-      OPL_S3_ACCESS_KEY: opl-ci-access
-      OPL_S3_SECRET_KEY: opl-ci-secret-key-1234
-      OPL_S3_BUCKET: orbi
-      OPL_S3_CONTAINER: opl-s3
+      ORBIVISOR_S3_ENDPOINT: http://127.0.0.1:9000
+      ORBIVISOR_S3_TLS_ENDPOINT: https://127.0.0.1:9443
+      ORBIVISOR_S3_CA: /tmp/opl-s3-certs/ca.pem
+      ORBIVISOR_S3_ACCESS_KEY: opl-ci-access
+      ORBIVISOR_S3_SECRET_KEY: opl-ci-secret-key-1234
+      ORBIVISOR_S3_BUCKET: orbi
+      ORBIVISOR_S3_CONTAINER: opl-s3
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -680,59 +680,59 @@ jobs:
           d=/tmp/opl-s3-certs
           mkdir -p "$d"
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
-            -subj "/CN=opl s3 test ca" -keyout "$d/ca.key" -out "$OPL_S3_CA"
+            -subj "/CN=opl s3 test ca" -keyout "$d/ca.key" -out "$ORBIVISOR_S3_CA"
           openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=127.0.0.1" \
             -keyout "$d/private.key" -out "$d/server.csr"
           printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > "$d/ext"
-          openssl x509 -req -in "$d/server.csr" -CA "$OPL_S3_CA" -CAkey "$d/ca.key" -CAcreateserial -days 2 \
+          openssl x509 -req -in "$d/server.csr" -CA "$ORBIVISOR_S3_CA" -CAkey "$d/ca.key" -CAcreateserial -days 2 \
             -extfile "$d/ext" -out "$d/public.crt"
           chmod 0644 "$d/private.key"
-          openssl verify -CAfile "$OPL_S3_CA" "$d/public.crt"
+          openssl verify -CAfile "$ORBIVISOR_S3_CA" "$d/public.crt"
       - name: SeaweedFS S3 over HTTP and HTTPS, and the bucket
         run: |
           d=/tmp/opl-s3-certs
           printf '{"identities":[{"name":"opl","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' \
-            "$OPL_S3_ACCESS_KEY" "$OPL_S3_SECRET_KEY" > "$d/s3.json"
+            "$ORBIVISOR_S3_ACCESS_KEY" "$ORBIVISOR_S3_SECRET_KEY" > "$d/s3.json"
           chmod 0644 "$d/s3.json"
-          docker run -d --name "$OPL_S3_CONTAINER" -p 127.0.0.1:9000:8333 -v "$d:/conf:ro" \
+          docker run -d --name "$ORBIVISOR_S3_CONTAINER" -p 127.0.0.1:9000:8333 -v "$d:/conf:ro" \
             "$S3_IMAGE" server -dir=/data -s3 -s3.port=8333 -s3.config=/conf/s3.json
           docker run -d --name opl-s3-tls -p 127.0.0.1:9443:8333 -v "$d:/conf:ro" \
             "$S3_IMAGE" server -dir=/data -s3 -s3.port=8333 -s3.config=/conf/s3.json \
             -s3.cert.file=/conf/public.crt -s3.key.file=/conf/private.key
           for _ in $(seq 90); do curl -s -o /dev/null http://127.0.0.1:9000/ && break; sleep 1; done
-          for _ in $(seq 90); do curl -s -o /dev/null --cacert "$OPL_S3_CA" https://127.0.0.1:9443/ && break; sleep 1; done
-          export AWS_ACCESS_KEY_ID="$OPL_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$OPL_S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
-          for _ in $(seq 30); do aws --endpoint-url "$OPL_S3_ENDPOINT" s3 mb "s3://$OPL_S3_BUCKET" && break; sleep 2; done
-          for _ in $(seq 30); do aws --endpoint-url "$OPL_S3_TLS_ENDPOINT" --ca-bundle "$OPL_S3_CA" s3 mb "s3://$OPL_S3_BUCKET" && break; sleep 2; done
-          aws --endpoint-url "$OPL_S3_ENDPOINT" s3 ls
-          docker exec "$OPL_S3_CONTAINER" weed version
+          for _ in $(seq 90); do curl -s -o /dev/null --cacert "$ORBIVISOR_S3_CA" https://127.0.0.1:9443/ && break; sleep 1; done
+          export AWS_ACCESS_KEY_ID="$ORBIVISOR_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$ORBIVISOR_S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
+          for _ in $(seq 30); do aws --endpoint-url "$ORBIVISOR_S3_ENDPOINT" s3 mb "s3://$ORBIVISOR_S3_BUCKET" && break; sleep 2; done
+          for _ in $(seq 30); do aws --endpoint-url "$ORBIVISOR_S3_TLS_ENDPOINT" --ca-bundle "$ORBIVISOR_S3_CA" s3 mb "s3://$ORBIVISOR_S3_BUCKET" && break; sleep 2; done
+          aws --endpoint-url "$ORBIVISOR_S3_ENDPOINT" s3 ls
+          docker exec "$ORBIVISOR_S3_CONTAINER" weed version
       - name: Backup store E2E against S3 (SeaweedFS)
         timeout-minutes: 60
         run: cargo test -p orbivisord --features s3-it --test backup_s3 -- --nocapture --test-threads=1
       - name: S3 server logs
         if: failure()
         run: |
-          docker logs --tail 200 "$OPL_S3_CONTAINER" || true
+          docker logs --tail 200 "$ORBIVISOR_S3_CONTAINER" || true
           docker logs --tail 200 opl-s3-tls || true
 
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는
-  # ldap-setup.sh가 아래 OPL_TEST_LDAP_* 값으로 만든다.
+  # ldap-setup.sh가 아래 ORBIVISOR_TEST_LDAP_* 값으로 만든다.
   ldap:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      OPL_TEST_LDAP_URL: "ldaps://127.0.0.1:636"
-      OPL_TEST_LDAP_STARTTLS_URL: "ldap://127.0.0.1:389"
-      OPL_TEST_LDAP_CA: /tmp/opl-test-ldap-ca.pem
-      OPL_TEST_LDAP_BASE_DN: "dc=example,dc=com"
-      OPL_TEST_LDAP_BIND_DN: "cn=admin,dc=example,dc=com"
-      OPL_TEST_LDAP_BIND_PASSWORD: opl-admin-pw
-      OPL_TEST_LDAP_USER: alice
-      OPL_TEST_LDAP_USER_PASSWORD: alice-pw
-      OPL_TEST_LDAP_OTHER_USER: bob
-      OPL_TEST_LDAP_OTHER_PASSWORD: bob-pw
-      OPL_TEST_LDAP_GROUP: "cn=admins,ou=groups,dc=example,dc=com"
+      ORBIVISOR_TEST_LDAP_URL: "ldaps://127.0.0.1:636"
+      ORBIVISOR_TEST_LDAP_STARTTLS_URL: "ldap://127.0.0.1:389"
+      ORBIVISOR_TEST_LDAP_CA: /tmp/opl-test-ldap-ca.pem
+      ORBIVISOR_TEST_LDAP_BASE_DN: "dc=example,dc=com"
+      ORBIVISOR_TEST_LDAP_BIND_DN: "cn=admin,dc=example,dc=com"
+      ORBIVISOR_TEST_LDAP_BIND_PASSWORD: opl-admin-pw
+      ORBIVISOR_TEST_LDAP_USER: alice
+      ORBIVISOR_TEST_LDAP_USER_PASSWORD: alice-pw
+      ORBIVISOR_TEST_LDAP_OTHER_USER: bob
+      ORBIVISOR_TEST_LDAP_OTHER_PASSWORD: bob-pw
+      ORBIVISOR_TEST_LDAP_GROUP: "cn=admins,ou=groups,dc=example,dc=com"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -759,9 +759,9 @@ jobs:
       GOVMOMI_VERSION: v0.56.2
       VCSIM_SHA256: 4c79fd49d94ffdb7a9095350ff71f38e77e90036bd0bc26b50362219ac88fd13
       GOVC_SHA256: 12889f30e42e868487041f6628e9789606c80e13a194fb37c099abffc92d5a59
-      OPL_TEST_VCSIM: "127.0.0.1:8989"
-      OPL_TEST_VCSIM_USER: user
-      OPL_TEST_VCSIM_PASSWORD: pass
+      ORBIVISOR_TEST_VCSIM: "127.0.0.1:8989"
+      ORBIVISOR_TEST_VCSIM_USER: user
+      ORBIVISOR_TEST_VCSIM_PASSWORD: pass
       GOVC_URL: "https://user:pass@127.0.0.1:8989/sdk"
       GOVC_INSECURE: "1"
     steps:
@@ -773,7 +773,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config nbdkit qemu-utils
           nbdkit --version
-          echo "OPL_TEST_NBDKIT=$(command -v nbdkit)" >> "$GITHUB_ENV"
+          echo "ORBIVISOR_TEST_NBDKIT=$(command -v nbdkit)" >> "$GITHUB_ENV"
       - name: govmomi vcsim and govc (pinned release, SHA-256 checked)
         run: |
           mkdir -p "$RUNNER_TEMP/govmomi" && cd "$RUNNER_TEMP/govmomi"
@@ -794,7 +794,7 @@ jobs:
       # 계획 72 스테이지 6: 우리가 내보낸 OVA(storage-it 왕복 시험이 남김)를 vcsim이 govc import.ova로 받는다.
       - name: VM export OVA into vcsim (govc import.ova)
         run: |
-          OPL_EXPORT_OVA_OUT="$RUNNER_TEMP/web.ova" cargo test -p orbivisor-api --features storage-it --test vm_import_tasks \
+          ORBIVISOR_EXPORT_OVA_OUT="$RUNNER_TEMP/web.ova" cargo test -p orbivisor-api --features storage-it --test vm_import_tasks \
             an_exported_ova_imports_back_with_the_same_disk -- --nocapture
           govc import.ova -pool=/DC0/host/DC0_C0/Resources -ds=LocalDS_0 -name=orbivisor-export "$RUNNER_TEMP/web.ova"
           govc vm.info -json orbivisor-export | jq -e '[.. | strings | select(endswith(".vmdk"))] | length >= 1'
@@ -832,7 +832,7 @@ jobs:
           install -m 0755 pebble-linux-amd64/linux/amd64/pebble pebble
           install -m 0755 pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv pebble-challtestsrv
           ./pebble -version
-          echo "OPL_TEST_PEBBLE_DIR=$RUNNER_TEMP/pebble" >> "$GITHUB_ENV"
+          echo "ORBIVISOR_TEST_PEBBLE_DIR=$RUNNER_TEMP/pebble" >> "$GITHUB_ENV"
       - name: Start BIND (TSIG zone bind.test)
         run: |
           # AppArmor의 named 프로필은 /etc/bind 밖을 막으므로 복사한 실행 파일로 띄운다.
@@ -890,8 +890,8 @@ jobs:
           cargo build -p orbivisord --features devserver --bin orbivisor-devserver
           cargo test -p orbivisord --features devserver --test devserver
           cargo run -q -p orbivisor-api --bin orbivisor-api-openapi > "$RUNNER_TEMP/openapi.json"
-          echo "OPL_DEVSERVER=$PWD/target/debug/orbivisor-devserver" >> "$GITHUB_ENV"
-          echo "OPL_OPENAPI=$RUNNER_TEMP/openapi.json" >> "$GITHUB_ENV"
+          echo "ORBIVISOR_DEVSERVER=$PWD/target/debug/orbivisor-devserver" >> "$GITHUB_ENV"
+          echo "ORBIVISOR_OPENAPI=$RUNNER_TEMP/openapi.json" >> "$GITHUB_ENV"
       - name: go mod verify, gofmt, go vet, staticcheck, govulncheck
         working-directory: terraform
         run: |

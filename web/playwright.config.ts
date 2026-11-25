@@ -2,9 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 // 실제 opld(QEMU)에 붙는 E2E. opld와 준비는 Rust 테스트가 한다:
 // `pnpm -C web build && cargo test -p orbivisord --features web-it --test web`
-if (!process.env.OPL_URL) {
+if (!process.env.ORBIVISOR_URL) {
   throw new Error(
-    "Set OPL_URL to a running opld (run through `cargo test -p orbivisord --features web-it --test web`).",
+    "Set ORBIVISOR_URL to a running opld (run through `cargo test -p orbivisord --features web-it --test web`).",
   );
 }
 
@@ -17,7 +17,7 @@ export default defineConfig({
   workers: 1,
   reporter: [["list"]],
   use: {
-    baseURL: process.env.OPL_URL,
+    baseURL: process.env.ORBIVISOR_URL,
     // opld는 클러스터 CA가 서명한 인증서를 쓴다.
     ignoreHTTPSErrors: true,
     trace: "retain-on-failure",

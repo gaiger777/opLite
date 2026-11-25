@@ -13,8 +13,8 @@ use orbivisor_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware, NicModel};
 use uuid::Uuid;
 
 fn host() -> HostProfile {
-    let share =
-        std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+    let share = orbivisor_types::legacy::env("QEMU_SHARE")
+        .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
     HostProfile::native(Path::new(&share))
 }
 
@@ -264,7 +264,8 @@ fn secure_boot_x86_host() -> Option<HostProfile> {
     }
     let pair = if cfg!(target_os = "macos") {
         let share = PathBuf::from(
-            std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into()),
+            orbivisor_types::legacy::env("QEMU_SHARE")
+                .unwrap_or_else(|| "/opt/homebrew/share/qemu".into()),
         );
         orbivisor_qemu::FirmwarePair {
             code: share.join("edk2-x86_64-secure-code.fd"),

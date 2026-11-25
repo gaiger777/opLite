@@ -4,12 +4,12 @@ import { expect, type Page, test } from "@playwright/test";
 // 서랍에서 두 줄(만듦·바뀜)과 바뀜 줄의 전후 표를 본 뒤, 만든 줄로 되돌린다(서버 계획의 diff를 보고 "Restore"). 되돌린 줄이
 // "restored from"과 함께 생긴다. 보안 탭의 인증서 보기는 빈 목록만 연다(ACME 디렉터리 없음). 메모리가 돌아왔는지는 Rust
 // 테스트(`crates/orbivisord/tests/web.rs`)가 본다.
-const user = process.env.OPL_USER ?? "admin";
-const password = process.env.OPL_PASSWORD ?? "";
+const user = process.env.ORBIVISOR_USER ?? "admin";
+const password = process.env.ORBIVISOR_PASSWORD ?? "";
 /** 되돌릴 VM 이름 */
-const vm = process.env.OPL_VM ?? "";
+const vm = process.env.ORBIVISOR_VM ?? "";
 if (!password || !vm) {
-  throw new Error("Set OPL_PASSWORD and OPL_VM (the Rust test sets them).");
+  throw new Error("Set ORBIVISOR_PASSWORD and ORBIVISOR_VM (the Rust test sets them).");
 }
 
 async function signIn(page: Page) {

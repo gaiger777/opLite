@@ -22,7 +22,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// 발급용 Ed25519 키 쌍을 만든다. 비밀 키(PKCS#8 base64)는 --out 파일(0600)에, 공개 키
-    /// (OPL_LICENSE_KEYS의 항목)는 표준 출력에.
+    /// (ORBIVISOR_LICENSE_KEYS의 항목)는 표준 출력에.
     Keygen {
         /// 비밀 키 파일. 이미 있으면 거절한다.
         #[arg(long)]
@@ -49,7 +49,7 @@ enum Cmd {
         #[arg(long)]
         issued_at: Option<u64>,
     },
-    /// 비밀 키 파일의 공개 키(OPL_LICENSE_KEYS의 항목)를 표준 출력에 낸다.
+    /// 비밀 키 파일의 공개 키(ORBIVISOR_LICENSE_KEYS의 항목)를 표준 출력에 낸다.
     Pubkey {
         /// keygen이 만든 비밀 키 파일
         #[arg(long)]

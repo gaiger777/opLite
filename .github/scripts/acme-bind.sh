@@ -1,7 +1,7 @@
 #!/bin/sh
 # ACME RFC 2136 시험용 BIND(계획 73): 영역 bind.test(모든 이름 → 127.0.0.1)를 TSIG 키 acme-key(hmac-sha256)로 바꿀 수 있게
 # 127.0.0.1:PORT에 띄운다. 쓰는 법: acme-bind.sh NAMED DIR PORT — NAMED는 named 실행 파일(우분투는 AppArmor를 비껴가게
-# 복사한 것), 끝나면 OPL_TEST_BIND·OPL_TEST_BIND_KEY를 KEY=VALUE 줄로 찍는다(GITHUB_ENV에 붙인다).
+# 복사한 것), 끝나면 ORBIVISOR_TEST_BIND·ORBIVISOR_TEST_BIND_KEY를 KEY=VALUE 줄로 찍는다(GITHUB_ENV에 붙인다).
 set -eu
 named=$1
 dir=$2
@@ -42,5 +42,5 @@ until dig +short -p "$port" @127.0.0.1 ns.bind.test A | grep -q 127.0.0.1; do
   fi
   sleep 0.2
 done
-echo "OPL_TEST_BIND=127.0.0.1:$port"
-echo "OPL_TEST_BIND_KEY=$secret"
+echo "ORBIVISOR_TEST_BIND=127.0.0.1:$port"
+echo "ORBIVISOR_TEST_BIND_KEY=$secret"

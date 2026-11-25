@@ -4,12 +4,12 @@ import { expect, type Page, test } from "@playwright/test";
 
 // 계획 69: 백업 안 파일 찾아보기. 실제 도우미 이미지·QEMU로 연 세션에서 디렉터리에 들어가고, 파일 하나와 폴더(zip)를
 // 내려받고, 닫는다. 고정물 ext4 디스크 VM과 그 저장소 백업은 Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비한다.
-const user = process.env.OPL_USER ?? "admin";
-const password = process.env.OPL_PASSWORD ?? "";
+const user = process.env.ORBIVISOR_USER ?? "admin";
+const password = process.env.ORBIVISOR_PASSWORD ?? "";
 /** 찾아볼 백업 이름 */
-const backup = process.env.OPL_BACKUP ?? "";
+const backup = process.env.ORBIVISOR_BACKUP ?? "";
 if (!password || !backup) {
-  throw new Error("Set OPL_PASSWORD and OPL_BACKUP (the Rust test sets them).");
+  throw new Error("Set ORBIVISOR_PASSWORD and ORBIVISOR_BACKUP (the Rust test sets them).");
 }
 
 async function signIn(page: Page) {
@@ -53,9 +53,9 @@ test("browses a backup, downloads a file and a folder, and closes the session", 
   // 이름은 <bdi> 안이고 링크 대상(→ hello.txt)도 같은 글이라 행의 체크 상자로 찾는다.
   await expect(root.getByRole("checkbox", { name: "Select hello.txt" })).toBeVisible();
   await expect(root.getByText("→ hello.txt")).toBeVisible();
-  // 문서용 화면(설정했을 때만): `OPL_SCREENSHOTS=<디렉터리>`
-  if (process.env.OPL_SCREENSHOTS) {
-    await page.screenshot({ path: `${process.env.OPL_SCREENSHOTS}/file-restore.png` });
+  // 문서용 화면(설정했을 때만): `ORBIVISOR_SCREENSHOTS=<디렉터리>`
+  if (process.env.ORBIVISOR_SCREENSHOTS) {
+    await page.screenshot({ path: `${process.env.ORBIVISOR_SCREENSHOTS}/file-restore.png` });
   }
   // 디렉터리에 들어갔다가 이동 경로로 돌아온다.
   await root.getByRole("button", { name: "dir", exact: true }).click();

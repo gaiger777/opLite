@@ -1,6 +1,6 @@
-//! 실제 LVM-thin 풀의 저장소 통합 테스트. 관리자가 만든 VG와 thin pool(`OPL_TEST_LVM=VG/THINPOOL`)에
+//! 실제 LVM-thin 풀의 저장소 통합 테스트. 관리자가 만든 VG와 thin pool(`ORBIVISOR_TEST_LVM=VG/THINPOOL`)에
 //! 볼륨 LV를 만들고 가져오고, thin 스냅샷을 만들어 되돌리고, 복사하고 지운다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_LVM=opltest/tp cargo test -p orbivisor-driver --features lvm-it --test lvm_storage`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_LVM=opltest/tp cargo test -p orbivisor-driver --features lvm-it --test lvm_storage`
 //! Linux에서 root, lvm2(thin-provisioning-tools), qemu-img, qemu-io가 필요하다.
 #![cfg(all(feature = "lvm-it", target_os = "linux"))]
 
@@ -24,12 +24,13 @@ const MNT: &str = "/nonexistent/opl-pools";
 
 const RAW: ImageFormat = ImageFormat::Raw;
 
-/// `OPL_TEST_LVM`의 VG와 thin pool
+/// `ORBIVISOR_TEST_LVM`의 VG와 thin pool
 fn vg_and_thinpool() -> (String, String) {
-    let target = std::env::var("OPL_TEST_LVM").expect("OPL_TEST_LVM must name VG/THINPOOL");
+    let target =
+        std::env::var("ORBIVISOR_TEST_LVM").expect("ORBIVISOR_TEST_LVM must name VG/THINPOOL");
     let (vg, thinpool) = target
         .split_once('/')
-        .expect("OPL_TEST_LVM must look like VG/THINPOOL");
+        .expect("ORBIVISOR_TEST_LVM must look like VG/THINPOOL");
     (vg.to_string(), thinpool.to_string())
 }
 

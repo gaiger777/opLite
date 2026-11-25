@@ -463,8 +463,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("OPL_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            // ORBIVISOR_LOG(옛 이름 OPL_LOG도 — 경고). 없거나 풀리지 않으면 warn.
+            orbivisor_types::legacy::env("LOG")
+                .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
+                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
     let args = Args::parse();

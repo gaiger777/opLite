@@ -1,7 +1,7 @@
-//! 실제 공유 LVM 풀의 저장소 통합 테스트. 관리자가 만든 공유 VG(`OPL_TEST_LVM_SHARED=VG`, lvmlockd의
+//! 실제 공유 LVM 풀의 저장소 통합 테스트. 관리자가 만든 공유 VG(`ORBIVISOR_TEST_LVM_SHARED=VG`, lvmlockd의
 //! `vgcreate --shared`, 잠금을 시작한 것)에 볼륨 LV를 만들어 0으로 채우고, 배타 활성화하고 끄고,
 //! 늘리고(늘린 부분을 0으로 채운다), 가져오고, 복사하고 지운다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_LVM_SHARED=oplshared cargo test -p orbivisor-driver --features lvm-shared-it --test lvm_shared_storage`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_LVM_SHARED=oplshared cargo test -p orbivisor-driver --features lvm-shared-it --test lvm_shared_storage`
 //! Linux에서 root, lvm2-lockd와 sanlock(또는 dlm), qemu-img, qemu-io가 필요하다.
 #![cfg(all(feature = "lvm-shared-it", target_os = "linux"))]
 
@@ -30,9 +30,10 @@ const RAW: ImageFormat = ImageFormat::Raw;
 /// 늘린 부분이 놓이는지 보는데, 다른 시험이 함께 돌면 그 자리를 먼저 차지할 수 있다.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// `OPL_TEST_LVM_SHARED`의 공유 VG
+/// `ORBIVISOR_TEST_LVM_SHARED`의 공유 VG
 fn vg() -> String {
-    std::env::var("OPL_TEST_LVM_SHARED").expect("OPL_TEST_LVM_SHARED must name a shared VG")
+    std::env::var("ORBIVISOR_TEST_LVM_SHARED")
+        .expect("ORBIVISOR_TEST_LVM_SHARED must name a shared VG")
 }
 
 fn shared_pool() -> StoragePool {

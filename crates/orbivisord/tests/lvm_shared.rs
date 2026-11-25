@@ -2,9 +2,9 @@
 //! 그 풀의 raw 볼륨(두꺼운 LV)을 블록 장치로 붙인 VM을 띄운다. VM이 도는 동안에만 LV가 이 노드에서
 //! 켜져 있고, opld가 다시 뜰 때 켜진 채 남은 LV는 끄되 실행 중인 VM의 LV는 그대로 둔다. 디렉터리
 //! 풀로 복제하고 모두 지운다. 게스트에는 OS가 없으므로(UEFI 펌웨어만) 디스크 내용은 LV 장치를 직접 본다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_LVM_SHARED=oplshared OPL_TEST_ISCSI=127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared cargo test -p orbivisord --features lvm-shared-it --test lvm_shared`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_LVM_SHARED=oplshared ORBIVISOR_TEST_ISCSI=127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared cargo test -p orbivisord --features lvm-shared-it --test lvm_shared`
 //! Linux에서 root, lvm2-lockd와 sanlock(또는 dlm), QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다.
-//! `OPL_TEST_LVM_SHARED`는 테스트가 LV를 만들고 지워도 되는 공유 VG다. `OPL_TEST_ISCSI`가 있으면 VG가
+//! `ORBIVISOR_TEST_LVM_SHARED`는 테스트가 LV를 만들고 지워도 되는 공유 VG다. `ORBIVISOR_TEST_ISCSI`가 있으면 VG가
 //! 그 타깃의 LUN 위에 있다고 보고, 시험 전에 VG 잠금을 멈추고 로그아웃해 opld가 다시 로그인하게 한다.
 #![cfg(all(feature = "lvm-shared-it", target_os = "linux"))]
 
@@ -23,17 +23,18 @@ use serde_json::{Value, json};
 /// 잠금 시작(sanlock 임대)과 iSCSI 로그인을 기다리는 시간
 const WAIT: Duration = Duration::from_secs(180);
 
-/// `OPL_TEST_LVM_SHARED`의 공유 VG
+/// `ORBIVISOR_TEST_LVM_SHARED`의 공유 VG
 fn vg() -> String {
-    std::env::var("OPL_TEST_LVM_SHARED").expect("OPL_TEST_LVM_SHARED must name a shared VG")
+    std::env::var("ORBIVISOR_TEST_LVM_SHARED")
+        .expect("ORBIVISOR_TEST_LVM_SHARED must name a shared VG")
 }
 
-/// `OPL_TEST_ISCSI`의 포털과 타깃
+/// `ORBIVISOR_TEST_ISCSI`의 포털과 타깃
 fn iscsi() -> Option<(String, String)> {
-    let value = std::env::var("OPL_TEST_ISCSI").ok()?;
+    let value = std::env::var("ORBIVISOR_TEST_ISCSI").ok()?;
     let (portal, target) = value
         .split_once(',')
-        .expect("OPL_TEST_ISCSI must look like PORTAL,TARGET");
+        .expect("ORBIVISOR_TEST_ISCSI must look like PORTAL,TARGET");
     Some((portal.to_string(), target.to_string()))
 }
 

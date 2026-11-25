@@ -44,8 +44,8 @@ pub fn free_port() -> u16 {
 impl Daemon {
     /// 유닉스 소켓 경로 길이 제한 때문에 /tmp 아래 짧은 경로를 쓴다.
     pub fn new(name: &str, extra_config: &str) -> Self {
-        // systemd가 있는 Linux(CI)에서만 `OPL_TEST_SYSTEMD=1`로 QEMU를 스코프로 감싼다.
-        let systemd_scope = std::env::var_os("OPL_TEST_SYSTEMD").is_some();
+        // systemd가 있는 Linux(CI)에서만 `ORBIVISOR_TEST_SYSTEMD=1`로 QEMU를 스코프로 감싼다.
+        let systemd_scope = std::env::var_os("ORBIVISOR_TEST_SYSTEMD").is_some();
         Self::with_hypervisor(
             name,
             extra_config,
@@ -61,8 +61,8 @@ impl Daemon {
             .unwrap();
         let port = free_port();
         let cluster_port = free_port();
-        let share =
-            std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into());
+        let share = orbivisor_types::legacy::env("QEMU_SHARE")
+            .unwrap_or_else(|| "/opt/homebrew/share/qemu".into());
         let config = format!(
             "name = \"{name}\"\naddress = \"127.0.0.1\"\nlisten = \"127.0.0.1:{port}\"\n\
              cluster_listen = \"127.0.0.1:{cluster_port}\"\ncontrol_socket = \"{sock}\"\n\

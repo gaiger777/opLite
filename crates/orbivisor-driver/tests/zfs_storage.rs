@@ -1,6 +1,6 @@
-//! 실제 ZFS 풀의 저장소 통합 테스트. 관리자가 만든 데이터셋(`OPL_TEST_ZFS=POOL/DATASET`)에 볼륨
+//! 실제 ZFS 풀의 저장소 통합 테스트. 관리자가 만든 데이터셋(`ORBIVISOR_TEST_ZFS=POOL/DATASET`)에 볼륨
 //! zvol을 만들고 가져오고, ZFS 스냅샷을 찍어 되돌리고, 복사하고 지운다.
-//! `sudo -E env "PATH=$PATH" OPL_TEST_ZFS=opltestz/opl cargo test -p orbivisor-driver --features zfs-it --test zfs_storage`
+//! `sudo -E env "PATH=$PATH" ORBIVISOR_TEST_ZFS=opltestz/opl cargo test -p orbivisor-driver --features zfs-it --test zfs_storage`
 //! Linux에서 root, zfsutils-linux, qemu-img, qemu-io가 필요하다.
 #![cfg(all(feature = "zfs-it", target_os = "linux"))]
 
@@ -25,9 +25,9 @@ const MNT: &str = "/nonexistent/opl-pools";
 
 const RAW: ImageFormat = ImageFormat::Raw;
 
-/// `OPL_TEST_ZFS`의 데이터셋
+/// `ORBIVISOR_TEST_ZFS`의 데이터셋
 fn dataset() -> String {
-    std::env::var("OPL_TEST_ZFS").expect("OPL_TEST_ZFS must name POOL/DATASET")
+    std::env::var("ORBIVISOR_TEST_ZFS").expect("ORBIVISOR_TEST_ZFS must name POOL/DATASET")
 }
 
 fn zfs_pool() -> StoragePool {

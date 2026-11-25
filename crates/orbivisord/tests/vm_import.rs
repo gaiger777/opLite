@@ -411,7 +411,7 @@ async fn web01_esxi() -> MockEsxi {
 }
 
 /// oplctl에 줄 ESXi 비밀번호 파일(`--password-file`). oplctl이 이 프로세스 안에서 돌므로 환경 변수
-/// (`OPL_ESXI_PASSWORD`)는 바꾸지 않는다.
+/// (`ORBIVISOR_ESXI_PASSWORD`)는 바꾸지 않는다.
 fn esxi_password_file(d: &Daemon) -> String {
     let file = d.path("esxi-password");
     std::fs::write(&file, ESXI_PASSWORD).unwrap();

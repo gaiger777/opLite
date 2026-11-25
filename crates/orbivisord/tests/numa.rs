@@ -4,7 +4,7 @@
 //! 노드 설정은 `node resources`, VM의 CPU 배치는 `vm create|set --cpu-policy/--hugepages`(계획 64 스테이지 5)로 준다.
 //! 스레드 친화는 `/proc/<pid>/task/<tid>/status`의 `Cpus_allowed_list`로 본다(vCPU 스레드는 `-name debug-threads=on`의
 //! 이름 `CPU n/KVM`). 커널 일꾼(`kvm-nx-lpage-recovery`·`vhost-*` — `stat` 플래그 `PF_USER_WORKER` 등)은 커널이 친화를
-//! 정하므로 보지 않는다(상한은 스코프 cpuset). hugepages는 root와 `OPL_TEST_NUMA_SYS=1`일 때만 실행 중 예약하고
+//! 정하므로 보지 않는다(상한은 스코프 cpuset). hugepages는 root와 `ORBIVISOR_TEST_NUMA_SYS=1`일 때만 실행 중 예약하고
 //! (`host_resources.hugepages`) 끝에 원래 수로 되돌린다.
 #![cfg(all(feature = "numa-it", target_os = "linux"))]
 
@@ -28,9 +28,9 @@ fn client(d: &Daemon) -> Client {
     .unwrap()
 }
 
-/// `/sys`에 써도 되는 시험(root와 `OPL_TEST_NUMA_SYS=1`)
+/// `/sys`에 써도 되는 시험(root와 `ORBIVISOR_TEST_NUMA_SYS=1`)
 fn sys_writable() -> bool {
-    std::env::var_os("OPL_TEST_NUMA_SYS").is_some_and(|v| v == "1")
+    std::env::var_os("ORBIVISOR_TEST_NUMA_SYS").is_some_and(|v| v == "1")
         && unsafe { libc::geteuid() } == 0
 }
 
@@ -240,7 +240,7 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
     vcpus.sort();
     assert_eq!(vcpus, ["2", "3"], "{:?}", threads(p));
     others_on(p, "1").await;
-    if std::env::var_os("OPL_TEST_SYSTEMD").is_some() && t["cpuset"] == true {
+    if std::env::var_os("ORBIVISOR_TEST_SYSTEMD").is_some() && t["cpuset"] == true {
         let id = v["id"].as_str().unwrap();
         let out = std::process::Command::new("systemctl")
             .args(["show", "--property=ControlGroup", "--value"])

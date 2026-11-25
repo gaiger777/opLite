@@ -256,7 +256,7 @@ mod tests {
     static TOOL: BlockTool = BlockTool::new(
         "test command",
         "an earlier test command still running on the same target",
-        &[("OPL_BLOCKCMD_TEST", "set")],
+        &[("ORBIVISOR_BLOCKCMD_TEST", "set")],
         DriverError::Lvm,
     );
 
@@ -290,7 +290,7 @@ mod tests {
         // 읽기는 표준 출력을 돌려준다. 환경 변수가 붙는다. 실패하면 둘 다 stderr 첫 줄이다.
         let long = Duration::from_secs(10);
         let out = TOOL
-            .run_read("/bin/sh", &["-c", "echo $OPL_BLOCKCMD_TEST"], long)
+            .run_read("/bin/sh", &["-c", "echo $ORBIVISOR_BLOCKCMD_TEST"], long)
             .await;
         assert_eq!(out.unwrap(), b"set\n");
         let fail = ["-c", "echo '  no vg' >&2; echo more >&2; exit 5"];
@@ -419,7 +419,10 @@ mod tests {
         let sink = format!("cat > {}", out.display());
         let target = format!("tank/{}", Uuid::now_v7());
         TOOL.run_pipe_change(
-            ("/bin/sh", &["-c", "echo $OPL_BLOCKCMD_TEST; echo data"]),
+            (
+                "/bin/sh",
+                &["-c", "echo $ORBIVISOR_BLOCKCMD_TEST; echo data"],
+            ),
             ("/bin/sh", &["-c", &sink]),
             &[&target],
             long,

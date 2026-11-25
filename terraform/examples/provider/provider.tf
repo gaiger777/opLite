@@ -6,7 +6,7 @@ terraform {
   }
 }
 
-# endpoint, api_token and ca_pem can also come from OPL_SERVER, OPL_TOKEN and OPL_CA_PEM.
+# endpoint, api_token and ca_pem can also come from ORBIVISOR_SERVER, ORBIVISOR_TOKEN and ORBIVISOR_CA_PEM.
 provider "orbivisor" {
   endpoint       = "https://node1.example.net:8006"
   api_token      = var.orbivisor_token

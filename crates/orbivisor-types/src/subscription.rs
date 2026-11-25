@@ -127,11 +127,18 @@ impl PublicKey {
     }
 }
 
-/// 이 빌드가 믿는 공개 키. 빌드 값 `OPL_LICENSE_KEYS`(base64 표준 공개 키를 쉼표로)가 있으면 그것만,
+/// 이 빌드가 믿는 공개 키. 빌드 값 `ORBIVISOR_LICENSE_KEYS`(base64 표준 공개 키를 쉼표로, 없으면 옛 이름
+/// `OPL_LICENSE_KEYS` — 옛 이름으로 빌드하는 릴리스 파이프라인)가 있으면 그것만,
 /// 없거나 공백뿐이면 저장소의 개발 키 하나다. 그 밖에 풀리는 키가 없으면(`","` 같은 값) 빈 목록이다.
 pub fn license_keys() -> Vec<PublicKey> {
-    keys_from(option_env!("OPL_LICENSE_KEYS"))
+    keys_from(BUILD_LICENSE_KEYS)
 }
+
+/// 빌드 값 `ORBIVISOR_LICENSE_KEYS`, 없으면 `OPL_LICENSE_KEYS`
+const BUILD_LICENSE_KEYS: Option<&str> = match option_env!("ORBIVISOR_LICENSE_KEYS") {
+    Some(v) => Some(v),
+    None => option_env!("OPL_LICENSE_KEYS"),
+};
 
 /// [`license_keys`]의 본체. 풀리지 않는 항목은 건너뛴다(그 키로 서명한 키는 invalid가 된다).
 /// 목록에 든 개발 공개 키도 개발 키로 표시한다.
@@ -220,7 +227,7 @@ fn sign_bytes(pkcs8: &[u8], json: &[u8]) -> Result<String, KeyError> {
 pub struct GeneratedKey {
     /// PKCS#8(v2) 비밀 키
     pub private_key: String,
-    /// 32바이트 공개 키(`OPL_LICENSE_KEYS`의 항목)
+    /// 32바이트 공개 키(`ORBIVISOR_LICENSE_KEYS`의 항목)
     pub public_key: String,
 }
 
@@ -236,7 +243,7 @@ pub fn generate_key() -> Result<GeneratedKey, KeyError> {
     })
 }
 
-/// PKCS#8(v2) Ed25519 비밀 키의 공개 키(base64 표준, `OPL_LICENSE_KEYS`의 항목)
+/// PKCS#8(v2) Ed25519 비밀 키의 공개 키(base64 표준, `ORBIVISOR_LICENSE_KEYS`의 항목)
 pub fn public_key(pkcs8: &[u8]) -> Result<String, KeyError> {
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8)
         .map_err(|_| KeyError::Format("not a PKCS#8 Ed25519 private key".into()))?;
@@ -646,7 +653,7 @@ mod tests {
         assert!(keys[1].development);
         // 풀리지 않는 항목은 건너뛴다.
         assert_eq!(keys_from(Some("not-base64,AAAA")), vec![]);
-        let want = match option_env!("OPL_LICENSE_KEYS") {
+        let want = match option_env!("ORBIVISOR_LICENSE_KEYS").or(option_env!("OPL_LICENSE_KEYS")) {
             Some(v) if !v.trim().is_empty() => keys_from(Some(v)),
             _ => dev_keys(),
         };

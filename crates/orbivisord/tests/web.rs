@@ -4,7 +4,7 @@
 //! 계획 62: 전역 역할이 없는 폴더 사용자로 로그인하면 자기 폴더만 보이고 2단계 인증으로 다시 로그인한다
 //! (`permissions.spec.ts`, QEMU 없음).
 //! 계획 69: 고정물 ext4 디스크 VM의 저장소 백업을 브라우저로 찾아보고 파일 하나·폴더(zip)를 내려받은 뒤 닫는다
-//! (`file-restore.spec.ts`, 실제 도우미 이미지 — `OPL_RESTORE_IMAGE_DIR`·`OPL_RESTORE_FIXTURES`가 없으면 건너뜀).
+//! (`file-restore.spec.ts`, 실제 도우미 이미지 — `ORBIVISOR_RESTORE_IMAGE_DIR`·`ORBIVISOR_RESTORE_FIXTURES`가 없으면 건너뜀).
 //! 계획 70: VM을 켠 뒤 인프라 › 노드의 보기 "지도"에서 노드 블록·VM 타일을 보고 키보드·누르기로 서랍을 열고 목록 보기·휴대폰 폭을 본다.
 //! 계획 71: 지도에서 `m`(한 노드라 옮길 곳 없음 알림과 Esc), 보기 "빌더"로 마우스·키보드·휴대폰 폭에서 VM을 만든다
 //! (`builder.spec.ts`, QEMU를 켜지 않음).
@@ -95,12 +95,15 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
     let out = playwright(
         "e2e/vm.spec.ts",
         vec![
-            ("OPL_URL", d.server()),
-            ("OPL_USER", "admin".into()),
-            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
-            ("OPL_POOL_PATH", pool.to_str().unwrap().into()),
-            ("OPL_BACKUP_POOL_PATH", backup_pool.to_str().unwrap().into()),
-            ("OPL_IMAGE", image.to_str().unwrap().into()),
+            ("ORBIVISOR_URL", d.server()),
+            ("ORBIVISOR_USER", "admin".into()),
+            ("ORBIVISOR_PASSWORD", d.admin_password.clone().unwrap()),
+            ("ORBIVISOR_POOL_PATH", pool.to_str().unwrap().into()),
+            (
+                "ORBIVISOR_BACKUP_POOL_PATH",
+                backup_pool.to_str().unwrap().into(),
+            ),
+            ("ORBIVISOR_IMAGE", image.to_str().unwrap().into()),
         ],
     )
     .await;
@@ -221,9 +224,9 @@ async fn browser_shows_a_folder_user_only_their_folder() {
     let out = playwright(
         "e2e/permissions.spec.ts",
         vec![
-            ("OPL_URL", d.server()),
-            ("OPL_USER", "alice".into()),
-            ("OPL_PASSWORD", password.into()),
+            ("ORBIVISOR_URL", d.server()),
+            ("ORBIVISOR_USER", "alice".into()),
+            ("ORBIVISOR_PASSWORD", password.into()),
         ],
     )
     .await;
@@ -293,10 +296,10 @@ async fn browser_builds_vms_with_the_builder() {
     let out = playwright(
         "e2e/builder.spec.ts",
         vec![
-            ("OPL_URL", d.server()),
-            ("OPL_USER", "admin".into()),
-            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
-            ("OPL_POOL", "local".into()),
+            ("ORBIVISOR_URL", d.server()),
+            ("ORBIVISOR_USER", "admin".into()),
+            ("ORBIVISOR_PASSWORD", d.admin_password.clone().unwrap()),
+            ("ORBIVISOR_POOL", "local".into()),
         ],
     )
     .await;
@@ -342,15 +345,15 @@ async fn browser_builds_vms_with_the_builder() {
 
 /// 계획 69: 도우미 이미지를 켠 노드에서 고정물 ext4 디스크(`make-disks.sh`의 `ext4.img`)를 단 꺼진 VM을 저장소에
 /// 백업하고, 브라우저가 백업 표의 "Browse files"로 세션을 열어 디렉터리에 들어가고 `hello.txt`(raw)와 볼륨 루트(zip)를
-/// 내려받은 뒤 닫는다. 닫은 세션은 목록에 없다. `OPL_RESTORE_IMAGE_DIR=<이미지> OPL_RESTORE_FIXTURES=<고정물>`이
+/// 내려받은 뒤 닫는다. 닫은 세션은 목록에 없다. `ORBIVISOR_RESTORE_IMAGE_DIR=<이미지> ORBIVISOR_RESTORE_FIXTURES=<고정물>`이
 /// 없으면 건너뛴다(`file_restore.rs`와 같은 입력).
 #[tokio::test]
 async fn browser_browses_backup_files() {
     let (Some(image_dir), Some(fixtures)) = (
-        std::env::var_os("OPL_RESTORE_IMAGE_DIR"),
-        std::env::var_os("OPL_RESTORE_FIXTURES"),
+        std::env::var_os("ORBIVISOR_RESTORE_IMAGE_DIR"),
+        std::env::var_os("ORBIVISOR_RESTORE_FIXTURES"),
     ) else {
-        eprintln!("skipping: set OPL_RESTORE_IMAGE_DIR and OPL_RESTORE_FIXTURES");
+        eprintln!("skipping: set ORBIVISOR_RESTORE_IMAGE_DIR and ORBIVISOR_RESTORE_FIXTURES");
         return;
     };
     let _one = BROWSER.lock().await;
@@ -408,10 +411,10 @@ async fn browser_browses_backup_files() {
     let out = playwright(
         "e2e/file-restore.spec.ts",
         vec![
-            ("OPL_URL", d.server()),
-            ("OPL_USER", "admin".into()),
-            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
-            ("OPL_BACKUP", "fr1".into()),
+            ("ORBIVISOR_URL", d.server()),
+            ("ORBIVISOR_USER", "admin".into()),
+            ("ORBIVISOR_PASSWORD", d.admin_password.clone().unwrap()),
+            ("ORBIVISOR_BACKUP", "fr1".into()),
         ],
     )
     .await;
@@ -468,16 +471,19 @@ async fn browser_migrates_a_vmware_vm_and_exports_it() {
     let out = playwright(
         "e2e/vmware.spec.ts",
         vec![
-            ("OPL_URL", d.server()),
-            ("OPL_USER", "admin".into()),
-            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
-            ("OPL_POOL", "local".into()),
-            ("OPL_NETWORK", "lan".into()),
-            ("OPL_VSPHERE_HOST", spec.host.clone()),
-            ("OPL_VSPHERE_PORT", spec.port.to_string()),
-            ("OPL_VSPHERE_USER", spec.user.clone()),
-            ("OPL_VSPHERE_PASSWORD", spec.password.expose().to_string()),
-            ("OPL_VSPHERE_FINGERPRINT", spec.fingerprint.clone()),
+            ("ORBIVISOR_URL", d.server()),
+            ("ORBIVISOR_USER", "admin".into()),
+            ("ORBIVISOR_PASSWORD", d.admin_password.clone().unwrap()),
+            ("ORBIVISOR_POOL", "local".into()),
+            ("ORBIVISOR_NETWORK", "lan".into()),
+            ("ORBIVISOR_VSPHERE_HOST", spec.host.clone()),
+            ("ORBIVISOR_VSPHERE_PORT", spec.port.to_string()),
+            ("ORBIVISOR_VSPHERE_USER", spec.user.clone()),
+            (
+                "ORBIVISOR_VSPHERE_PASSWORD",
+                spec.password.expose().to_string(),
+            ),
+            ("ORBIVISOR_VSPHERE_FINGERPRINT", spec.fingerprint.clone()),
         ],
     )
     .await;
@@ -534,10 +540,10 @@ async fn browser_restores_a_vm_from_its_config_history() {
     let out = playwright(
         "e2e/history.spec.ts",
         vec![
-            ("OPL_URL", d.server()),
-            ("OPL_USER", "admin".into()),
-            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
-            ("OPL_VM", "hist".into()),
+            ("ORBIVISOR_URL", d.server()),
+            ("ORBIVISOR_USER", "admin".into()),
+            ("ORBIVISOR_PASSWORD", d.admin_password.clone().unwrap()),
+            ("ORBIVISOR_VM", "hist".into()),
         ],
     )
     .await;

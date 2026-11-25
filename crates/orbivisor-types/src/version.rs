@@ -2,26 +2,37 @@
 
 use std::cmp::Ordering;
 
-/// 이 빌드의 버전. 패키지 빌드는 환경 변수 `OPL_VERSION`으로 넣고, 없거나 비었으면 크레이트 버전이다.
-pub const BUILD: &str = match option_env!("OPL_VERSION") {
+/// 이 빌드의 버전. 패키지 빌드는 환경 변수 `ORBIVISOR_VERSION`으로 넣고(옛 이름 `OPL_VERSION`도 받는다 — 옛 이름으로
+/// 빌드하는 릴리스 파이프라인), 둘 다 없거나 비었으면 크레이트 버전이다.
+pub const BUILD: &str = match option_env!("ORBIVISOR_VERSION") {
     Some(v) if !v.is_empty() => v,
-    _ => env!("CARGO_PKG_VERSION"),
+    _ => match option_env!("OPL_VERSION") {
+        Some(v) if !v.is_empty() => v,
+        _ => env!("CARGO_PKG_VERSION"),
+    },
 };
 
 /// Orbivisor APT 저장소의 Debian 배포판(suite)
 pub const SUITE: &str = "trixie";
 
-/// 이 빌드에 넣은 Orbivisor APT 저장소 URL(빌드 때 환경 변수 `OPL_APT_URL`). 없으면 빈 문자열이다.
-pub const APT_URL: &str = match option_env!("OPL_APT_URL") {
+/// 이 빌드에 넣은 Orbivisor APT 저장소 URL(빌드 때 환경 변수 `ORBIVISOR_APT_URL`, 없으면 옛 이름 `OPL_APT_URL`).
+/// 없으면 빈 문자열이다.
+pub const APT_URL: &str = match option_env!("ORBIVISOR_APT_URL") {
     Some(v) => v,
-    None => "",
+    None => match option_env!("OPL_APT_URL") {
+        Some(v) => v,
+        None => "",
+    },
 };
 
-/// 이 빌드의 텔레메트리 기본 끝점(빌드 때 환경 변수 `OPL_TELEMETRY_URL`). 없거나 비었으면 빈 문자열이고,
-/// 그러면 설정에 끝점을 주어야 텔레메트리를 켠다.
-pub const TELEMETRY_URL: &str = match option_env!("OPL_TELEMETRY_URL") {
+/// 이 빌드의 텔레메트리 기본 끝점(빌드 때 환경 변수 `ORBIVISOR_TELEMETRY_URL`, 없으면 옛 이름 `OPL_TELEMETRY_URL`).
+/// 없거나 비었으면 빈 문자열이고, 그러면 설정에 끝점을 주어야 텔레메트리를 켠다.
+pub const TELEMETRY_URL: &str = match option_env!("ORBIVISOR_TELEMETRY_URL") {
     Some(v) => v,
-    None => "",
+    None => match option_env!("OPL_TELEMETRY_URL") {
+        Some(v) => v,
+        None => "",
+    },
 };
 
 /// 두 버전을 Debian 규칙으로 비교한다: `[에포크:]업스트림[-리비전]`, `~`는 끝보다도 낮다.
@@ -98,9 +109,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_is_opl_version_or_crate_version() {
-        let want = match option_env!("OPL_VERSION") {
-            Some(v) if !v.is_empty() => v,
+    fn build_is_orbivisor_version_or_crate_version() {
+        let want = match (option_env!("ORBIVISOR_VERSION"), option_env!("OPL_VERSION")) {
+            (Some(v), _) if !v.is_empty() => v,
+            (_, Some(v)) if !v.is_empty() => v,
             _ => env!("CARGO_PKG_VERSION"),
         };
         assert!(!BUILD.is_empty());
@@ -109,11 +121,18 @@ mod tests {
 
     #[test]
     fn apt_url_is_the_build_variable_or_empty() {
-        assert_eq!(APT_URL, option_env!("OPL_APT_URL").unwrap_or(""));
+        assert_eq!(
+            APT_URL,
+            option_env!("ORBIVISOR_APT_URL")
+                .or(option_env!("OPL_APT_URL"))
+                .unwrap_or("")
+        );
         assert_eq!(SUITE, "trixie");
         assert_eq!(
             TELEMETRY_URL,
-            option_env!("OPL_TELEMETRY_URL").unwrap_or("")
+            option_env!("ORBIVISOR_TELEMETRY_URL")
+                .or(option_env!("OPL_TELEMETRY_URL"))
+                .unwrap_or("")
         );
     }
 

@@ -653,7 +653,7 @@ async fn esxi_import_without_credentials_fails() {
 
 /// 계획 72 §12 왕복: OVA로 가져온 VM을 OVA로 내보내(실제 `qemu-img` streamOptimized VMDK) 링크로 받고, 그것을 다시 가져오면
 /// 같은 디스크 바이트(`qemu-img compare`)·CPU·메모리의 VM이 된다. 서술자의 guestId·MAC은 처음 가져온 원본의 것이다.
-/// `OPL_EXPORT_OVA_OUT`이 있으면 받은 OVA를 그 파일에 남긴다.
+/// `ORBIVISOR_EXPORT_OVA_OUT`이 있으면 받은 OVA를 그 파일에 남긴다.
 #[tokio::test]
 async fn an_exported_ova_imports_back_with_the_same_disk() {
     let mut env = Env::start().await;
@@ -721,7 +721,7 @@ async fn an_exported_ova_imports_back_with_the_same_disk() {
     assert_eq!(length, Some(exported.len() as u64));
     assert_eq!(ex["status"]["ova_bytes"], exported.len() as u64);
     // GitHub `vmware-sim` 작업이 이 OVA를 `govc import.ova`로 vcsim에 넣어 본다(govmomi의 OVF 해석).
-    if let Some(out) = std::env::var_os("OPL_EXPORT_OVA_OUT") {
+    if let Some(out) = std::env::var_os("ORBIVISOR_EXPORT_OVA_OUT") {
         std::fs::write(out, &exported).unwrap();
     }
 

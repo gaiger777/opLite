@@ -4,11 +4,11 @@
 //! 증분)을 열면 체인을 다 붙인 디스크(재생된 저널)가 보이는지, (3) 도우미 QEMU를 `kill -9`하면 세션이 실패로 끝나고 치워지는지,
 //! (4) 세션이 열린 채 opld가 죽었다가 다시 뜨면 남은 도우미를 치우고 세션은 실패로 남는지, (5) 실제 게스트 에이전트(시험
 //! 게스트 — `packaging/restore-image/build.sh --test-guest`, Debian qemu-ga)가 도는 VM에 디렉터리·keep·overwrite로 되돌려
-//! 쓴 뒤 그 VM을 끄고 다시 백업해 세션으로 열면 쓴 파일이 고정물과 같은지 본다. (5)는 `OPL_RESTORE_TEST_GUEST=<시험 게스트
+//! 쓴 뒤 그 VM을 끄고 다시 백업해 세션으로 열면 쓴 파일이 고정물과 같은지 본다. (5)는 `ORBIVISOR_RESTORE_TEST_GUEST=<시험 게스트
 //! 디렉터리>`가 있을 때만 — 시험 게스트 VM은 QEMU 감싸개가 `-kernel`·`-initrd`를 더해 띄운다(VM 스펙에 직접 커널 부팅이 없다).
-//! `OPL_RESTORE_IMAGE_DIR=<이미지> OPL_RESTORE_FIXTURES=<고정물> cargo test -p orbivisord --features restore-it --test file_restore`
-//! (QEMU가 PATH 밖이면 `OPL_TEST_QEMU=<qemu-system-…>`, 가속 `OPL_TEST_ACCEL`, 기본 tcg; 배포판 UEFI 펌웨어가 `-kernel`을
-//! 띄우지 못하면 `OPL_TEST_UEFI_CODE`·`OPL_TEST_UEFI_VARS`)
+//! `ORBIVISOR_RESTORE_IMAGE_DIR=<이미지> ORBIVISOR_RESTORE_FIXTURES=<고정물> cargo test -p orbivisord --features restore-it --test file_restore`
+//! (QEMU가 PATH 밖이면 `ORBIVISOR_TEST_QEMU=<qemu-system-…>`, 가속 `ORBIVISOR_TEST_ACCEL`, 기본 tcg; 배포판 UEFI 펌웨어가 `-kernel`을
+//! 띄우지 못하면 `ORBIVISOR_TEST_UEFI_CODE`·`ORBIVISOR_TEST_UEFI_VARS`)
 #![cfg(feature = "restore-it")]
 
 mod common;
@@ -28,10 +28,10 @@ struct Inputs {
 
 fn inputs() -> Option<Inputs> {
     let (Some(image_dir), Some(fixtures)) = (
-        std::env::var_os("OPL_RESTORE_IMAGE_DIR"),
-        std::env::var_os("OPL_RESTORE_FIXTURES"),
+        std::env::var_os("ORBIVISOR_RESTORE_IMAGE_DIR"),
+        std::env::var_os("ORBIVISOR_RESTORE_FIXTURES"),
     ) else {
-        eprintln!("skipping: set OPL_RESTORE_IMAGE_DIR and OPL_RESTORE_FIXTURES");
+        eprintln!("skipping: set ORBIVISOR_RESTORE_IMAGE_DIR and ORBIVISOR_RESTORE_FIXTURES");
         return None;
     };
     Some(Inputs {
@@ -80,26 +80,26 @@ async fn daemon_with(inputs: &Inputs, qemu: Option<&Path>) -> Daemon {
         "[reconciler]\nacpi_timeout_secs = 5\n[file_restore]\nimage_dir = \"{}\"\nrun_as = \"\"\n",
         inputs.image_dir.display()
     );
-    // QEMU가 PATH 밖이면(svc01의 /opt/qemu) `OPL_TEST_QEMU`·`OPL_TEST_ACCEL`로 준다.
+    // QEMU가 PATH 밖이면(svc01의 /opt/qemu) `ORBIVISOR_TEST_QEMU`·`ORBIVISOR_TEST_ACCEL`로 준다.
     let mut d = match qemu
         .map(|q| q.display().to_string())
         .ok_or(())
-        .or_else(|()| std::env::var("OPL_TEST_QEMU"))
+        .or_else(|()| std::env::var("ORBIVISOR_TEST_QEMU"))
     {
         Ok(qemu) => {
-            // 시험 게스트 감싸개만이면(`OPL_TEST_QEMU` 없음) 호스트에 맞는 가속(KVM·HVF)
-            let fallback = if std::env::var_os("OPL_TEST_QEMU").is_some() {
+            // 시험 게스트 감싸개만이면(`ORBIVISOR_TEST_QEMU` 없음) 호스트에 맞는 가속(KVM·HVF)
+            let fallback = if std::env::var_os("ORBIVISOR_TEST_QEMU").is_some() {
                 "tcg"
             } else {
                 "auto"
             };
-            let accel = std::env::var("OPL_TEST_ACCEL").unwrap_or_else(|_| fallback.into());
-            let scope = std::env::var_os("OPL_TEST_SYSTEMD").is_some();
+            let accel = std::env::var("ORBIVISOR_TEST_ACCEL").unwrap_or_else(|_| fallback.into());
+            let scope = std::env::var_os("ORBIVISOR_TEST_SYSTEMD").is_some();
             // 배포판 펌웨어가 `-kernel`을 띄우지 못하면(svc01 Rocky AAVMF) QEMU에 딸린 edk2를 준다.
             let mut uefi = String::new();
             if let (Ok(code), Ok(vars)) = (
-                std::env::var("OPL_TEST_UEFI_CODE"),
-                std::env::var("OPL_TEST_UEFI_VARS"),
+                std::env::var("ORBIVISOR_TEST_UEFI_CODE"),
+                std::env::var("ORBIVISOR_TEST_UEFI_VARS"),
             ) {
                 uefi = format!("\nuefi_code = \"{code}\"\nuefi_vars = \"{vars}\"");
             }
@@ -476,9 +476,9 @@ async fn killed_helpers_and_restarts_leave_nothing_behind() {
     gone(&d, &again).await;
 }
 
-/// 이 호스트의 QEMU(`OPL_TEST_QEMU`, 없으면 PATH의 `qemu-system-<arch>`) 절대 경로
+/// 이 호스트의 QEMU(`ORBIVISOR_TEST_QEMU`, 없으면 PATH의 `qemu-system-<arch>`) 절대 경로
 fn real_qemu() -> String {
-    if let Ok(q) = std::env::var("OPL_TEST_QEMU") {
+    if let Ok(q) = std::env::var("ORBIVISOR_TEST_QEMU") {
         return q;
     }
     let name = format!("qemu-system-{}", std::env::consts::ARCH);
@@ -533,9 +533,9 @@ async fn got_hash(d: &Daemon, backup: &str, path: &str, work: &Path) -> String {
 #[tokio::test]
 async fn files_are_restored_into_a_real_guest_agent() {
     let Some(inputs) = inputs() else { return };
-    let Some(guest) = std::env::var_os("OPL_RESTORE_TEST_GUEST") else {
+    let Some(guest) = std::env::var_os("ORBIVISOR_RESTORE_TEST_GUEST") else {
         eprintln!(
-            "skipping (5): set OPL_RESTORE_TEST_GUEST (packaging/restore-image/build.sh --test-guest)"
+            "skipping (5): set ORBIVISOR_RESTORE_TEST_GUEST (packaging/restore-image/build.sh --test-guest)"
         );
         return;
     };
