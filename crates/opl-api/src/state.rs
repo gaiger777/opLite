@@ -99,6 +99,8 @@ pub struct AppState {
     pub vmware: crate::vmware::VmwareNodeConfig,
     /// 원본별 vSphere 세션(5분)·인벤토리(60초) 캐시(계획 72 §7.1·§8.2 — 이 노드의 API가 쓴다)
     pub vmware_cache: Arc<crate::vmware_sources::VsphereCache>,
+    /// 이 노드가 세운 선언형 적용 계획(계획 73 §8.3 — 30분, 적용 Task가 가져간다)
+    pub(crate) plans: crate::declarative::Plans,
 }
 
 impl AppState {
@@ -146,6 +148,7 @@ impl AppState {
             file_restore: Arc::default(),
             vmware: Default::default(),
             vmware_cache: Default::default(),
+            plans: Default::default(),
         }
     }
 }

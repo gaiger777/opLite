@@ -629,6 +629,15 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/permissions/mine", Handler),
     ("GET", "/permissions/effective", Handler),
     ("GET", "/permissions/who", Handler),
+    // 선언형 적용(계획 73 §13): 핸들러가 루트 `system.read`와 단계마다 그 종류·대상의 지금 권한을 본다. 내보내기는 볼 수
+    // 있는 것만, 적용 묶음 보기는 루트 `system.read`, 지우기는 묶음 객체 모두의 바꾸기 권한.
+    ("POST", "/apply", Handler),
+    ("GET", "/manifests", List),
+    ("GET", "/manifests/{kind}/{key}", Handler),
+    ("DELETE", "/manifests/{kind}/{key}", Handler),
+    ("GET", "/apply-sets", Root(SystemRead)),
+    ("GET", "/apply-sets/{key}", Root(SystemRead)),
+    ("DELETE", "/apply-sets/{key}", Handler),
 ];
 
 /// (메서드, 경로 템플릿)의 규칙. HEAD는 GET으로 본다.

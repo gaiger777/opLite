@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod console;
 mod cpu;
+mod declarative;
 #[cfg(test)]
 mod fake_api;
 mod file_restore;
@@ -30,3 +31,4 @@ mod web_cross;
 
 pub use cli::run;
 pub use client::Client;
+pub use declarative::Exit;

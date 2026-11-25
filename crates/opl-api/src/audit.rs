@@ -514,6 +514,22 @@ impl AuditNote {
             slot.set_principal(principal, auth);
         }
     }
+
+    /// 요청 밖에서 처리기를 부를 때(선언형 적용 Task — 계획 73)의 메모: 남긴 설명은 버린다(적용이 단계마다 따로 적는다).
+    pub(crate) fn detached() -> Self {
+        Self(None)
+    }
+}
+
+/// `fut`을 `principal`이 보낸 요청 안처럼 돌린다(선언형 적용 Task가 처리기를 부를 때 — Task를 만든 사용자·SDN 주소 규칙의
+/// 주체를 깊은 곳이 찾는다, 계획 73). 감사 줄은 쓰지 않는다.
+pub(crate) async fn as_principal<F: std::future::Future>(
+    principal: Principal,
+    fut: F,
+) -> F::Output {
+    let slot = AuditSlot::default();
+    slot.0.lock().unwrap().principal = Some(principal);
+    REQUEST.scope(slot, fut).await
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for AuditNote {

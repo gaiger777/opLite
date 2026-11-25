@@ -29,6 +29,7 @@ opl-types.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde-saphyr.workspace = true
 sha2.workspace = true
 time = { workspace = true, features = ["parsing"] }
 tokio.workspace = true

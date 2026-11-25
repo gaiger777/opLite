@@ -200,10 +200,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: crate::vmware::VmwareCmd,
     },
-    /// VM 내보내기(OVA/OVF, 계획 72): 목록·보기·내려받기·지우기. 만들기는 `vm export`
+    /// 하위 명령 없이: 지금 클러스터를 매니페스트 YAML로 내보낸다(계획 73). 하위 명령은 VM 내보내기(OVA/OVF, 계획 72):
+    /// 목록·보기·내려받기·지우기(만들기는 `vm export`)
+    #[command(args_conflicts_with_subcommands = true)]
     Export {
         #[command(subcommand)]
-        cmd: crate::vm_export::ExportCmd,
+        cmd: Option<crate::vm_export::ExportCmd>,
+        #[command(flatten)]
+        manifests: crate::declarative::ExportArgs,
+    },
+    /// 매니페스트 파일을 계획해 보이고 묻고 적용한다(계획 73 — 서버가 계획한다, 다시 적용하면 바뀐 것만).
+    Apply(crate::declarative::ApplyArgs),
+    /// 매니페스트와 클러스터의 차이(끝 코드 0 같음, 1 다름, 2 오류 — CI에서 쓴다)
+    Diff(crate::declarative::Files),
+    /// 적용하지 않고 계획만 보인다(`--out`이면 저장해 `apply --plan`으로 그대로 적용한다).
+    Plan(crate::declarative::PlanArgs),
+    /// 적용 묶음(계획 73): 마지막 선언을 기억하는 이름
+    Set {
+        #[command(subcommand)]
+        cmd: crate::declarative::SetCmd,
     },
     Task {
         #[command(subcommand)]
@@ -6630,7 +6645,7 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         }
         Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
         Cmd::Vmware { cmd } => Box::pin(crate::vmware::vmware(&client, cmd, json_out, out)).await?,
-        Cmd::Export { cmd } => {
+        Cmd::Export { cmd: Some(cmd), .. } => {
             Box::pin(crate::vm_export::export(
                 &client,
                 cmd,
@@ -6640,6 +6655,23 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             ))
             .await?
         }
+        Cmd::Export {
+            cmd: None,
+            manifests,
+        } => {
+            Box::pin(crate::declarative::export(
+                &client, manifests, json_out, out,
+            ))
+            .await?
+        }
+        Cmd::Apply(args) => {
+            Box::pin(crate::declarative::apply(&client, args, json_out, out)).await?
+        }
+        Cmd::Diff(files) => {
+            Box::pin(crate::declarative::diff(&client, files, json_out, out)).await?
+        }
+        Cmd::Plan(args) => Box::pin(crate::declarative::plan(&client, args, json_out, out)).await?,
+        Cmd::Set { cmd } => Box::pin(crate::declarative::set(&client, cmd, json_out, out)).await?,
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
                 let list = client.get("/tasks").await?;
@@ -14460,13 +14492,71 @@ mod tests {
         assert!(matches!(
             cli.cmd,
             Cmd::Export {
-                cmd: crate::vm_export::ExportCmd::Download { ref export, ref out_file, ref file }
+                cmd: Some(crate::vm_export::ExportCmd::Download { ref export, ref out_file, ref file }),
+                ..
             } if export == "web-out" && out_file.as_deref() == Some("x.ova") && file.as_deref() == Some("web.ovf")
         ));
         for sub in [&["list"][..], &["get", "x"], &["delete", "x"]] {
             let mut argv = vec!["oplctl", "export"];
             argv.extend_from_slice(sub);
             assert!(Cli::try_parse_from(argv).is_ok(), "{sub:?}");
+        }
+        // 하위 명령 없는 `export`는 매니페스트 내보내기(계획 73) — 하위 명령과 섞을 수 없다.
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "export",
+            "--kind",
+            "vm",
+            "--folder",
+            "/prod",
+            "--minimal",
+            "--dir",
+            "out",
+        ])
+        .unwrap();
+        assert!(matches!(cli.cmd, Cmd::Export { cmd: None, .. }));
+        assert!(Cli::try_parse_from(["oplctl", "export", "--minimal", "list"]).is_err());
+    }
+
+    #[test]
+    fn declarative_commands_parse() {
+        for argv in [
+            &[
+                "oplctl",
+                "apply",
+                "-f",
+                "a.yaml",
+                "-f",
+                "dir",
+                "-R",
+                "--set",
+                "web",
+                "--prune",
+                "--prune-data",
+                "--yes",
+            ][..],
+            &[
+                "oplctl",
+                "apply",
+                "--plan",
+                "plan.json",
+                "--reason",
+                "INC-1",
+            ],
+            &["oplctl", "plan", "-f", "a.yaml", "--out", "plan.json"],
+            &["oplctl", "diff", "-f", "-"],
+            &["oplctl", "set", "list"],
+            &["oplctl", "set", "delete", "web"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        // 가지치기는 묶음이, 데이터 가지치기는 가지치기가 있어야 한다. 저장한 계획과 파일은 함께 주지 않는다.
+        for argv in [
+            &["oplctl", "apply", "-f", "a", "--prune"][..],
+            &["oplctl", "apply", "-f", "a", "--set", "s", "--prune-data"],
+            &["oplctl", "apply", "--plan", "p", "-f", "a"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
         }
     }
 

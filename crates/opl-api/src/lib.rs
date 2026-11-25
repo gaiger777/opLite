@@ -21,6 +21,7 @@ pub mod cluster;
 mod console;
 mod cpu;
 mod cpu_baseline;
+mod declarative;
 mod drain;
 pub mod error;
 mod fan_out;
@@ -139,6 +140,7 @@ pub use vip::{VipAgent, VipAgentConfig, VipManager, VipManagerConfig};
 pub use vm_exports::ExportFiles;
 pub use vmware_scheduler::{VmwareScheduler, VmwareSchedulerConfig};
 
+use crate::declarative::ManifestSchemas;
 use crate::resources as r;
 
 #[derive(OpenApi)]
@@ -154,7 +156,7 @@ use crate::resources as r;
             history next to the change."
     ),
     servers((url = "/api/v1")),
-    modifiers(&Security),
+    modifiers(&Security, &ManifestSchemas),
     security(("token" = []), ("session" = [])),
 )]
 struct ApiDoc;
@@ -529,6 +531,17 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(permissions::my_permissions))
         .routes(routes!(permissions::effective_permissions))
         .routes(routes!(permissions::who_permissions))
+        .routes(routes!(declarative::apply))
+        .routes(routes!(declarative::list_manifests))
+        .routes(routes!(
+            declarative::get_manifest,
+            declarative::delete_manifest
+        ))
+        .routes(routes!(declarative::list_apply_sets))
+        .routes(routes!(
+            declarative::get_apply_set,
+            declarative::delete_apply_set
+        ))
 }
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.

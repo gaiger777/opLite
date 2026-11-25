@@ -22,6 +22,8 @@ opl-store = { path = "crates/opl-store" }
 opl-restore = { path = "crates/opl-restore" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# 계획 73: 매니페스트 YAML(oplctl만 — 서버는 JSON만 읽는다). 안전한 Rust 파서(serde_yaml·unsafe-libyaml은 유지 중단)
+serde-saphyr = "2.1.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs", "signal"] }
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }

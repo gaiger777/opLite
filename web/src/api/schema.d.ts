@@ -140,6 +140,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 매니페스트를 지금 상태와 견주어 계획을 세우고 적용한다. 어딘가의 `system.read`(폴더 사용자도 — 볼 수 있는 것만 다룬다)와 단계마다 그 종류·대상의 지금 쓰기 권한이
+         *     든다(없으면 그 단계가 `blocked: forbidden` — 볼 수 없는 리소스의 이름·폴더를 새지 않는다).
+         * @description `?dry_run=true`: 계획만(200, 아무것도 쓰지 않음). 아니면 막힌 단계가 있으면 409 `plan_blocked`(`details`가 계획), 없으면
+         *     Task `apply`(202). `plan`을 주면 그 저장한 계획을 적용한다: 다른 사용자·다른 노드·30분이 지났으면 404
+         *     `plan_not_found`, 문서가 다르거나 그사이 본 리소스가 바뀌었으면 412 `plan_stale`. 문서 꼴이 틀리면 400
+         *     `manifest_invalid`(문서 번호·칸), 같은 리소스가 두 번이면 400 `manifest_duplicate`, 참조 고리는 400 `manifest_cycle`,
+         *     아직 다루지 않는 종류는 400 `manifest_unsupported`, 본문이 8 MiB를 넘으면 413. 옛 노드가 남았으면 409
+         *     `cluster_upgrading`.
+         */
+        post: operations["apply"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/apply-sets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 적용 묶음 목록(루트 `system.read`, 묶음 안 객체는 볼 수 있는 것만) */
+        get: operations["list_apply_sets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/apply-sets/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_apply_set"];
+        put?: never;
+        post?: never;
+        /**
+         * 적용 묶음을 지운다: 리소스는 지우지 않고 레이블 `orbivisor.io/apply-set`만 뗀다. 묶음이 기억하는 객체 모두의 바꾸기
+         *     권한이 든다(루트 `system.read`도 — 하나라도 없으면 403, 아무것도 바꾸지 않음).
+         */
+        delete: operations["delete_apply_set"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/audit": {
         parameters: {
             query?: never;
@@ -1845,6 +1908,47 @@ export interface paths {
          *     필요한 멤버 네트워크만 남긴다.
          */
         patch: operations["patch_load_balancer"];
+        trace?: never;
+    };
+    "/manifests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 지금 클러스터를 매니페스트로 내보낸다(적용 차례, 볼 수 있는 것만, 비밀은 `secretRef`). 이 결과를 그대로 같은 클러스터에
+         *     적용하면 모든 단계가 `unchanged`다.
+         */
+        get: operations["list_manifests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/manifests/{kind}/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 리소스 하나의 매니페스트(`kind`는 `vm`·`Vm` 꼴, `key`는 id 또는 이름 — 폴더는 id 또는 `트리:경로`). 볼 수 없으면 404. */
+        get: operations["get_manifest"];
+        put?: never;
+        post?: never;
+        /**
+         * 리소스 하나를 그 종류의 지금 지우기 길로 지운다(경로표의 지우기 권한 — Terraform 공급자의 Delete). 켜진 VM은 먼저
+         *     끈다(600초까지). 볼 수 없으면 404, 처리기의 거절(쓰는 VM이 있는 네트워크 등)은 그대로.
+         */
+        delete: operations["delete_manifest"];
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/metrics": {
@@ -4795,6 +4899,31 @@ export interface components {
              */
             value?: number;
         };
+        /** @description 바꾼 주체 */
+        Actor: {
+            auth?: components["schemas"]["ActorAuth"];
+            /**
+             * Format: uuid
+             * @description 이 쓰기를 한 Task(Task 실행기가 쓴 spec)
+             */
+            task?: string;
+            /** @description 사용자 이름(그때의 이름) */
+            user?: string;
+            /** Format: uuid */
+            user_id?: string;
+        };
+        /** @description 어떻게 인증한 주체인가 */
+        ActorAuth: {
+            /** @enum {string} */
+            kind: "session";
+        } | {
+            /** @enum {string} */
+            kind: "token";
+            name: string;
+        } | {
+            /** @enum {string} */
+            kind: "system";
+        };
         /**
          * @description 옮겨 갈 주소의 출처(앞이 먼저)
          * @enum {string}
@@ -5010,6 +5139,77 @@ export interface components {
         ApiEndpoints: {
             /** @description 이름 순 */
             items: components["schemas"]["ApiEndpoint"][];
+        };
+        /** @description 묶음이 선언한 객체 하나 */
+        AppliedObject: {
+            /** @description 정규화한 선언 칸만(비밀은 지문 없이 `"$secret"`) */
+            declared: unknown;
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["Kind"];
+            name: string;
+            /**
+             * Format: int64
+             * @description 적용 뒤 객체의 revision
+             */
+            revision: number;
+        };
+        /** @description `POST /apply`의 본문 */
+        ApplyRequest: {
+            /** @description 적용 묶음 이름: 이 묶음이 마지막 선언을 기억하고(세 갈래 비교), 든 리소스에 레이블 `orbivisor.io/apply-set`을 단다. */
+            apply_set?: string;
+            /** @description 매니페스트 문서(1 000개까지). 저장한 계획(`plan`)을 적용할 때는 비워도 되고, 주면 계획 때와 같아야 한다. */
+            documents?: components["schemas"]["Manifest"][];
+            /** @description 관리하는 도구(`terraform` — 레이블 `orbivisor.io/managed-by=terraform`, 이력 출처 `terraform`) */
+            manager?: components["schemas"]["Manager"];
+            /**
+             * Format: uuid
+             * @description `POST /apply?dry_run=true`가 돌려준 계획 id: 그 계획을 그대로 적용한다(그사이 바뀐 것이 있으면 412 `plan_stale`).
+             */
+            plan?: string;
+            /** @description 묶음이 기억하는데 문서에 없는 리소스를 지운다(`apply_set`이 있어야 한다). */
+            prune?: boolean;
+            /** @description 가지치기가 VM·볼륨·백업 저장소도 지운다(묶음의 `protect_data`). */
+            prune_data?: boolean;
+        };
+        ApplySetSpec: {
+            description?: string;
+            /**
+             * @description 참이면 가지치기에서 VM·볼륨·백업 저장소를 `--prune-data` 없이는 지우지 않는다. 기본은 참이고 그때는 쓰지 않는다.
+             * @default true
+             */
+            protect_data: boolean;
+        };
+        /** @description 묶음의 마지막 적용과 드리프트 */
+        ApplySetStatus: {
+            /**
+             * Format: int64
+             * @description 마지막 적용을 마친 때(유닉스 밀리초)
+             * @default null
+             */
+            applied_at: number;
+            /**
+             * @description 마지막으로 적용한 사용자 이름
+             * @default null
+             */
+            applied_by: string;
+            /**
+             * Format: int64
+             * @description 마지막 적용이 끝난 때의 클러스터 revision(드리프트의 "누가 바꿨나"는 이 뒤 이력에서 찾는다)
+             * @default 0
+             */
+            applied_revision: number;
+            /** @default null */
+            drift: components["schemas"]["DriftReport"];
+            /** @default null */
+            last_error: string;
+            /** @default [] */
+            objects: components["schemas"]["AppliedObject"][];
+        };
+        /** @description 적용을 시작했다(Task `apply`) */
+        ApplyStarted: {
+            plan: components["schemas"]["PlanView"];
+            task: components["schemas"]["Resource_TaskSpec_TaskStatus"];
         };
         /**
          * @description CPU 아키텍처. 노드가 등록할 때 기록하고, 머신 타입마다 하나로 정해진다.
@@ -5763,6 +5963,21 @@ export interface components {
             max?: (number | null)[];
             min?: (number | null)[];
         };
+        /** @description 칸 하나의 바뀜 */
+        Change: {
+            new?: unknown;
+            old?: unknown;
+            op: components["schemas"]["ChangeOp"];
+            /** @description 점으로 이은 칸 경로(`cpu.cores`). 목록은 통째로 하나다(`nics`). */
+            path: string;
+        };
+        /** @enum {string} */
+        ChangeOp: "add" | "remove" | "replace";
+        /**
+         * @description 바뀜이 어디서 왔나
+         * @enum {string}
+         */
+        ChangeSource: "api" | "web" | "cli" | "apply" | "terraform" | "task" | "system";
         /**
          * @description 업데이트 채널. APT 소스 파일의 `Components`가 된다.
          * @enum {string}
@@ -6849,6 +7064,33 @@ export interface components {
             paths: components["schemas"]["EntryPath"][];
             volume: string;
         };
+        DriftItem: {
+            /** @description 그 칸을 처음 바꾼 이력 줄 */
+            by?: components["schemas"]["HistoryRef"];
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["Kind"];
+            name: string;
+            /** @description 다른 칸(JSON 경로) */
+            paths?: string[];
+            state: components["schemas"]["DriftState"];
+        };
+        /** @description 선언과 실제의 차이 */
+        DriftReport: {
+            /**
+             * Format: int64
+             * @description 견준 때(유닉스 밀리초)
+             */
+            checked_at: number;
+            items?: components["schemas"]["DriftItem"][];
+            /**
+             * Format: int64
+             * @description 견준 클러스터 revision
+             */
+            revision: number;
+        };
+        /** @enum {string} */
+        DriftState: "modified" | "missing" | "unmanaged";
         /** @description 유효 권한과 그 근거 */
         EffectivePermissions: {
             /** @description 이 대상에 닿는 그 사용자(와 그 그룹)의 grant */
@@ -7727,6 +7969,16 @@ export interface components {
         HealthCheck: "quorum" | "apply_lag" | "lease" | "runtimes" | "maintenance" | "role";
         /** @enum {string} */
         HealthStatus: "ok" | "unavailable";
+        /** @description 다른 기록이 가리키는 이력 줄(드리프트의 "누가 바꿨나") */
+        HistoryRef: {
+            actor: components["schemas"]["Actor"];
+            /** Format: int64 */
+            at_ms: number;
+            reason?: string;
+            /** Format: int64 */
+            revision: number;
+            source: components["schemas"]["ChangeSource"];
+        };
         /** @description 기록 조회의 답. 열은 웹 uPlot이 그대로 받는 배열이고, 점 `i`의 시각은 `start + i × step_ms`(칸 시작)다. */
         HistoryReply: {
             /** @description 칸 이름([`MetricField::as_str`]) → 열 */
@@ -8657,6 +8909,58 @@ export interface components {
                     notified?: {
                         [key: string]: number;
                     };
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_ApplySetSpec_ApplySetStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    description?: string;
+                    /**
+                     * @description 참이면 가지치기에서 VM·볼륨·백업 저장소를 `--prune-data` 없이는 지우지 않는다. 기본은 참이고 그때는 쓰지 않는다.
+                     * @default true
+                     */
+                    protect_data: boolean;
+                };
+                /** @description 묶음의 마지막 적용과 드리프트 */
+                status: {
+                    /**
+                     * Format: int64
+                     * @description 마지막 적용을 마친 때(유닉스 밀리초)
+                     * @default null
+                     */
+                    applied_at: number;
+                    /**
+                     * @description 마지막으로 적용한 사용자 이름
+                     * @default null
+                     */
+                    applied_by: string;
+                    /**
+                     * Format: int64
+                     * @description 마지막 적용이 끝난 때의 클러스터 revision(드리프트의 "누가 바꿨나"는 이 뒤 이력에서 찾는다)
+                     * @default 0
+                     */
+                    applied_revision: number;
+                    /** @default null */
+                    drift: components["schemas"]["DriftReport"];
+                    /** @default null */
+                    last_error: string;
+                    /** @default [] */
+                    objects: components["schemas"]["AppliedObject"][];
                 };
             }[];
             /** Format: int64 */
@@ -10299,6 +10603,130 @@ export interface components {
         /** @enum {string} */
         MachineType: "q35" | "virt";
         /**
+         * @description 객체를 관리하는 도구(`orbivisor.io/managed-by` 레이블과 설정 이력의 출처)
+         * @enum {string}
+         */
+        Manager: "terraform";
+        /** @description 매니페스트 문서 하나. `spec`은 그 종류의 만들기 본문 spec과 같은 꼴이고 참조는 id가 아니라 이름이다. */
+        Manifest: {
+            apiVersion: string;
+            kind: components["schemas"]["ManifestKind"];
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec?: unknown;
+            state?: components["schemas"]["ManifestState"];
+        };
+        /** @description `DELETE /manifests/{kind}/{key}`의 답 */
+        ManifestDeleted: {
+            /**
+             * Format: uuid
+             * @description 지우기가 만든 Task(볼륨 — 끝날 때까지 기다리지 않는다)
+             */
+            task?: string;
+        };
+        ManifestFloatingIp: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "FloatingIp";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["FloatingIpSpec"];
+        };
+        ManifestFolder: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "Folder";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["FolderSpec"];
+        };
+        /**
+         * @description 매니페스트로 다루는 종류(스물다섯). `Kind`와 [`ManifestKind::kind`]로 잇는다. 노드·Task·스냅샷·백업·가져오기·이전·
+         *     내보내기·SDN 설치·Ceph·사용자 비밀번호·토큰·2FA는 없다(§8.1).
+         * @enum {string}
+         */
+        ManifestKind: "Vm" | "Volume" | "Network" | "Router" | "FloatingIp" | "SecurityGroup" | "LoadBalancer" | "StoragePool" | "Folder" | "PlacementRule" | "HaGroup" | "HaCheck" | "BackupJob" | "BackupStore" | "Remote" | "Grant" | "AccessRole" | "Group" | "AlertRule" | "NotificationTarget" | "Realm" | "Settings" | "Certificate" | "AcmeAccount" | "AcmeDns";
+        /** @description 내보낸 매니페스트와 그때의 revision */
+        ManifestList: {
+            documents: components["schemas"]["Manifest"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 매니페스트의 이름표 */
+        ManifestMetadata: {
+            /** @description 서버가 저장하지 않는 표시(`orbivisor.io/prune: "false"` 등) */
+            annotations?: {
+                [key: string]: string;
+            };
+            /** @description 폴더 경로(`/prod/web`). 없으면 뿌리. 폴더를 따르는 종류만 쓴다. */
+            folder?: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+        };
+        ManifestNetwork: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "Network";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["NetworkSpec"];
+        };
+        ManifestPlacementRule: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "PlacementRule";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["PlacementRuleSpec"];
+        };
+        ManifestRouter: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "Router";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["RouterSpec"];
+        };
+        ManifestSecurityGroup: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "SecurityGroup";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["SecurityGroupSpec"];
+        };
+        /**
+         * @description VM의 원하는 전원 상태(`state` — VM만)
+         * @enum {string}
+         */
+        ManifestState: "running" | "stopped";
+        ManifestStoragePool: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "StoragePool";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["StoragePoolSpec"];
+        };
+        ManifestVm: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "Vm";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["VmSpec"];
+            state?: components["schemas"]["ManifestState"];
+        };
+        ManifestVolume: {
+            /** @enum {string} */
+            apiVersion: "orbivisor.io/v1";
+            /** @enum {string} */
+            kind: "Volume";
+            metadata: components["schemas"]["ManifestMetadata"];
+            spec: components["schemas"]["VolumeSpec"];
+        };
+        /**
          * @description 멤버의 건강(SB `Service_Monitor`)
          * @enum {string}
          */
@@ -11701,6 +12129,19 @@ export interface components {
             recommendations: components["schemas"]["PlacementMove"][];
             settings: components["schemas"]["PlacementSettings"];
         };
+        /** @description 계획(`POST /apply?dry_run=true`의 답 — 받은 노드가 30분 기억한다) */
+        PlanView: {
+            apply_set?: string;
+            /**
+             * Format: int64
+             * @description 계획을 세운 때의 revision
+             */
+            base_revision: number;
+            /** Format: uuid */
+            plan: string;
+            steps: components["schemas"]["StepView"][];
+            summary: components["schemas"]["Summary"];
+        };
         /** @description 다리 계획 */
         PlannedBridge: {
             /** @description 다리를 놓을 수 없는 까닭(그러면 옮기기를 시작하지 못한다) */
@@ -11922,6 +12363,17 @@ export interface components {
             /** @enum {string} */
             type: "group";
         };
+        /** @description 단계의 문제(오류면 막힘) */
+        Problem: {
+            /** @description `forbidden`·`missing_reference`·`immutable`·`protected`·`quota_exceeded`·`mac_in_use`… (처리기의 오류 코드) */
+            code: string;
+            level: components["schemas"]["ProblemLevel"];
+            message: string;
+            /** @description 칸 자리(`nics.0`·`metadata.folder`) */
+            path?: string;
+        };
+        /** @enum {string} */
+        ProblemLevel: "error" | "warning";
         /** @description Prometheus 끝점에서 바꿀 값 */
         PrometheusPatch: {
             /** @description 켜면 각 노드가 `GET /api/v1/metrics`로 지표를 내보낸다(Node·Vm 읽기 권한 토큰). 끄면 404다. */
@@ -12454,6 +12906,54 @@ export interface components {
                 notified?: {
                     [key: string]: number;
                 };
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_ApplySetSpec_ApplySetStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                description?: string;
+                /**
+                 * @description 참이면 가지치기에서 VM·볼륨·백업 저장소를 `--prune-data` 없이는 지우지 않는다. 기본은 참이고 그때는 쓰지 않는다.
+                 * @default true
+                 */
+                protect_data: boolean;
+            };
+            /** @description 묶음의 마지막 적용과 드리프트 */
+            status: {
+                /**
+                 * Format: int64
+                 * @description 마지막 적용을 마친 때(유닉스 밀리초)
+                 * @default null
+                 */
+                applied_at: number;
+                /**
+                 * @description 마지막으로 적용한 사용자 이름
+                 * @default null
+                 */
+                applied_by: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 적용이 끝난 때의 클러스터 revision(드리프트의 "누가 바꿨나"는 이 뒤 이력에서 찾는다)
+                 * @default 0
+                 */
+                applied_revision: number;
+                /** @default null */
+                drift: components["schemas"]["DriftReport"];
+                /** @default null */
+                last_error: string;
+                /** @default [] */
+                objects: components["schemas"]["AppliedObject"][];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -14820,6 +15320,27 @@ export interface components {
              */
             nexthop: string;
         };
+        /**
+         * @description 단계의 동작
+         * @enum {string}
+         */
+        StepAction: "create" | "update" | "unchanged" | "delete" | "blocked";
+        /** @description 계획의 단계 하나 */
+        StepView: {
+            action: components["schemas"]["StepAction"];
+            /** @description 먼저 해야 하는 단계 번호 */
+            after?: number[];
+            /** @description 바뀌는 칸(비밀은 `(changed)`) */
+            diff?: components["schemas"]["Change"][];
+            folder?: string;
+            kind: components["schemas"]["ManifestKind"];
+            /** @description 1부터, 적용 차례 */
+            n: number;
+            name: string;
+            problems?: components["schemas"]["Problem"][];
+            /** @description 켜진 VM의 하드웨어를 바꾼다(핫플러그 Task 또는 다음 재시작 때 적용) */
+            restart?: boolean;
+        };
         StoragePoolSpec: {
             backend: components["schemas"]["PoolBackend"];
             /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
@@ -15098,6 +15619,13 @@ export interface components {
          * @enum {string}
          */
         SubscriptionState: "none" | "active" | "expired" | "invalid" | "over_limit";
+        Summary: {
+            blocked: number;
+            create: number;
+            delete: number;
+            unchanged: number;
+            update: number;
+        };
         /** @description 넘겨받기 본문 */
         TakeOverRequest: {
             /** @description 주인의 하트비트가 24시간 안이어도 넘겨받는다(옛 주인이 아직 살아 있으면 두 클러스터가 서로의 백업을 지울 수 있다). */
@@ -17717,6 +18245,135 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["NotificationHistoryResponse"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    apply: {
+        parameters: {
+            query?: {
+                /** @description 계획만 세우고 쓰지 않는다(권한·참조·할당량·용량·MAC/IP를 단계에 보인다). */
+                dry_run?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyRequest"];
+            };
+        };
+        responses: {
+            /** @description the plan (dry run) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanView"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplyStarted"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_apply_sets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_ApplySetSpec_ApplySetStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_apply_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_ApplySetSpec_ApplySetStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_apply_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -21348,6 +22005,106 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_LoadBalancerSpec_LoadBalancerStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_manifests: {
+        parameters: {
+            query?: {
+                /** @description 쉼표로 구분한 종류(`vm,volume` 또는 `Vm,Volume`). 없으면 다루는 종류 모두 */
+                kinds?: string;
+                /** @description 이 폴더 경로와 그 아래만(`/prod/web` — 트리마다) */
+                folder?: string;
+                /** @description 이 적용 묶음이 기억하는 것만 */
+                apply_set?: string;
+                /** @description 기본값과 같은 칸(빈 목록·`false`·`null`)과 서버가 만든 MAC·주소를 뺀다(사람이 읽을 파일). */
+                minimal?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManifestList"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_manifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description manifest kind */
+                kind: string;
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Manifest"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_manifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description manifest kind */
+                kind: string;
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManifestDeleted"];
                 };
             };
             "4XX": {

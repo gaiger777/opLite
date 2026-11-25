@@ -34,7 +34,9 @@ export type Kind =
   | "vmware-source"
   | "vmware-migration"
   | "vmware-vm"
-  | "vm-export";
+  | "vm-export"
+  // 선언형 적용 묶음(계획 73, 루트 — 읽기 `system.read`, 쓰기는 적용 단계마다 그 종류의 권한)
+  | "apply-set";
 
 /** 권한(계획 62 설계 §6.2). 이름은 서버의 `Privilege`와 같다. */
 export const PRIVILEGES = [
@@ -118,7 +120,8 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
         : FOLDER_KINDS.has(kind) ||
             kind === "backup-store" ||
             kind === "vmware-migration" ||
-            kind === "vmware-vm"
+            kind === "vmware-vm" ||
+            kind === "apply-set"
           ? "system.read"
           : "cluster.read";
     case "write":

@@ -332,7 +332,9 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             | Kind::Folder
             | Kind::VmwareMigration
             | Kind::VmwareVm
-            | Kind::VmExport => SystemRead,
+            | Kind::VmExport
+            // 계획 73: 적용 묶음(선언 — 묶음 안 객체는 핸들러가 볼 수 있는 것만 낸다)
+            | Kind::ApplySet => SystemRead,
             _ => ClusterRead,
         },
         Action::Write => match kind {
@@ -719,6 +721,11 @@ mod tests {
         );
         assert_eq!(
             kind_privilege(Action::Read, Kind::VmwareVm),
+            Privilege::SystemRead
+        );
+        // 계획 73: 적용 묶음 보기는 `system.read`(쓰기는 적용이 단계마다 그 종류의 권한을 본다)
+        assert_eq!(
+            kind_privilege(Action::Read, Kind::ApplySet),
             Privilege::SystemRead
         );
         assert_eq!(

@@ -52,7 +52,7 @@ pub(crate) fn folder_path(cluster: &Cluster, id: Uuid) -> String {
 }
 
 /// 부모(없으면 그 트리의 루트)라는 대상
-fn parent_target(parent: Option<Uuid>) -> AuthzTarget {
+pub(crate) fn parent_target(parent: Option<Uuid>) -> AuthzTarget {
     match parent {
         Some(p) => AuthzTarget::Folder(p),
         None => AuthzTarget::Root,
@@ -94,7 +94,7 @@ fn require_move_inside(
 }
 
 /// 대상에서 `privilege`. 볼 수 없는 폴더는 없는 폴더와 같은 404다.
-fn require_at(
+pub(crate) fn require_at(
     state: &AppState,
     principal: &Principal,
     privilege: Privilege,

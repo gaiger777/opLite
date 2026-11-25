@@ -1338,8 +1338,16 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::VmwareRevert => return Box::pin(vmware::revert(ctx, task)).await,
         TaskOp::VmExport { export } => return export::export(ctx, task, *export).await,
         TaskOp::VmExportDelete => return export::delete(ctx, id).await,
-        // 선언형 적용(계획 73 스테이지 2)·ACME 주문(스테이지 4)은 그 스테이지가 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::Apply { .. } => Err("apply tasks are not available yet".into()),
+        // 선언형 적용(계획 73 §8.3): 받은 노드의 저장한 계획을 단계마다 지금 처리기로
+        TaskOp::Apply { plan, .. } => {
+            return Box::pin(crate::declarative::run_apply(
+                ctx.config.api.clone(),
+                task,
+                *plan,
+            ))
+            .await;
+        }
+        // ACME 주문(스테이지 4)은 그 스테이지가 더한다. 그 전에는 API가 만들지 않는다.
         TaskOp::AcmeOrder { .. } => Err("ACME order tasks are not available yet".into()),
     };
     done.map(|()| None)

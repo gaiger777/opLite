@@ -31,6 +31,9 @@ it("mirrors the server's builtin roles and kind privileges", () => {
   expect(kindPrivilege("read", "vm-export")).toBe("system.read");
   expect(kindPrivilege("write", "vm-export")).toBe("vm.export");
   expect(kindPrivilege("operate", "vm-export")).toBe("vm.export");
+  // 선언형 적용 묶음(계획 73): 읽기 system.read, 쓰기는 기본(cluster.admin — 적용이 단계마다 본다)
+  expect(kindPrivilege("read", "apply-set")).toBe("system.read");
+  expect(kindPrivilege("write", "apply-set")).toBe("cluster.admin");
 });
 
 it("answers per folder and per object from /permissions/mine", () => {
