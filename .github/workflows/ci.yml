@@ -21,6 +21,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # 우분투 러너의 빈 자리(약 14 GB)로는 시험 바이너리가 모자란다(계획 72에서 넘침) — 쓰지 않는 도구를 지운다
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - name: OpenSSL headers (Linux; native-tls)
         if: runner.os == 'Linux'
         run: |
@@ -790,7 +796,7 @@ jobs:
         run: |
           OPL_EXPORT_OVA_OUT="$RUNNER_TEMP/web.ova" cargo test -p opl-api --features storage-it --test vm_import_tasks \
             an_exported_ova_imports_back_with_the_same_disk -- --nocapture
-          govc import.ova -name=orbivisor-export "$RUNNER_TEMP/web.ova"
+          govc import.ova -pool=/DC0/host/DC0_C0/Resources -ds=LocalDS_0 -name=orbivisor-export "$RUNNER_TEMP/web.ova"
           govc vm.info -json orbivisor-export | jq -e '[.. | strings | select(endswith(".vmdk"))] | length >= 1'
       - name: vcsim log
         if: failure()
