@@ -249,6 +249,53 @@ async fn sources_check_the_fingerprint_hide_the_password_and_cache_sessions() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// 리뷰 1: 저장한 비밀번호는 다른 서버로 가지 않는다 — 호스트·포트·사용자를 바꾸면서 비밀번호를 주지 않으면 400
+/// `password_required`이고 새 서버에 로그인(비밀번호)이 가지 않는다. 비밀번호를 같이 주면 바뀐다.
+#[tokio::test]
+async fn changing_the_endpoint_needs_the_password_again() {
+    let (_env, admin, fake) = setup().await;
+    let other = FakeVsphere::start(FakeConfig::default()).await;
+    let spec = other.source_spec();
+    other.clear_requests();
+    for body in [
+        json!({ "host": "127.0.0.2" }),
+        json!({ "port": spec.port, "fingerprint": spec.fingerprint }),
+        json!({ "user": "someone-else" }),
+    ] {
+        let (status, err) = admin.patch("/vmware-sources/vc1", body.clone(), None).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("password_required")),
+            "{body}: {err}"
+        );
+    }
+    assert!(other.requests().is_empty(), "{:?}", other.requests());
+    // 같은 값을 다시 주는 것은 바꾸는 것이 아니다.
+    let mine = fake.source_spec();
+    let (status, got) = admin
+        .patch(
+            "/vmware-sources/vc1",
+            json!({ "host": mine.host, "port": mine.port, "user": mine.user }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    // 비밀번호를 같이 주면 새 서버로 바뀐다.
+    let (status, got) = admin
+        .patch(
+            "/vmware-sources/vc1",
+            json!({
+                "port": spec.port, "fingerprint": spec.fingerprint,
+                "password": spec.password.expose(),
+            }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["port"], spec.port);
+    assert_eq!(count(&other, "Login"), 1);
+}
+
 /// 쉰 세션은 닫는다(로그아웃), 다음 요청은 다시 로그인한다.
 #[tokio::test]
 async fn idle_sessions_are_logged_out() {

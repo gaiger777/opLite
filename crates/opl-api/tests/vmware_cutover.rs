@@ -195,6 +195,49 @@ async fn act(admin: &Client, item: &str, action: &str, body: Value) -> Value {
     admin.wait_task(&json!({ "id": got["task"] })).await
 }
 
+/// 루트에 `vm.create`만 가진 사용자(계획을 만들고 돌릴 수 있지만 대상 폴더의 `vm.power`가 없다)
+async fn migrator(env: &Env, admin: &Client) -> Client {
+    let (status, role) = admin
+        .post(
+            "/access-roles",
+            json!({ "name": "migrator", "privileges": ["vm.create"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let (status, body) = admin
+        .post(
+            "/users",
+            json!({ "name": "mig", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": body["id"] },
+                "role": { "type": "custom", "id": role["id"] },
+                "target": { "type": "root" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.login("mig", "password-1").await
+}
+
+/// 항목이 `pred`를 만족할 때까지 기다린다(10초).
+async fn wait_item(env: &Env, id: Uuid, pred: impl Fn(&VmwareVmStatus) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = item(env, id).status;
+        if pred(&s) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{s:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn vm_named(env: &Env, name: &str) -> Option<opl_types::vm::Vm> {
     env.cluster.get_by_name::<VmSpec>(name).unwrap()
 }
@@ -378,7 +421,7 @@ async fn cold_cutover_and_finalize() {
 /// VM이 없다. 원본을 끈 뒤의 실패는 `rolled-back`, 그 전은 `syncing`이다.
 #[tokio::test]
 async fn every_failing_step_leaves_the_source_running() {
-    let (env, admin, fake, _storage) = setup().await;
+    let (env, admin, fake, storage) = setup().await;
     let mut src = Source::new(&fake, "web01", 2);
     let it = start_plan(&env, &admin, "f1", "DC1/vm/Prod/web01", "warm", json!({})).await;
     sync(&env, &admin, it.id, true).await;
@@ -461,13 +504,14 @@ async fn every_failing_step_leaves_the_source_running() {
         sync(&env, &admin, it.id, false).await;
         assert!(fake.snapshots("web01").len() <= 1);
     }
-    // VM 켜기 실패 → 만든 VM을 지우고 되돌림
+    // VM 켜기 실패 → 만든 VM을 지우고 되돌림. 켠 VM의 게스트가 대상에 썼을 수 있으므로 대상 내용을 버리고 처음부터 다시
+    // 복사한다(리뷰 1 — 두 갈래가 섞이지 않게): `copying`, 볼륨 파일 없음, 그새 전환은 409.
     env.hv
         .fail_next_start(DriverError::StartFailed("no firmware".into()));
     let task = act(&admin, "f1-web01", "cutover", json!({})).await;
     assert_eq!(task["status"]["state"], "failed", "{task}");
     let s = item(&env, it.id).status;
-    assert_eq!(s.state, VmwareVmState::RolledBack, "{s:?}");
+    assert_eq!(s.state, VmwareVmState::Copying, "{s:?}");
     assert!(
         s.error
             .as_deref()
@@ -475,12 +519,34 @@ async fn every_failing_step_leaves_the_source_running() {
             .contains("cutover failed at starting-vm"),
         "{s:?}"
     );
+    assert_eq!(s.rounds, 0, "{s:?}");
+    assert!(
+        s.disks
+            .iter()
+            .all(|d| d.change_id.is_none() && d.rounds == 0),
+        "{s:?}"
+    );
     assert_source_restored(&env, &fake, "web01", &s);
-    // 되돌린 뒤 다시 전환하면 된다.
+    for d in &s.disks {
+        assert!(storage.contents(d.volume.unwrap()).is_none(), "{s:?}");
+    }
+    let (status, body) = admin.post("/vmware-vms/f1-web01/cutover", json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("not_ready")),
+        "{body}"
+    );
+    // 다시 전체 복사한 뒤 전환하면 된다.
     src.write(&fake, 0, 2 * BLOCK, b"after rollback");
+    sync(&env, &admin, it.id, true).await;
+    assert_eq!(item(&env, it.id).status.state, VmwareVmState::Syncing);
     let task = act(&admin, "f1-web01", "cutover", json!({})).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
-    assert_eq!(item(&env, it.id).status.state, VmwareVmState::Done);
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Done);
+    for (i, d) in s.disks.iter().enumerate() {
+        assert!(storage.contents(d.volume.unwrap()).unwrap() == src.disks[i]);
+    }
     assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
     src.check(&fake);
 }
@@ -551,9 +617,63 @@ async fn a_failed_rollback_reports_manual_steps_and_retry_finishes_it() {
         "{error}"
     );
     assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
-    // 다시 하기가 되돌림을 다시 한다.
-    let task = act(&admin, "r1-web01", "retry", json!({})).await;
+    // 리뷰 1: 루트 `vm.create`만으로는 원본 전원을 다루는 다시 하기·취소를 할 수 없다(전환과 같은 권한).
+    let mig = migrator(&env, &admin).await;
+    for path in [
+        "/vmware-vms/r1-web01/retry",
+        "/vmware-vms/r1-web01/cancel",
+        "/vmware-migrations/r1/actions/cancel",
+    ] {
+        let (status, body) = mig.post(path, json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+    }
+    // 다시 하기가 요청하지 않은 전환 Task(겹친 요청 등)는 아무것도 하지 않는다.
+    let mut stray: opl_types::task::Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VmwareCutover,
+            target: it.id,
+            node: env.node,
+        },
+    );
+    stray.name = stray.id.to_string();
+    env.cluster.create(&stray).await.unwrap();
+    let task = admin.wait_task(&json!({ "id": stray.id })).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(item(&env, it.id).status.state, VmwareVmState::Failed);
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
+    // 다시 하기 둘이 겹쳐도 Task는 하나다(하나는 409 `migration_busy`).
+    let (a, b) = tokio::join!(
+        admin.post("/vmware-vms/r1-web01/retry", json!({})),
+        admin.post("/vmware-vms/r1-web01/retry", json!({})),
+    );
+    let mut ok = Vec::new();
+    for (status, body) in [a, b] {
+        if status == StatusCode::OK {
+            ok.push(body);
+        } else {
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (StatusCode::CONFLICT, Some("migration_busy")),
+                "{body}"
+            );
+        }
+    }
+    assert_eq!(ok.len(), 1, "{ok:?}");
+    let task = admin.wait_task(&json!({ "id": ok[0]["task"] })).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let cutovers = env
+        .cluster
+        .list::<TaskSpec>()
+        .unwrap()
+        .1
+        .into_iter()
+        .filter(|t| t.spec.target == it.id && t.spec.op == TaskOp::VmwareCutover)
+        .count();
+    assert_eq!(
+        cutovers, 3,
+        "the first cutover, the stray task and one retry"
+    );
     let s = item(&env, it.id).status;
     assert_eq!(s.state, VmwareVmState::RolledBack, "{s:?}");
     assert!(!s.error.as_deref().unwrap().contains("rollback failed"));
@@ -607,5 +727,199 @@ async fn the_scheduler_cuts_over_at_the_scheduled_time() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(item(&env, it.id).status.state, VmwareVmState::Done);
     scheduler.shutdown().await;
+    src.check(&fake);
+}
+
+/// 리뷰 1: 계획을 취소해도 전환한(`done`) VM은 그대로다 — 대상 VM이 남아 돌고 원본은 꺼진 채, 마무리·되돌리기로 끝낸다.
+/// 마무리가 실패하면 `done`에 오류만 남기고(취소로 대상을 지울 수 없음) 다시 마무리하면 된다.
+#[tokio::test]
+async fn cancelling_a_migration_keeps_cut_over_vms() {
+    let (env, admin, fake, storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "k1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    let task = act(&admin, "k1-web01", "cutover", json!({})).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (status, body) = admin
+        .post("/vmware-migrations/k1/actions/cancel", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let scheduler = VmwareScheduler::spawn(
+        env.state.clone(),
+        VmwareSchedulerConfig {
+            tick: Duration::from_millis(100),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    scheduler.shutdown().await;
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Done, "{s:?}");
+    let vm = vm_named(&env, "web01").expect("the cut over VM is kept");
+    assert_eq!(Some(vm.id), s.target_vm);
+    assert_eq!(vm.spec.power, opl_types::vm::PowerState::Running);
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
+    for (i, d) in s.disks.iter().enumerate() {
+        assert!(storage.contents(d.volume.unwrap()).unwrap() == src.disks[i]);
+    }
+    let tasks = env.cluster.list::<TaskSpec>().unwrap().1;
+    assert!(
+        !tasks
+            .iter()
+            .any(|t| t.spec.target == it.id && matches!(t.spec.op, TaskOp::VmwareCleanup { .. })),
+        "no cleanup for a cut over VM"
+    );
+    // 마무리 실패(CBT 끄기) → `done`에 오류, 취소는 409, 다시 마무리
+    fake.fail_next("ReconfigVM_Task", "GenericVmConfigFault");
+    let task = act(&admin, "k1-web01", "finalize", json!({})).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Done, "{s:?}");
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap()
+            .contains("changed block tracking"),
+        "{s:?}"
+    );
+    let (status, body) = admin.post("/vmware-vms/k1-web01/cancel", json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("vmware_vm_state")),
+        "{body}"
+    );
+    let task = act(&admin, "k1-web01", "finalize", json!({})).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(item(&env, it.id).status.state, VmwareVmState::Finalized);
+    assert!(vm_named(&env, "web01").is_some());
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
+    src.check(&fake);
+}
+
+/// 리뷰 1: 원본 끄기 중에 사용자 스냅샷(백업 제품)이 생기고 게스트가 마지막으로 쓰면, 마지막 델타가 그 쓰기를 놓치지 않게
+/// 회차가 스냅샷 나무를 다시 보고 멈춘다 — 전환은 되돌려지고(원본 다시 켬) 대상은 `done`이 되지 않는다.
+#[tokio::test]
+async fn a_snapshot_taken_during_the_cutover_rolls_it_back() {
+    let (env, admin, fake, _storage) = setup().await;
+    let mut src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "u1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    fake.ignore_shutdown(true);
+    let (status, got) = admin.post("/vmware-vms/u1-web01/cutover", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    // 원본 보호를 마치고 게스트 종료를 보낼 참이다.
+    wait_item(&env, it.id, |s| s.source_changes.powered_off_by_us).await;
+    fake.add_user_snapshot("web01", "veeam-temp");
+    src.user_snapshots = user_snapshots(&fake, "web01");
+    src.write(&fake, 0, 5 * BLOCK + 3, b"LAST WRITE DURING SHUTDOWN");
+    fake.set_power("web01", VmwarePower::PoweredOff);
+    fake.ignore_shutdown(false);
+    let task = admin.wait_task(&json!({ "id": got["task"] })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::RolledBack, "{s:?}");
+    let error = s.error.clone().unwrap();
+    assert!(
+        error.contains("cutover failed at final-sync") && error.contains("veeam-temp"),
+        "{error}"
+    );
+    assert_source_restored(&env, &fake, "web01", &s);
+    src.check(&fake);
+}
+
+/// 리뷰 1: 게스트 종료가 시간 한도를 넘긴 뒤 곧 꺼지면(느린 게스트) 되돌림이 원본을 다시 켠다.
+#[tokio::test]
+async fn a_slow_guest_shutdown_is_powered_on_again() {
+    let (env, admin, fake, _storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "g1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    fake.ignore_shutdown(true);
+    let (status, got) = admin.post("/vmware-vms/g1-web01/cutover", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    // 원본 보호를 마치고 게스트 종료를 보낼 참이다.
+    wait_item(&env, it.id, |s| s.source_changes.powered_off_by_us).await;
+    // 한도(1초)를 넘긴 뒤, 더 지켜보는 동안 꺼진다.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    fake.set_power("web01", VmwarePower::PoweredOff);
+    fake.ignore_shutdown(false);
+    let task = admin.wait_task(&json!({ "id": got["task"] })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Syncing, "{s:?}");
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap()
+            .contains("vmware_shutdown_timeout")
+    );
+    assert!(
+        s.history.iter().any(|h| h
+            .event
+            .starts_with("the guest shut down after the time limit")),
+        "{s:?}"
+    );
+    assert_source_restored(&env, &fake, "web01", &s);
+    src.check(&fake);
+}
+
+/// 리뷰 1: 이미 내용이 있는 대상에 다시 전체 복사(`"*"`)하면 원본에서 쓰이지 않은 곳을 0으로 쓴다(남은 옛 내용이 없다).
+#[tokio::test]
+async fn a_full_copy_over_an_old_target_zeroes_the_gaps() {
+    let (env, admin, fake, storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "z1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    let vol = item(&env, it.id).status.disks[0].volume.unwrap();
+    // 블록 2는 원본에서 쓰이지 않았다(가짜 vSphere의 처음 내용).
+    assert!(
+        src.disks[0][2 * BLOCK as usize..3 * BLOCK as usize]
+            .iter()
+            .all(|b| *b == 0)
+    );
+    storage.poke(vol, 2 * BLOCK as usize + 5, b"stale target data");
+    sync(&env, &admin, it.id, true).await;
+    assert!(
+        storage.contents(vol).unwrap() == src.disks[0],
+        "stale data is left"
+    );
+    src.check(&fake);
+}
+
+/// 리뷰 1: 취소 정리는 다른 노드의 로컬 풀에 있는 대상 볼륨의 기록을 지우지 않는다(파일이 그 노드에 남으므로 그 노드가
+/// 시작할 때 고아 정리가 지운다). 우리 스냅샷은 지운다.
+#[tokio::test]
+async fn cancel_leaves_volumes_on_another_nodes_local_pool() {
+    let (env, admin, fake, storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "o1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    let vol = item(&env, it.id).status.disks[0].volume.unwrap();
+    let other = item(&env, it.id).status.disks[1].volume.unwrap();
+    let v = env.cluster.get::<VolumeSpec>(vol).unwrap().unwrap();
+    let mut status = v.status.clone();
+    status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(vol, &status)
+        .await
+        .unwrap();
+    let task = act(&admin, "o1-web01", "cancel", json!({})).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Cancelled, "{s:?}");
+    assert!(env.cluster.get::<VolumeSpec>(vol).unwrap().is_some());
+    assert!(
+        storage.contents(vol).is_some(),
+        "the file is left for its node"
+    );
+    assert!(
+        s.history
+            .iter()
+            .any(|h| h.event.contains("that node removes it")),
+        "{s:?}"
+    );
+    // 다른 디스크(이 노드)는 지웠다.
+    assert!(s.disks[1].volume.is_none());
+    assert!(env.cluster.get::<VolumeSpec>(other).unwrap().is_none());
+    assert!(fake.snapshots("web01").is_empty());
     src.check(&fake);
 }

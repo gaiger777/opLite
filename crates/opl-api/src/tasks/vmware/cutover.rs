@@ -28,6 +28,9 @@ use super::*;
 use crate::audit::system_entry;
 use opl_types::audit::AuditTarget;
 
+/// 게스트 종료 시간을 넘긴 뒤 더 지켜보는 시간의 상한(그새 꺼지면 다시 켠다)
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+
 /// 걸음 하나의 실패
 struct StepError {
     step: VmwareCutoverStep,
@@ -206,11 +209,28 @@ fn vm_gone(ctx: &Ctx, vm: Uuid) -> bool {
 // ---- vmware-cutover ----
 
 /// `vmware-cutover` Task(설계 §10.1): `ready`·`syncing`·`rolled-back` 항목을 전환한다. 끊긴 전환(`cutting-over`)은 적힌
-/// 걸음부터 잇고, 되돌림이 실패한 항목(`failed` + 걸음)은 되돌림을 다시 한다.
+/// 걸음부터 잇고, 되돌림이 실패한 항목(`failed` + 걸음)은 되돌림을 다시 한다 — 다시 하기가 적은 Task(`rollback_task`)일
+/// 때만. 그 Task가 항목을 다른 상태에서 보면(겹친 요청 등) 아무것도 하지 않는다. 취소된 계획의 항목은 새로 전환하지 않는다.
 pub(in crate::tasks) async fn cutover(ctx: &Ctx, task: &Task) -> Result<Option<String>, String> {
     let id = task.spec.target;
     let item = get_item(ctx, id)?;
+    let skip = |why: &str| {
+        Ok(Some(format!(
+            "skipped: vmware-vm {:?} is {}{why}",
+            item.name,
+            item.status.state.as_str()
+        )))
+    };
+    let retry = item.status.rollback_task == Some(task.id);
     let from = match item.status.state {
+        VmwareVmState::Failed if retry && item.status.cutover_step.is_some() => {
+            let step = item.status.cutover_step.expect("checked");
+            // 앞 실패의 까닭만 남긴다(되돌림 실패 문구는 버린다).
+            let error = item.status.error.clone().unwrap_or_default();
+            let cause = error.split("; rollback failed").next().unwrap_or_default();
+            return Box::pin(roll_back(ctx, id, step, cause)).await;
+        }
+        _ if retry => return skip("; nothing to roll back"),
         VmwareVmState::Ready | VmwareVmState::Syncing | VmwareVmState::RolledBack => {
             VmwareCutoverStep::Preparing
         }
@@ -219,21 +239,17 @@ pub(in crate::tasks) async fn cutover(ctx: &Ctx, task: &Task) -> Result<Option<S
             .cutover_step
             .unwrap_or(VmwareCutoverStep::Preparing),
         VmwareVmState::Failed if item.status.cutover_step.is_some() => {
-            let step = item.status.cutover_step.expect("checked");
-            // 앞 실패의 까닭만 남긴다(되돌림 실패 문구는 버린다).
-            let error = item.status.error.clone().unwrap_or_default();
-            let cause = error.split("; rollback failed").next().unwrap_or_default();
-            return Box::pin(roll_back(ctx, id, step, cause)).await;
+            return skip("; retry it to roll back");
         }
-        state => {
-            return Ok(Some(format!(
-                "skipped: vmware-vm {:?} is {}",
-                item.name,
-                state.as_str()
-            )));
-        }
+        _ => return skip(""),
     };
     let migration = get_migration(ctx, item.spec.migration).map_err(|e| e.message)?;
+    if from == VmwareCutoverStep::Preparing
+        && item.status.state != VmwareVmState::CuttingOver
+        && migration.status.phase == VmwareMigrationPhase::Cancelled
+    {
+        return skip(" and its migration was cancelled");
+    }
     let warm = migration.spec.mode == VmwareMigrationMode::Warm;
     if item.status.state != VmwareVmState::CuttingOver {
         let at = now();
@@ -563,6 +579,29 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
                 break;
             }
             if Instant::now() >= deadline {
+                // 보낸 종료는 거둘 수 없다: 느린 게스트(업데이트·큰 DB)는 곧 꺼진다. 조금 더 지켜보고, 그새 꺼지면 되돌림이
+                // (NIC를 먼저 되돌린 뒤) 다시 켠다 — `powered_off_by_us`가 남아 있다(리뷰 1).
+                let grace = limit.min(SHUTDOWN_GRACE);
+                let until = Instant::now() + grace;
+                while Instant::now() < until {
+                    tokio::time::sleep(every).await;
+                    let p = run
+                        .session
+                        .power_state(&vm_ref)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if p == VmwarePower::PoweredOff {
+                        let at_time = now();
+                        update_item(ctx, run.item, |s| {
+                            s.push_history(
+                                at_time,
+                                "the guest shut down after the time limit; powering the source VM on again",
+                            );
+                        })
+                        .await?;
+                        break;
+                    }
+                }
                 return Err(format!(
                     "vmware_shutdown_timeout: the guest did not shut down within {}s; the source VM was left running",
                     limit.as_secs()
@@ -892,20 +931,53 @@ async fn roll_back(
         fail_rollback(ctx, id, step, message, &e).await?;
         return Err(format!("{message}; rollback failed: {e}"));
     }
-    let warm = get_migration(ctx, item.spec.migration)
-        .map(|m| m.spec.mode == VmwareMigrationMode::Warm)
-        .unwrap_or(true);
+    let migration = get_migration(ctx, item.spec.migration).ok();
+    let warm = migration
+        .as_ref()
+        .is_none_or(|m| m.spec.mode == VmwareMigrationMode::Warm);
+    // 켠 대상 VM의 게스트가 대상 볼륨에 썼다(저널·로그): 따뜻한 이전의 다음 델타는 원본이 바꾼 곳만 옮기므로 두 갈래가 섞인다.
+    // 대상 내용을 버리고 처음부터 다시 복사한다(리뷰 1). 차가운 이전은 같은 갈래(한 번 켠 디스크)라 그대로 둔다.
+    let booted = step == VmwareCutoverStep::StartingVm
+        && migration.as_ref().is_none_or(|m| m.spec.rules.start_after);
+    let discard = warm && booted;
+    let mut note = None;
+    if discard && let Err(e) = discard_target(ctx, id).await {
+        // 파일이 남아도 다음 전체 복사가 빈 곳을 0으로 쓴다(새 볼륨이 아니면).
+        note = Some(format!("cannot delete the target volume files: {e}"));
+    }
     let at_time = now();
     let item = update_item(ctx, id, |s| {
-        s.state = VmwareVmState::RolledBack;
+        if discard {
+            s.state = VmwareVmState::Copying;
+            s.rounds = 0;
+            s.estimate_s = None;
+            for d in &mut s.disks {
+                d.change_id = None;
+                d.copied_bytes = 0;
+                d.rounds = 0;
+                d.last_delta_bytes = 0;
+            }
+        } else {
+            s.state = VmwareVmState::RolledBack;
+        }
         s.cutover_step = None;
         s.source_stopped_at = None;
         // 원본이 다시 켜져 바뀐 것은 다음 델타가 옮긴다.
-        s.next_sync_at = warm.then_some(at_time);
-        s.error = Some(format!(
-            "{message}; rolled back (the source VM was restored)"
-        ));
+        s.next_sync_at = (warm || discard).then_some(at_time);
+        s.error = Some(if discard {
+            format!(
+                "{message}; rolled back (the source VM was restored); the Orbivisor VM had started, so its disks are copied again in full"
+            )
+        } else {
+            format!("{message}; rolled back (the source VM was restored)")
+        });
         s.push_history(at_time, format!("rolled back after {}", step_name(step)));
+        if discard {
+            s.push_history(at_time, "target disks discarded; copying again in full");
+        }
+        if let Some(n) = &note {
+            s.push_history(at_time, n.clone());
+        }
     })
     .await?;
     recount(ctx, item.spec.migration).await;
@@ -916,6 +988,27 @@ async fn roll_back(
         format!("vmware-vm rollback {} ({message})", item.name),
     );
     Ok(None)
+}
+
+/// 대상 볼륨 파일을 지운다(기록은 `pending`으로 남긴다 — 다음 동기화가 새로 만들어 전체로 복사한다).
+async fn discard_target(ctx: &Ctx, id: Uuid) -> Result<(), String> {
+    let item = get_item(ctx, id)?;
+    for disk in &item.status.disks {
+        let Some(vol) = disk.volume else { continue };
+        let Some(v) = ctx
+            .cluster
+            .get::<VolumeSpec>(vol)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let pool = ready_pool(ctx, &v.spec.pool)?;
+        match ctx.storage.delete_volume(&pool, vol, v.spec.format).await {
+            Ok(()) | Err(DriverError::VolumeNotFound(_)) => {}
+            Err(e) => return Err(format!("{:?}: {e}", v.name)),
+        }
+    }
+    Ok(())
 }
 
 /// 되돌림이 실패했다: `failed`(걸음은 남김 — 다시 하기가 되돌림을 다시 한다)와 손으로 할 일.

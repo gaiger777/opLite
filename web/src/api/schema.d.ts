@@ -4241,7 +4241,9 @@ export interface paths {
         put?: never;
         /**
          * 계획을 취소한다(`cancelled`, 끝난 계획은 409 `migration_state`). 원본·우리 쪽에 남긴 것이 없는 항목은 곧 `cancelled`다.
-         *     복사를 시작한 항목은 스케줄러가 만드는 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다.
+         *     복사를 시작한 항목은 스케줄러가 만드는 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다. 전환한
+         *     (`done`) 항목과 전환 중인 항목은 건드리지 않는다 — 마무리나 되돌리기로 끝낸다(전환 중이던 항목이 되돌려지면 그때
+         *     정리한다). 원본 전원을 되돌릴 수 있는 항목(전환 중·되돌림 실패)이 있으면 그 대상 폴더의 `vm.create`·`vm.power`가 든다.
          */
         post: operations["cancel_migration"];
         delete?: never;
@@ -4365,8 +4367,9 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * 원본 연결을 바꾼다: 주어진 값만 바꾸고 다시 로그인해 본 뒤 저장한다(로그인이 거절되면 저장하지 않는다). 지문을
-         *     바꾸려면 새 지문을 준다(서버 인증서가 바뀐 뒤). VDDK 길이면 썸프린트를 다시 잰다. `If-Match`로 revision을 볼 수 있다.
+         * 원본 연결을 바꾼다: 주어진 값만 바꾸고 다시 로그인해 본 뒤 저장한다(로그인이 거절되면 저장하지 않는다). 호스트·포트·
+         *     사용자를 바꾸면 비밀번호도 다시 줘야 한다(아니면 400 `password_required`). 지문을 바꾸려면 새 지문을 준다(서버 인증서가
+         *     바뀐 뒤). VDDK 길이면 썸프린트를 다시 잰다. `If-Match`로 revision을 볼 수 있다.
          */
         patch: operations["patch_source"];
         trace?: never;
@@ -4457,7 +4460,8 @@ export interface paths {
         /**
          * 항목 하나를 취소한다(설계 §10.3): 원본·우리 쪽에 남긴 것이 없으면 곧 `cancelled`, 있으면 `vmware-cleanup` Task(우리
          *     스냅샷 지움, 우리가 켠 CBT 끔, 대상 볼륨 지움 — 원본 VM·디스크는 그대로)를 항목의 노드에 만든다(도는 동기화 뒤에 돈다).
-         *     끝났거나 전환 중·전환한 항목은 409 `vmware_vm_state`.
+         *     끝났거나 전환 중·전환한 항목은 409 `vmware_vm_state`. 원본 전원을 되돌릴 수 있는 항목(전환의 되돌림이 실패함)은 대상
+         *     폴더의 `vm.create`·`vm.power`가 든다.
          */
         post: operations["cancel_item"];
         delete?: never;
@@ -4524,7 +4528,8 @@ export interface paths {
          *     확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
          *     (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
          *     다음 동기화 없음)은 다시 시작한다. 전환의 자동 되돌림이 실패한 항목(`failed` + 걸음)은 되돌림을 다시 하는 `vmware-cutover`
-         *     Task를 만든다. 그 밖은 409 `vmware_vm_state`.
+         *     Task를 만든다 — 대상 폴더의 `vm.create`·`vm.power`가 들고, 이미 다시 하기를 요청했으면 409 `migration_busy`다. 그 밖은
+         *     409 `vmware_vm_state`.
          */
         post: operations["retry_item"];
         delete?: never;
@@ -9866,6 +9871,11 @@ export interface components {
                     /** @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다). */
                     cbt_enabled_by_us?: boolean;
                     /**
+                     * Format: int32
+                     * @description 연달아 실패한 정리(취소) 수 — 동기화 실패 수와 따로 센다([`MAX_CLEANUP_FAILURES`]번이면 스케줄러가 멈춘다).
+                     */
+                    cleanup_failures?: number;
+                    /**
                      * Format: int64
                      * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
                      */
@@ -9892,6 +9902,11 @@ export interface components {
                     next_sync_at?: number;
                     /** @description 만들었지만 옛 스냅샷을 아직 지우지 못한 새 스냅샷(회차 1·2단계 사이 — 다음 시도가 먼저 옛 것을 지운다) */
                     pending_snapshot?: components["schemas"]["VmwareSnapshotRef"];
+                    /**
+                     * Format: uuid
+                     * @description 되돌림 다시 하기로 만든 `vmware-cutover` Task(만들기 전에 적는다 — 그 Task만 되돌리고, 겹친 다시 하기는 409)
+                     */
+                    rollback_task?: string;
                     /**
                      * Format: int32
                      * @description 끝낸 회차 수
@@ -13801,6 +13816,11 @@ export interface components {
                 /** @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다). */
                 cbt_enabled_by_us?: boolean;
                 /**
+                 * Format: int32
+                 * @description 연달아 실패한 정리(취소) 수 — 동기화 실패 수와 따로 센다([`MAX_CLEANUP_FAILURES`]번이면 스케줄러가 멈춘다).
+                 */
+                cleanup_failures?: number;
+                /**
                  * Format: int64
                  * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
                  */
@@ -13827,6 +13847,11 @@ export interface components {
                 next_sync_at?: number;
                 /** @description 만들었지만 옛 스냅샷을 아직 지우지 못한 새 스냅샷(회차 1·2단계 사이 — 다음 시도가 먼저 옛 것을 지운다) */
                 pending_snapshot?: components["schemas"]["VmwareSnapshotRef"];
+                /**
+                 * Format: uuid
+                 * @description 되돌림 다시 하기로 만든 `vmware-cutover` Task(만들기 전에 적는다 — 그 Task만 되돌리고, 겹친 다시 하기는 409)
+                 */
+                rollback_task?: string;
                 /**
                  * Format: int32
                  * @description 끝낸 회차 수
@@ -16946,6 +16971,11 @@ export interface components {
             /** @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다). */
             cbt_enabled_by_us?: boolean;
             /**
+             * Format: int32
+             * @description 연달아 실패한 정리(취소) 수 — 동기화 실패 수와 따로 센다([`MAX_CLEANUP_FAILURES`]번이면 스케줄러가 멈춘다).
+             */
+            cleanup_failures?: number;
+            /**
              * Format: int64
              * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
              */
@@ -16972,6 +17002,11 @@ export interface components {
             next_sync_at?: number;
             /** @description 만들었지만 옛 스냅샷을 아직 지우지 못한 새 스냅샷(회차 1·2단계 사이 — 다음 시도가 먼저 옛 것을 지운다) */
             pending_snapshot?: components["schemas"]["VmwareSnapshotRef"];
+            /**
+             * Format: uuid
+             * @description 되돌림 다시 하기로 만든 `vmware-cutover` Task(만들기 전에 적는다 — 그 Task만 되돌리고, 겹친 다시 하기는 409)
+             */
+            rollback_task?: string;
             /**
              * Format: int32
              * @description 끝낸 회차 수

@@ -22,7 +22,7 @@ use opl_types::node::{Node, NodeSpec, VMWARE_MIGRATE};
 use opl_types::storage::{StoragePool, StoragePoolSpec, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec};
 use opl_types::vmware::{
-    MAX_SYNC_FAILURES, VmwareMigration, VmwareMigrationPhase, VmwareMigrationSpec,
+    MAX_CLEANUP_FAILURES, VmwareMigration, VmwareMigrationPhase, VmwareMigrationSpec,
     VmwareMigrationStatus, VmwareVm, VmwareVmSpec, VmwareVmState,
 };
 use tokio::sync::oneshot;
@@ -270,12 +270,19 @@ pub(crate) fn plan(
             }
             VmwareMigrationPhase::Cancelled => {
                 for item in mine {
-                    if item.status.state.is_final() || busy(item.id) {
+                    // 전환한(`done`) 항목과 전환 중인 항목은 취소가 건드리지 않는다 — 마무리나 되돌리기로 끝낸다.
+                    if item.status.state.is_final()
+                        || matches!(
+                            item.status.state,
+                            VmwareVmState::Done | VmwareVmState::CuttingOver
+                        )
+                        || busy(item.id)
+                    {
                         continue;
                     }
                     if !holds_something(item) {
                         out.push(Action::Cancel { item: item.id });
-                    } else if item.status.sync_failures < MAX_SYNC_FAILURES {
+                    } else if item.status.cleanup_failures < MAX_CLEANUP_FAILURES {
                         let node = item.spec.node.filter(|n| online(*n)).or_else(|| {
                             nodes
                                 .iter()
@@ -548,6 +555,7 @@ mod tests {
     use opl_types::storage::StoragePoolSpec;
     use opl_types::task::{TaskState, TaskStatus};
     use opl_types::vm_import::{SourceDisk, SourceVm};
+    use opl_types::vmware::MAX_SYNC_FAILURES;
     use opl_types::vmware::{VmwareMigrationMode, VmwareSourceVm, VmwareSyncDisk};
 
     fn node(name: &str) -> Node {
@@ -911,9 +919,30 @@ mod tests {
         held.spec.node = Some(n1.id);
         let mut gave_up = held.clone();
         gave_up.id = Uuid::now_v7();
-        gave_up.status.sync_failures = MAX_SYNC_FAILURES;
+        gave_up.status.cleanup_failures = MAX_CLEANUP_FAILURES;
+        // 동기화를 세 번 실패한 항목도 정리한다(정리 실패 수는 따로 센다 — 리뷰 1).
+        let mut sync_failed = held.clone();
+        sync_failed.id = Uuid::now_v7();
+        sync_failed.status.state = VmwareVmState::Failed;
+        sync_failed.status.sync_failures = MAX_SYNC_FAILURES;
+        // 전환한 항목·전환 중인 항목은 취소가 건드리지 않는다(리뷰 1 — 대상 VM을 지우지 않게).
+        let mut cut_over = held.clone();
+        cut_over.id = Uuid::now_v7();
+        cut_over.status.state = VmwareVmState::Done;
+        cut_over.status.target_vm = Some(Uuid::now_v7());
+        let mut cutting = cut_over.clone();
+        cutting.id = Uuid::now_v7();
+        cutting.status.state = VmwareVmState::CuttingOver;
         let done = item(&m, "d", VmwareVmState::Cancelled, "esx1");
-        let items = vec![bare.clone(), held.clone(), gave_up, done.clone()];
+        let items = vec![
+            bare.clone(),
+            held.clone(),
+            gave_up,
+            sync_failed.clone(),
+            cut_over,
+            cutting,
+            done.clone(),
+        ];
         let actions = plan(
             0,
             std::slice::from_ref(&m),
@@ -929,10 +958,17 @@ mod tests {
                 Action::Cleanup {
                     item: held.id,
                     node: n1.id
+                },
+                Action::Cleanup {
+                    item: sync_failed.id,
+                    node: n1.id
                 }
             ]
         );
-        let tasks = [running(&held, n1.id, TaskOp::VmwareSync { full: false })];
+        let tasks = [
+            running(&held, n1.id, TaskOp::VmwareSync { full: false }),
+            running(&sync_failed, n1.id, TaskOp::VmwareSync { full: false }),
+        ];
         assert_eq!(
             plan(
                 0,

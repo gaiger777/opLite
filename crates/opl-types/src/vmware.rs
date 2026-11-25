@@ -34,6 +34,8 @@ pub const VMWARE_VM_LABEL: &str = "orbivisor.io/vmware-vm";
 pub const SNAPSHOT_PREFIX: &str = "orbivisor-migration-";
 /// 동기화가 연달아 이만큼 실패하면 항목이 `failed`다(설계 §9.5).
 pub const MAX_SYNC_FAILURES: u32 = 3;
+/// 취소된 계획의 정리가 연달아 이만큼 실패하면 스케줄러가 더 하지 않는다(항목 취소로 다시 한다).
+pub const MAX_CLEANUP_FAILURES: u32 = 3;
 
 /// 비밀 문자열. JSON은 문자열 그대로(Raft에 저장)이고 `Debug`는 `<redacted>`다. API 보기·watch·감사에는 내지 않는다.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -867,6 +869,14 @@ pub struct VmwareVmStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cutover_requested_at: Option<u64>,
+    /// 연달아 실패한 정리(취소) 수 — 동기화 실패 수와 따로 센다([`MAX_CLEANUP_FAILURES`]번이면 스케줄러가 멈춘다).
+    #[serde(skip_serializing_if = "is_zero32")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cleanup_failures: u32,
+    /// 되돌림 다시 하기로 만든 `vmware-cutover` Task(만들기 전에 적는다 — 그 Task만 되돌리고, 겹친 다시 하기는 409)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub rollback_task: Option<Uuid>,
 }
 
 impl VmwareVmStatus {

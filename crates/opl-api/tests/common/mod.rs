@@ -923,6 +923,13 @@ impl FakeStorage {
             .map(|d| d.lock().unwrap().clone())
     }
 
+    /// 볼륨 `id`의 내용을 바꾼다(대상 게스트의 쓰기처럼 — 열지 않은 볼륨이면 없음).
+    pub fn poke(&self, id: Uuid, offset: usize, data: &[u8]) {
+        let all = self.contents.lock().unwrap();
+        let mut d = all.get(&id).expect("volume was written").lock().unwrap();
+        d[offset..offset + data.len()].copy_from_slice(data);
+    }
+
     /// 볼륨 `id`를 `open_target`으로 연 수
     pub fn opened_targets(&self, id: Uuid) -> usize {
         self.opened_targets
@@ -1006,6 +1013,7 @@ impl Storage for FakeStorage {
             ));
         }
         self.files.lock().unwrap().remove(&id);
+        self.contents.lock().unwrap().remove(&id);
         self.deleted.lock().unwrap().push(id);
         Ok(())
     }

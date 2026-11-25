@@ -1515,11 +1515,16 @@ orbivisorctl vmware vm revert wave1-db01 --confirm db01 --wait   # 대상 VM을 
 - **상태.** 항목은 `draft`(시작 전) → `pending` → `copying`(전체 복사) → `syncing`(따뜻한 — 델타 회차를 돈다) 또는 `ready`(차가운 —
   복사 끝) → `cutting-over`(걸음 `preparing`·`stopping-source`·`final-sync`·`creating-vm`·`starting-vm`) → `done` → `finalized`나
   `reverted`. 실패는 `failed`(이유는 `error`, `vmware vm retry`가 체크포인트부터 다시 한다), 전환 중 실패해 원본을 되살렸으면
-  `rolled-back`(다시 전환할 수 있다), 취소는 `cancelled`(우리 스냅샷·CBT·대상 볼륨을 치운다). 회차·전체 복사·전환은 끊기거나
+  `rolled-back`(다시 전환할 수 있다), 취소는 `cancelled`(우리 스냅샷·CBT·대상 볼륨을 치운다). **계획을 취소해도 전환한(`done`)
+  VM과 전환 중인 VM은 건드리지 않는다** — 대상 VM은 돌고 원본은 꺼진 채 남아 `finalize`나 `revert`로 끝낸다(전환 중이던 VM이
+  되돌려지면 그때 치운다). 취소 정리가 세 번 실패하면 스케줄러가 멈추고(동기화 실패 수와 따로 센다) `vmware vm cancel`이 다시
+  한다. 다른 노드의 로컬 풀에 있는 대상 볼륨은 그 노드가 다시 시작할 때 지운다(기록을 남긴다). 회차·전체 복사·전환은 끊기거나
   orbivisord가 다시 떠도 Raft에 적힌 체크포인트·걸음부터 잇는다. 리더가 바뀌어도 새 리더의 스케줄러가 다음 틱(15초)에 잇는다.
 - **한도.** 계획의 `--parallel`(동시 동기화·전환, 기본 4), `--per-host`(ESXi 호스트마다 2), `--per-node`(대상 노드마다 2)와
   대역(`limits.bandwidth_mib_s`, API·웹)을 지킨다. 델타·전환이 새 전체 복사보다 먼저 돈다. 사용자 스냅샷이 있는 VM은 따뜻한
-  이전에서 그 회차를 건너뛰고 경고한다(스냅샷을 지우면 다음 주기에 잇는다). 14일(`stop_after_days`) 동안 전환하지 않으면 원본에
+  이전에서 그 회차를 건너뛰고 경고한다(스냅샷을 지우면 다음 주기에 잇는다). 회차는 읽기 직전에 스냅샷 나무를 다시 봐서, 검사 뒤에
+  생긴 스냅샷이 있어도 건너뛴다(전환의 마지막 델타면 되돌린다 — 놓친 쓰기로 `done`이 되지 않게). 이미 내용이 있는 대상에 전체로
+  다시 복사하면(CBT 초기화·디스크 늘림·`full`) 원본에서 쓰이지 않은 곳을 0으로 쓴다. 14일(`stop_after_days`) 동안 전환하지 않으면 원본에
   스냅샷이 오래 남지 않게 동기화를 멈춘다(`retry`가 다시 시작).
 - **미리 확인.** VM마다 계획 71의 만들기 검사(대상 폴더 권한 먼저, 할당량·풀 공간·네트워크·노드 — 숨은 풀·네트워크는 새지
   않는다)와 VMware 쪽 표(`vmware_snapshots`·`vmware_ft`·`vmware_template`·`vmware_rdm`·`vmware_independent_disk`·`vmware_multi_writer`·
@@ -1532,13 +1537,16 @@ orbivisorctl vmware vm revert wave1-db01 --confirm db01 --wait   # 대상 VM을 
    원본을 끄지 않고 멈춘다(`final_delta_too_large`).
 2. 게스트 맞추기를 **원본에서 미리** 한다(아래) — 다음 델타가 그 바뀐 파일을 옮긴다.
 3. 전환: 원본 보호(`protect_source`, 기본 켬)면 원본 NIC의 "켤 때 연결"을 끄고 설명에 "Migrated to Orbivisor VM …"을 붙인 뒤, 켜진
-   채 델타 한 번 → 게스트 종료(VMware Tools, `shutdown_timeout_s` 기본 600초 — 넘기면 원본은 켜진 채 멈춤) 또는 전원 끄기 → 마지막
+   채 델타 한 번 → 게스트 종료(VMware Tools, `shutdown_timeout_s` 기본 600초 — 넘기면 원본은 켜진 채 멈춤; 그 뒤 최대 120초 더
+   지켜보다 느린 게스트가 꺼지면 다시 켠다) 또는 전원 끄기 → 마지막
    델타 → VM 만들기(원본 MAC 그대로, `--new-macs`면 새 MAC) → 켜기(`--no-start`면 꺼진 채). 걸음마다 Raft에 먼저 적는다.
 4. **자동 되돌림**: `final-sync` 뒤 어느 걸음에서든 실패하면 대상 VM을 지우고(볼륨은 남김) NIC·설명을 되돌린 뒤 원본을 다시 켠다 →
    `rolled-back`(이유는 `error`). 되돌림까지 실패하면 `failed`와 손으로 할 일("stop and delete Orbivisor VM …, then turn "Connect At
-   Power On" back on …, then power on … in vCenter")을 남기고, `retry`가 되돌림을 다시 한다. 할당량·용량을 넘으면 VM 만들기에서
-   막혀 같은 되돌림을 한다.
-5. 새 VM이 잘 돌면 `finalize`(우리 스냅샷·우리가 켠 CBT를 지움, 원본 보호는 남김). 안 되면 `revert --confirm <Orbivisor VM 이름>`:
+   Power On" back on …, then power on … in vCenter")을 남기고, `retry`가 되돌림을 다시 한다(전환과 같은 권한, 겹친 다시 하기는
+   409 `migration_busy`). 할당량·용량을 넘으면 VM 만들기에서 막혀 같은 되돌림을 한다. 대상 VM을 **켠 뒤**(`starting-vm`) 되돌린
+   따뜻한 이전은 그 게스트가 대상 디스크에 썼을 수 있어 대상 내용을 버리고 `copying`(처음부터 전체 복사)으로 돌아간다.
+5. 새 VM이 잘 돌면 `finalize`(우리 스냅샷·우리가 켠 CBT를 지움, 원본 보호는 남김 — 실패하면 `done`에 오류를 남기고 다시
+   마무리한다). 안 되면 `revert --confirm <Orbivisor VM 이름>`:
    대상 VM을 끄고(지우지 않음) NIC·설명을 되돌리고 원본을 켠다 → `reverted`. **전환 뒤 대상 VM에서 쓴 데이터는 원본으로 가지
    않는다.** 내린 시간은 항목 `downtime_s`·기록 "cut over; downtime 4m12s"·감사 로그에 남는다.
 6. **예약 전환**: `--cutover-at 2026-12-01T02:00:00Z`면 그 시각이 지난 뒤 스케줄러가 `ready`·`syncing`(회차 ≥ 1) 항목을 같은 한도
@@ -1591,8 +1599,9 @@ vddk_libdir = "/opt/vmware-vix-disklib-distrib"   # 원본의 --vddk-libdir가 �
 한도·전환 정책 → 미리 확인(VM마다 칩, "막힌 VM은 빼고 시작").
 
 **권한.** 원본 보기 `cluster.read`, 원본 만들기·바꾸기·지우기 `cluster.admin`(비밀번호는 Raft에만 — API·watch·감사·로그·`Debug`에
-없다). 계획·항목 보기 루트 `system.read`, 만들기·시작·멈춤·취소·다시 하기 루트 `vm.create`, 전환·되돌리기·마무리는 **대상 폴더의**
-`vm.create` + `vm.power`. 기능 `vmware-migrate`가 없는 노드가 있으면 409 `cluster_upgrading`.
+없다; 호스트·포트·사용자를 바꾸면 비밀번호도 다시 줘야 한다, 아니면 400 `password_required`). 계획·항목 보기 루트 `system.read`,
+만들기·시작·멈춤·취소·다시 하기 루트 `vm.create`, 전환·되돌리기·마무리와 원본 전원을 다루는 다시 하기·취소(전환 중이거나 되돌림이
+실패한 VM)는 **대상 폴더의** `vm.create` + `vm.power`. 기능 `vmware-migrate`가 없는 노드가 있으면 409 `cluster_upgrading`.
 
 **한계.** 실제 vCenter·ESXi·VDDK에서 시험하지 않았다(위 손 확인). 사용자 스냅샷·독립 디스크·RDM·FT·멀티라이터 디스크 VM은
 따뜻한 이전을 받지 않는다(차가운 이전은 꺼진 VM의 일부만). 게스트를 고치지 않고, 실제 게스트 부팅은 실험실에서 확인하지 못했다

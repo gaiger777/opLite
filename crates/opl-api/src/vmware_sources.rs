@@ -511,8 +511,9 @@ pub async fn create_source(
     Ok((StatusCode::CREATED, Json(view(&source)?)))
 }
 
-/// 원본 연결을 바꾼다: 주어진 값만 바꾸고 다시 로그인해 본 뒤 저장한다(로그인이 거절되면 저장하지 않는다). 지문을
-/// 바꾸려면 새 지문을 준다(서버 인증서가 바뀐 뒤). VDDK 길이면 썸프린트를 다시 잰다. `If-Match`로 revision을 볼 수 있다.
+/// 원본 연결을 바꾼다: 주어진 값만 바꾸고 다시 로그인해 본 뒤 저장한다(로그인이 거절되면 저장하지 않는다). 호스트·포트·
+/// 사용자를 바꾸면 비밀번호도 다시 줘야 한다(아니면 400 `password_required`). 지문을 바꾸려면 새 지문을 준다(서버 인증서가
+/// 바뀐 뒤). VDDK 길이면 썸프린트를 다시 잰다. `If-Match`로 revision을 볼 수 있다.
 #[utoipa::path(patch, path = "/vmware-sources/{key}", tag = "vmware",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = SourcePatch,
@@ -541,6 +542,7 @@ pub async fn patch_source(
     if let Some(u) = patch.user {
         spec.user = u;
     }
+    let password_given = patch.password.is_some();
     if let Some(p) = patch.password {
         spec.password = Secret::new(p);
     }
@@ -565,6 +567,16 @@ pub async fn patch_source(
         spec.transport = VmwareTransport::Folder;
     }
     spec.normalize().map_err(invalid)?;
+    // 저장한 비밀번호는 같은 호스트·포트·사용자에게만 보낸다(다른 서버로 돌려 비밀번호를 빼 가지 못하게).
+    let moved = spec.host != source.spec.host
+        || spec.port != source.spec.port
+        || spec.user != source.spec.user;
+    if moved && !password_given {
+        return Err(ApiError::bad_request(
+            "give the password again when changing the host, port or user",
+        )
+        .with_code("password_required"));
+    }
     if !keep {
         spec.transport = vddk_transport(&spec, want).await?;
         spec.normalize().map_err(invalid)?;

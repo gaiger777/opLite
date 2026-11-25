@@ -73,6 +73,17 @@ pub(crate) async fn create_task(
     target: Uuid,
     node: Uuid,
 ) -> Result<Task, ApiError> {
+    create_task_with_id(cluster, Uuid::now_v7(), op, target, node).await
+}
+
+/// [`create_task`]와 같되 Task id를 미리 정한다(대상에 먼저 적어 두는 Task — VMware 되돌림 다시 하기).
+pub(crate) async fn create_task_with_id(
+    cluster: &Cluster,
+    id: Uuid,
+    op: TaskOp,
+    target: Uuid,
+    node: Uuid,
+) -> Result<Task, ApiError> {
     // 템플릿 Task와 새 칸은 옛 노드가 풀지 못한다(계획 58). 경로마다 검증 전에 보지만, 빠뜨린 길이 없게 여기서도 본다.
     if op.needs_templates() {
         crate::cluster::require_feature(cluster, opl_types::node::TEMPLATES)?;
@@ -97,6 +108,7 @@ pub(crate) async fn create_task(
         crate::cluster::require_feature(cluster, opl_types::node::VM_EXPORT)?;
     }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
+    task.id = id;
     task.name = task.id.to_string();
     // 요청한 사용자(리뷰 2 N7). 레이블이라 옛 노드도 그대로 읽는다(`TaskSpec`은 모르는 칸을 거절한다).
     if let Some(user) = crate::audit::requester() {

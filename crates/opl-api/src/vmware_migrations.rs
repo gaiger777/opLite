@@ -1181,13 +1181,15 @@ pub async fn resume_migration(
 }
 
 /// 계획을 취소한다(`cancelled`, 끝난 계획은 409 `migration_state`). 원본·우리 쪽에 남긴 것이 없는 항목은 곧 `cancelled`다.
-/// 복사를 시작한 항목은 스케줄러가 만드는 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다.
+/// 복사를 시작한 항목은 스케줄러가 만드는 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다. 전환한
+/// (`done`) 항목과 전환 중인 항목은 건드리지 않는다 — 마무리나 되돌리기로 끝낸다(전환 중이던 항목이 되돌려지면 그때
+/// 정리한다). 원본 전원을 되돌릴 수 있는 항목(전환 중·되돌림 실패)이 있으면 그 대상 폴더의 `vm.create`·`vm.power`가 든다.
 #[utoipa::path(post, path = "/vmware-migrations/{key}/actions/cancel", tag = "vmware",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 200, body = MigrationView), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn cancel_migration(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
 ) -> Result<Json<MigrationView>, ApiError> {
@@ -1202,6 +1204,14 @@ pub async fn cancel_migration(
                 phase_name(m.status.phase)
             ),
         ));
+    }
+    for item in items_of(&state, m.id)? {
+        if item.status.state != VmwareVmState::Done
+            && !item.status.state.is_final()
+            && touches_power(&item.status)
+        {
+            require_item_power(&state, &principal, &m, &item)?;
+        }
     }
     write_status(
         &state,
@@ -1269,7 +1279,8 @@ fn item_busy(state: &AppState, item: Uuid) -> Result<bool, ApiError> {
 /// 확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
 /// (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
 /// 다음 동기화 없음)은 다시 시작한다. 전환의 자동 되돌림이 실패한 항목(`failed` + 걸음)은 되돌림을 다시 하는 `vmware-cutover`
-/// Task를 만든다. 그 밖은 409 `vmware_vm_state`.
+/// Task를 만든다 — 대상 폴더의 `vm.create`·`vm.power`가 들고, 이미 다시 하기를 요청했으면 409 `migration_busy`다. 그 밖은
+/// 409 `vmware_vm_state`.
 #[utoipa::path(post, path = "/vmware-vms/{key}/retry", tag = "vmware",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody),
@@ -1309,15 +1320,25 @@ pub async fn retry_item(
             ),
         ));
     }
-    // 전환의 자동 되돌림이 실패한 항목: 되돌림을 다시 한다(전환 Task가 적힌 걸음부터 되돌린다).
+    // 전환의 자동 되돌림이 실패한 항목: 되돌림을 다시 한다(전환 Task가 적힌 걸음부터 되돌린다). 원본·대상 VM 전원을
+    // 다루므로 전환과 같은 권한이고, 겹친 요청이 Task를 둘 만들지 않게 만들 Task의 id를 revision을 보고 먼저 적는다
+    // (`rollback_task` — 전환 Task는 그 id일 때만 되돌리고, 그 Task가 항목을 다른 상태에서 보면 아무것도 하지 않는다).
     if item.status.state == VmwareVmState::Failed && item.status.cutover_step.is_some() {
-        let task = crate::tasks::create_task(
+        require_item_power(&state, &principal, &m, &item)?;
+        let id = Uuid::now_v7();
+        let mut status = item.status.clone();
+        status.rollback_task = Some(id);
+        status.push_history(now(), "rollback retry requested");
+        write_item(&state, &item, &status).await?;
+        let task = crate::tasks::create_task_with_id(
             &state.cluster,
+            id,
             opl_types::task::TaskOp::VmwareCutover,
             item.id,
             item_node(&state, &item),
         )
         .await?;
+        let item = lookup::<VmwareVmSpec>(&state.cluster, &item.id.to_string())?;
         return Ok(Json(ItemAction {
             item,
             task: Some(task.id),
@@ -1382,18 +1403,22 @@ pub async fn retry_item(
 
 /// 항목 하나를 취소한다(설계 §10.3): 원본·우리 쪽에 남긴 것이 없으면 곧 `cancelled`, 있으면 `vmware-cleanup` Task(우리
 /// 스냅샷 지움, 우리가 켠 CBT 끔, 대상 볼륨 지움 — 원본 VM·디스크는 그대로)를 항목의 노드에 만든다(도는 동기화 뒤에 돈다).
-/// 끝났거나 전환 중·전환한 항목은 409 `vmware_vm_state`.
+/// 끝났거나 전환 중·전환한 항목은 409 `vmware_vm_state`. 원본 전원을 되돌릴 수 있는 항목(전환의 되돌림이 실패함)은 대상
+/// 폴더의 `vm.create`·`vm.power`가 든다.
 #[utoipa::path(post, path = "/vmware-vms/{key}/cancel", tag = "vmware",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn cancel_item(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
 ) -> Result<Json<ItemAction>, ApiError> {
     require_feature(&state.cluster, VMWARE_MIGRATE)?;
     let item = lookup::<VmwareVmSpec>(&state.cluster, &key)?;
+    if touches_power(&item.status) {
+        require_item_power(&state, &principal, &migration_of(&state, &item)?, &item)?;
+    }
     audit.detail(format!("vmware-vm cancel {}", item.name));
     if item.status.state.is_final()
         || matches!(
@@ -1442,6 +1467,15 @@ pub async fn cancel_item(
         item,
         task: Some(task.id),
     }))
+}
+
+/// 항목을 치우면 원본 전원이나 대상 VM을 건드리나(전환을 시작했다 — 되돌림이 실패한 항목 등): 그러면 전환·되돌리기와 같은
+/// 권한이 든다.
+fn touches_power(s: &VmwareVmStatus) -> bool {
+    s.state == VmwareVmState::CuttingOver
+        || s.cutover_step.is_some()
+        || s.target_vm.is_some()
+        || s.source_changes.powered_off_by_us
 }
 
 /// 항목의 계획(없으면 404)

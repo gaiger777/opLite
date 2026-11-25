@@ -71,6 +71,8 @@ struct SyncError {
     permanent: bool,
     /// 원본이 무료 ESXi(API 읽기 전용)다 — 원본 연결 상태에 적는다.
     restricted: bool,
+    /// 회차 중 우리 것이 아닌 스냅샷이 보였다 — 따뜻한 동기화는 이번 회차를 건너뛴다(실패로 세지 않음).
+    foreign: bool,
 }
 
 impl SyncError {
@@ -79,6 +81,7 @@ impl SyncError {
             message: message.into(),
             permanent: false,
             restricted: false,
+            foreign: false,
         }
     }
 
@@ -87,8 +90,17 @@ impl SyncError {
             message: message.into(),
             permanent: true,
             restricted: false,
+            foreign: false,
         }
     }
+}
+
+/// 우리 것이 아닌 스냅샷이 있다는 말(이름들)
+fn foreign_message(names: &[&str]) -> String {
+    format!(
+        "the VM has snapshots that are not Orbivisor's ({}); consolidate or delete them",
+        names.join(", ")
+    )
 }
 
 impl From<VsphereError> for SyncError {
@@ -105,6 +117,7 @@ impl From<VsphereError> for SyncError {
                         | VsphereError::Fingerprint { .. }
                 ),
             restricted,
+            foreign: false,
         }
     }
 }
@@ -449,28 +462,11 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
         .map(|s| s.name.as_str())
         .collect();
     if !foreign.is_empty() {
-        let message = format!(
-            "the VM has snapshots that are not Orbivisor's ({}); consolidate or delete them",
-            foreign.join(", ")
-        );
+        let message = foreign_message(&foreign);
         if !run.warm() {
             return Err(SyncError::fatal(format!("vmware_snapshots: {message}")));
         }
-        // 따뜻한 이전: 이번 회차를 건너뛰고 다음 주기에 다시 본다(설계 §9.2).
-        let at = now();
-        let every = sync_every(run.ctx, &run.migration);
-        let warning =
-            format!("{message}; skipping this round until only Orbivisor snapshots remain");
-        let item = update_item(ctx, id, |s| {
-            s.next_sync_at = Some(at + every);
-            if !s.warnings.contains(&warning) {
-                s.warnings.push(warning.clone());
-            }
-            s.push_history(at, "round skipped: foreign snapshots");
-        })
-        .await?;
-        recount(ctx, item.spec.migration).await;
-        return Ok(Some(warning));
+        return Box::pin(skip_round(&run, &message)).await;
     }
     // `stop_after_days`가 지나도록 전환하지 않았다: 우리 스냅샷을 지우고 동기화를 멈춘다(§9.3 — changeId는 남겨 다시
     // 시작하면 `"*"` 대신 이어 간다).
@@ -508,7 +504,13 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
     let targets = Box::pin(ensure_disks(&run)).await?;
     let started = Instant::now();
     let copied = if run.warm() {
-        Box::pin(warm_round(&run, &targets, full)).await?
+        match Box::pin(warm_round(&run, &targets, full)).await {
+            Err(e) if e.foreign => {
+                let message = e.message.trim_start_matches("vmware_snapshots: ");
+                return Box::pin(skip_round(&run, message)).await;
+            }
+            copied => copied?,
+        }
     } else {
         Box::pin(cold_round(&run, &targets)).await?
     };
@@ -518,6 +520,23 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
         VmwareVmState::Ready
     };
     finish_round(&run, copied, started.elapsed(), Some(state)).await
+}
+
+/// 따뜻한 이전: 우리 것이 아닌 스냅샷 때문에 이번 회차를 건너뛰고 다음 주기에 다시 본다(설계 §9.2).
+async fn skip_round(run: &Run<'_>, message: &str) -> Result<Option<String>, SyncError> {
+    let at = now();
+    let every = sync_every(run.ctx, &run.migration);
+    let warning = format!("{message}; skipping this round until only Orbivisor snapshots remain");
+    let item = update_item(run.ctx, run.item, |s| {
+        s.next_sync_at = Some(at + every);
+        if !s.warnings.contains(&warning) {
+            s.warnings.push(warning.clone());
+        }
+        s.push_history(at, "round skipped: foreign snapshots");
+    })
+    .await?;
+    recount(run.ctx, item.spec.migration).await;
+    Ok(Some(warning))
 }
 
 /// 오래 전환하지 않은 따뜻한 항목의 동기화를 멈춘다: 우리 스냅샷을 지우고 다음 동기화를 지운다(`retry`가 다시 시작한다).
@@ -617,6 +636,8 @@ async fn finish_round(
 struct Target {
     volume: Volume,
     pool: StoragePool,
+    /// 이 Task가 방금 만든 볼륨(비어 있다 — 전체 복사가 빈 곳을 0으로 쓸 필요가 없다)
+    fresh: bool,
 }
 
 /// 디스크 표를 채우고(첫 동기화 — 볼륨 id를 먼저 적음) 대상 볼륨을 만든다(있으면 그대로). 원본 디스크가 바뀌었으면(수·키)
@@ -767,7 +788,11 @@ async fn ensure_disks(run: &Run<'_>) -> Result<Vec<Target>, SyncError> {
             .await?;
             restart_disk(ctx, run.item, i).await?;
         }
-        out.push(Target { volume, pool });
+        out.push(Target {
+            volume,
+            pool,
+            fresh: made,
+        });
     }
     Ok(out)
 }
@@ -891,6 +916,23 @@ async fn warm_round(run: &Run<'_>, targets: &[Target], full: bool) -> Result<u64
         .snapshot
         .clone()
         .ok_or_else(|| SyncError::retry("the round has no snapshot"))?;
+    // 기반 파일 = S(n+1)은 그 사이에 다른 스냅샷이 없을 때만이다: 검사 뒤 생긴 사용자 스냅샷(백업 제품 등)이 있으면 기반은
+    // 그 시점이라 바뀐 구역을 옛 내용으로 읽는다(리뷰 1). 읽기 전에 스냅샷 나무를 다시 보고 우리 것만 있어야 한다.
+    let now_vm = inventory::refresh_vm(&run.session, &run.inv, &run.vm.moref).await?;
+    let foreign: Vec<&str> = now_vm
+        .snapshots
+        .iter()
+        .filter(|s| s.moref != snap.moref)
+        .map(|s| s.name.as_str())
+        .collect();
+    if !foreign.is_empty() {
+        return Err(SyncError {
+            message: format!("vmware_snapshots: {}", foreign_message(&foreign)),
+            permanent: false,
+            restricted: false,
+            foreign: true,
+        });
+    }
     let snap_ref = MoRef::new("VirtualMachineSnapshot", &snap.moref);
     let snap_disks = run.session.snapshot_disks(&snap_ref).await?;
     let ids: BTreeMap<i32, Option<String>> = snap_disks
@@ -910,6 +952,7 @@ async fn warm_round(run: &Run<'_>, targets: &[Target], full: bool) -> Result<u64
             ))
         })?;
         let since = disk.change_id.clone();
+        let mut whole = since.is_none();
         let areas = match cbt::changed_areas(
             &run.session,
             &vm_ref,
@@ -933,6 +976,7 @@ async fn warm_round(run: &Run<'_>, targets: &[Target], full: bool) -> Result<u64
                     }
                 })
                 .await?;
+                whole = true;
                 cbt::changed_areas(
                     &run.session,
                     &vm_ref,
@@ -946,7 +990,18 @@ async fn warm_round(run: &Run<'_>, targets: &[Target], full: bool) -> Result<u64
             Err(e) => return Err(e.into()),
         };
         let disk = get_item(ctx, run.item)?.status.disks[i].clone();
-        copied += Box::pin(copy_disk(run, i, &disk, target, &areas, Some(&snap_ref))).await?;
+        // `"*"`은 쓰인 구역만 준다: 앞 회차의 내용이 있는 볼륨이면 그 밖(원본이 그새 비운 곳)을 0으로 쓴다(리뷰 1).
+        let zero_gaps = whole && !target.fresh;
+        copied += Box::pin(copy_disk(
+            run,
+            i,
+            &disk,
+            target,
+            &areas,
+            Some(&snap_ref),
+            zero_gaps,
+        ))
+        .await?;
         let total = cbt::total(&areas);
         update_item(ctx, run.item, |s| {
             if let Some(d) = s.disks.get_mut(i) {
@@ -982,7 +1037,7 @@ async fn cold_round(run: &Run<'_>, targets: &[Target]) -> Result<u64, SyncError>
             .await?;
         }
         let areas = [(0, disk.capacity_bytes)];
-        copied += Box::pin(copy_disk(run, i, &disk, target, &areas, None)).await?;
+        copied += Box::pin(copy_disk(run, i, &disk, target, &areas, None, false)).await?;
         update_item(ctx, run.item, |s| {
             if let Some(d) = s.disks.get_mut(i) {
                 d.copied_bytes = 0;
@@ -1108,8 +1163,8 @@ async fn open_readers(
     }
 }
 
-/// 구역들을 원본에서 읽어 대상 볼륨에 쓴다(체크포인트 `disk.copied_bytes`부터 — 구역 목록 안 위치). 복사한 바이트를
-/// 돌려준다.
+/// 구역들을 원본에서 읽어 대상 볼륨에 쓴다(체크포인트 `disk.copied_bytes`부터 — 구역 목록 안 위치). `zero_gaps`면 먼저
+/// (디스크를 처음부터 쓸 때) 구역 밖을 `WRITE_ZEROES`로 비운다. 복사한 바이트를 돌려준다.
 async fn copy_disk(
     run: &Run<'_>,
     i: usize,
@@ -1117,10 +1172,12 @@ async fn copy_disk(
     target: &Target,
     areas: &[(u64, u64)],
     snapshot: Option<&MoRef>,
+    zero_gaps: bool,
 ) -> Result<u64, SyncError> {
     let ctx = run.ctx;
     let total = cbt::total(areas);
-    if total == 0 {
+    let zero_gaps = zero_gaps && disk.copied_bytes == 0;
+    if total == 0 && !zero_gaps {
         return Ok(0);
     }
     let (volume, pool) = (&target.volume, &target.pool);
@@ -1152,6 +1209,10 @@ async fn copy_disk(
                 "volume {:?} is smaller than the source disk",
                 volume.name
             )))
+        } else if zero_gaps
+            && let Err(e) = write_gaps(&mut client, areas, disk.capacity_bytes).await
+        {
+            Err(SyncError::retry(format!("cannot write disk {i}: {e}")))
         } else {
             match open_readers(run, disk, snapshot).await {
                 Ok(readers) => Box::pin(pump(run, i, disk, &mut client, readers, areas)).await,
@@ -1174,6 +1235,31 @@ async fn copy_disk(
         tracing::warn!(volume = %volume.name, error = %e, "cannot release the target volume");
     }
     result
+}
+
+/// 구역 밖(`[0, capacity)`에서 `areas`가 덮지 않는 곳)을 0으로 쓴다(얇은 대상에서는 싸다).
+async fn write_gaps(
+    client: &mut NbdClient,
+    areas: &[(u64, u64)],
+    capacity: u64,
+) -> Result<(), opl_store::nbd::NbdError> {
+    let mut sorted = areas.to_vec();
+    sorted.sort_unstable();
+    let mut at = 0u64;
+    let mut gaps = Vec::new();
+    for (offset, len) in sorted {
+        if offset > at {
+            gaps.push((at, offset - at));
+        }
+        at = at.max(offset + len);
+    }
+    if capacity > at {
+        gaps.push((at, capacity - at));
+    }
+    for (offset, len) in gaps {
+        client.write_zeroes(offset, len).await?;
+    }
+    Ok(())
 }
 
 /// 읽개 묶음으로 나란히 읽고 차례대로 쓴다. 체크포인트(바이트·시간)마다 `FLUSH`한 뒤 Raft에 위치를 적고 Task 진행률을
@@ -1309,8 +1395,9 @@ async fn pump(
 
 /// `vmware-cleanup` Task(설계 §10.3): 원본의 우리 스냅샷(Raft에 적힌 moref만)을 지우고, 우리가 켠 CBT를 끄고, 바꾼 원본
 /// 설정(NIC `startConnected`·설명)을 되돌린다. `delete_target`(취소)이면 대상 볼륨도 지우고 `cancelled`, 아니면(마무리)
-/// `finalized`다. 원본 VM의 전원·디스크·사용자 스냅샷은 그대로다. 실패하면 항목을 `failed`로 두고 이유를 적는다(다시
-/// 취소하면 남은 것부터 한다).
+/// `finalized`다. 원본 VM의 전원·디스크·사용자 스냅샷은 그대로다. 취소가 실패하면 항목을 `failed`로 두고 이유를 적는다(다시
+/// 취소하면 남은 것부터 한다 — 실패 수는 `cleanup_failures`). 마무리가 실패하면 `done`에 오류만 남긴다(다시 마무리한다).
+/// 취소는 전환한 항목(`done`·`cutting-over`, 또는 되돌림 실패가 아닌데 대상 VM이 있음)을 건드리지 않는다(리뷰 1).
 pub(super) async fn cleanup(
     ctx: &Ctx,
     task: &Task,
@@ -1321,6 +1408,23 @@ pub(super) async fn cleanup(
     if item.status.state.is_final() {
         return Ok(None);
     }
+    let s = &item.status;
+    let cut_over = matches!(s.state, VmwareVmState::Done | VmwareVmState::CuttingOver)
+        || (s.target_vm.is_some() && s.cutover_step.is_none());
+    if delete_target && cut_over {
+        return Ok(Some(format!(
+            "skipped: vmware-vm {:?} is {} (cut over VMs are finalized or reverted, not cancelled)",
+            item.name,
+            s.state.as_str()
+        )));
+    }
+    if !delete_target && s.state != VmwareVmState::Done {
+        return Ok(Some(format!(
+            "skipped: vmware-vm {:?} is {}",
+            item.name,
+            s.state.as_str()
+        )));
+    }
     match Box::pin(run_cleanup(ctx, &item, delete_target)).await {
         Ok(()) => Ok(None),
         Err(e) => {
@@ -1328,9 +1432,14 @@ pub(super) async fn cleanup(
             let message = format!("cleanup: {e}");
             match update_item(ctx, id, |s| {
                 s.error = Some(message.clone());
-                s.sync_failures += 1;
-                s.state = VmwareVmState::Failed;
-                s.push_history(at, "cleanup failed");
+                if delete_target {
+                    s.cleanup_failures += 1;
+                    s.state = VmwareVmState::Failed;
+                    s.push_history(at, "cleanup failed");
+                } else {
+                    // 전환한 VM은 그대로 돈다: `done`에 남겨 다시 마무리하게 한다.
+                    s.push_history(at, "finalize failed");
+                }
             })
             .await
             {
@@ -1393,6 +1502,21 @@ async fn run_cleanup(ctx: &Ctx, item: &VmwareVm, delete_target: bool) -> Result<
         cutover::remove_target_vm(ctx, id).await?;
         for (i, disk) in s.disks.iter().enumerate() {
             let Some(volume) = disk.volume else { continue };
+            // 다른 노드의 로컬 풀에 있는 볼륨은 여기서 지울 수 없다: 기록을 남겨 그 노드가 시작할 때 지우게 한다(항목이
+            // 끝나면 그 노드의 고아 정리가 지운다 — 기록을 지우면 파일이 남는다).
+            if let Some(owner) = elsewhere(ctx, volume)? {
+                let at = now();
+                update_item(ctx, id, |s| {
+                    s.push_history(
+                        at,
+                        format!(
+                            "the target volume of disk {i} is on node {owner}'s local pool; that node removes it"
+                        ),
+                    );
+                })
+                .await?;
+                continue;
+            }
             super::remove_volume(ctx, volume)
                 .await
                 .map_err(|e| format!("cannot delete the target volume of disk {i}: {e}"))?;
@@ -1413,6 +1537,7 @@ async fn run_cleanup(ctx: &Ctx, item: &VmwareVm, delete_target: bool) -> Result<
         };
         s.error = None;
         s.sync_failures = 0;
+        s.cleanup_failures = 0;
         s.next_sync_at = None;
         s.push_history(
             at,
@@ -1426,6 +1551,35 @@ async fn run_cleanup(ctx: &Ctx, item: &VmwareVm, delete_target: bool) -> Result<
     .await?;
     recount(ctx, item.spec.migration).await;
     Ok(())
+}
+
+/// 볼륨이 다른 노드의 로컬(공유 아닌) 풀에 있으면 그 노드 이름(없으면 id)
+fn elsewhere(ctx: &Ctx, volume: Uuid) -> Result<Option<String>, String> {
+    let Some(v) = ctx
+        .cluster
+        .get::<VolumeSpec>(volume)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(node) = v.status.node.filter(|n| *n != ctx.config.node) else {
+        return Ok(None);
+    };
+    let shared = ctx
+        .cluster
+        .get_by_name::<StoragePoolSpec>(&v.spec.pool)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|p| opl_types::storage::is_shared(&p));
+    if shared {
+        return Ok(None);
+    }
+    let name = ctx
+        .cluster
+        .get::<opl_types::node::NodeSpec>(node)
+        .ok()
+        .flatten()
+        .map_or_else(|| node.to_string(), |n| n.name);
+    Ok(Some(name))
 }
 
 #[cfg(test)]
