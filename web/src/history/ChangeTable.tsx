@@ -39,7 +39,16 @@ function Value({ value, tone }: { value: unknown; tone: "old" | "new" }) {
  * 칸 바뀜 표(전·후 — 바뀐 경로만, 설계 §13 웹). 설정 기록 서랍과 계획 표가 같이 쓴다. 글은 상태 토큰(`-soft` 위 `-fg`)이라
  * 두 테마에서 대비가 맞는다(`tokens.test.ts`).
  */
-export function ChangeTable({ changes, label }: { changes: readonly Change[]; label: string }) {
+export function ChangeTable({
+  changes,
+  label,
+  removed,
+}: {
+  changes: readonly Change[];
+  label: string;
+  /** 지운 칸의 "후" 자리 글(되돌리기 계획 — spec 전체를 바꾸므로 지운 칸은 기본값으로 돌아간다). 없으면 "—" */
+  removed?: string;
+}) {
   const { t } = useTranslation();
   return (
     <div className="overflow-x-auto">
@@ -61,7 +70,11 @@ export function ChangeTable({ changes, label }: { changes: readonly Change[]; la
                 <Value value={c.op === "add" ? undefined : c.old} tone="old" />
               </TableCell>
               <TableCell className="max-w-56 align-top whitespace-normal">
-                <Value value={c.op === "remove" ? undefined : c.new} tone="new" />
+                {c.op === "remove" && removed !== undefined ? (
+                  <span className="text-muted-foreground italic">{removed}</span>
+                ) : (
+                  <Value value={c.op === "remove" ? undefined : c.new} tone="new" />
+                )}
               </TableCell>
             </TableRow>
           ))}

@@ -17,7 +17,8 @@
       "summary": "{{create}} to create, {{update}} to change, {{delete}} to delete, {{unchanged}} unchanged, {{blocked}} blocked",
       "steps": "Plan steps",
       "changesOf": "Changed fields of {{kind}} {{name}}",
-      "restart": "Takes effect after hot-plug or the next restart"
+      "restart": "Takes effect after hot-plug or the next restart",
+      "toDefault": "→ default"
     },
     "export": {
       "title": "{{name}} as YAML",

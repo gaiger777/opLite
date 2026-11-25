@@ -44,6 +44,8 @@ function Step({ step }: { step: StepView }) {
         <ChangeTable
           changes={diff}
           label={t("declarative.plan.changesOf", { kind: step.kind, name: step.name })}
+          // 되돌리기 계획은 spec 전체를 바꾼다(`replace`) — 바꾸는 단계에서 지운 칸은 기본값으로 돌아간다
+          removed={step.action === "update" ? t("declarative.plan.toDefault") : undefined}
         />
       )}
     </li>

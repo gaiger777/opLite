@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import { ApplySetPage } from "@/declarative/ApplySetPage";
+import { refreshApplySets } from "@/declarative/api";
 import { ApplySetsPage } from "@/declarative/ApplySetsPage";
 import { expectNoAxeViolations } from "@/test/axe";
 import { applySet, AT, DRIFTED, SET_ID, WEB_ID } from "@/test/declarative";
@@ -84,9 +85,10 @@ it("shows each object's state, who changed it, and adopts the chosen ones", asyn
   ).toBeInTheDocument();
 });
 
-it("adopts all only after confirming, naming the visible drift rows instead of sending an empty list", async () => {
-  const user = userEvent.setup();
-  const LAN_ID = "019a0f3c-0000-7000-8073-000000000002";
+const LAN_ID = "019a0f3c-0000-7000-8073-000000000002";
+
+/** 서버 `visible_set`처럼: 밖에서 지운 `lan`은 `status.objects`에서 빠지고 드리프트 보고에만 `missing`으로 남는다. */
+function lanDeletedSet() {
   const set = applySet("web-prod", {
     drift: {
       checked_at: AT,
@@ -104,15 +106,26 @@ it("adopts all only after confirming, naming the visible drift rows instead of s
       ],
     },
   });
+  set.status.objects = set.status.objects.filter((o) => o.id !== LAN_ID);
+  return set;
+}
+
+function mockAdopt(set: ReturnType<typeof lanDeletedSet>) {
   mockLists({});
-  let adopted: unknown;
+  const sent: unknown[] = [];
   server.use(
     http.get(apiUrl("/apply-sets/:key"), () => HttpResponse.json(set)),
     http.post(apiUrl("/apply-sets/:key/adopt"), async ({ request }) => {
-      adopted = await request.json();
+      sent.push(await request.json());
       return HttpResponse.json(applySet("web-prod"));
     }),
   );
+  return sent;
+}
+
+it("adopts all only after confirming, with an empty body so the server picks what the caller may update", async () => {
+  const user = userEvent.setup();
+  const sent = mockAdopt(lanDeletedSet());
   renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
   await user.click(
     await screen.findByRole("button", { name: "Accept all actual values as declared" }),
@@ -120,13 +133,55 @@ it("adopts all only after confirming, naming the visible drift rows instead of s
   const confirm = await screen.findByRole("alertdialog", {
     name: "Accept the actual values in web-prod?",
   });
+  expect(confirm).toHaveTextContent("vm web: its actual values become the declaration");
   expect(confirm).toHaveTextContent(
     "network lan: gone from the cluster, so it leaves the apply set",
   );
   expect(confirm).not.toHaveTextContent("stray");
-  expect(adopted).toBeUndefined();
+  expect(sent).toEqual([]);
   await user.click(within(confirm).getByRole("button", { name: "Accept" }));
-  await waitFor(() => expect(adopted).toEqual({ objects: [LAN_ID, WEB_ID] }));
+  await waitFor(() => expect(sent).toEqual([{}]));
+});
+
+it("lets an object deleted outside the set be chosen and adopted", async () => {
+  const user = userEvent.setup();
+  const sent = mockAdopt(lanDeletedSet());
+  renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
+  const table = await screen.findByRole("table", { name: "Objects of web-prod" });
+  const lan = within(table).getByRole("row", { name: /lan/ });
+  expect(lan).toHaveTextContent("Missing");
+  expect(within(table).queryByRole("checkbox", { name: "Choose stray" })).not.toBeInTheDocument();
+  await user.click(within(lan).getByRole("checkbox", { name: "Choose lan" }));
+  await user.click(screen.getByRole("button", { name: "Accept 1 actual value as declared" }));
+  const confirm = await screen.findByRole("alertdialog");
+  expect(confirm).toHaveTextContent("network lan: gone from the cluster");
+  expect(confirm).not.toHaveTextContent("vm web");
+  await user.click(within(confirm).getByRole("button", { name: "Accept" }));
+  await waitFor(() => expect(sent).toEqual([{ objects: [LAN_ID] }]));
+});
+
+it("drops chosen rows that stop drifting on refresh instead of widening to all", async () => {
+  const user = userEvent.setup();
+  const set = lanDeletedSet();
+  const sent = mockAdopt(set);
+  const { queryClient } = renderPage(<ApplySetPage />, {
+    path: "/apply-sets/:name",
+    url: "/apply-sets/web-prod",
+  });
+  const table = await screen.findByRole("table", { name: "Objects of web-prod" });
+  await user.click(within(table).getByRole("checkbox", { name: "Choose web" }));
+  await user.click(screen.getByRole("button", { name: "Accept 1 actual value as declared" }));
+  const confirm = await screen.findByRole("alertdialog");
+  // 누가 web을 다시 적용해 드리프트 고리가 web을 지웠다 — 지켜보기가 묶음을 다시 받는다
+  set.status.drift!.items = set.status.drift!.items!.filter((d) => d.id !== WEB_ID);
+  await refreshApplySets(queryClient);
+  await waitFor(() =>
+    expect(within(confirm).getByRole("button", { name: "Accept" })).toBeDisabled(),
+  );
+  expect(confirm).not.toHaveTextContent("network lan");
+  await user.click(within(confirm).getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("button", { name: "Accept 0 actual values as declared" })).toBeDisabled();
+  expect(sent).toEqual([]);
 });
 
 it("hides adopting from viewers", async () => {

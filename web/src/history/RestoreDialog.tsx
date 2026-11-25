@@ -8,7 +8,14 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { applyPlan, blocked, noop, type PlanView, refreshApplySets } from "@/declarative/api";
+import {
+  applyPlan,
+  blocked,
+  noop,
+  type PlanView,
+  refreshApplySets,
+  replanNeeded,
+} from "@/declarative/api";
 import { PlanTable } from "@/declarative/PlanTable";
 import { type HistoryEntry, planRestoreOne, refreshHistory } from "@/history/api";
 import { errorMessage } from "@/i18n/errors";
@@ -29,11 +36,6 @@ export function onlyManagedElsewhere(plan: PlanView): boolean {
     .filter((s) => s.action === "blocked")
     .flatMap((s) => (s.problems ?? []).filter((p) => p.level === "error"));
   return errors.length > 0 && errors.every((p) => p.code === "managed_elsewhere");
-}
-
-/** 적용할 때 계획을 다시 세워야 하는 오류(그사이 바뀜 412, 계획이 없음 404 — 만료·다른 노드) */
-function replanNeeded(err: unknown): boolean {
-  return err instanceof ApiError && (err.code === "plan_stale" || err.code === "plan_not_found");
 }
 
 /**

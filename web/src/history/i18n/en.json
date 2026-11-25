@@ -75,7 +75,7 @@
       "recreateOpen": "Recreate from this revision…",
       "title": "Restore {{name}} to revision {{revision}}?",
       "recreateTitle": "Recreate {{name}} from revision {{revision}}?",
-      "hint": "The server plans the change; nothing is written until you restore. Secrets, the name and the power state are not restored.",
+      "hint": "The server plans the change; nothing is written until you restore. Secrets, the name and the power state are not restored. Every field goes back to that revision — fields it left at their defaults are reset; secrets added since stay.",
       "recreateHint": "The resource comes back with the same id, so what pointed at it works again. Its data (disks, backups) is not restored.",
       "submit": "Restore",
       "recreate": "Recreate",
@@ -92,7 +92,7 @@
     "point": {
       "open": "Restore to a point in time…",
       "title": "Restore to a point in time",
-      "hint": "Put every resource in the scope back the way it was at that time. Review the server's plan before restoring.",
+      "hint": "Put every resource in the scope back the way it was at that time. Review the server's plan before restoring. Every field goes back to that revision — fields it left at their defaults are reset; secrets added since stay.",
       "at": "Point in time",
       "atKind": "Point in time by",
       "byTime": "Time",

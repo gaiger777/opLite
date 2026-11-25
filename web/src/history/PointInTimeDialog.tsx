@@ -15,6 +15,7 @@ import {
   noop,
   type PlanView,
   refreshApplySets,
+  replanNeeded,
   useApplySets,
 } from "@/declarative/api";
 import { PlanTable } from "@/declarative/PlanTable";
@@ -149,7 +150,18 @@ export function PointInTimeDialog({
     if (!plan) {
       return false;
     }
-    const task = await applyPlan(plan);
+    let task;
+    try {
+      task = await applyPlan(plan);
+    } catch (err) {
+      // 같은 계획 id로 다시 보내면 늘 같은 오류다 — 지금 입력으로 새 계획을 세워 보이고 다시 확인하게 한다.
+      if (!replanNeeded(err)) {
+        throw err;
+      }
+      setPlanned(null);
+      void preview();
+      throw new Error(t("history.restore.stale"), { cause: err });
+    }
     trackTask(task, t("tasks.op.apply", { target: t("history.point.taskTarget") }));
     await Promise.all([refreshHistory(queryClient), refreshApplySets(queryClient)]);
   }

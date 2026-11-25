@@ -3,7 +3,7 @@
 // 화면은 목록을 열 때·적용·받아들이기 뒤에 다시 읽는다.
 import { type QueryClient, useQuery } from "@tanstack/react-query";
 
-import { api, call } from "@/api/client";
+import { api, ApiError, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import type { Task } from "@/api/types";
 import i18n from "@/i18n";
@@ -41,6 +41,11 @@ export function useApplySet(key: string) {
 
 export async function refreshApplySets(queryClient: QueryClient) {
   await queryClient.invalidateQueries({ queryKey: APPLY_SETS_KEY });
+}
+
+/** 적용할 때 계획을 다시 세워야 하는 오류(그사이 바뀜 412, 계획이 없음 404 — 만료·다른 노드) */
+export function replanNeeded(err: unknown): boolean {
+  return err instanceof ApiError && (err.code === "plan_stale" || err.code === "plan_not_found");
 }
 
 /** 막힌 단계가 있으면 적용할 수 없다(서버 409 `plan_blocked`). */

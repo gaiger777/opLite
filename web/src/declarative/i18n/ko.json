@@ -17,7 +17,8 @@
       "summary": "만들기 {{create}} · 바꾸기 {{update}} · 지우기 {{delete}} · 그대로 {{unchanged}} · 막힘 {{blocked}}",
       "steps": "계획 단계",
       "changesOf": "{{kind}} {{name}}의 바뀌는 칸",
-      "restart": "핫플러그나 다음 재시작 때 적용됩니다"
+      "restart": "핫플러그나 다음 재시작 때 적용됩니다",
+      "toDefault": "→ 기본값"
     },
     "export": {
       "title": "{{name}} YAML",

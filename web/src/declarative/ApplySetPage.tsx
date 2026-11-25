@@ -42,6 +42,11 @@ const TONE: Record<RowState, StatusTone> = {
   unmanaged: "neutral",
 };
 
+/** 받아들일 수 있는 드리프트 줄(관리 밖은 묶음에 없어 받아들일 것이 없다) */
+function isAdoptable(item: DriftItem): boolean {
+  return item.state !== "unmanaged";
+}
+
 /** 다른 칸과 "누가 바꿨나"(이력 줄 — 사용자·시각·출처·사유) */
 function DriftDetail({ item }: { item: DriftItem }) {
   const { t, i18n } = useTranslation();
@@ -103,13 +108,14 @@ export function ApplySetPage() {
     ...objects.map((o) => ({ id: o.id, kind: o.kind, name: o.name, item: drift.get(o.id) })),
     ...extra.map((d) => ({ id: d.id, kind: d.kind, name: d.name, item: d })),
   ];
-  // 받아들일 수 있는 줄: 묶음이 기억하는 객체 가운데 보이는 드리프트(관리 밖은 묶음에 없어 받아들일 것이 없다). 서버는
-  // 빈 목록을 묶음의 모든 드리프트로 넓히므로(볼 수 없는 것까지) 늘 보이는 id를 적어 보낸다.
-  const candidates = rows.filter(
-    (r) => r.item && r.item.state !== "unmanaged" && objects.some((o) => o.id === r.id),
-  );
+  // 받아들일 수 있는 줄: 관리 밖이 아닌 드리프트(관리 밖은 묶음에 없어 받아들일 것이 없다). 밖에서 지운 객체는 서버가
+  // `status.objects`에서 빼므로 `extra`의 `missing` 줄로만 온다 — 받아들이면 묶음에서 빠진다.
+  const candidates = rows.filter((r) => r.item !== undefined && isAdoptable(r.item));
   const adoptable = canRestoreAnything(perms) && candidates.length > 0;
-  const targets = chosen.size > 0 ? candidates.filter((r) => chosen.has(r.id)) : candidates;
+  // 고른 것은 늘 지금 후보와 겹친 것만(묶음을 다시 받을 때마다 정리 — 사라진 id가 "모두"로 넓어지지 않게)
+  const selecting = chosen.size > 0;
+  const picked = candidates.filter((r) => chosen.has(r.id));
+  const targets = selecting ? picked : candidates;
   const pick = (id: string, on: boolean) =>
     setChosen((prev) => {
       const next = new Set(prev);
@@ -122,10 +128,11 @@ export function ApplySetPage() {
     });
 
   async function adopt() {
+    // "모두"는 빈 본문 — 서버가 부른 이가 보고 바꿀 수 있는 것만(밖에서 지운 것 포함) 받아들인다
     await call(
       api.POST("/apply-sets/{key}/adopt", {
         params: { path: { key: s.id } },
-        body: { objects: targets.map((r) => r.id) },
+        body: selecting ? { objects: picked.map((r) => r.id) } : {},
       }),
     );
     toast.success(t("declarative.set.adopted", { name: s.name }));
@@ -180,9 +187,14 @@ export function ApplySetPage() {
           <p>{t("declarative.set.driftHint", { count: drift.size })}</p>
           {adoptable && (
             <div>
-              <Button size="sm" variant="outline" onClick={() => setConfirming(true)}>
-                {chosen.size > 0
-                  ? t("declarative.set.adoptChosen", { count: chosen.size })
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={selecting && picked.length === 0}
+                onClick={() => setConfirming(true)}
+              >
+                {selecting
+                  ? t("declarative.set.adoptChosen", { count: picked.length })
                   : t("declarative.set.adoptAll")}
               </Button>
             </div>
@@ -240,6 +252,8 @@ export function ApplySetPage() {
         title={t("declarative.set.adoptTitle", { name: s.name })}
         description={t("declarative.set.adoptHint")}
         confirmLabel={t("declarative.set.adopt")}
+        // 고른 것이 그새 모두 사라졌으면 보내지 않는다(빈 목록은 서버가 거절한다)
+        confirmDisabled={targets.length === 0}
         impact={targets.map((r) =>
           t(
             r.item?.state === "missing"

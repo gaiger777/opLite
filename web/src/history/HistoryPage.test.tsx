@@ -382,6 +382,87 @@ it("plans again when the restore plan went stale or is gone, and applies the new
   await waitFor(() => expect(dialog).not.toBeInTheDocument());
 });
 
+it("plans a point-in-time restore again when its plan went stale or is gone", async () => {
+  const user = userEvent.setup();
+  mockLists({});
+  mockTimeline();
+  const fresh = "019a0f3c-0000-7000-8073-0000000000f2";
+  let planned = 0;
+  const applied: unknown[] = [];
+  server.use(
+    http.post(apiUrl("/history/restore"), () => {
+      planned++;
+      return HttpResponse.json(plan(planned > 1 ? { plan: fresh } : {}));
+    }),
+    http.post(apiUrl("/apply"), async ({ request }) => {
+      const body = (await request.json()) as { plan: string };
+      applied.push(body);
+      return body.plan === fresh
+        ? HttpResponse.json({ plan: plan(), task: task("t2", "apply", WEB_ID) }, { status: 202 })
+        : HttpResponse.json(
+            { code: "plan_not_found", message: "no such plan; plan again" },
+            { status: 404 },
+          );
+    }),
+  );
+  renderPage(<HistoryPage />, { path: "/history" });
+  await user.click(await screen.findByRole("button", { name: "Restore to a point in time…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore to a point in time" });
+  await user.type(within(dialog).getByLabelText("Folder"), "/prod/web");
+  await user.click(within(dialog).getByRole("button", { name: "Show the plan" }));
+  await within(dialog).findByText(/1 to change/);
+  await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+  expect(
+    await within(dialog).findByText(
+      "The resource changed or the plan expired. Review the new plan and restore again.",
+    ),
+  ).toBeInTheDocument();
+  await waitFor(() => expect(planned).toBe(2));
+  await within(dialog).findByText(/1 to change/);
+  await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+  await waitFor(() => expect(applied).toEqual([{ plan: plan().plan }, { plan: fresh }]));
+});
+
+it("explains that restoring replaces the whole spec and shows removed fields going back to default", async () => {
+  const user = userEvent.setup();
+  mockLists({});
+  mockTimeline();
+  server.use(
+    http.post(apiUrl("/history/vm/:key/restore"), () =>
+      HttpResponse.json(
+        plan({
+          steps: [
+            {
+              n: 1,
+              kind: "Vm",
+              name: "web",
+              action: "update",
+              diff: [
+                { path: "memory_mib", op: "replace", old: 8192, new: 4096 },
+                { path: "max_memory_mib", op: "remove", old: 16384 },
+              ],
+            },
+          ],
+        }),
+      ),
+    ),
+  );
+  renderPage(<HistoryPage />, { path: "/history" });
+  const [first] = await screen.findAllByRole("button", { name: /more memory/ });
+  await user.click(first!);
+  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  expect(dialog).toHaveTextContent(
+    "Every field goes back to that revision — fields it left at their defaults are reset; secrets added since stay.",
+  );
+  const table = await within(dialog).findByRole("table", { name: "Changed fields of Vm web" });
+  const row = within(table).getByRole("row", { name: /max_memory_mib/ });
+  expect(row).toHaveTextContent("16384");
+  expect(row).toHaveTextContent("→ default");
+  expect(within(table).getByRole("row", { name: /^memory_mib/ })).not.toHaveTextContent("default");
+});
+
 it("offers to take over a Terraform-managed resource and plans with force_conflicts", async () => {
   const user = userEvent.setup();
   mockLists({});
