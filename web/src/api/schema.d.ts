@@ -4466,6 +4466,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vmware-vms/{key}/cutover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * VM 하나를 전환한다(설계 §10.1): `ready`·`syncing`·`rolled-back` 항목만(아니면 409 `not_ready`), 계획이 `running`·`paused`일
+         *     때(409 `migration_state`). 원본을 건드리기 전에 다시 본다 — 대상 이름이 그새 쓰였으면 409 `name_taken`, VMware 쪽 표(노드
+         *     캐시의 인벤토리 — 사용자 스냅샷·FT·Tools 등)에 막는 문제가 있으면 409 `preflight_blocked`(`details.problems`). 할당량·용량은
+         *     VM을 만들 때 상태 머신이 보고, 넘으면 자동 되돌림이다. Task `vmware-cutover`를 항목의 노드에 만든다. 대상 폴더의
+         *     `vm.create`·`vm.power`가 든다.
+         */
+        post: operations["cutover_item"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-vms/{key}/finalize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 전환을 마무리한다(설계 §10.3, `done`만 — 아니면 409 `vmware_vm_state`): `vmware-cleanup` — 원본에 남은 우리 스냅샷을 지우고
+         *     우리가 켠 CBT를 끈다. 원본 보호(NIC `startConnected=false`·설명)는 그대로 둔다 → `finalized`(되돌릴 수 없다). 대상 폴더의
+         *     `vm.create`·`vm.power`가 든다.
+         */
+        post: operations["finalize_item"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vmware-vms/{key}/retry": {
         parameters: {
             query?: never;
@@ -4479,9 +4523,31 @@ export interface paths {
          * 실패한 항목을 다시 한다(계획이 `running`·`paused`일 때, 아니면 409 `migration_state`). 복사를 시작하지 않은 항목(미리
          *     확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
          *     (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
-         *     다음 동기화 없음)은 다시 시작한다. 그 밖은 409 `vmware_vm_state`.
+         *     다음 동기화 없음)은 다시 시작한다. 전환의 자동 되돌림이 실패한 항목(`failed` + 걸음)은 되돌림을 다시 하는 `vmware-cutover`
+         *     Task를 만든다. 그 밖은 409 `vmware_vm_state`.
          */
         post: operations["retry_item"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-vms/{key}/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 전환한 VM을 되돌린다(설계 §10.3, `done`만 — 아니면 409 `vmware_vm_state`): 대상 VM을 끄고(지우지 않음) 원본 NIC·설명을
+         *     되돌리고 원본을 켠다 → `reverted`. 대상에서 쓴 데이터는 원본으로 가지 않으므로 본문 `confirm`이 대상 VM 이름이어야 한다
+         *     (아니면 400 `confirm_mismatch`). 대상 폴더의 `vm.create`·`vm.power`가 든다.
+         */
+        post: operations["revert_item"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8116,12 +8182,12 @@ export interface components {
             /** @description 타깃 이름(`iqn.`·`eui.`·`naa.`로 시작) */
             target: string;
         };
-        /** @description 항목 동작(`retry`·`cancel`)의 답: 바뀐 항목과 만든 Task(정리) */
+        /** @description 항목 동작(`retry`·`cancel`·`cutover`·`revert`·`finalize`)의 답: 바뀐 항목과 만든 Task */
         ItemAction: {
             item: components["schemas"]["Resource_VmwareVmSpec_VmwareVmStatus"];
             /**
              * Format: uuid
-             * @description 만든 Task(취소가 원본·우리 쪽에 남은 것을 치우는 `vmware-cleanup`)
+             * @description 만든 Task(취소·마무리의 `vmware-cleanup`, 전환 `vmware-cutover`, 되돌리기 `vmware-revert`)
              */
             task?: string;
         };
@@ -9812,10 +9878,20 @@ export interface components {
                      * @default false
                      */
                     cbt_enabled_by_us: boolean;
+                    /**
+                     * Format: int64
+                     * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
+                     */
+                    cutover_requested_at?: number;
                     /** @description `state`가 `cutting-over`일 때 지금 걸음 */
                     cutover_step?: components["schemas"]["VmwareCutoverStep"];
                     /** @default [] */
                     disks: components["schemas"]["VmwareSyncDisk"][];
+                    /**
+                     * Format: int64
+                     * @description 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
+                     */
+                    downtime_s?: number;
                     error?: string;
                     /**
                      * Format: int64
@@ -9848,6 +9924,11 @@ export interface components {
                      * @default {}
                      */
                     source_changes: components["schemas"]["VmwareSourceChanges"];
+                    /**
+                     * Format: int64
+                     * @description 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
+                     */
+                    source_stopped_at?: number;
                     /**
                      * Format: int64
                      * @description 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
@@ -13755,10 +13836,20 @@ export interface components {
                  * @default false
                  */
                 cbt_enabled_by_us: boolean;
+                /**
+                 * Format: int64
+                 * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
+                 */
+                cutover_requested_at?: number;
                 /** @description `state`가 `cutting-over`일 때 지금 걸음 */
                 cutover_step?: components["schemas"]["VmwareCutoverStep"];
                 /** @default [] */
                 disks: components["schemas"]["VmwareSyncDisk"][];
+                /**
+                 * Format: int64
+                 * @description 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
+                 */
+                downtime_s?: number;
                 error?: string;
                 /**
                  * Format: int64
@@ -13791,6 +13882,11 @@ export interface components {
                  * @default {}
                  */
                 source_changes: components["schemas"]["VmwareSourceChanges"];
+                /**
+                 * Format: int64
+                 * @description 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
+                 */
+                source_stopped_at?: number;
                 /**
                  * Format: int64
                  * @description 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
@@ -13898,6 +13994,11 @@ export interface components {
             vm: string;
             /** @description 세션의 볼륨 id */
             volume: string;
+        };
+        /** @description 켠 뒤 되돌리기의 확인 */
+        RevertRequest: {
+            /** @description 대상(Orbivisor) VM 이름. 되돌리면 그 VM에서 쓴 데이터는 원본으로 가지 않는다. */
+            confirm: string;
         };
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer" | "none";
@@ -16927,10 +17028,20 @@ export interface components {
              * @default false
              */
             cbt_enabled_by_us: boolean;
+            /**
+             * Format: int64
+             * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
+             */
+            cutover_requested_at?: number;
             /** @description `state`가 `cutting-over`일 때 지금 걸음 */
             cutover_step?: components["schemas"]["VmwareCutoverStep"];
             /** @default [] */
             disks: components["schemas"]["VmwareSyncDisk"][];
+            /**
+             * Format: int64
+             * @description 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
+             */
+            downtime_s?: number;
             error?: string;
             /**
              * Format: int64
@@ -16963,6 +17074,11 @@ export interface components {
              * @default {}
              */
             source_changes: components["schemas"]["VmwareSourceChanges"];
+            /**
+             * Format: int64
+             * @description 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
+             */
+            source_stopped_at?: number;
             /**
              * Format: int64
              * @description 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
@@ -26838,6 +26954,74 @@ export interface operations {
             };
         };
     };
+    cutover_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemAction"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    finalize_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemAction"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     retry_item: {
         parameters: {
             query?: never;
@@ -26864,6 +27048,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revert_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevertRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemAction"];
                 };
             };
             "4XX": {

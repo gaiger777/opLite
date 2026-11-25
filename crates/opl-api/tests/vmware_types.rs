@@ -106,13 +106,12 @@ async fn vm_export_privilege_needs_every_node() {
 
 /// (Task, 기능, 없는 대상에 대한 결과 — `None`이면 성공)
 fn ops() -> Vec<(TaskOp, &'static str, Option<&'static str>)> {
-    let vmware = Some("VMware migration tasks are not available yet");
-    // 스테이지 4: 동기화·정리는 돈다 — 없는 항목은 그대로 알린다.
+    // 스테이지 4·5: 동기화·정리·전환·되돌리기는 돈다 — 없는 항목은 그대로 알린다.
     let gone = Some("vmware-vm was deleted");
     vec![
         (TaskOp::VmwareSync { full: true }, VMWARE_MIGRATE, gone),
-        (TaskOp::VmwareCutover, VMWARE_MIGRATE, vmware),
-        (TaskOp::VmwareRevert, VMWARE_MIGRATE, vmware),
+        (TaskOp::VmwareCutover, VMWARE_MIGRATE, gone),
+        (TaskOp::VmwareRevert, VMWARE_MIGRATE, gone),
         (
             TaskOp::VmwareCleanup {
                 delete_target: false,

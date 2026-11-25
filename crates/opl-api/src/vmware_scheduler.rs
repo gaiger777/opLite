@@ -7,6 +7,8 @@
 //!   `max_per_node`(호스트·노드는 모든 계획의 Task를 센다).
 //! - 노드: 항목의 `spec.node` > 규칙의 `node` > 디스크의 풀을 모두 쓸 수 있는 온라인 노드 중 VMware Task가 가장 적은 것(고른
 //!   노드는 항목에 먼저 적는다 — 대상 볼륨이 그 노드의 로컬 풀에 생긴다). 노드가 오프라인이면 그 항목을 건너뛴다.
+//! - 예약 전환(`cutover.at`이 지난 `running` 계획): `ready`·`syncing` 항목마다 `vmware-cutover`(같은 한도, 델타와 함께 먼저).
+//!   항목마다 그 시각 뒤 한 번만 한다(`cutover_requested_at` — 실패해 되돌린 항목을 다시 끄지 않는다).
 //! - `cancelled` 계획: 원본·우리 쪽에 남긴 것이 있는 항목은 `vmware-cleanup`(대상 볼륨도 지움), 없는 항목은 곧 `cancelled`.
 //! - 모든 항목이 끝난(`finalized`·`reverted`·`cancelled`) `running` 계획은 `finished`다.
 
@@ -99,6 +101,8 @@ pub(crate) enum Action {
         full: bool,
         pick: bool,
     },
+    /// 예약 전환: 요청 시각을 항목에 먼저 적고 `vmware-cutover`를 항목의 노드에 만든다.
+    Cutover { item: Uuid, node: Uuid },
     /// 취소된 계획의 항목이 남긴 것을 치운다(대상 볼륨도).
     Cleanup { item: Uuid, node: Uuid },
     /// 남긴 것이 없는 항목은 곧 `cancelled`
@@ -160,12 +164,23 @@ fn item_pools(m: &VmwareMigration, item: &VmwareVm) -> Vec<String> {
     out
 }
 
-/// 동기화할 차례인 항목(차례: 델타 0·이어 가기 1·새 복사 2, 그다음 시각·이름)
+/// 동기화·전환할 차례인 항목(차례: 전환·델타 0·이어 가기 1·새 복사 2, 그다음 시각·이름)
 struct Due<'a> {
     order: (u8, u64, String),
     m: &'a VmwareMigration,
     item: &'a VmwareVm,
     full: bool,
+    cutover: bool,
+}
+
+/// 예약 전환할 항목: 시각이 지났고, 복사를 끝낸 `ready`·`syncing`이고, 그 시각 뒤에 전환을 요청한 적이 없다.
+fn cutover_due(now: u64, m: &VmwareMigration, item: &VmwareVm) -> Option<u64> {
+    let at = m.spec.cutover.at.filter(|at| *at <= now)?;
+    let s = &item.status;
+    (matches!(s.state, VmwareVmState::Ready | VmwareVmState::Syncing)
+        && s.rounds > 0
+        && s.cutover_requested_at.is_none_or(|t| t < at))
+    .then_some(at)
 }
 
 /// 틱 하나에 할 일을 고른다(`now`는 유닉스 초). 순수 함수.
@@ -218,6 +233,16 @@ pub(crate) fn plan(
                     if busy(item.id) {
                         continue;
                     }
+                    if let Some(at) = cutover_due(now, m, item) {
+                        due.push(Due {
+                            order: (0, at, item.name.clone()),
+                            m,
+                            item,
+                            full: false,
+                            cutover: true,
+                        });
+                        continue;
+                    }
                     let s = &item.status;
                     let order = match s.state {
                         VmwareVmState::Syncing | VmwareVmState::RolledBack => {
@@ -239,6 +264,7 @@ pub(crate) fn plan(
                         m,
                         item,
                         full,
+                        cutover: false,
                     });
                 }
             }
@@ -270,7 +296,14 @@ pub(crate) fn plan(
         }
     }
     due.sort_by(|a, b| a.order.cmp(&b.order));
-    for Due { m, item, full, .. } in due {
+    for Due {
+        m,
+        item,
+        full,
+        cutover,
+        ..
+    } in due
+    {
         let limits = &m.spec.limits;
         if per_migration.get(&m.id).copied().unwrap_or(0) >= usize::from(limits.max_parallel) {
             continue;
@@ -279,6 +312,25 @@ pub(crate) fn plan(
         if let Some(h) = &host
             && per_host.get(h).copied().unwrap_or(0) >= usize::from(limits.max_per_host)
         {
+            continue;
+        }
+        // 전환은 대상 볼륨이 있는 항목의 노드에서만(동기화가 고른 노드)
+        if cutover {
+            let Some(node) = item.spec.node.filter(|n| online(*n)) else {
+                continue;
+            };
+            if per_node.get(&node).copied().unwrap_or(0) >= usize::from(limits.max_per_node) {
+                continue;
+            }
+            *per_migration.entry(m.id).or_default() += 1;
+            *per_node.entry(node).or_default() += 1;
+            if let Some(h) = host {
+                *per_host.entry(h).or_default() += 1;
+            }
+            out.push(Action::Cutover {
+                item: item.id,
+                node,
+            });
             continue;
         }
         let (node, pick) = match item.spec.node.or(m.spec.rules.node) {
@@ -392,6 +444,23 @@ async fn act(state: &AppState, action: &Action) -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
             }
             create_task(cluster, TaskOp::VmwareSync { full }, item, node)
+                .await
+                .map_err(|e| e.message)?;
+        }
+        Action::Cutover { item, node } => {
+            let current = cluster
+                .get::<VmwareVmSpec>(item)
+                .map_err(|e| e.to_string())?
+                .ok_or("vmware-vm was deleted")?;
+            let mut status = current.status.clone();
+            status.cutover_requested_at = Some(now());
+            status.push_history(now(), "scheduled cutover");
+            // 먼저 적는다: Task를 만들지 못해도 같은 시각에 다시 끄지 않는다(다음 계획 시각·손 전환은 된다).
+            cluster
+                .update_status_checked::<VmwareVmSpec>(item, current.revision, &status)
+                .await
+                .map_err(|e| e.to_string())?;
+            create_task(cluster, TaskOp::VmwareCutover, item, node)
                 .await
                 .map_err(|e| e.message)?;
         }
@@ -692,6 +761,60 @@ mod tests {
             .collect();
         assert_eq!(picked.len(), 2);
         assert_ne!(picked[0], picked[1]);
+    }
+
+    /// 예약 전환: 시각이 지나면 복사를 끝낸 `ready`·`syncing` 항목마다 그 노드에 전환(델타 대신, 한도 안), 시각 뒤에 요청한
+    /// 항목·되돌린 항목·시각 전에는 하지 않는다.
+    #[test]
+    fn scheduled_cutovers_run_once_per_item_after_the_time() {
+        let n1 = node("n1");
+        let mut m = migration((2, 8, 8));
+        m.spec.cutover.at = Some(1000);
+        let mut ready = item(&m, "a", VmwareVmState::Syncing, "esx1");
+        ready.status.rounds = 2;
+        ready.status.next_sync_at = Some(10);
+        ready.spec.node = Some(n1.id);
+        let mut cold = item(&m, "b", VmwareVmState::Ready, "esx1");
+        cold.status.rounds = 1;
+        cold.spec.node = Some(n1.id);
+        let mut asked = cold.clone();
+        asked.id = Uuid::now_v7();
+        asked.name = "wave1-c".into();
+        asked.status.cutover_requested_at = Some(1001);
+        let mut rolled = item(&m, "d", VmwareVmState::RolledBack, "esx1");
+        rolled.status.rounds = 2;
+        rolled.spec.node = Some(n1.id);
+        let mut copying = item(&m, "e", VmwareVmState::Pending, "esx1");
+        copying.spec.node = Some(n1.id);
+        let items = vec![ready.clone(), cold.clone(), asked, rolled, copying.clone()];
+        let nodes = std::slice::from_ref(&n1);
+        let pools = [pool("local")];
+        // 시각 전: 델타와 새 복사만
+        let before = plan(999, std::slice::from_ref(&m), &items, &[], nodes, &pools);
+        assert!(
+            !before.iter().any(|a| matches!(a, Action::Cutover { .. })),
+            "{before:?}"
+        );
+        // 시각 뒤: 전환 둘이 먼저(한도 2 — 새 복사는 기다림), 이미 요청한 항목·되돌린 항목은 아님
+        let after = plan(1005, std::slice::from_ref(&m), &items, &[], nodes, &pools);
+        assert_eq!(
+            after,
+            vec![
+                Action::Cutover {
+                    item: ready.id,
+                    node: n1.id
+                },
+                Action::Cutover {
+                    item: cold.id,
+                    node: n1.id
+                },
+            ]
+        );
+        // 항목 노드가 오프라인이면 건너뛴다.
+        let mut off = n1.clone();
+        off.status.online = false;
+        let none = plan(1005, &[m], &items, &[], &[off], &pools);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// 노드: 항목에 적힌 노드(오프라인이면 건너뜀), 풀을 쓸 수 없는 노드는 고르지 않는다.

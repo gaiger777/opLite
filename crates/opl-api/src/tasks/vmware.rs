@@ -6,7 +6,9 @@
 //!   적으므로(스냅샷 moref, 디스크별 체크포인트 `copied_bytes`, 회차가 끝난 디스크의 `rounds`) 다시 뜬 opld가 이어 간다 — 한
 //!   회차 동안 기반은 얼어 있어 같은 구역을 다시 읽으면 같은 바이트다.
 //! - `vmware-cleanup`: 취소(대상 볼륨도 지움 → `cancelled`)·마무리(→ `finalized`). 우리 스냅샷(Raft에 적힌 moref만)·CBT
-//!   (우리가 켰을 때만)·바꾼 원본 설정을 되돌린다. 원본 VM·디스크·사용자 스냅샷은 건드리지 않는다.
+//!   (우리가 켰을 때만)을 치운다. 취소는 바꾼 원본 설정을 되돌리고, 마무리는 원본 보호(NIC `startConnected=false`·설명)를
+//!   그대로 둔다(§10.3). 원본 VM·디스크·사용자 스냅샷은 건드리지 않는다.
+//! - `vmware-cutover`·`vmware-revert`: 전환 상태 기계와 켠 뒤 되돌리기([`cutover`] 모듈, 설계 §10).
 //!
 //! 쓰기: 대상 볼륨을 `qemu-nbd`로 쓰기로 열고(`Storage::open_target`, 연결 하나) 0 조각은 `WRITE_ZEROES`(씬 유지), 체크포인트
 //! 전과 끝에 `FLUSH`한다. 읽기는 디스크마다 `streams_per_disk`개의 `/folder` 범위 읽개(VDDK 길은 nbdkit 하나)로 나란히 하고
@@ -55,6 +57,11 @@ const CHECKPOINT_EVERY: Duration = Duration::from_secs(30);
 const COALESCE_GAP: u64 = 256 << 10;
 /// 읽기·쓰기 한 조각이 이만큼 끝나지 않으면(바이트가 늘지 않으면) 회차가 실패한다(설계 §9.5).
 pub const STALL: Duration = Duration::from_secs(600);
+/// 전환이 만든 VM이 `running`으로 보이기를 기다리는 시간(설계 §10.1)
+pub const START_TIMEOUT: Duration = Duration::from_secs(300);
+
+mod cutover;
+pub(super) use cutover::{cutover, revert};
 
 /// 동기화가 멈춘 까닭
 #[derive(Debug)]
@@ -294,6 +301,50 @@ impl Run<'_> {
     }
 }
 
+/// 항목 하나를 다룰 [`Run`]을 연다: 원본 세션, 인벤토리(노드 캐시 — 없는 VM이면 새로), VM 하나를 새로 읽고 같은 VM인지
+/// (instanceUuid) 본다.
+async fn open_run<'a>(
+    ctx: &'a Ctx,
+    task: &'a Task,
+    item: &VmwareVm,
+    migration: VmwareMigration,
+) -> Result<Run<'a>, SyncError> {
+    let source = get_source(ctx, &migration)?;
+    let session = session_for(ctx, &source).await?;
+    let mut inv = inventory_for(ctx, &source, &session, false).await?;
+    if inv.vm(&item.spec.source_ref).is_none() {
+        inv = inventory_for(ctx, &source, &session, true).await?;
+    }
+    let vm = match inventory::refresh_vm(&session, &inv, &item.spec.source_ref).await {
+        Ok(vm) => vm,
+        Err(VsphereError::NotFound { .. }) => {
+            return Err(SyncError::fatal(format!(
+                "vmware_vm_gone: the VM {} no longer exists on the source",
+                item.spec.source_ref
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if vm.instance_uuid.as_deref() != Some(item.spec.instance_uuid.as_str()) {
+        return Err(SyncError::fatal(format!(
+            "vmware_vm_replaced: {} is now another VM (instance UUID {})",
+            item.spec.source_ref,
+            vm.instance_uuid.as_deref().unwrap_or("-")
+        )));
+    }
+    Ok(Run {
+        ctx,
+        task,
+        item: item.id,
+        migration,
+        source,
+        session,
+        inv,
+        vm,
+        warnings: Mutex::default(),
+    })
+}
+
 // ---- vmware-sync ----
 
 /// `vmware-sync` Task: 회차 하나. 실패하면 항목에 이유를 적고, 다시 해도 같은 실패이거나 연달아
@@ -371,40 +422,7 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
     if migration.status.phase == VmwareMigrationPhase::Cancelled {
         return Ok(Some("skipped: the migration was cancelled".into()));
     }
-    let source = get_source(ctx, &migration)?;
-    let session = session_for(ctx, &source).await?;
-    let mut inv = inventory_for(ctx, &source, &session, false).await?;
-    if inv.vm(&item.spec.source_ref).is_none() {
-        inv = inventory_for(ctx, &source, &session, true).await?;
-    }
-    let vm = match inventory::refresh_vm(&session, &inv, &item.spec.source_ref).await {
-        Ok(vm) => vm,
-        Err(VsphereError::NotFound { .. }) => {
-            return Err(SyncError::fatal(format!(
-                "vmware_vm_gone: the VM {} no longer exists on the source",
-                item.spec.source_ref
-            )));
-        }
-        Err(e) => return Err(e.into()),
-    };
-    if vm.instance_uuid.as_deref() != Some(item.spec.instance_uuid.as_str()) {
-        return Err(SyncError::fatal(format!(
-            "vmware_vm_replaced: {} is now another VM (instance UUID {})",
-            item.spec.source_ref,
-            vm.instance_uuid.as_deref().unwrap_or("-")
-        )));
-    }
-    let run = Run {
-        ctx,
-        task,
-        item: id,
-        migration,
-        source,
-        session,
-        inv,
-        vm,
-        warnings: Mutex::default(),
-    };
+    let run = Box::pin(open_run(ctx, task, &item, migration)).await?;
 
     // 우리 스냅샷(Raft의 moref)과 이번 회차에 만들 이름이 아닌 스냅샷은 사용자 것이다(백업 제품 등).
     let n = item.status.rounds + 1;
@@ -485,7 +503,12 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
     } else {
         Box::pin(cold_round(&run, &targets)).await?
     };
-    finish_round(&run, copied, started.elapsed()).await
+    let state = if run.warm() {
+        VmwareVmState::Syncing
+    } else {
+        VmwareVmState::Ready
+    };
+    finish_round(&run, copied, started.elapsed(), Some(state)).await
 }
 
 /// 오래 전환하지 않은 따뜻한 항목의 동기화를 멈춘다: 우리 스냅샷을 지우고 다음 동기화를 지운다(`retry`가 다시 시작한다).
@@ -528,11 +551,13 @@ async fn stop_syncing(run: &Run<'_>, days: u64) -> Result<Option<String>, SyncEr
     Ok(Some(warning))
 }
 
-/// 회차를 끝낸다: 회차 수·시각·다음 동기화·예상 내릴 시간, 상태(따뜻한 `syncing`, 차가운 `ready`), 오류·실패 수를 지운다.
+/// 회차를 끝낸다: 회차 수·시각·다음 동기화·예상 내릴 시간, 상태(`state` — 없으면 그대로, 전환 중의 회차), 오류·실패 수를
+/// 지운다.
 async fn finish_round(
     run: &Run<'_>,
     copied: u64,
     took: Duration,
+    state: Option<VmwareVmState>,
 ) -> Result<Option<String>, SyncError> {
     let at = now();
     let warm = run.warm();
@@ -554,12 +579,10 @@ async fn finish_round(
                 0
             }
         });
-        s.state = if warm {
-            VmwareVmState::Syncing
-        } else {
-            VmwareVmState::Ready
-        };
-        s.error = None;
+        if let Some(state) = state {
+            s.state = state;
+            s.error = None;
+        }
         s.sync_failures = 0;
         for w in &warnings {
             if !s.warnings.contains(w) {
@@ -1342,25 +1365,11 @@ async fn run_cleanup(ctx: &Ctx, item: &VmwareVm, delete_target: bool) -> Result<
             })
             .await?;
         }
-        let changes = &s.source_changes;
-        if !changes.nics_disconnected.is_empty() {
-            session
-                .set_nics_start_connected(&vm_ref, &changes.nics_disconnected, true)
-                .await
-                .map_err(|e| format!("cannot reconnect the source NICs: {e}"))?;
-            update_item(ctx, id, |s| s.source_changes.nics_disconnected.clear()).await?;
-        }
-        if changes.annotation_added {
-            let old = changes.old_annotation.clone().unwrap_or_default();
-            session
-                .set_annotation(&vm_ref, &old)
-                .await
-                .map_err(|e| format!("cannot restore the source annotation: {e}"))?;
-            update_item(ctx, id, |s| {
-                s.source_changes.annotation_added = false;
-                s.source_changes.old_annotation = None;
-            })
-            .await?;
+        // 취소는 바꾼 원본 설정(NIC·설명·우리가 끈 전원)을 되돌리고, 마무리는 원본 보호를 그대로 둔다(실수로 켜도 같은
+        // MAC·IP가 붙지 않게 — §10.3).
+        if delete_target {
+            cutover::remove_target_vm(ctx, id).await?;
+            cutover::restore_source(ctx, &session, &vm_ref, id).await?;
         }
         if s.cbt_enabled_by_us {
             match session.set_change_tracking(&vm_ref, false).await {
@@ -1371,6 +1380,8 @@ async fn run_cleanup(ctx: &Ctx, item: &VmwareVm, delete_target: bool) -> Result<
         }
     }
     if delete_target {
+        // 되돌림이 실패한 항목은 대상 VM이 남아 있을 수 있다(볼륨을 쓰므로 먼저 지운다).
+        cutover::remove_target_vm(ctx, id).await?;
         for (i, disk) in s.disks.iter().enumerate() {
             let Some(volume) = disk.volume else { continue };
             super::remove_volume(ctx, volume)

@@ -843,6 +843,18 @@ pub struct VmwareVmStatus {
     /// 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
     #[serde(skip_serializing_if = "is_zero32")]
     pub sync_failures: u32,
+    /// 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub source_stopped_at: Option<u64>,
+    /// 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub downtime_s: Option<u64>,
+    /// 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cutover_requested_at: Option<u64>,
 }
 
 impl VmwareVmStatus {
@@ -1535,6 +1547,20 @@ mod tests {
                     "old_annotation": "" })
         );
         assert_eq!(serde_json::from_value::<VmwareVmStatus>(v).unwrap(), status);
+        // 전환 칸(스테이지 5)은 있을 때만 쓴다.
+        let done = VmwareVmStatus {
+            state: VmwareVmState::Done,
+            source_stopped_at: Some(10),
+            downtime_s: Some(252),
+            cutover_requested_at: Some(9),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&done).unwrap();
+        assert_eq!(
+            v,
+            json!({ "state": "done", "source_stopped_at": 10, "downtime_s": 252, "cutover_requested_at": 9 })
+        );
+        assert_eq!(serde_json::from_value::<VmwareVmStatus>(v).unwrap(), done);
         for i in 0..25u64 {
             status.push_history(i, format!("event {i}"));
         }

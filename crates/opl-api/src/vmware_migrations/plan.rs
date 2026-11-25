@@ -3,11 +3,13 @@
 //! 제안(`propose`). VMware 쪽 검사는 인벤토리 값만 본다(원본을 부르지 않는다).
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
+use opl_types::network::Network;
 use opl_types::resource::validate_name;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::VolumeSpec;
-use opl_types::vm::{CdromSpec, DiskBus, PowerState, VmSpec};
+use opl_types::vm::{CdromSpec, DiskBus, MacAddr, PowerState, VmSpec};
 use opl_types::vm_check::{VmCheckLevel, VmCheckProblem};
 use opl_types::vm_import::{ImportRun, is_windows, propose};
 use opl_types::vmware::{
@@ -250,6 +252,44 @@ pub(crate) fn map_vm(input: &MapInput<'_>) -> Result<Mapped, Vec<VmCheckProblem>
         volumes,
         warnings,
     })
+}
+
+/// Tools가 알린 IP를 SDN 주소로 예약한다(설계 §11 `reserve_ips`): 대상 네트워크가 SDN이고 주소를 받지 않은 NIC마다, 그 NIC
+/// MAC의 Tools IP 중 네트워크 서브넷 안의 것(주소 체계마다 하나)을 `ips`에 둔다. 서브넷 밖의 주소는 경고로 알린다.
+pub(crate) fn reserve_ips(
+    spec: &mut VmSpec,
+    guest_ips: &BTreeMap<String, Vec<IpAddr>>,
+    networks: &[Network],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (i, nic) in spec.nics.iter_mut().enumerate() {
+        let Some(mac) = nic.mac else { continue };
+        let Some(net) = networks
+            .iter()
+            .find(|n| n.name == nic.network && n.spec.is_sdn())
+        else {
+            continue;
+        };
+        if !nic.ips.is_empty() {
+            continue;
+        }
+        let ips = guest_ips
+            .iter()
+            .filter(|(m, _)| m.parse::<MacAddr>().is_ok_and(|m| m == mac))
+            .flat_map(|(_, ips)| ips);
+        for ip in ips {
+            let inside = net.spec.subnets.iter().any(|s| s.cidr.contains(*ip));
+            if !inside {
+                warnings.push(format!(
+                    "NIC {i}: address {ip} reported by VMware Tools is outside the subnets of network {:?}; not reserved",
+                    net.name
+                ));
+            } else if !nic.ips.iter().any(|a| a.is_ipv4() == ip.is_ipv4()) {
+                nic.ips.push(*ip);
+            }
+        }
+    }
+    warnings
 }
 
 /// RHEL 계열 guestId(dracut `hostonly` — initramfs에 virtio 모듈이 없을 수 있다)
@@ -594,6 +634,54 @@ mod tests {
             networks: &nets,
             format: &raw,
         })
+    }
+
+    /// Tools IP 예약: SDN 네트워크의 NIC만, 그 MAC의 IP 중 서브넷 안의 것(체계마다 하나), 밖이면 경고. 주소가 있는 NIC·SDN
+    /// 아닌 네트워크는 그대로.
+    #[test]
+    fn tools_ips_are_reserved_on_sdn_networks_inside_the_subnets() {
+        let mut v = vm();
+        v.guest_ips = BTreeMap::from([
+            (
+                "00:50:56:AA:BB:01".to_string(),
+                vec![
+                    "10.0.0.5".parse().unwrap(),
+                    "10.0.0.6".parse().unwrap(),
+                    "192.168.9.9".parse().unwrap(),
+                ],
+            ),
+            (
+                "00:50:56:aa:bb:02".to_string(),
+                vec!["10.1.0.7".parse().unwrap()],
+            ),
+        ]);
+        let mut m = map(&rules(), &item(), &v).unwrap();
+        let net = |name: &str, spec: serde_json::Value| -> Network {
+            opl_types::resource::Resource::new(name, serde_json::from_value(spec).unwrap())
+        };
+        let networks = vec![
+            net(
+                "VM Network",
+                serde_json::json!({ "sdn": {}, "subnets": [{ "cidr": "10.0.0.0/24" }] }),
+            ),
+            net("web", serde_json::json!({ "bridge": "br0" })),
+        ];
+        let warnings = reserve_ips(&mut m.spec.clone(), &v.guest_ips, &networks);
+        assert_eq!(
+            warnings,
+            [
+                "NIC 0: address 192.168.9.9 reported by VMware Tools is outside the subnets of network \"VM Network\"; not reserved"
+            ]
+        );
+        reserve_ips(&mut m.spec, &v.guest_ips, &networks);
+        let ips: Vec<Vec<IpAddr>> = m.spec.nics.iter().map(|n| n.ips.clone()).collect();
+        assert_eq!(
+            ips,
+            vec![vec!["10.0.0.5".parse::<IpAddr>().unwrap()], vec![]]
+        );
+        // 이미 주소가 있으면 건드리지 않는다.
+        assert!(reserve_ips(&mut m.spec, &v.guest_ips, &networks).is_empty());
+        assert_eq!(m.spec.nics[0].ips.len(), 1);
     }
 
     #[test]

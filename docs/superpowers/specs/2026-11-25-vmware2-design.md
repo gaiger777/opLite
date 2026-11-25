@@ -555,6 +555,62 @@ OVF 1.0 봉투(ovftool·vSphere·VirtualBox가 모두 받는 판, `vmw` 확장):
   64 KiB 블록 16개 델타 0.28초. 실제 `qemu-nbd` 쓰기(디렉터리 풀 qcow2, `storage-it`)도 이 Mac에서 바이트가 같다. 실제 vCenter
   수치는 손 확인.
 
+### 스테이지 5
+
+- **걸음과 상태**: 전환 Task가 시작할 때 항목을 `cutting-over`·`preparing`으로 적고, 걸음마다 `cutover_step`을 먼저 적은 뒤 한다
+  (이어 갈 때 그 걸음부터 — 걸음은 모두 다시 해도 같게 짰다). 받는 상태는 `ready`·`syncing`에 **`rolled-back`을 더했다**(되돌린
+  항목을 다시 전환할 수 있게 — 켜진 채 델타가 그새 바뀐 것을 옮긴다). 타입에 더한 칸(빈 값은 쓰지 않음): `source_stopped_at`(내린
+  시간의 시작), `downtime_s`, `cutover_requested_at`(예약 전환을 그 시각 뒤 한 번만 — 실패해 되돌린 항목을 점검 창마다 다시 끄지
+  않게, 손 전환도 적는다).
+- **실패 갈래**: `preparing`·`stopping-source` 실패는 §10.1 표대로 바꾼 원본 설정을 되돌리고(우리가 껐고 지금 꺼져 있으면 켬) 앞 상태
+  (따뜻한 `syncing`·차가운 `ready`)와 오류로 둔다 — 게스트 종료 시간 넘김(`vmware_shutdown_timeout`)도 이 갈래다(원본은 켜진 채).
+  `final-sync` 이후는 자동 되돌림 → `rolled-back`(따뜻한 이전은 `next_sync_at` = 지금 — 원본이 다시 켜져 바뀐 것을 곧 옮김). 되돌림은
+  **NIC·설명을 먼저 되돌린 뒤 원본을 켠다**(§10.2의 "켬 → NIC 되돌림" 차례를 바꿈 — `startConnected`는 켤 때 보는 값이라 켜기 전에
+  되돌려야 원본이 연결된 채 켜진다). 되돌림이 실패하면 `failed` + 걸음을 남기고 손으로 할 일("stop and delete Orbivisor VM …, then
+  turn "Connect At Power On" back on …, then power on web01 in vCenter")을 오류에 적는다. 그 항목의 **`retry`는 되돌림을 다시 하는
+  `vmware-cutover` Task**를 만든다(취소도 된다 — 정리 Task가 대상 VM을 지우고 원본 설정·전원을 되돌린다).
+- **다시 미리 확인**: §10.1의 "§8.5 1단계를 다시"는 그대로 하지 않았다 — 대상 볼륨이 이미 있어 `check_planned`의 만들 볼륨 검사가
+  이름 겹침으로 막고, 예약 전환에는 묻는 주체가 없다. 대신 (1) API(`POST …/cutover`)가 대상 폴더 `vm.create`·`vm.power`, 대상 이름,
+  **원본 VM을 새로 읽은**(`refresh_vm` — 캐시의 인벤토리는 60초 묵음) VMware 쪽 표를 보고 409 `name_taken`·`preflight_blocked`
+  (`details.problems`)로 막고, (2) Task의 `preparing`이 주체 없이 볼 수 있는 것(VMware 쪽 표·Tools(게스트 종료면 없을 때 막음)·대상
+  이름·원본 MAC이 다른 VM에 쓰임)을 원본 호출 전에 다시 본다. 할당량·용량·주소는 VM을 만들 때 상태 머신이 보고 넘으면 자동
+  되돌림이다(§13의 "할당량 → 자동 되돌림"과 같다).
+- **`max_final_delta_gib`**: `preparing`의 켜진 채 델타(끄기 직전 회차)가 이 크기를 넘으면 원본을 끄지 않고 멈춘다
+  (`final_delta_too_large`) — 마지막 델타는 그보다 작으므로 "원본이 너무 빨리 바뀐다"는 알림이다.
+- **원본 보호**: 설명은 `Migrated to Orbivisor VM "web01" by migration "w1". Keep this VM powered off; …` 뒤에 옛 설명을 남긴다(옛
+  값은 Raft `old_annotation`에 먼저). NIC는 지금 `startConnected`가 켜진 것만 끊고 그 키를 먼저 적는다. `powered_off_by_us`도 끄기 전에
+  적고, 되돌림은 원본이 **지금 꺼져 있을 때만** 켠다(시간 넘김 뒤 켜진 원본에 `PowerOn`을 보내지 않음). `ShutdownGuest`의
+  `InvalidPowerState`(그새 꺼짐)만 넘어가고 Tools 없음 등은 실패다.
+- **VM 만들기**: `plan::map_vm`을 다시 부르고(제안 후보 네트워크 = 모든 네트워크 — Task에는 주체가 없다) 머신은
+  `vms::default_machine`(동기화 노드의 아키텍처 — 미리 확인과 같게), **노드는 규칙의 노드 > 동기화 노드**(대상 볼륨이 그 노드의
+  로컬 풀일 수 있고, 노드 없는 VM은 아무도 켜지 않는다). Mirror 폴더는 `inventory.folder`를 만들 때 본 대로 원본 경로의 VM 폴더를
+  찾거나 만든다(`folders` 기능이 있을 때). `reserve_ips`(덮어쓰기 `ips`가 없을 때): SDN 네트워크 NIC마다 그 MAC의 Tools IP 중
+  서브넷 안의 것(체계마다 하나), 밖은 Task 경고 — 그새 쓰인 주소는 IPAM이 다른 주소를 주고 경고(덮어쓰기 `ips`는 엄격 — 쓰였으면
+  실패 → 되돌림). VM id는 만들기 전에 `target_vm`에 적고(이어 갈 때 다시 만들지 않음), 볼륨은 만들기 바로 전에 `ready`.
+- **켜기·내린 시간**: `start_after`면 켜고 `running`을 5분(`vmware_start_timeout`) 기다린다(꺼진 채 만들면 VM을 만든 때까지가 내린
+  시간). `done`에 `downtime_s`와 history "cut over; downtime 4m12s", 감사 로그에 노드의 일 `vmware-vm.cutover`("vmware-vm cutover
+  w1-web01 (downtime 4m12s)")·`vmware-vm.rollback`·`vmware-vm.revert`(요청 감사는 "vmware-vm cutover …"만 — 내린 시간은 끝나야
+  안다).
+- **되돌리기·마무리**: `POST …/revert {confirm}`은 대상 VM의 **지금 이름**과 같아야 한다(400 `confirm_mismatch`). Task는 대상 VM을
+  끄고(지우지 않음) NIC·설명을 되돌리고 원본을 켜고(우리가 끄지 않았어도 — 되돌리기는 원본을 쓰는 상태로) 남은 우리 스냅샷·우리가
+  켠 CBT를 치운다 → `reverted`(끝난 상태 — 같은 VM을 새 계획에 넣을 수 있다). 실패하면 `done`에 오류(다시 하면 남은 것부터).
+  `finalize`는 `vmware-cleanup{delete_target:false}`이고 **원본 보호(NIC·설명)를 그대로 둔다**(스테이지 4의 정리는 둘 다 되돌렸다 —
+  §10.3대로 바꿈). 취소(`delete_target`)는 대상 VM이 남았으면 먼저 지우고 원본 설정·전원도 되돌린다.
+- **경로·권한**: `/vmware-vms/{key}/{cutover|revert|finalize}`는 경로표 `Handler`(핸들러가 루트 `system.read` 뒤 대상 폴더의
+  `vm.create`·`vm.power`)이고 답은 `ItemAction{item, task}`. 계획이 `running`·`paused`일 때만(409 `migration_state`), 상태가 아니면 409
+  `not_ready`(전환)·`vmware_vm_state`(되돌리기·마무리), Task가 돌면 409 `migration_busy`. Task는 항목의 노드(오프라인이면 이 노드).
+- **예약 전환**: 스케줄러가 `cutover.at`이 지난 `running` 계획의 `ready`·`syncing`(회차 ≥ 1) 항목을 델타와 같은 차례(0)로 같은 한도
+  안에서 항목의 노드에 전환한다(노드가 오프라인이면 건너뜀). 요청 시각을 항목에 먼저 적어 한 번만 한다. 예약 전환에는 API의 다시
+  확인이 없고 Task의 `preparing` 검사만 있다.
+- **실행기**: `vmware-cutover`·`vmware-revert`를 이어 가는 Task·시간 제한 없는 Task 목록에 더했다(걸음마다 한도: 게스트 종료
+  `shutdown_timeout_s`, 켜기 5분, 조각 멈춤 `vmware_stall`). 시험용 `TaskRunnerConfig.vmware_shutdown_limit`(종료 기다림 상한).
+- **가짜 vSphere**: `fail_later(method, skip, fault)`(앞 호출 `skip`번은 지나가게 — 켜진 채 델타의 스냅샷 지우기는 되고 마지막 델타의
+  지우기가 실패하는 주입). 시험 `tests/vmware_cutover.rs`(qemu 없이, `PATH=/usr/bin:/bin`): 따뜻한 전환 → 바이트 같음·원본 꺼짐·보호·
+  감사 → revert(이름 틀림 400), 차가운 전환(flat 바뀜 → 다시 복사)·finalize, 사용자 스냅샷 → 409·Task도 막음, 걸음마다 실패 주입
+  (`preparing`·설명 바꾸기·게스트 종료 시간 넘김·`final-sync`·켜기) → 원본 켜짐·NIC·설명 되돌림·대상 VM 없음·볼륨 `pending`,
+  할당량 넘음 → 되돌림, 되돌림 실패 → 손으로 할 일 → `retry`, 예약 전환. 모든 시험 끝에 원본 디스크 바이트(시작 + 게스트 쓰기)와
+  사용자 스냅샷이 그대로인지 본다.
+
 ### 스테이지 6
 
 - **응답과 이름**: `POST /vms/{key}/export`는 202 `{export, task}`(`VmExportStarted`)다. 요청에 `name`을 더했다(없으면 백업과 같은

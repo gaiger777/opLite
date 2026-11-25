@@ -788,6 +788,15 @@ impl FakeVsphere {
             .push_back(fault.to_string());
     }
 
+    /// `method`의 다음 `skip`번 호출은 그대로 두고 그다음 한 번을 `fault` 형식 결함으로 실패시킨다(여러 걸음 중 뒤 걸음의
+    /// 실패 주입 — 앞에 쌓인 [`FakeVsphere::fail_next`] 뒤에 붙는다).
+    pub fn fail_later(&self, method: &str, skip: usize, fault: &str) {
+        let mut f = self.server.faults.lock().unwrap();
+        let q = f.next.entry(method.to_string()).or_default();
+        q.extend(std::iter::repeat_n(String::new(), skip));
+        q.push_back(fault.to_string());
+    }
+
     /// 다음 `n`번의 `/folder` 범위 읽기를 본문 도중에 끊는다.
     pub fn cut_reads(&self, n: u32) {
         self.server.faults.lock().unwrap().cut_reads = n;
@@ -1276,7 +1285,12 @@ impl Server {
         }
         let (restricted, injected) = {
             let mut f = self.faults.lock().unwrap();
-            let injected = f.next.get_mut(&method).and_then(|q| q.pop_front());
+            // 빈 항목은 그 호출을 그대로 둔다([`FakeVsphere::fail_later`]).
+            let injected = f
+                .next
+                .get_mut(&method)
+                .and_then(|q| q.pop_front())
+                .filter(|k| !k.is_empty());
             (
                 f.restricted && WRITE_METHODS.contains(&method.as_str()),
                 injected,

@@ -1228,11 +1228,11 @@ pub async fn cancel_migration(
     Ok(Json(view(&state, m.id)?))
 }
 
-/// 항목 동작(`retry`·`cancel`)의 답: 바뀐 항목과 만든 Task(정리)
+/// 항목 동작(`retry`·`cancel`·`cutover`·`revert`·`finalize`)의 답: 바뀐 항목과 만든 Task
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ItemAction {
     pub item: Resource<VmwareVmSpec, VmwareVmStatus>,
-    /// 만든 Task(취소가 원본·우리 쪽에 남은 것을 치우는 `vmware-cleanup`)
+    /// 만든 Task(취소·마무리의 `vmware-cleanup`, 전환 `vmware-cutover`, 되돌리기 `vmware-revert`)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub task: Option<Uuid>,
@@ -1268,7 +1268,8 @@ fn item_busy(state: &AppState, item: Uuid) -> Result<bool, ApiError> {
 /// 실패한 항목을 다시 한다(계획이 `running`·`paused`일 때, 아니면 409 `migration_state`). 복사를 시작하지 않은 항목(미리
 /// 확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
 /// (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
-/// 다음 동기화 없음)은 다시 시작한다. 그 밖은 409 `vmware_vm_state`.
+/// 다음 동기화 없음)은 다시 시작한다. 전환의 자동 되돌림이 실패한 항목(`failed` + 걸음)은 되돌림을 다시 하는 `vmware-cutover`
+/// Task를 만든다. 그 밖은 409 `vmware_vm_state`.
 #[utoipa::path(post, path = "/vmware-vms/{key}/retry", tag = "vmware",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody),
@@ -1307,6 +1308,20 @@ pub async fn retry_item(
                 item.name
             ),
         ));
+    }
+    // 전환의 자동 되돌림이 실패한 항목: 되돌림을 다시 한다(전환 Task가 적힌 걸음부터 되돌린다).
+    if item.status.state == VmwareVmState::Failed && item.status.cutover_step.is_some() {
+        let task = crate::tasks::create_task(
+            &state.cluster,
+            opl_types::task::TaskOp::VmwareCutover,
+            item.id,
+            item_node(&state, &item),
+        )
+        .await?;
+        return Ok(Json(ItemAction {
+            item,
+            task: Some(task.id),
+        }));
     }
     let at = now();
     let stopped = item.status.state == VmwareVmState::Syncing && item.status.next_sync_at.is_none();
@@ -1421,6 +1436,299 @@ pub async fn cancel_item(
         },
         item.id,
         node,
+    )
+    .await?;
+    Ok(Json(ItemAction {
+        item,
+        task: Some(task.id),
+    }))
+}
+
+/// 항목의 계획(없으면 404)
+fn migration_of(state: &AppState, item: &VmwareVm) -> Result<VmwareMigration, ApiError> {
+    state
+        .cluster
+        .get::<VmwareMigrationSpec>(item.spec.migration)?
+        .ok_or_else(|| ApiError::not_found("vmware-migration not found"))
+}
+
+/// 전환·되돌리기·마무리의 권한(설계 §13): 항목을 볼 수 있고(루트 `system.read`) 대상 폴더에 `vm.create`와 `vm.power`
+fn require_item_power(
+    state: &AppState,
+    principal: &Principal,
+    m: &VmwareMigration,
+    item: &VmwareVm,
+) -> Result<(), ApiError> {
+    state.authorize(principal, Action::Read, VmwareVmSpec::KIND)?;
+    let folder = target_folder(&m.spec.rules, &item.spec);
+    for p in [Privilege::VmCreate, Privilege::VmPower] {
+        state.authz.require_new(principal, p, Kind::Vm, folder)?;
+    }
+    Ok(())
+}
+
+fn require_busy_free(state: &AppState, item: &VmwareVm) -> Result<(), ApiError> {
+    if item_busy(state, item.id)? {
+        return Err(ApiError::conflict(
+            "migration_busy",
+            format!(
+                "vmware-vm {:?} has a task running; try again later",
+                item.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 항목 Task를 둘 노드: 항목의 노드(대상 볼륨이 있는 곳)가 온라인이면 그곳, 아니면 이 노드
+fn item_node(state: &AppState, item: &VmwareVm) -> Uuid {
+    item.spec
+        .node
+        .filter(|n| {
+            state
+                .cluster
+                .get::<opl_types::node::NodeSpec>(*n)
+                .ok()
+                .flatten()
+                .is_some_and(|n| n.status.online)
+        })
+        .unwrap_or(state.node)
+}
+
+/// 항목 상태를 `revision`일 때만 바꾼다(겹친 요청은 409 `migration_busy`).
+async fn write_item(
+    state: &AppState,
+    item: &VmwareVm,
+    status: &VmwareVmStatus,
+) -> Result<(), ApiError> {
+    state
+        .cluster
+        .update_status_checked::<VmwareVmSpec>(item.id, item.revision, status)
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            ClusterError::Rejected(Rejection::RevisionMismatch { .. }) => ApiError::conflict(
+                "migration_busy",
+                format!(
+                    "vmware-vm {:?} was changed by another request; try again",
+                    item.name
+                ),
+            ),
+            e => e.into(),
+        })
+}
+
+/// VM 하나를 전환한다(설계 §10.1): `ready`·`syncing`·`rolled-back` 항목만(아니면 409 `not_ready`), 계획이 `running`·`paused`일
+/// 때(409 `migration_state`). 원본을 건드리기 전에 다시 본다 — 대상 이름이 그새 쓰였으면 409 `name_taken`, VMware 쪽 표(노드
+/// 캐시의 인벤토리 — 사용자 스냅샷·FT·Tools 등)에 막는 문제가 있으면 409 `preflight_blocked`(`details.problems`). 할당량·용량은
+/// VM을 만들 때 상태 머신이 보고, 넘으면 자동 되돌림이다. Task `vmware-cutover`를 항목의 노드에 만든다. 대상 폴더의
+/// `vm.create`·`vm.power`가 든다.
+#[utoipa::path(post, path = "/vmware-vms/{key}/cutover", tag = "vmware",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody),
+        (status = 502, body = crate::error::ErrorBody)))]
+pub async fn cutover_item(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<Json<ItemAction>, ApiError> {
+    require_feature(&state.cluster, VMWARE_MIGRATE)?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &key)?;
+    let m = migration_of(&state, &item)?;
+    require_item_power(&state, &principal, &m, &item)?;
+    audit.detail(format!("vmware-vm cutover {}", item.name));
+    if !matches!(
+        m.status.phase,
+        VmwareMigrationPhase::Running | VmwareMigrationPhase::Paused
+    ) {
+        return Err(ApiError::conflict(
+            "migration_state",
+            format!(
+                "vmware-migration {:?} is {}, not running or paused",
+                m.name,
+                phase_name(m.status.phase)
+            ),
+        ));
+    }
+    if !matches!(
+        item.status.state,
+        VmwareVmState::Ready | VmwareVmState::Syncing | VmwareVmState::RolledBack
+    ) {
+        return Err(ApiError::conflict(
+            "not_ready",
+            format!(
+                "vmware-vm {:?} is {}; only ready or syncing VMs can be cut over",
+                item.name,
+                item.status.state.as_str()
+            ),
+        ));
+    }
+    require_busy_free(&state, &item)?;
+    if let Some(vm) = state
+        .cluster
+        .get_by_name::<VmSpec>(&item.spec.target_name)?
+        && Some(vm.id) != item.status.target_vm
+    {
+        return Err(ApiError::conflict(
+            "name_taken",
+            format!("a VM named {:?} already exists", item.spec.target_name),
+        ));
+    }
+    // 원본 VM 하나를 새로 읽는다(캐시의 인벤토리는 60초까지 묵는다 — 그새 생긴 사용자 스냅샷 등).
+    let source = source_of(&state, &m.spec)?;
+    let (inv, _) = inventory_of(&state, &source, false).await?;
+    let session = state
+        .vmware_cache
+        .session(&source)
+        .await
+        .map_err(VsphereError::api_error)?;
+    let fresh =
+        match crate::vmware::inventory::refresh_vm(&session, &inv, &item.spec.source_ref).await {
+            Ok(vm) => Some(vm),
+            Err(VsphereError::NotFound { .. }) => None,
+            Err(e) => return Err(e.api_error()),
+        };
+    if let Some(vm) = &fresh {
+        let ours: Vec<&str> = [&item.status.snapshot, &item.status.pending_snapshot]
+            .into_iter()
+            .flatten()
+            .map(|s| s.moref.as_str())
+            .collect();
+        let ctx = plan::SourceContext {
+            mode: m.spec.mode,
+            cutover: &m.spec.cutover,
+            status: &source.status,
+            transport: &source.spec.transport,
+            inventory: &inv,
+        };
+        let problems: Vec<VmCheckProblem> = source_problems(&ctx, &item.spec, vm, &ours)
+            .into_iter()
+            .filter(|p| p.level == VmCheckLevel::Error)
+            .collect();
+        if !problems.is_empty() {
+            let text: Vec<String> = problems
+                .iter()
+                .map(|p| format!("{}: {}", p.code, p.message))
+                .collect();
+            let mut e = ApiError::conflict(
+                "preflight_blocked",
+                format!(
+                    "vmware-vm {:?} cannot be cut over: {}",
+                    item.name,
+                    text.join("; ")
+                ),
+            );
+            e.details = Some(serde_json::json!({ "problems": problems }));
+            return Err(e);
+        }
+    }
+    let mut status = item.status.clone();
+    status.cutover_requested_at = Some(now());
+    write_item(&state, &item, &status).await?;
+    let task = crate::tasks::create_task(
+        &state.cluster,
+        opl_types::task::TaskOp::VmwareCutover,
+        item.id,
+        item_node(&state, &item),
+    )
+    .await?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &item.id.to_string())?;
+    Ok(Json(ItemAction {
+        item,
+        task: Some(task.id),
+    }))
+}
+
+/// 켠 뒤 되돌리기의 확인
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevertRequest {
+    /// 대상(Orbivisor) VM 이름. 되돌리면 그 VM에서 쓴 데이터는 원본으로 가지 않는다.
+    pub confirm: String,
+}
+
+/// 전환한 VM을 되돌린다(설계 §10.3, `done`만 — 아니면 409 `vmware_vm_state`): 대상 VM을 끄고(지우지 않음) 원본 NIC·설명을
+/// 되돌리고 원본을 켠다 → `reverted`. 대상에서 쓴 데이터는 원본으로 가지 않으므로 본문 `confirm`이 대상 VM 이름이어야 한다
+/// (아니면 400 `confirm_mismatch`). 대상 폴더의 `vm.create`·`vm.power`가 든다.
+#[utoipa::path(post, path = "/vmware-vms/{key}/revert", tag = "vmware",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = RevertRequest,
+    responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn revert_item(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+    Json(req): Json<RevertRequest>,
+) -> Result<Json<ItemAction>, ApiError> {
+    require_feature(&state.cluster, VMWARE_MIGRATE)?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &key)?;
+    let m = migration_of(&state, &item)?;
+    require_item_power(&state, &principal, &m, &item)?;
+    audit.detail(format!("vmware-vm revert {}", item.name));
+    if item.status.state != VmwareVmState::Done {
+        return Err(item_state_conflict(
+            &item,
+            "only cut over VMs can be reverted",
+        ));
+    }
+    let target = item
+        .status
+        .target_vm
+        .and_then(|id| state.cluster.get::<VmSpec>(id).ok().flatten())
+        .map_or_else(|| item.spec.target_name.clone(), |vm| vm.name);
+    if req.confirm != target {
+        return Err(ApiError::bad_request(format!(
+            "type the Orbivisor VM name {target:?} to revert; writes made on it are not copied back to the source"
+        ))
+        .with_code("confirm_mismatch"));
+    }
+    require_busy_free(&state, &item)?;
+    let task = crate::tasks::create_task(
+        &state.cluster,
+        opl_types::task::TaskOp::VmwareRevert,
+        item.id,
+        item_node(&state, &item),
+    )
+    .await?;
+    Ok(Json(ItemAction {
+        item,
+        task: Some(task.id),
+    }))
+}
+
+/// 전환을 마무리한다(설계 §10.3, `done`만 — 아니면 409 `vmware_vm_state`): `vmware-cleanup` — 원본에 남은 우리 스냅샷을 지우고
+/// 우리가 켠 CBT를 끈다. 원본 보호(NIC `startConnected=false`·설명)는 그대로 둔다 → `finalized`(되돌릴 수 없다). 대상 폴더의
+/// `vm.create`·`vm.power`가 든다.
+#[utoipa::path(post, path = "/vmware-vms/{key}/finalize", tag = "vmware",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn finalize_item(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<Json<ItemAction>, ApiError> {
+    require_feature(&state.cluster, VMWARE_MIGRATE)?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &key)?;
+    let m = migration_of(&state, &item)?;
+    require_item_power(&state, &principal, &m, &item)?;
+    audit.detail(format!("vmware-vm finalize {}", item.name));
+    if item.status.state != VmwareVmState::Done {
+        return Err(item_state_conflict(
+            &item,
+            "only cut over VMs can be finalized",
+        ));
+    }
+    require_busy_free(&state, &item)?;
+    let task = crate::tasks::create_task(
+        &state.cluster,
+        opl_types::task::TaskOp::VmwareCleanup {
+            delete_target: false,
+        },
+        item.id,
+        item_node(&state, &item),
     )
     .await?;
     Ok(Json(ItemAction {

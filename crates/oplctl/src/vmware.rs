@@ -1,6 +1,6 @@
 //! `orbivisorctl vmware source …`·`vmware migration …`·`vmware vm …`(계획 72 §13): 저장한 vCenter·ESXi 연결(지문 확인 흐름,
 //! 비밀번호는 파일·`OPL_VMWARE_PASSWORD`·터미널에서), 인벤토리 찾아보기, 이전 계획 만들기·미리 확인·시작·멈춤·이어 가기·
-//! 취소·지우기, 계획 안 VM 하나의 다시 하기·취소.
+//! 취소·지우기, 계획 안 VM 하나의 다시 하기·취소·전환·되돌리기·마무리.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,6 +40,30 @@ pub(crate) enum VmCmd {
     Cancel {
         vm: String,
         /// 정리 Task가 끝날 때까지 기다린다.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// VM 하나를 전환한다: (따뜻한 이전은 켜진 채 델타 한 번) 원본을 끄고 마지막 델타를 옮긴 뒤 Orbivisor VM을 만들어 켠다.
+    /// 어느 걸음에서 실패해도 원본을 다시 켜서 되돌린다.
+    Cutover {
+        vm: String,
+        /// 전환이 끝날 때까지 기다리고 내린 시간을 알린다.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 전환한 VM을 되돌린다: Orbivisor VM을 끄고(지우지 않음) 원본을 다시 켠다. Orbivisor VM에서 쓴 데이터는 원본으로 가지
+    /// 않는다.
+    Revert {
+        vm: String,
+        /// 확인: Orbivisor VM 이름
+        #[arg(long, value_name = "VM_NAME")]
+        confirm: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 전환을 마무리한다: 원본의 Orbivisor 스냅샷·우리가 켠 CBT를 치운다(원본 보호 설정은 남김, 되돌릴 수 없다).
+    Finalize {
+        vm: String,
         #[arg(long)]
         wait: bool,
     },
@@ -381,18 +405,50 @@ async fn vm(
     json_out: bool,
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let (vm, action, wait) = match &cmd {
-        VmCmd::Retry { vm } => (vm, "retry", false),
-        VmCmd::Cancel { vm, wait } => (vm, "cancel", *wait),
+    let (vm, action, wait, body) = match &cmd {
+        VmCmd::Retry { vm } => (vm, "retry", false, json!({})),
+        VmCmd::Cancel { vm, wait } => (vm, "cancel", *wait, json!({})),
+        VmCmd::Cutover { vm, wait } => (vm, "cutover", *wait, json!({})),
+        VmCmd::Revert { vm, confirm, wait } => (vm, "revert", *wait, json!({ "confirm": confirm })),
+        VmCmd::Finalize { vm, wait } => (vm, "finalize", *wait, json!({})),
     };
     let got = client
-        .post(&format!("/vmware-vms/{}/{action}", seg(vm)), &json!({}))
+        .post(&format!("/vmware-vms/{}/{action}", seg(vm)), &body)
         .await?;
     if json_out && !wait {
         return Ok(print_json(out, &got)?);
     }
     let name = cell(&got["item"]["name"]);
-    match (&cmd, got.get("task").filter(|t| t.is_string())) {
+    let task = got.get("task").filter(|t| t.is_string());
+    if let (VmCmd::Cutover { .. } | VmCmd::Revert { .. } | VmCmd::Finalize { .. }, Some(task)) =
+        (&cmd, task)
+    {
+        if !wait {
+            let doing = match action {
+                "cutover" => "being cut over",
+                "revert" => "being reverted",
+                _ => "being finalized",
+            };
+            writeln!(out, "vmware-vm {name} is {doing} (task {})", cell(task))?;
+            return Ok(());
+        }
+        client
+            .wait_task_for(&json!({ "id": task }), BACKUP_WAIT)
+            .await?;
+        let item = client.get(&format!("/vmware-vms/{}", seg(vm))).await?;
+        if json_out {
+            return Ok(print_json(out, &item)?);
+        }
+        let state = cell(&item["status"]["state"]);
+        match item["status"]["downtime_s"].as_u64() {
+            Some(s) if action == "cutover" => {
+                writeln!(out, "vmware-vm {name} is {state} (downtime {s}s)")?
+            }
+            _ => writeln!(out, "vmware-vm {name} is {state}")?,
+        }
+        return Ok(());
+    }
+    match (&cmd, task) {
         (VmCmd::Retry { .. }, _) => writeln!(
             out,
             "vmware-vm {name} is {} again",
@@ -410,6 +466,8 @@ async fn vm(
             "vmware-vm {name} is being cancelled (task {})",
             cell(task)
         )?,
+        // 전환·되돌리기·마무리는 늘 Task가 있다(위에서 다룸).
+        (_, _) => writeln!(out, "vmware-vm {name}")?,
     }
     Ok(())
 }
@@ -1063,6 +1121,52 @@ mod tests {
         );
         assert!(text.contains("being cancelled (task t-1)"), "{text}");
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// `vm cutover --wait`는 Task를 기다린 뒤 내린 시간을 알리고, `vm revert`는 확인 이름을 본문에 보낸다.
+    #[tokio::test]
+    async fn vm_cutover_waits_and_revert_sends_the_confirmation() {
+        let (client, seen) = fake_api(|method, path| match (method, path) {
+            ("POST", "/api/v1/vmware-vms/w-web01/cutover") => (
+                200,
+                json!({ "item": { "name": "w-web01", "status": { "state": "syncing" } }, "task": "0b7f3a52-3f0e-4d5c-9a51-2b8f0c1d2e3f" }),
+            ),
+            ("GET", "/api/v1/tasks/0b7f3a52-3f0e-4d5c-9a51-2b8f0c1d2e3f") => (
+                200,
+                json!({ "id": "0b7f3a52-3f0e-4d5c-9a51-2b8f0c1d2e3f", "spec": { "node": "n1" }, "status": { "state": "succeeded" } }),
+            ),
+            ("GET", "/api/v1/vmware-vms/w-web01") => (
+                200,
+                json!({ "name": "w-web01", "status": { "state": "done", "downtime_s": 42 } }),
+            ),
+            ("POST", "/api/v1/vmware-vms/w-web01/revert") => (
+                200,
+                json!({ "item": { "name": "w-web01", "status": { "state": "done" } }, "task": "t-2" }),
+            ),
+            _ => (404, json!({ "code": "not_found", "message": path })),
+        })
+        .await;
+        let mut out = Vec::new();
+        let cmd = VmCmd::Cutover {
+            vm: "w-web01".into(),
+            wait: true,
+        };
+        vm(&client, cmd, false, &mut out).await.unwrap();
+        let cmd = VmCmd::Revert {
+            vm: "w-web01".into(),
+            confirm: "web01".into(),
+            wait: false,
+        };
+        vm(&client, cmd, false, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("vmware-vm w-web01 is done (downtime 42s)"),
+            "{text}"
+        );
+        assert!(text.contains("is being reverted (task t-2)"), "{text}");
+        let seen = seen.lock().unwrap();
+        let revert = seen.iter().find(|r| r.line.contains("/revert ")).unwrap();
+        assert_eq!(revert.body, json!({ "confirm": "web01" }));
     }
 
     /// 지문 없이 더하면 서버 지문을 알려 주고 비밀번호를 묻지 않는다. 막힌 VM이 있는 미리 확인은 실패로 끝난다.

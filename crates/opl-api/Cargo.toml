@@ -37,6 +37,10 @@ name = "vmware_sync"
 required-features = ["fake-vsphere"]
 
 [[test]]
+name = "vmware_cutover"
+required-features = ["fake-vsphere"]
+
+[[test]]
 name = "vcsim"
 required-features = ["vcsim-it"]
 

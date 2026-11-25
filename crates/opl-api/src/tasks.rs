@@ -203,6 +203,10 @@ pub struct TaskRunnerConfig {
     pub vmware_stall: Duration,
     /// VMware 이전 동기화: 디스크별 체크포인트를 적는 바이트 간격(시험이 줄인다).
     pub vmware_checkpoint_bytes: u64,
+    /// VMware 전환(계획 72 §10.1): 만든 VM이 `running`으로 보이기를 기다리는 시간(5분)
+    pub vmware_start_timeout: Duration,
+    /// VMware 전환: 게스트 종료 기다림의 상한(시험이 줄인다 — 없으면 계획의 `shutdown_timeout_s`)
+    pub vmware_shutdown_limit: Option<Duration>,
 }
 
 impl TaskRunnerConfig {
@@ -248,6 +252,8 @@ impl TaskRunnerConfig {
             backup_serve_scope: false,
             vmware_stall: vmware::STALL,
             vmware_checkpoint_bytes: vmware::CHECKPOINT_BYTES,
+            vmware_start_timeout: vmware::START_TIMEOUT,
+            vmware_shutdown_limit: None,
         }
     }
 }
@@ -788,6 +794,8 @@ fn start(
                 | TaskOp::NetworkMigrate { .. }
                 | TaskOp::BackupLiveRestore { .. }
                 | TaskOp::VmwareSync { .. }
+                | TaskOp::VmwareCutover
+                | TaskOp::VmwareRevert
                 | TaskOp::VmwareCleanup { .. }
         );
         if interrupted && !resumes {
@@ -852,10 +860,14 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
         // VM 내보내기(계획 72)는 디스크 크기만큼 변환하고 다시 읽어 해시를 잰다.
         || matches!(task.spec.op, TaskOp::VmExport { .. })
         // VMware 동기화는 디스크 크기만큼 복사하고(조각마다 멈춤 한도 `vmware_stall`), 정리는 스냅샷 합치기를 기다린다
-        // (vSphere Task마다 한도).
+        // (vSphere Task마다 한도). 전환은 마지막 델타를 복사하고 걸음마다 한도(게스트 종료·켜기)가 있고, 되돌리기는 VM 끄기를
+        // 기다린다.
         || matches!(
             task.spec.op,
-            TaskOp::VmwareSync { .. } | TaskOp::VmwareCleanup { .. }
+            TaskOp::VmwareSync { .. }
+                | TaskOp::VmwareCutover
+                | TaskOp::VmwareRevert
+                | TaskOp::VmwareCleanup { .. }
         );
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
@@ -1268,10 +1280,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::VmwareCleanup { delete_target } => {
             return Box::pin(vmware::cleanup(ctx, task, *delete_target)).await;
         }
-        // 전환·되돌리기는 스테이지 5가 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::VmwareCutover | TaskOp::VmwareRevert => {
-            Err("VMware migration tasks are not available yet".into())
-        }
+        // 전환(이어 감 — 걸음은 항목에)·켠 뒤 되돌리기(계획 72 §10)
+        TaskOp::VmwareCutover => return Box::pin(vmware::cutover(ctx, task)).await,
+        TaskOp::VmwareRevert => return Box::pin(vmware::revert(ctx, task)).await,
         TaskOp::VmExport { export } => return export::export(ctx, task, *export).await,
         TaskOp::VmExportDelete => return export::delete(ctx, id).await,
     };
