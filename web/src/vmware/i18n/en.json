@@ -6,6 +6,7 @@
     "no": "No",
     "countOf": "{{count}} {{state}}",
     "stateStep": "Cutting over: {{step}}",
+    "rollbackFailedAt": "Rollback failed: {{step}}",
     "sources": {
       "title": "Saved vCenter and ESXi connections. Their passwords stay in the cluster and are never shown again.",
       "empty": "No VMware sources",
@@ -149,7 +150,8 @@
       "estimate": "Est. downtime",
       "nextSync": "Next sync",
       "target": "Target VM",
-      "noVms": "No VMs in this migration."
+      "noVms": "No VMs in this migration.",
+      "downtime": "{{time}} (actual)"
     },
     "action": {
       "cutover": "Cut over…",
@@ -157,7 +159,8 @@
       "finalize": "Finalize…",
       "retry": "Retry",
       "cancel": "Cancel",
-      "retried": "{{name}} will try again."
+      "retried": "{{name}} will try again.",
+      "retryRollback": "Retry rollback"
     },
     "drawer": {
       "description": "Migrating from {{source}}",
@@ -178,7 +181,11 @@
       "copied": "Copied",
       "copiedOf": "Copied of {{file}}",
       "lastDelta": "Last delta",
-      "history": "History"
+      "history": "History",
+      "cutoverRequested": "Cutover requested",
+      "sourceStopped": "Source stopped",
+      "downtime": "Downtime",
+      "rollbackFailed": "The automatic rollback failed. Do these steps by hand, or retry the rollback:"
     },
     "cutover": {
       "title_one": "Cut over {{count}} VM?",
@@ -359,9 +366,12 @@
       "migration_busy": "Another change is running. Try again.",
       "vm_started": "A started VM cannot be removed; cancel it instead.",
       "vmware_vm_state": "This VM cannot do that now: {{message}}",
-      "not_ready": "Only ready or syncing VMs can be cut over.",
+      "not_ready": "Only ready, syncing or rolled-back VMs can be cut over.",
       "vmware_permission": "The VMware user may not do this: {{message}}",
-      "vmware_restricted": "This ESXi host is read only (free license). Use a cold migration."
+      "vmware_restricted": "This ESXi host is read only (free license). Use a cold migration.",
+      "preflight_blocked": "The source VM cannot be cut over now:",
+      "name_taken": "That name is already in use: {{message}}",
+      "confirm_mismatch": "Type the current name of the Orbivisor VM to revert it."
     }
   }
 }

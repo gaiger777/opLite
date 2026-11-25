@@ -429,9 +429,16 @@ export function lastDelta(item: MigrationItem): number | undefined {
     : undefined;
 }
 
-/** 전환할 수 있는 항목(`ready`·`syncing`, 설계 §10.1) */
+/** 전환할 수 있는 항목(`ready`·`syncing`, 설계 §10.1 — 자동 되돌림한 `rolled-back`도 다시 전환할 수 있다) */
 export function canCutover(item: MigrationItem): boolean {
-  return item.status.state === "ready" || item.status.state === "syncing";
+  return ["ready", "syncing", "rolled-back"].includes(item.status.state);
+}
+
+/**
+ * 전환의 자동 되돌림이 실패한 항목(`failed`인데 걸음이 남음). 오류에 손으로 할 일이 적혀 있고, 다시 하기는 되돌림을 다시 한다.
+ */
+export function rollbackFailed(item: MigrationItem): boolean {
+  return item.status.state === "failed" && item.status.cutover_step !== undefined;
 }
 
 /** 취소할 수 있는 항목(설계 §10.3 — `pending`~`syncing`·`failed`·`rolled-back`) */

@@ -187,6 +187,117 @@ it("reverts a cut-over VM only after its name is typed", async () => {
   );
 });
 
+it("shows the measured downtime of a cut-over VM in the table and the drawer", async () => {
+  const user = userEvent.setup();
+  const done = migrationItem("db01", 3, {
+    ...DB.status,
+    cutover_requested_at: 1_793_761_000,
+    source_stopped_at: 1_793_761_010,
+    downtime_s: 252,
+    history: [{ at: 1_793_761_262, event: "cut over; downtime 4m12s" }],
+  });
+  setup([done]);
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  expect(await within(table).findByRole("row", { name: /db01/ })).toHaveTextContent(
+    "4m 12s (actual)",
+  );
+  await user.click(screen.getByRole("button", { name: "Open db01" }));
+  const sheet = screen.getByRole("dialog", { name: "db01" });
+  expect(sheet).toHaveTextContent("Downtime4m 12s");
+  expect(sheet).toHaveTextContent("Source stopped");
+  expect(sheet).toHaveTextContent("Cutover requested");
+  expect(within(sheet).getByText("cut over; downtime 4m12s")).toBeInTheDocument();
+});
+
+it("cuts over a rolled-back VM again", async () => {
+  const user = userEvent.setup();
+  const back = migrationItem("web01", 1, { ...WEB.status, state: "rolled-back" });
+  const posted = setup([back]);
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  await user.click(await within(table).findByRole("checkbox", { name: "Select web01" }));
+  await user.click(screen.getByRole("button", { name: "Cut over" }));
+  const dialog = screen.getByRole("alertdialog", { name: "Cut over 1 VM?" });
+  await user.click(within(dialog).getByRole("button", { name: "Cut over" }));
+  await waitFor(() => expect(posted).toEqual([{ path: `${back.id}/cutover`, body: null }]));
+});
+
+it("shows why the server blocked a cutover with the problems it found", async () => {
+  const user = userEvent.setup();
+  setup([WEB]);
+  server.use(
+    http.post(apiUrl("/vmware-vms/:key/cutover"), () =>
+      HttpResponse.json(
+        {
+          code: "preflight_blocked",
+          message: 'vmware-vm "wave1-web01" cannot be cut over: user_snapshots: …',
+          details: {
+            problems: [
+              {
+                at: "source",
+                code: "user_snapshots",
+                level: "error",
+                message: "web01 has 1 snapshot; remove it first",
+              },
+            ],
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  await user.click(await within(table).findByRole("checkbox", { name: "Select web01" }));
+  await user.click(screen.getByRole("button", { name: "Cut over" }));
+  const dialog = screen.getByRole("alertdialog", { name: "Cut over 1 VM?" });
+  await user.click(within(dialog).getByRole("button", { name: "Cut over" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "web01: The source VM cannot be cut over now: source: web01 has 1 snapshot; remove it first",
+  );
+});
+
+it("sends the current name of a renamed target VM when reverting", async () => {
+  const user = userEvent.setup();
+  const posted = setup();
+  mockLists({ vm: [{ ...TARGET, name: "db01-new" }] });
+  open();
+  await user.click(await screen.findByRole("button", { name: "Open db01" }));
+  await user.click(
+    within(screen.getByRole("dialog", { name: "db01" })).getByRole("button", { name: "Revert…" }),
+  );
+  const dialog = screen.getByRole("alertdialog", { name: "Revert db01-new?" });
+  await user.type(within(dialog).getByRole("textbox"), "db01-new");
+  await user.click(within(dialog).getByRole("button", { name: "Revert" }));
+  await waitFor(() =>
+    expect(posted).toEqual([{ path: `${DB.id}/revert`, body: { confirm: "db01-new" } }]),
+  );
+});
+
+it("shows the manual steps of a failed rollback and retries the rollback", async () => {
+  const user = userEvent.setup();
+  const stuck = migrationItem("web01", 1, {
+    state: "failed",
+    cutover_step: "creating-vm",
+    error:
+      'rollback failed: PowerOn: timeout. By hand: stop and delete Orbivisor VM "web01", then power on web01 in vCenter',
+  });
+  const posted = setup([stuck]);
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  expect(await within(table).findByRole("row", { name: /web01/ })).toHaveTextContent(
+    "Rollback failed: creating the VM",
+  );
+  await user.click(screen.getByRole("button", { name: "Open web01" }));
+  const sheet = screen.getByRole("dialog", { name: "web01" });
+  const alert = within(sheet).getByRole("alert");
+  expect(alert).toHaveTextContent("The automatic rollback failed. Do these steps by hand");
+  expect(alert).toHaveTextContent("power on web01 in vCenter");
+  await user.click(within(sheet).getByRole("button", { name: "Retry rollback" }));
+  await waitFor(() => expect(posted).toEqual([{ path: `${stuck.id}/retry`, body: null }]));
+});
+
 it("shows history, disks and the round in the drawer and retries a failed VM", async () => {
   const user = userEvent.setup();
   const failed = migrationItem("old01", 4, { state: "failed", error: "vmware_stall: no progress" });

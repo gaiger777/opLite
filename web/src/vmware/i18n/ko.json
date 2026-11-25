@@ -6,6 +6,7 @@
     "no": "아니요",
     "countOf": "{{state}} {{count}}",
     "stateStep": "전환 중: {{step}}",
+    "rollbackFailedAt": "되돌림 실패: {{step}}",
     "sources": {
       "title": "저장한 vCenter·ESXi 연결입니다. 비밀번호는 클러스터에만 두고 다시 보이지 않습니다.",
       "empty": "VMware 원본이 없습니다",
@@ -149,7 +150,8 @@
       "estimate": "예상 내리는 시간",
       "nextSync": "다음 동기화",
       "target": "대상 VM",
-      "noVms": "이 계획에 VM이 없습니다."
+      "noVms": "이 계획에 VM이 없습니다.",
+      "downtime": "{{time}}(실제)"
     },
     "action": {
       "cutover": "전환…",
@@ -157,7 +159,8 @@
       "finalize": "마무리…",
       "retry": "다시 하기",
       "cancel": "취소",
-      "retried": "{{name}}을(를) 다시 합니다."
+      "retried": "{{name}}을(를) 다시 합니다.",
+      "retryRollback": "되돌림 다시 하기"
     },
     "drawer": {
       "description": "{{source}}에서 옮기는 중",
@@ -178,7 +181,11 @@
       "copied": "복사함",
       "copiedOf": "{{file}} 복사함",
       "lastDelta": "마지막 델타",
-      "history": "기록"
+      "history": "기록",
+      "cutoverRequested": "전환 요청",
+      "sourceStopped": "원본 끈 시각",
+      "downtime": "내린 시간",
+      "rollbackFailed": "자동 되돌림이 실패했습니다. 아래 일을 손으로 하거나 되돌림을 다시 하세요."
     },
     "cutover": {
       "title_one": "VM {{count}}대를 전환할까요?",
@@ -359,9 +366,12 @@
       "migration_busy": "다른 바꾸기가 도는 중입니다. 다시 해 보세요.",
       "vm_started": "시작한 VM은 뺄 수 없습니다. 취소하세요.",
       "vmware_vm_state": "지금은 이 VM이 그렇게 할 수 없습니다: {{message}}",
-      "not_ready": "준비됐거나 동기화 중인 VM만 전환할 수 있습니다.",
+      "not_ready": "준비됐거나 동기화 중이거나 되돌려진 VM만 전환할 수 있습니다.",
       "vmware_permission": "VMware 사용자에게 권한이 없습니다: {{message}}",
-      "vmware_restricted": "이 ESXi 호스트는 읽기 전용(무료 라이선스)입니다. 차가운 이전을 쓰세요."
+      "vmware_restricted": "이 ESXi 호스트는 읽기 전용(무료 라이선스)입니다. 차가운 이전을 쓰세요.",
+      "preflight_blocked": "지금은 원본 VM을 전환할 수 없습니다:",
+      "name_taken": "이미 쓰는 이름입니다: {{message}}",
+      "confirm_mismatch": "되돌리려면 Orbivisor VM의 지금 이름을 그대로 적으세요."
     }
   }
 }

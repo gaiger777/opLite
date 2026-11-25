@@ -12,6 +12,7 @@ import {
   formatDuration,
   lastDelta,
   proposeNetworks,
+  rollbackFailed,
   snapshotCount,
   usedDatastores,
   usedNetworks,
@@ -186,6 +187,12 @@ it("reads item progress, deltas and allowed actions", () => {
   expect(lastDelta(copying)).toBeUndefined();
   expect(canCutover(synced)).toBe(true);
   expect(canCutover(copying)).toBe(false);
+  expect(canCutover(migrationItem("a", 4, { state: "rolled-back" }))).toBe(true);
+  expect(canCutover(migrationItem("a", 5, { state: "done" }))).toBe(false);
+  expect(rollbackFailed(migrationItem("a", 6, { state: "failed" }))).toBe(false);
+  expect(
+    rollbackFailed(migrationItem("a", 7, { state: "failed", cutover_step: "starting-vm" })),
+  ).toBe(true);
   expect(canCancel(copying)).toBe(true);
   expect(canCancel(migrationItem("a", 3, { state: "done" }))).toBe(false);
   expect(formatDuration(42)).toBe("42s");

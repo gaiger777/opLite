@@ -25,6 +25,7 @@ export type Rules = Schemas["VmwareRules"];
 export type Limits = Schemas["VmwareLimits"];
 export type SyncPolicy = Schemas["VmwareSyncPolicy"];
 export type CutoverPolicy = Schemas["VmwareCutoverPolicy"];
+export type VmCheckProblem = Schemas["VmCheckProblem"];
 
 export const SOURCES_KEY = ["vmware-sources"] as const;
 export const MIGRATIONS_KEY = ["vmware-migrations"] as const;
@@ -90,10 +91,27 @@ export async function refreshVmware(queryClient: QueryClient) {
   );
 }
 
+/** 전환 요청이 원본을 새로 읽고 막은 까닭(409 `preflight_blocked`의 `details.problems`) */
+function blockedProblems(err: ApiError): string[] {
+  const problems = (err.details as { problems?: unknown } | undefined)?.problems;
+  return Array.isArray(problems)
+    ? (problems as Partial<VmCheckProblem>[])
+        .filter((p) => typeof p.message === "string")
+        .map((p) => (p.at ? `${p.at}: ${p.message}` : p.message!))
+    : [];
+}
+
+/** API 오류 하나의 문장. 막힌 전환은 문제를 `; `로 이어 덧붙인다(대화상자의 오류 줄은 한 문단이다). */
+function apiErrorText(t: TFunction, err: ApiError): string {
+  const text = codeMessage(t, err.code, err.message, "vmware.errors");
+  const problems = err.code === "preflight_blocked" ? blockedProblems(err) : [];
+  return problems.length > 0 ? `${text} ${problems.join("; ")}` : text;
+}
+
 /** VMware API 오류를 문장으로(`vmware.errors.<code>`가 먼저, 없으면 공통 문구나 서버 설명) */
 export function vmwareErrorText(t: TFunction, err: unknown): string {
   return err instanceof ApiError
-    ? codeMessage(t, err.code, err.message, "vmware.errors")
+    ? apiErrorText(t, err)
     : err instanceof Error
       ? err.message
       : String(err);
@@ -105,7 +123,7 @@ export function vmwareErrorText(t: TFunction, err: unknown): string {
  */
 export function localized(t: TFunction, err: unknown): unknown {
   if (err instanceof ApiError) {
-    const text = codeMessage(t, err.code, err.message, "vmware.errors");
+    const text = apiErrorText(t, err);
     // 머리를 붙인 코드는 공통 문구(`errors.<code>`)에 없으므로 대화상자가 이 문장을 그대로 보인다.
     return new ApiError(err.status, `vmware:${err.code}`, text, err.details);
   }

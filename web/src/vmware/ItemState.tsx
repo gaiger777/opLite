@@ -4,14 +4,16 @@ import { StatusChip } from "@/components/StatusChip";
 import type { MigrationItem } from "@/vmware/api";
 import { stateBusy, stateTone } from "@/vmware/inventory";
 
-/** 항목 상태 칩. 전환 중이면 지금 걸음도 보인다. */
+/** 항목 상태 칩. 전환 중이면 지금 걸음, 되돌림이 실패했으면 그 걸음도 보인다. */
 export function ItemStateChip({ item }: { item: MigrationItem }) {
   const { t } = useTranslation();
   const { state, cutover_step: step } = item.status;
   const text =
     state === "cutting-over" && step
       ? t("vmware.stateStep", { step: t(`vmware.step.${step}`) })
-      : t(`vmware.state.${state}`);
+      : state === "failed" && step
+        ? t("vmware.rollbackFailedAt", { step: t(`vmware.step.${step}`) })
+        : t(`vmware.state.${state}`);
   return (
     <StatusChip tone={stateTone(state)} busy={stateBusy(state)}>
       {text}

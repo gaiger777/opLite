@@ -703,3 +703,16 @@ For stage 8: docs (vms.md export section, access.md vm.export, development.md te
 - **스테이지 8이 할 것**: 스테이지 5 합친 뒤 `gen:api` → `api5.ts` 지우기, `web/e2e/vmware.spec.ts`(가짜 vSphere로 원본 더하기 →
   마법사 → `Ready` → 전환 → VM 링크, 내보내기 → 내려받기), `docs/guide/web-ui.md`(가져오기 탭 보기 넷·VM 메뉴의 내보내기가 내보내기
   보기로 감).
+
+### 스테이지 7 맞춤 (스테이지 5를 합친 뒤)
+
+- `api5.ts`를 지우고 생성된 `POST /vmware-vms/{key}/{cutover|revert|finalize}`를 바로 부른다(답 `ItemAction`은 가정과 같았다).
+- 전환 단추는 `rolled-back`에도 켜진다(스테이지 5가 받는 상태). 409 `preflight_blocked`는 `details.problems`의 `자리: 까닭`을 문구
+  뒤에 잇고, `not_ready`·`confirm_mismatch`·`name_taken`(서버 설명 포함) 문구를 더했다.
+- **되돌리기 확인 이름은 대상 VM의 지금 이름**이다(서버가 `target_vm`의 지금 이름과 견준다 — 전환 뒤 VM 이름을 바꿨으면
+  `target_name`으로는 400 `confirm_mismatch`). VM 목록에서 찾고, 없으면 `target_name`.
+- `failed` + `cutover_step` = 자동 되돌림 실패: 칩 "되돌림 실패: <걸음>", 서랍의 오류 위에 "손으로 하거나 다시 하기" 머리(오류에
+  서버가 적은 손으로 할 일), 단추 "되돌림 다시 하기"(`retry`가 되돌림 Task를 만든다).
+- 새 칸: 서랍에 전환 요청·원본 끈 시각·내린 시간(`cutover_requested_at`·`source_stopped_at`·`downtime_s`), 표의 예상 내릴 시간
+  칸은 끝난 항목이면 실제 내린 시간("4m 12s(실제)"). history의 "cut over; downtime …"는 서버 글 그대로.
+- 첫 화면 묶음 480,433 → 480,434 B.

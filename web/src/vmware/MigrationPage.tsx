@@ -33,7 +33,6 @@ import {
   useSources,
   vmwareErrorText,
 } from "@/vmware/api";
-import { finalizeItem } from "@/vmware/api5";
 import { CutoverDialog } from "@/vmware/CutoverDialog";
 import { canCancel, canCutover, copyProgress, formatDuration, lastDelta } from "@/vmware/inventory";
 import { ItemStateChip, Progress } from "@/vmware/ItemState";
@@ -344,9 +343,13 @@ export function MigrationPage() {
                     </TableCell>
                     <TableCell>{delta !== undefined ? formatBytes(delta) : "—"}</TableCell>
                     <TableCell>
-                      {item.status.estimate_s !== undefined
-                        ? formatDuration(item.status.estimate_s)
-                        : "—"}
+                      {item.status.downtime_s !== undefined
+                        ? t("vmware.migration.downtime", {
+                            time: formatDuration(item.status.downtime_s),
+                          })
+                        : item.status.estimate_s !== undefined
+                          ? formatDuration(item.status.estimate_s)
+                          : "—"}
                     </TableCell>
                     <TableCell>
                       {item.status.next_sync_at !== undefined
@@ -394,7 +397,11 @@ export function MigrationPage() {
             return;
           }
           try {
-            await finalizeItem(dialog.item.id);
+            await call(
+              api.POST("/vmware-vms/{key}/finalize", {
+                params: { path: { key: dialog.item.id } },
+              }),
+            );
           } catch (err) {
             throw localized(t, err);
           }

@@ -2,10 +2,10 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { api, call } from "@/api/client";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { formatBytes } from "@/lib/format";
 import { localized, type Migration, type MigrationItem, refreshVmware } from "@/vmware/api";
-import { cutoverItem } from "@/vmware/api5";
 import { formatDuration, lastDelta } from "@/vmware/inventory";
 
 /**
@@ -39,7 +39,9 @@ export function CutoverDialog({
         const failed: string[] = [];
         for (const item of items) {
           try {
-            await cutoverItem(item.id);
+            await call(
+              api.POST("/vmware-vms/{key}/cutover", { params: { path: { key: item.id } } }),
+            );
           } catch (err) {
             failed.push(`${item.name}: ${(localized(t, err) as Error).message}`);
           }

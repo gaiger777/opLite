@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/table";
 import { formatBytes, formatTime } from "@/lib/format";
 import type { MigrationItem } from "@/vmware/api";
-import { canCancel, canCutover, formatDuration } from "@/vmware/inventory";
+import { canCancel, canCutover, formatDuration, rollbackFailed } from "@/vmware/inventory";
 import { ItemStateChip, Progress } from "@/vmware/ItemState";
 
 /** 항목에 할 수 있는 동작(권한과 상태를 본 뒤) */
@@ -81,7 +81,7 @@ export function VmDrawer({
             )}
             {actions.retry && state === "failed" && (
               <Button size="sm" variant="outline" onClick={actions.retry}>
-                {t("vmware.action.retry")}
+                {t(rollbackFailed(item) ? "vmware.action.retryRollback" : "vmware.action.retry")}
               </Button>
             )}
             {actions.cancel && canCancel(item) && (
@@ -97,6 +97,17 @@ export function VmDrawer({
             <Row label={t("vmware.drawer.rounds")}>{status.rounds}</Row>
             {status.estimate_s !== undefined && (
               <Row label={t("vmware.drawer.estimate")}>{formatDuration(status.estimate_s)}</Row>
+            )}
+            {status.cutover_requested_at !== undefined && (
+              <Row label={t("vmware.drawer.cutoverRequested")}>
+                {time(status.cutover_requested_at)}
+              </Row>
+            )}
+            {status.source_stopped_at !== undefined && (
+              <Row label={t("vmware.drawer.sourceStopped")}>{time(status.source_stopped_at)}</Row>
+            )}
+            {status.downtime_s !== undefined && (
+              <Row label={t("vmware.drawer.downtime")}>{formatDuration(status.downtime_s)}</Row>
             )}
             {status.last_sync_at !== undefined && (
               <Row label={t("vmware.drawer.lastSync")}>{time(status.last_sync_at)}</Row>
@@ -135,9 +146,12 @@ export function VmDrawer({
             )}
           </dl>
           {status.error && (
-            <p role="alert" className="text-sm break-words whitespace-pre-wrap text-destructive">
-              {status.error}
-            </p>
+            <div role="alert" className="flex flex-col gap-1 text-sm text-destructive">
+              {rollbackFailed(item) && (
+                <p className="font-medium">{t("vmware.drawer.rollbackFailed")}</p>
+              )}
+              <p className="break-words whitespace-pre-wrap">{status.error}</p>
+            </div>
           )}
           {status.warnings.length > 0 && (
             <div className="flex flex-col gap-1">
