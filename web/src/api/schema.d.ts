@@ -9912,6 +9912,13 @@ export interface components {
                      * @description 끝낸 회차 수
                      */
                     rounds?: number;
+                    /**
+                     * Format: int64
+                     * @description 멈춘 전환이 보낸 게스트 종료가 시간 한도를 넘겼다(유닉스 초 — 보낸 시각). 보낸 종료는 거둘 수 없어 게스트가 늦게 꺼질
+                     *     수 있다: 다음 동기화가 원본이 꺼져 있으면 다시 켜고(보낸 뒤 [`SHUTDOWN_WATCH_S`] 안), 켜져 있거나 그 뒤면 지운다.
+                     *     다음 전환은 이것이 있을 때 꺼진 원본을 우리가 끈 것으로 적는다(리뷰 2).
+                     */
+                    shutdown_sent_at?: number;
                     /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
                     snapshot?: components["schemas"]["VmwareSnapshotRef"];
                     /** @description 원본 VM(인벤토리에서 읽은 것) */
@@ -13857,6 +13864,13 @@ export interface components {
                  * @description 끝낸 회차 수
                  */
                 rounds?: number;
+                /**
+                 * Format: int64
+                 * @description 멈춘 전환이 보낸 게스트 종료가 시간 한도를 넘겼다(유닉스 초 — 보낸 시각). 보낸 종료는 거둘 수 없어 게스트가 늦게 꺼질
+                 *     수 있다: 다음 동기화가 원본이 꺼져 있으면 다시 켜고(보낸 뒤 [`SHUTDOWN_WATCH_S`] 안), 켜져 있거나 그 뒤면 지운다.
+                 *     다음 전환은 이것이 있을 때 꺼진 원본을 우리가 끈 것으로 적는다(리뷰 2).
+                 */
+                shutdown_sent_at?: number;
                 /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
                 snapshot?: components["schemas"]["VmwareSnapshotRef"];
                 /** @description 원본 VM(인벤토리에서 읽은 것) */
@@ -17012,6 +17026,13 @@ export interface components {
              * @description 끝낸 회차 수
              */
             rounds?: number;
+            /**
+             * Format: int64
+             * @description 멈춘 전환이 보낸 게스트 종료가 시간 한도를 넘겼다(유닉스 초 — 보낸 시각). 보낸 종료는 거둘 수 없어 게스트가 늦게 꺼질
+             *     수 있다: 다음 동기화가 원본이 꺼져 있으면 다시 켜고(보낸 뒤 [`SHUTDOWN_WATCH_S`] 안), 켜져 있거나 그 뒤면 지운다.
+             *     다음 전환은 이것이 있을 때 꺼진 원본을 우리가 끈 것으로 적는다(리뷰 2).
+             */
+            shutdown_sent_at?: number;
             /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
             snapshot?: components["schemas"]["VmwareSnapshotRef"];
             /** @description 원본 VM(인벤토리에서 읽은 것) */

@@ -36,6 +36,8 @@ pub const SNAPSHOT_PREFIX: &str = "orbivisor-migration-";
 pub const MAX_SYNC_FAILURES: u32 = 3;
 /// 취소된 계획의 정리가 연달아 이만큼 실패하면 스케줄러가 더 하지 않는다(항목 취소로 다시 한다).
 pub const MAX_CLEANUP_FAILURES: u32 = 3;
+/// 시간 한도를 넘긴 게스트 종료가 늦게 끝나면 원본을 다시 켜는 기간(초 — 보낸 시각부터, [`VmwareVmStatus::shutdown_sent_at`])
+pub const SHUTDOWN_WATCH_S: u64 = 6 * 3600;
 
 /// 비밀 문자열. JSON은 문자열 그대로(Raft에 저장)이고 `Debug`는 `<redacted>`다. API 보기·watch·감사에는 내지 않는다.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -877,6 +879,12 @@ pub struct VmwareVmStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub rollback_task: Option<Uuid>,
+    /// 멈춘 전환이 보낸 게스트 종료가 시간 한도를 넘겼다(유닉스 초 — 보낸 시각). 보낸 종료는 거둘 수 없어 게스트가 늦게 꺼질
+    /// 수 있다: 다음 동기화가 원본이 꺼져 있으면 다시 켜고(보낸 뒤 [`SHUTDOWN_WATCH_S`] 안), 켜져 있거나 그 뒤면 지운다.
+    /// 다음 전환은 이것이 있을 때 꺼진 원본을 우리가 끈 것으로 적는다(리뷰 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub shutdown_sent_at: Option<u64>,
 }
 
 impl VmwareVmStatus {

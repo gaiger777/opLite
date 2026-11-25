@@ -6,7 +6,7 @@
 //! | `stopping-source` | 원본 보호(설명·NIC `startConnected=false` — 옛 값을 먼저 적음), 게스트 종료(시간 한도) 또는 전원 끄기 | 바꾼 원본 설정을 되돌리고(우리가 껐으면 켬) 앞 상태로 |
 //! | `final-sync` | (따뜻한 이전) 꺼진 원본의 마지막 델타, 우리 스냅샷 지움 | 자동 되돌림 |
 //! | `creating-vm` | 볼륨 `ready`, 매핑한 VmSpec(머신·Mirror 폴더·Tools IP 예약·드라이버 ISO)으로 VM 만들기 | 자동 되돌림 |
-//! | `starting-vm` | `start_after`면 켜고 `running`을 본다(5분) | 자동 되돌림 |
+//! | `starting-vm` | `start_after`면 켜고 `running`을 본다(5분) | 이 Task가 처음 켜다 실패했을 때만 자동 되돌림. 켰거나 켰을 수 있으면(이어 감) `done`에 오류, VM·디스크는 둠 |
 //!
 //! 자동 되돌림(§10.2): 대상 VM을 끄고 지움(볼륨은 `pending`으로 되돌려 남김) → 원본 NIC·설명 되돌림 → 우리가 끈 원본을 켬 →
 //! `rolled-back`. 되돌림이 실패하면 `failed`로 두고 어느 걸음까지 했는지와 손으로 할 일을 적는다(다시 하기가 되돌림을 다시
@@ -19,7 +19,8 @@ use opl_types::storage::VolumeStatus;
 use opl_types::vm::{MacAddr, PowerState, Vm, VmSpec};
 use opl_types::vm_check::VmCheckLevel;
 use opl_types::vmware::{
-    VmwareCutoverStep, VmwareFolderRule, VmwarePower, VmwareShutdown, VmwareSourceChanges,
+    SHUTDOWN_WATCH_S, VmwareCutoverStep, VmwareFolderRule, VmwarePower, VmwareShutdown,
+    VmwareSourceChanges,
 };
 
 use super::super::clone::create_vm;
@@ -30,6 +31,8 @@ use opl_types::audit::AuditTarget;
 
 /// 게스트 종료 시간을 넘긴 뒤 더 지켜보는 시간의 상한(그새 꺼지면 다시 켠다)
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+/// 게스트 종료가 시간 한도를 넘겨 멈춘 전환 뒤 다음 동기화까지의 시간 상한(초 — 늦게 꺼진 원본을 곧 다시 켠다)
+const SHUTDOWN_RECHECK_S: u64 = 300;
 
 /// 걸음 하나의 실패
 struct StepError {
@@ -302,37 +305,40 @@ async fn steps(
 ) -> Result<Option<String>, StepError> {
     use VmwareCutoverStep::*;
     let item = get_item(ctx, id).map_err(at(from))?;
-    let mut run = Box::pin(open_run(ctx, task, &item, migration))
-        .await
-        .map_err(at(from))?;
-    if from <= Preparing {
-        Box::pin(prepare(&run)).await?;
-    }
-    if from <= StoppingSource {
-        set_step(ctx, id, StoppingSource).await?;
-        refresh(&mut run).await.map_err(at(StoppingSource))?;
-        Box::pin(stop_source(&run))
-            .await
-            .map_err(at(StoppingSource))?;
-    }
-    if from <= FinalSync {
-        set_step(ctx, id, FinalSync).await?;
-        if run.warm() {
-            refresh(&mut run).await.map_err(at(FinalSync))?;
-            Box::pin(final_sync(&run)).await.map_err(at(FinalSync))?;
-        }
-    }
+    // 만든 VM이 있으면 남은 걸음(켜기·적기)에 vSphere가 필요 없다: 이어 갈 때 원본 연결이 안 돼도(세션 만료·원본을 지움)
+    // 켠 VM을 되돌리지 않는다(리뷰 2).
+    let exists = item.status.target_vm.is_some_and(|vm| !vm_gone(ctx, vm));
     let mut warnings = Vec::new();
-    if from <= CreatingVm {
+    if from <= FinalSync || (from == CreatingVm && !exists) {
+        let mut run = Box::pin(open_run(ctx, task, &item, migration.clone()))
+            .await
+            .map_err(at(from))?;
+        if from <= Preparing {
+            Box::pin(prepare(&run)).await?;
+        }
+        if from <= StoppingSource {
+            set_step(ctx, id, StoppingSource).await?;
+            refresh(&mut run).await.map_err(at(StoppingSource))?;
+            Box::pin(stop_source(&run))
+                .await
+                .map_err(at(StoppingSource))?;
+        }
+        if from <= FinalSync {
+            set_step(ctx, id, FinalSync).await?;
+            if run.warm() {
+                refresh(&mut run).await.map_err(at(FinalSync))?;
+                Box::pin(final_sync(&run)).await.map_err(at(FinalSync))?;
+            }
+        }
         set_step(ctx, id, CreatingVm).await?;
         Box::pin(create_target(&run, &mut warnings))
             .await
             .map_err(at(CreatingVm))?;
+        warnings.extend(run.warnings());
     }
     set_step(ctx, id, StartingVm).await?;
-    Box::pin(start_target(&run)).await.map_err(at(StartingVm))?;
-    finish(&run).await.map_err(at(StartingVm))?;
-    warnings.extend(run.warnings());
+    // 이어 가는 `starting-vm`은 앞 opld가 이미 켰을 수 있다(QEMU는 opld 없이도 돈다 — 게스트가 대상 디스크에 썼다).
+    Box::pin(start_and_finish(ctx, &migration, id, from == StartingVm)).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
@@ -508,7 +514,12 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
     let policy = &run.migration.spec.cutover;
     let item = get_item(ctx, run.item)?;
     if policy.protect_source {
-        if !item.status.source_changes.annotation_added {
+        // 이어 갈 때도 적은 것만 믿지 않고 원본의 지금 값(걸음 앞에서 새로 읽음)과 맞춘다: 적은 뒤 `ReconfigVM` 전에 opld가
+        // 죽었으면 다시 바꾼다(같은 값으로 바꾸기는 해가 없다 — 리뷰 2).
+        let changes = &item.status.source_changes;
+        let old = if changes.annotation_added {
+            changes.old_annotation.clone().unwrap_or_default()
+        } else {
             let old = run.vm.annotation.clone().unwrap_or_default();
             let o = old.clone();
             update_item(ctx, run.item, |s| {
@@ -516,8 +527,12 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
                 s.source_changes.old_annotation = Some(o.clone());
             })
             .await?;
+            old
+        };
+        let note = protect_note(run, &item, &old);
+        if run.vm.annotation.as_deref().unwrap_or_default() != note {
             run.session
-                .set_annotation(&vm_ref, &protect_note(run, &item, &old))
+                .set_annotation(&vm_ref, &note)
                 .await
                 .map_err(|e| format!("cannot annotate the source VM: {e}"))?;
         }
@@ -527,7 +542,6 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
             .iter()
             .filter(|n| n.start_connected != Some(false))
             .map(|n| n.key)
-            .filter(|k| !item.status.source_changes.nics_disconnected.contains(k))
             .collect();
         if !keys.is_empty() {
             let k = keys.clone();
@@ -550,6 +564,15 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
         .power_state(&vm_ref)
         .await
         .map_err(|e| e.to_string())?;
+    if item.status.shutdown_sent_at.is_some() {
+        // 앞서 멈춘 전환이 보낸 게스트 종료로 꺼졌을 수 있다: 우리가 끈 것으로 적는다(되돌림이 켠다).
+        let off = power == VmwarePower::PoweredOff;
+        update_item(ctx, run.item, |s| {
+            s.shutdown_sent_at = None;
+            s.source_changes.powered_off_by_us |= off;
+        })
+        .await?;
+    }
     if power == VmwarePower::PoweredOff {
         return Ok(());
     }
@@ -567,6 +590,7 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
             Err(VsphereError::InvalidState { kind, .. }) if kind == "InvalidPowerState" => {}
             Err(e) => return Err(format!("cannot shut the guest down: {e}")),
         }
+        let sent = now();
         let every = (limit / 4).clamp(Duration::from_millis(50), Duration::from_secs(2));
         let deadline = Instant::now() + limit;
         loop {
@@ -583,6 +607,7 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
                 // (NIC를 먼저 되돌린 뒤) 다시 켠다 — `powered_off_by_us`가 남아 있다(리뷰 1).
                 let grace = limit.min(SHUTDOWN_GRACE);
                 let until = Instant::now() + grace;
+                let mut off = false;
                 while Instant::now() < until {
                     tokio::time::sleep(every).await;
                     let p = run
@@ -599,12 +624,23 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
                             );
                         })
                         .await?;
+                        off = true;
                         break;
                     }
                 }
+                if off {
+                    return Err(format!(
+                        "vmware_shutdown_timeout: the guest did not shut down within {}s; the source VM was left running",
+                        limit.as_secs()
+                    ));
+                }
+                // 아직 켜져 있다: 게스트가 더 늦게 꺼질 수 있다 — 다음 동기화가 보고 다시 켠다(리뷰 2).
+                update_item(ctx, run.item, |s| s.shutdown_sent_at = Some(sent)).await?;
                 return Err(format!(
-                    "vmware_shutdown_timeout: the guest did not shut down within {}s; the source VM was left running",
-                    limit.as_secs()
+                    "vmware_shutdown_timeout: the guest did not shut down within {}s; the source VM was left running, \
+                     but it may still finish shutting down: the next sync powers it on again if it does (within {}h)",
+                    limit.as_secs(),
+                    SHUTDOWN_WATCH_S / 3600
                 ));
             }
             tokio::time::sleep(every).await;
@@ -626,6 +662,81 @@ async fn stop_source(run: &Run<'_>) -> Result<(), String> {
     })
     .await?;
     Ok(())
+}
+
+/// 멈춘 전환이 보낸 게스트 종료를 동기화가 다시 볼 때 할 일([`VmwareVmStatus::shutdown_sent_at`])
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownWatch {
+    /// 아직 켜져 있고 기간 안 — 표시를 두고 다음에 다시 본다.
+    Wait,
+    /// 기간 안에 꺼졌다 — 보낸 종료로 꺼진 것이다: 다시 켠다.
+    PowerOn,
+    /// 기간이 지났다 — 표시를 지운다(꺼져 있으면 켜지 않고 경고만 — 사용자가 끈 것일 수 있다).
+    Expired { off: bool },
+}
+
+fn shutdown_watch(sent: u64, at: u64, off: bool) -> ShutdownWatch {
+    match (at < sent + SHUTDOWN_WATCH_S, off) {
+        (true, false) => ShutdownWatch::Wait,
+        (true, true) => ShutdownWatch::PowerOn,
+        (false, off) => ShutdownWatch::Expired { off },
+    }
+}
+
+/// 동기화 회차 앞(리뷰 2): 멈춘 전환이 보낸 게스트 종료가 늦게 끝나 원본이 꺼졌으면 다시 켜고 기록·감사에 남긴다(원본은
+/// 아직 운영 VM이다 — 대상 VM이 없다). 기간([`SHUTDOWN_WATCH_S`])이 지나면 표시를 지우고, 그때 꺼져 있으면 경고를 남긴다.
+pub(super) async fn recheck_shutdown(run: &mut Run<'_>, sent: u64) -> Result<(), SyncError> {
+    let ctx = run.ctx;
+    let at_time = now();
+    let off = run.vm.power == Some(VmwarePower::PoweredOff);
+    match shutdown_watch(sent, at_time, off) {
+        ShutdownWatch::Wait => Ok(()),
+        ShutdownWatch::PowerOn => {
+            run.session.power_on(&run.vm_ref()).await?;
+            let item = update_item(ctx, run.item, |s| {
+                s.shutdown_sent_at = None;
+                s.push_history(
+                    at_time,
+                    "the guest finished the shutdown sent by the stopped cutover; the source VM was powered on again",
+                );
+            })
+            .await?;
+            audit(
+                ctx,
+                "vmware-vm.source-power-on",
+                &item.name,
+                format!(
+                    "vmware-vm {}: source VM powered on again after a late guest shutdown",
+                    item.name
+                ),
+            );
+            refresh(run).await
+        }
+        ShutdownWatch::Expired { off } => {
+            let warning = off.then(|| {
+                "the source VM is powered off; it may have finished the guest shutdown sent by a stopped cutover \
+                 — power it on in vCenter if it should run"
+                    .to_string()
+            });
+            update_item(ctx, run.item, |s| {
+                s.shutdown_sent_at = None;
+                if let Some(w) = &warning
+                    && !s.warnings.contains(w)
+                {
+                    s.warnings.push(w.clone());
+                    s.push_history(
+                        at_time,
+                        "source VM found powered off after the shutdown watch",
+                    );
+                }
+            })
+            .await?;
+            if let Some(w) = warning {
+                run.warn(w);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// 원본이 꺼져 있는지 본다(같은 MAC이 둘 켜지지 않게 — 대상 VM을 만들기 전에).
@@ -815,16 +926,57 @@ async fn create_target(run: &Run<'_>, warnings: &mut Vec<String>) -> Result<(), 
     Ok(())
 }
 
-/// `starting-vm`: `start_after`면 켜고 `running`이 보일 때까지(한도 5분) 기다린다.
-async fn start_target(run: &Run<'_>) -> Result<(), String> {
-    let ctx = run.ctx;
-    if !run.migration.spec.rules.start_after {
-        return Ok(());
+/// `starting-vm`: `start_after`면 켜고 `running`이 보일 때까지(한도 5분) 기다린 뒤 `done`을 적는다. 이 Task가 켜기를
+/// 처음 청했고 `running`을 보기 전에 실패했을 때만 되돌림이다(게스트가 돌지 않았다). VM이 이미 켜졌거나 켜졌을 수 있으면
+/// (이어 감, 손으로 켬) 되돌리지 않는다: 켜지 못해도 `done`에 오류를 남기고 VM·디스크를 둔다 — 되돌아갈 길은 되돌리기뿐이다.
+/// `done` 쓰기가 실패하면(Raft) 그 걸음에 머문 채 다시 쓴다(리뷰 2).
+async fn start_and_finish(
+    ctx: &Ctx,
+    migration: &VmwareMigration,
+    id: Uuid,
+    resumed: bool,
+) -> Result<(), StepError> {
+    let step = VmwareCutoverStep::StartingVm;
+    if migration.spec.rules.start_after {
+        let item = get_item(ctx, id).map_err(at(step))?;
+        let vm = item
+            .status
+            .target_vm
+            .ok_or_else(|| at(step)("the cutover has no Orbivisor VM"))?;
+        let started_before = resumed
+            || ctx
+                .cluster
+                .get::<VmSpec>(vm)
+                .ok()
+                .flatten()
+                .is_some_and(|v| v.spec.power == PowerState::Running);
+        match start_target(ctx, vm).await {
+            Ok(()) => {}
+            Err(e) if !started_before => return Err(at(step)(e)),
+            Err(e) => {
+                let message = format!(
+                    "the Orbivisor VM {} may have run already but is not running now ({e}); it and its disks were kept: \
+                     check it, then finalize, or revert to run the source VM again",
+                    item.spec.target_name
+                );
+                finish(ctx, id, Some(&message)).await.map_err(at(step))?;
+                return Err(StepError {
+                    step,
+                    message: format!("cutover finished at starting-vm: {message}"),
+                    recorded: true,
+                });
+            }
+        }
     }
-    let vm = get_item(ctx, run.item)?
-        .status
-        .target_vm
-        .ok_or("the cutover has no Orbivisor VM")?;
+    finish(ctx, id, None).await.map_err(|e| StepError {
+        step,
+        message: format!("the cutover could not be recorded: {e}"),
+        recorded: true,
+    })
+}
+
+/// VM을 켜고 `running`이 보일 때까지(한도 `vmware_start_timeout`) 기다린다.
+async fn start_target(ctx: &Ctx, vm: Uuid) -> Result<(), String> {
     set_power(ctx, vm, PowerState::Running).await?;
     let limit = ctx.config.vmware_start_timeout;
     match tokio::time::timeout(limit, wait_vm(ctx, vm, started)).await {
@@ -837,16 +989,39 @@ async fn start_target(run: &Run<'_>) -> Result<(), String> {
     }
 }
 
-/// `done`: 내린 시간(원본 끄기 시작 → 대상 켜짐)을 적고 감사 로그에 남긴다.
-async fn finish(run: &Run<'_>) -> Result<(), String> {
-    let ctx = run.ctx;
+/// `done`을 적는다. 쓰기가 실패하면(Raft 쿼럼 없음 등) 항목이 아직 전환 중인 동안 간격을 늘려 가며 다시 쓴다(Task는 이어
+/// 가는 Task라 opld가 다시 떠도 이 걸음부터 잇는다). 항목이 지워졌거나 다른 상태면 그 오류를 돌려준다.
+async fn finish(ctx: &Ctx, id: Uuid, error: Option<&str>) -> Result<(), String> {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match record_done(ctx, id, error).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let cutting = match ctx.cluster.get::<VmwareVmSpec>(id) {
+                    Ok(Some(i)) => i.status.state == VmwareVmState::CuttingOver,
+                    Ok(None) => false,
+                    Err(_) => true,
+                };
+                if !cutting {
+                    return Err(e);
+                }
+                tracing::warn!(item = %id, error = %e, "cannot record the finished cutover; retrying");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// `done`: 내린 시간(원본 끄기 시작 → 대상 켜짐)을 적고 감사 로그에 남긴다(`error`면 켜지지 않은 VM의 오류도).
+async fn record_done(ctx: &Ctx, id: Uuid, error: Option<&str>) -> Result<(), String> {
     let at_time = now();
-    let item = update_item(ctx, run.item, |s| {
+    let item = update_item(ctx, id, |s| {
         let downtime = s.source_stopped_at.map(|t| at_time.saturating_sub(t));
         s.state = VmwareVmState::Done;
         s.cutover_step = None;
         s.downtime_s = downtime;
-        s.error = None;
+        s.error = error.map(str::to_string);
         s.next_sync_at = None;
         s.estimate_s = None;
         s.push_history(
@@ -856,6 +1031,9 @@ async fn finish(run: &Run<'_>) -> Result<(), String> {
                 duration_text(downtime.unwrap_or(0))
             ),
         );
+        if error.is_some() {
+            s.push_history(at_time, "the Orbivisor VM is not running; it was kept");
+        }
     })
     .await?;
     recount(ctx, item.spec.migration).await;
@@ -898,8 +1076,15 @@ async fn stop_before_source(ctx: &Ctx, id: Uuid, warm: bool, message: &str) -> R
         };
         s.cutover_step = None;
         s.source_stopped_at = None;
-        if warm && s.next_sync_at.is_none() {
-            s.next_sync_at = Some(at_time + every);
+        if warm {
+            // 보낸 게스트 종료가 남았으면 곧 다시 본다(늦게 꺼진 원본을 켠다).
+            let wait = if s.shutdown_sent_at.is_some() {
+                every.min(SHUTDOWN_RECHECK_S)
+            } else {
+                every
+            };
+            let next = at_time + wait;
+            s.next_sync_at = Some(s.next_sync_at.map_or(next, |t| t.min(next)));
         }
         s.error = Some(message.to_string());
         s.push_history(at_time, "cutover stopped; the source VM keeps running");
@@ -1185,6 +1370,25 @@ mod tests {
         assert_eq!(
             manual_steps("web01", &VmwareSourceChanges::default(), false, "x"),
             "nothing is left to undo; retry"
+        );
+    }
+
+    #[test]
+    fn a_late_shutdown_is_powered_on_only_within_the_watch() {
+        let sent = 1_000;
+        assert_eq!(shutdown_watch(sent, sent + 60, false), ShutdownWatch::Wait);
+        assert_eq!(
+            shutdown_watch(sent, sent + 60, true),
+            ShutdownWatch::PowerOn
+        );
+        let late = sent + SHUTDOWN_WATCH_S;
+        assert_eq!(
+            shutdown_watch(sent, late, true),
+            ShutdownWatch::Expired { off: true }
+        );
+        assert_eq!(
+            shutdown_watch(sent, late, false),
+            ShutdownWatch::Expired { off: false }
         );
     }
 

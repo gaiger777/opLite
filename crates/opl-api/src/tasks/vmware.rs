@@ -444,7 +444,11 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
     if migration.status.phase == VmwareMigrationPhase::Cancelled {
         return Ok(Some("skipped: the migration was cancelled".into()));
     }
-    let run = Box::pin(open_run(ctx, task, &item, migration)).await?;
+    let mut run = Box::pin(open_run(ctx, task, &item, migration)).await?;
+    if let Some(sent) = item.status.shutdown_sent_at {
+        Box::pin(cutover::recheck_shutdown(&mut run, sent)).await?;
+    }
+    let run = run;
 
     // 우리 스냅샷(Raft의 moref)과 이번 회차에 만들 이름이 아닌 스냅샷은 사용자 것이다(백업 제품 등).
     let n = item.status.rounds + 1;

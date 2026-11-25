@@ -923,3 +923,190 @@ async fn cancel_leaves_volumes_on_another_nodes_local_pool() {
     assert!(fake.snapshots("web01").is_empty());
     src.check(&fake);
 }
+
+/// 항목 상태를 손으로 고쳐 쓴다(opld가 걸음 중에 죽은 것처럼).
+async fn set_status(env: &Env, id: Uuid, change: impl Fn(&mut VmwareVmStatus)) {
+    let mut s = item(env, id).status;
+    change(&mut s);
+    env.cluster
+        .update_status::<VmwareVmSpec>(id, &s)
+        .await
+        .unwrap();
+}
+
+/// 끊긴 전환을 잇는 Task(opld가 다시 떠서 잇는 것과 같다)를 만들고 끝을 기다린다.
+async fn resume_cutover(env: &Env, admin: &Client, id: Uuid) -> Value {
+    let mut t: opl_types::task::Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VmwareCutover,
+            target: id,
+            node: env.node,
+        },
+    );
+    t.name = t.id.to_string();
+    env.cluster.create(&t).await.unwrap();
+    admin.wait_task(&json!({ "id": t.id })).await
+}
+
+/// 리뷰 2: `starting-vm`에서 잇는 전환은 vSphere가 필요 없다 — 원본 연결이 실패해도 켜진 대상 VM을 되돌리지 않고(대상
+/// 디스크에 쓴 것이 남음) `done`을 적는다.
+#[tokio::test]
+async fn a_resumed_start_never_rolls_back_a_running_vm() {
+    let (env, admin, fake, storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "r1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    let task = act(&admin, "r1-web01", "cutover", json!({})).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vol = item(&env, it.id).status.disks[0].volume.unwrap();
+    let written = b"WRITTEN ON THE ORBIVISOR VM";
+    storage.poke(vol, 100, written);
+    // `done`을 적기 전에 opld가 죽었다.
+    set_status(&env, it.id, |s| {
+        s.state = VmwareVmState::CuttingOver;
+        s.cutover_step = Some(opl_types::vmware::VmwareCutoverStep::StartingVm);
+    })
+    .await;
+    fake.fail_next("RetrievePropertiesEx", "SystemError");
+    let task = resume_cutover(&env, &admin, it.id).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Done, "{s:?}");
+    assert!(s.error.is_none(), "{s:?}");
+    let vm = vm_named(&env, "web01").expect("the target VM is kept");
+    assert_eq!(vm.status.phase, VmPhase::Running);
+    assert_eq!(
+        &storage.contents(vol).unwrap()[100..100 + written.len()],
+        written
+    );
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
+
+    // 이어 갈 때 VM이 켜지지 않아도(앞 opld가 켰을 수 있다) 되돌리지 않는다: `done`에 오류, VM·디스크는 둔다.
+    set_status(&env, it.id, |s| {
+        s.state = VmwareVmState::CuttingOver;
+        s.cutover_step = Some(opl_types::vmware::VmwareCutoverStep::StartingVm);
+    })
+    .await;
+    let mut spec = vm.spec.clone();
+    spec.power = opl_types::vm::PowerState::Stopped;
+    env.cluster
+        .update_spec::<VmSpec>(vm.id, None, vm.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while vm_named(&env, "web01").unwrap().status.phase != VmPhase::Stopped {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    env.hv
+        .fail_next_start(DriverError::StartFailed("no firmware".into()));
+    let task = resume_cutover(&env, &admin, it.id).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Done, "{s:?}");
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap()
+            .contains("it and its disks were kept"),
+        "{s:?}"
+    );
+    assert_eq!(s.target_vm, Some(vm.id));
+    assert!(vm_named(&env, "web01").is_some());
+    assert_eq!(
+        &storage.contents(vol).unwrap()[100..100 + written.len()],
+        written
+    );
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
+    // 돌아가는 길은 되돌리기다. 두 번 이어 간 전환은 vSphere를 부르지 않았다: 넣은 오류가 아직 남아 첫 되돌리기가 맞는다.
+    let task = act(&admin, "r1-web01", "revert", json!({ "confirm": "web01" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected SystemError"),
+        "{task}"
+    );
+    let task = act(&admin, "r1-web01", "revert", json!({ "confirm": "web01" })).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOn);
+    src.check(&fake);
+}
+
+/// 리뷰 2: 원본 보호를 적은 뒤 `ReconfigVM` 전에 opld가 죽었으면, 이어 가는 전환이 NIC·설명을 원본의 지금 값과 맞춘다.
+#[tokio::test]
+async fn a_resumed_stop_applies_the_recorded_protection() {
+    let (env, admin, fake, _storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "p1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    // 가짜 vSphere의 NIC 장치 키
+    let keys = vec![4000, 4001];
+    set_status(&env, it.id, |s| {
+        s.state = VmwareVmState::CuttingOver;
+        s.cutover_step = Some(opl_types::vmware::VmwareCutoverStep::StoppingSource);
+        s.source_changes.nics_disconnected = keys.clone();
+        s.source_changes.annotation_added = true;
+        s.source_changes.old_annotation = Some(NOTE.into());
+    })
+    .await;
+    let task = resume_cutover(&env, &admin, it.id).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(item(&env, it.id).status.state, VmwareVmState::Done);
+    assert_eq!(fake.nics_start_connected("web01"), vec![false, false]);
+    let note = fake.annotation("web01");
+    assert!(note.starts_with("Migrated to Orbivisor VM"), "{note}");
+    assert!(note.ends_with(NOTE), "{note}");
+    src.check(&fake);
+}
+
+/// 리뷰 2: 시간 한도와 더 지켜보는 시간을 넘긴 뒤에 게스트가 꺼지면 다음 동기화가 원본을 다시 켠다.
+#[tokio::test]
+async fn a_shutdown_finishing_after_the_watch_is_powered_on_by_the_next_sync() {
+    let (env, admin, fake, _storage) = setup().await;
+    let src = Source::new(&fake, "web01", 2);
+    let it = start_plan(&env, &admin, "l1", "DC1/vm/Prod/web01", "warm", json!({})).await;
+    sync(&env, &admin, it.id, true).await;
+    fake.ignore_shutdown(true);
+    let task = act(&admin, "l1-web01", "cutover", json!({})).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    fake.ignore_shutdown(false);
+    let s = item(&env, it.id).status;
+    assert_eq!(s.state, VmwareVmState::Syncing, "{s:?}");
+    assert!(s.shutdown_sent_at.is_some(), "{s:?}");
+    assert!(
+        s.error
+            .as_deref()
+            .unwrap()
+            .contains("may still finish shutting down"),
+        "{s:?}"
+    );
+    assert_source_restored(&env, &fake, "web01", &s);
+    // 보낸 종료가 늦게 끝났다.
+    fake.set_power("web01", VmwarePower::PoweredOff);
+    sync(&env, &admin, it.id, false).await;
+    let s = item(&env, it.id).status;
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOn, "{s:?}");
+    assert!(s.shutdown_sent_at.is_none(), "{s:?}");
+    assert!(
+        s.history
+            .iter()
+            .any(|h| h.event.contains("the source VM was powered on again")),
+        "{s:?}"
+    );
+    src.check(&fake);
+
+    // 표시가 남은 채 다시 전환할 때 원본이 꺼져 있으면 우리가 끈 것으로 적는다(되돌림·되돌리기가 켠다).
+    set_status(&env, it.id, |s| s.shutdown_sent_at = Some(1)).await;
+    fake.set_power("web01", VmwarePower::PoweredOff);
+    let task = act(&admin, "l1-web01", "cutover", json!({})).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let s = item(&env, it.id).status;
+    assert!(
+        s.shutdown_sent_at.is_none() && s.source_changes.powered_off_by_us,
+        "{s:?}"
+    );
+    src.check(&fake);
+}

@@ -767,3 +767,22 @@ For stage 8: docs (vms.md export section, access.md vm.export, development.md te
   it") — 항목이 끝났으니 그 노드가 시작할 때 고아 정리가 파일과 기록을 지운다.
 - **전체로 다시 복사할 때 빈 곳(엔진 8).** `"*"` 구역을 이 Task가 방금 만들지 않은 볼륨에 쓸 때(CBT 초기화·디스크 늘림·`full`·앞
   시도가 만든 볼륨) 디스크를 처음부터 쓰기 전에 구역 밖을 `WRITE_ZEROES`로 비운다(얇은 대상에서 싸다 — 두꺼운 LVM은 실제로 0을 쓴다).
+
+### 리뷰 2
+
+- **켠 뒤에는 자동 되돌림이 없다(API 1).** 이어 가는 `starting-vm`(그리고 VM을 이미 만든 `creating-vm`)은 vSphere 연결을 열지 않는다
+  — 남은 일(켜기·`done` 적기)은 우리 쪽뿐이라 원본 세션 만료·원본을 지움(`vmware_vm_gone`)·vCenter 잠깐 오류가 켠 VM을 되돌리지
+  못한다. 자동 되돌림(대상 VM 지움 + 따뜻한 이전이면 대상 파일 버림)은 **이 Task가 처음 켜기를 청했고 `running`을 보기 전에 실패했을
+  때만**이다. 이어 갔거나(앞 opld가 켰을 수 있다 — QEMU는 opld 없이 돈다) 켜기 전에 VM이 이미 켜라는 상태면, 켜지 못해도 `done`에
+  오류("may have run already but is not running now … it and its disks were kept")를 남기고 VM·디스크를 둔다(Task는 실패) —
+  돌아갈 길은 되돌리기뿐이다. `done` 쓰기(Raft)가 실패하면 항목이 `cutting-over`인 동안 1초→30초 간격으로 다시 쓴다(전환은 이어
+  가는 Task라 opld가 다시 떠도 이 걸음부터 잇는다).
+- **NIC·설명 바꾸기는 이어 갈 때 다시 맞춘다(API 2).** `stopping-source`는 적은 것만 믿지 않고 걸음 앞에서 새로 읽은 원본 값과 맞춘다:
+  `startConnected`가 `false`가 아닌 NIC 모두(새 키는 먼저 적고)에 `set_nics_start_connected(false)`, 설명은 `annotation_added`면 적은
+  옛 설명으로 만든 보호 문구와 지금 설명이 다를 때 다시 쓴다(같은 값 쓰기는 해가 없다).
+- **늦게 꺼진 원본 다시 켜기(API 3).** 고른 길: 자동으로 다시 켠다(기간 안), 기간 뒤에는 경고만. 시간 한도 + 더 지켜보기 뒤에도 켜져
+  있으면 새 칸 `shutdown_sent_at`(보낸 시각)을 남기고 오류 문구가 "it may still finish shutting down"을 말한다. 멈춘 전환은 다음 동기화를
+  `min(주기, 5분)` 뒤로 당긴다. 동기화 회차 앞: 표시가 있고 원본이 꺼져 있으면 보낸 뒤 `SHUTDOWN_WATCH_S`(6시간) 안이면 원본을 켜고
+  기록 "… the source VM was powered on again"·감사 `vmware-vm.source-power-on`; 켜져 있으면 그대로(기간이 지나면 지움); 기간 뒤
+  꺼져 있으면 켜지 않고(사용자가 끈 것일 수 있다) 경고를 남기고 지운다. 원본은 아직 운영 VM(대상 VM 없음)이라 켜는 쪽이 안전하다.
+  다음 전환이 표시를 보면 지우고, 그때 원본이 꺼져 있으면 `powered_off_by_us`로 적는다(되돌림·되돌리기가 켠다).

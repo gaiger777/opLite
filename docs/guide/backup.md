@@ -1538,13 +1538,17 @@ orbivisorctl vmware vm revert wave1-db01 --confirm db01 --wait   # 대상 VM을 
 2. 게스트 맞추기를 **원본에서 미리** 한다(아래) — 다음 델타가 그 바뀐 파일을 옮긴다.
 3. 전환: 원본 보호(`protect_source`, 기본 켬)면 원본 NIC의 "켤 때 연결"을 끄고 설명에 "Migrated to Orbivisor VM …"을 붙인 뒤, 켜진
    채 델타 한 번 → 게스트 종료(VMware Tools, `shutdown_timeout_s` 기본 600초 — 넘기면 원본은 켜진 채 멈춤; 그 뒤 최대 120초 더
-   지켜보다 느린 게스트가 꺼지면 다시 켠다) 또는 전원 끄기 → 마지막
+   지켜보다 느린 게스트가 꺼지면 다시 켠다. 그 뒤에 꺼지면 6시간 안의 다음 동기화(5분 안에 당겨짐)가 다시 켜고 기록·감사에 남긴다)
+   또는 전원 끄기 → 마지막
    델타 → VM 만들기(원본 MAC 그대로, `--new-macs`면 새 MAC) → 켜기(`--no-start`면 꺼진 채). 걸음마다 Raft에 먼저 적는다.
 4. **자동 되돌림**: `final-sync` 뒤 어느 걸음에서든 실패하면 대상 VM을 지우고(볼륨은 남김) NIC·설명을 되돌린 뒤 원본을 다시 켠다 →
    `rolled-back`(이유는 `error`). 되돌림까지 실패하면 `failed`와 손으로 할 일("stop and delete Orbivisor VM …, then turn "Connect At
    Power On" back on …, then power on … in vCenter")을 남기고, `retry`가 되돌림을 다시 한다(전환과 같은 권한, 겹친 다시 하기는
    409 `migration_busy`). 할당량·용량을 넘으면 VM 만들기에서 막혀 같은 되돌림을 한다. 대상 VM을 **켠 뒤**(`starting-vm`) 되돌린
-   따뜻한 이전은 그 게스트가 대상 디스크에 썼을 수 있어 대상 내용을 버리고 `copying`(처음부터 전체 복사)으로 돌아간다.
+   따뜻한 이전은 그 게스트가 대상 디스크에 썼을 수 있어 대상 내용을 버리고 `copying`(처음부터 전체 복사)으로 돌아간다. 이 자동
+   되돌림은 전환 Task가 처음 켜다 `running`을 보기 전에 실패했을 때만이다: 대상 VM이 켜졌거나 켜졌을 수 있으면(opld가 다시 떠
+   `starting-vm`부터 잇는 등) 절대 자동으로 되돌리지 않고 — 이때는 vCenter에 연결하지도 않는다 — 켜지 못해도 `done`에 오류를 남기고
+   VM·디스크를 둔다. 그 뒤 돌아갈 길은 `revert`뿐이다.
 5. 새 VM이 잘 돌면 `finalize`(우리 스냅샷·우리가 켠 CBT를 지움, 원본 보호는 남김 — 실패하면 `done`에 오류를 남기고 다시
    마무리한다). 안 되면 `revert --confirm <Orbivisor VM 이름>`:
    대상 VM을 끄고(지우지 않음) NIC·설명을 되돌리고 원본을 켠다 → `reverted`. **전환 뒤 대상 VM에서 쓴 데이터는 원본으로 가지
