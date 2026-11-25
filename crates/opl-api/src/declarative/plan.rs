@@ -287,8 +287,13 @@ fn labels_of(
     prev: Option<&Value>,
     set: Option<&str>,
     manager: Option<Manager>,
+    replace: bool,
 ) -> BTreeMap<String, String> {
     let mut out = live.map(|l| l.labels.clone()).unwrap_or_default();
+    if replace {
+        // 되돌리기(§12): 레이블도 그 줄 그대로 — 서버가 다는 `orbivisor.io/` 레이블만 지금 값을 둔다.
+        out.retain(|k, _| k.starts_with("orbivisor.io/"));
+    }
     if let Some(prev) = prev
         .and_then(|p| p.pointer("/metadata/labels"))
         .and_then(Value::as_object)
@@ -834,7 +839,7 @@ async fn plan_doc(
             let normalized = a
                 .normalize(&store)
                 .map_err(|e| invalid_doc(kind, &name, e))?;
-            step.labels = labels_of(None, doc, None, set, req.manager);
+            step.labels = labels_of(None, doc, None, set, req.manager, false);
             if a.may_create(state, principal, &store, folder_for_check)
                 .is_err()
             {
@@ -892,7 +897,7 @@ async fn plan_doc(
                 }
             };
             let fields = top_fields(&changes);
-            step.labels = labels_of(Some(live), doc, prev, set, req.manager);
+            step.labels = labels_of(Some(live), doc, prev, set, req.manager, req.replace);
             step.labels_changed = step.labels != live.labels;
             step.spec_changed = !changes.is_empty();
             step.fields = fields.clone();
@@ -1089,14 +1094,21 @@ mod tests {
             labels: tf.clone(),
             spec: json!({}),
         };
-        let labels = labels_of(Some(&live), &doc, None, Some("web"), None);
+        let labels = labels_of(Some(&live), &doc, None, Some("web"), None, false);
         assert_eq!(labels.get(APPLY_SET_LABEL).map(String::as_str), Some("web"));
         assert!(!labels.contains_key(MANAGED_BY_LABEL));
         let live = Live {
             labels: web,
             ..live
         };
-        let labels = labels_of(Some(&live), &doc, None, None, Some(Manager::Terraform));
+        let labels = labels_of(
+            Some(&live),
+            &doc,
+            None,
+            None,
+            Some(Manager::Terraform),
+            false,
+        );
         assert!(!labels.contains_key(APPLY_SET_LABEL));
     }
 
@@ -1116,7 +1128,14 @@ mod tests {
             ]),
             spec: json!({}),
         };
-        let labels = labels_of(Some(&live), &doc, None, None, Some(Manager::Terraform));
+        let labels = labels_of(
+            Some(&live),
+            &doc,
+            None,
+            None,
+            Some(Manager::Terraform),
+            false,
+        );
         assert_eq!(
             labels,
             BTreeMap::from([
@@ -1126,8 +1145,17 @@ mod tests {
             ])
         );
         // 다른 손님(묶음 없는 적용)은 선언하지 않은 레이블을 그대로 둔다.
-        let labels = labels_of(Some(&live), &doc, None, None, None);
+        let labels = labels_of(Some(&live), &doc, None, None, None, false);
         assert!(labels.contains_key("added-in-web"));
+        // 되돌리기는 그 줄의 레이블 그대로 — 뒤에 단 레이블은 떼고 서버 레이블은 둔다(배포 확인에서 찾음).
+        let labels = labels_of(Some(&live), &doc, None, None, None, true);
+        assert_eq!(
+            labels,
+            BTreeMap::from([
+                ("orbivisor.io/other".to_string(), "keep".to_string()),
+                ("tier".to_string(), "web".to_string()),
+            ])
+        );
     }
 
     #[test]
