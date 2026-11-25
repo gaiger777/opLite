@@ -83,7 +83,7 @@ export function VmDrawer({
                 {t("vmware.action.finalize")}
               </Button>
             )}
-            {actions.retry && state === "failed" && (
+            {actions.retry && (
               <Button size="sm" variant="outline" onClick={actions.retry}>
                 {t(rollbackFailed(item) ? "vmware.action.retryRollback" : "vmware.action.retry")}
               </Button>

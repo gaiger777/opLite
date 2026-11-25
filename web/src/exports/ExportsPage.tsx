@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Download, PackageOpen, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -8,7 +8,7 @@ import { toast } from "sonner";
 import { api, ApiError, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { objectTarget, ROOT } from "@/auth/permissions";
-import { usePermissions } from "@/auth/usePermissions";
+import { usePermissions, usePermissionsReady } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { ListPending } from "@/components/ListPending";
@@ -24,7 +24,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { ExportDialog } from "@/exports/ExportDialog";
-import { downloadExport, refreshExports, useExports, type VmExport } from "@/exports/exports";
+import {
+  downloadExport,
+  exportReason,
+  refreshExports,
+  useExports,
+  type VmExport,
+} from "@/exports/exports";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatBytes, formatTime, uuidTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
@@ -43,6 +49,7 @@ const TONE = {
 export function ExportsPage() {
   const { t, i18n } = useTranslation();
   const perms = usePermissions();
+  const permsReady = usePermissionsReady();
   const queryClient = useQueryClient();
   const exports = useExports();
   const vms = useList("vm");
@@ -50,7 +57,16 @@ export function ExportsPage() {
   // VM 메뉴의 "OVA로 내보내기…"는 `?export=<VM 이름>`으로 이 보기를 열고 대화상자를 띄운다.
   const [params, setParams] = useSearchParams();
   const exporting = params.get("export");
-  const exportVm = exporting ? vms.data?.find((v) => v.name === exporting) : undefined;
+  const named = exporting ? vms.data?.find((v) => v.name === exporting) : undefined;
+  // 메뉴와 같은 조건(`vm.export`, 꺼져 있음)일 때만 연다 — 저장한 링크나 뒤로 가기로 켠 VM이 올 수 있다. 권한은 받은
+  // 뒤에 본다(그 전은 전역 역할로 본 값이다).
+  const refused =
+    !named || !permsReady
+      ? null
+      : !perms.has("vm.export", objectTarget("vm", named))
+        ? "errors.forbidden"
+        : exportReason(named);
+  const exportVm = refused || !permsReady ? undefined : named;
   const closeExport = () =>
     setParams(
       (p) => {
@@ -59,6 +75,18 @@ export function ExportsPage() {
       },
       { replace: true },
     );
+  useEffect(() => {
+    if (refused) {
+      toast.error(t(refused));
+      setParams(
+        (p) => {
+          p.delete("export");
+          return p;
+        },
+        { replace: true },
+      );
+    }
+  }, [refused, t, setParams]);
   const items = [...(exports.data ?? [])].sort((a, b) => b.id.localeCompare(a.id));
   const vmOf = (exp: VmExport) => vms.data?.find((v) => v.id === exp.spec.vm);
   const allowed = (exp: VmExport) => {
@@ -170,7 +198,8 @@ export function ExportsPage() {
                           <Download />
                         </Button>
                       )}
-                      {can && (
+                      {/* 쓰는 동안 지우면 서버가 409 `export_busy` — 내려받기처럼 끝난 것만 */}
+                      {can && (phase === "ready" || phase === "failed") && (
                         <Button
                           variant="ghost"
                           size="icon-sm"

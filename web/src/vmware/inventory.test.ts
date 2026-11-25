@@ -3,6 +3,7 @@ import {
   buildTree,
   canCancel,
   canCutover,
+  canRetry,
   checkWizardStep,
   copyProgress,
   createRequestOf,
@@ -198,4 +199,18 @@ it("reads item progress, deltas and allowed actions", () => {
   expect(formatDuration(42)).toBe("42s");
   expect(formatDuration(252)).toBe("4m 12s");
   expect(formatDuration(3780)).toBe("1h 3m");
+});
+
+it("offers retry exactly when the server's retry_item accepts it", () => {
+  const failed = migrationItem("a", 1, { state: "failed" });
+  const stopped = migrationItem("b", 2, { state: "syncing" });
+  const syncing = migrationItem("c", 3, { state: "syncing", next_sync_at: 100 });
+  const ready = migrationItem("d", 4, { state: "ready" });
+  expect(canRetry("running", failed)).toBe(true);
+  expect(canRetry("paused", stopped)).toBe(true);
+  expect(canRetry("running", syncing)).toBe(false);
+  expect(canRetry("running", ready)).toBe(false);
+  // 계획이 running·paused가 아니면 409 migration_state
+  expect(canRetry("draft", failed)).toBe(false);
+  expect(canRetry("finished", stopped)).toBe(false);
 });

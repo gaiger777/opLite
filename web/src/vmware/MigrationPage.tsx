@@ -34,7 +34,14 @@ import {
   vmwareErrorText,
 } from "@/vmware/api";
 import { CutoverDialog } from "@/vmware/CutoverDialog";
-import { canCancel, canCutover, copyProgress, formatDuration, lastDelta } from "@/vmware/inventory";
+import {
+  canCancel,
+  canCutover,
+  canRetry,
+  copyProgress,
+  formatDuration,
+  lastDelta,
+} from "@/vmware/inventory";
 import { ItemStateChip, Progress } from "@/vmware/ItemState";
 import { CountsText, MigrationPhaseChip } from "@/vmware/MigrationsPage";
 import { PreflightTable } from "@/vmware/PreflightTable";
@@ -158,7 +165,7 @@ export function MigrationPage() {
                 finalize: () => setDialog({ kind: "finalize", item }),
               }
             : {}),
-          retry: () => void retry(item),
+          ...(canRetry(phase, item) ? { retry: () => void retry(item) } : {}),
           cancel: () => setDialog({ kind: "cancel", items: [item] }),
         }
       : {};
@@ -421,17 +428,27 @@ export function MigrationPage() {
           if (dialog?.kind !== "cancel") {
             return;
           }
+          // 하나가 실패해도 나머지는 취소한다(전환 확인과 같다). 모두 실패했을 때만 대화상자에 남는다.
+          const failed: string[] = [];
+          const done: string[] = [];
           for (const item of dialog.items) {
             try {
               await call(
                 api.POST("/vmware-vms/{key}/cancel", { params: { path: { key: item.id } } }),
               );
+              done.push(item.id);
             } catch (err) {
-              throw localized(t, err);
+              failed.push(`${item.spec.target_name}: ${(localized(t, err) as Error).message}`);
             }
           }
-          setSelected([]);
+          setSelected((s) => s.filter((id) => !done.includes(id)));
           await refreshVmware(queryClient);
+          if (failed.length === dialog.items.length) {
+            throw new Error(failed.join("\n"));
+          }
+          if (failed.length > 0) {
+            toast.error(failed.join("\n"));
+          }
         }}
       />
       <ConfirmDialog

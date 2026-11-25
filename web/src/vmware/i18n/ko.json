@@ -6,6 +6,7 @@
     "no": "아니요",
     "countOf": "{{state}} {{count}}",
     "stateStep": "전환 중: {{step}}",
+    "syncStopped": "동기화 멈춤",
     "rollbackFailedAt": "되돌림 실패: {{step}}",
     "sources": {
       "title": "저장한 vCenter·ESXi 연결입니다. 비밀번호는 클러스터에만 두고 다시 보이지 않습니다.",
@@ -241,6 +242,8 @@
       "draftLocked": "초안 {{name}}을(를) 이미 저장했습니다. 이름·원본·방식은 그대로입니다.",
       "reload": "다시 읽기",
       "fetched": "{{time}}에 읽음",
+      "vanished_one": "고른 VM {{count}}대가 인벤토리에 없어 고른 것에서 뺐습니다.",
+      "vanished_other": "고른 VM {{count}}대가 인벤토리에 없어 고른 것에서 뺐습니다.",
       "loadingInventory": "인벤토리를 읽는 중…",
       "start_one": "VM {{count}}대 시작",
       "start_other": "VM {{count}}대 시작",

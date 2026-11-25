@@ -231,6 +231,17 @@ export function MigrationWizard() {
             body: { remove_vms: blocked },
           }),
         );
+        // 뺀 VM은 초안·확인 결과·고른 것에서도 뺀다 — 시작이 실패해 다시 눌러도 이미 뺀 것을 또 빼지 않고, 다시 확인해도
+        // 도로 넣지 않는다.
+        const gone = [...draft.items]
+          .filter(([, item]) => blocked.includes(item))
+          .map(([ref]) => ref);
+        setDraft({
+          ...draft,
+          items: new Map([...draft.items].filter(([ref]) => !gone.includes(ref))),
+        });
+        setPreflight(preflight.filter((v) => v.level !== "blocked"));
+        setForm((f) => ({ ...f, selected: f.selected.filter((ref) => !gone.includes(ref)) }));
       }
       await call(
         api.POST("/vmware-migrations/{key}/actions/start", {
@@ -251,6 +262,13 @@ export function MigrationWizard() {
     try {
       const fresh = await fetchInventory(form.source, true);
       queryClient.setQueryData(inventoryKey(form.source), fresh);
+      // 원본에서 사라진 VM은 표에 없어 풀 수 없다 — 고른 것에서 빼고 알린다.
+      const there = new Set(fresh.inventory.vms.map((vm) => vm.moref));
+      const gone = form.selected.filter((ref) => !there.has(ref));
+      if (gone.length > 0) {
+        set({ selected: form.selected.filter((ref) => there.has(ref)) });
+        toast.info(t("vmware.wizard.vanished", { count: gone.length }));
+      }
     } catch (err) {
       toast.error(vmwareErrorText(t, err));
     }
@@ -391,6 +409,7 @@ export function MigrationWizard() {
             ) : (
               <VmPicker
                 inventory={inventory.data}
+                draft={draft?.name}
                 selected={form.selected}
                 onChange={(selected) => set({ selected })}
               />

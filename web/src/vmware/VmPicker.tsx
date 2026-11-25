@@ -87,14 +87,17 @@ function TreeBranch({
 
 /**
  * 인벤토리 나무 + 표에서 VM 고르기(계획 72 §13 ②): 나무(VM 폴더 또는 클러스터·호스트)에서 마디를 고르면 그 아래 VM만, 찾기·
- * 전원 거르기, 이미 끝나지 않은 계획에 든 VM은 흐리게 두고 고를 수 없다.
+ * 전원 거르기, 이미 끝나지 않은 계획에 든 VM은 흐리게 두고 고를 수 없다(마법사가 만든 초안 `draft`에 든 VM은 빼고).
  */
 export function VmPicker({
   inventory,
+  draft,
   selected,
   onChange,
 }: {
   inventory: SourceInventory;
+  /** 마법사가 이미 만든 초안의 이름 — 그 초안의 VM은 다른 계획에 든 것이 아니다. */
+  draft?: string;
   selected: readonly string[];
   onChange(selected: string[]): void;
 }) {
@@ -105,8 +108,13 @@ export function VmPicker({
   const [power, setPower] = useState<PowerFilter>("all");
   const all = inventory.inventory.vms;
   const busy = useMemo(
-    () => new Map(inventory.migrating.map((m) => [m.instance_uuid, m] as const)),
-    [inventory.migrating],
+    () =>
+      new Map(
+        inventory.migrating
+          .filter((m) => m.migration !== draft)
+          .map((m) => [m.instance_uuid, m] as const),
+      ),
+    [inventory.migrating, draft],
   );
   const tree = useMemo(() => buildTree(all, view), [all, view]);
   const shown = useMemo(

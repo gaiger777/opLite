@@ -6,6 +6,7 @@
     "no": "No",
     "countOf": "{{count}} {{state}}",
     "stateStep": "Cutting over: {{step}}",
+    "syncStopped": "Sync stopped",
     "rollbackFailedAt": "Rollback failed: {{step}}",
     "sources": {
       "title": "Saved vCenter and ESXi connections. Their passwords stay in the cluster and are never shown again.",
@@ -241,6 +242,8 @@
       "draftLocked": "Draft {{name}} is already saved; its name, source and mode stay.",
       "reload": "Read again",
       "fetched": "Read at {{time}}",
+      "vanished_one": "{{count}} chosen VM is no longer in the inventory and was unselected.",
+      "vanished_other": "{{count}} chosen VMs are no longer in the inventory and were unselected.",
       "loadingInventory": "Reading the inventory…",
       "start_one": "Start {{count}} VM",
       "start_other": "Start {{count}} VMs",

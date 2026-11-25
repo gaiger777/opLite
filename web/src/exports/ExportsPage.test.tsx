@@ -139,6 +139,35 @@ describe("VM menu", () => {
     );
   });
 
+  it("does not open the dialog from a link for a running VM", async () => {
+    mockLists({ vm: [WEB, RUNNING], node: [NODE] });
+    server.use(
+      http.get(apiUrl("/vm-exports"), () => HttpResponse.json({ revision: 1, items: [] })),
+    );
+    const { router } = renderPage(<ExportsPage />, {
+      path: "/vm-exports",
+      url: "/vm-exports?export=app",
+    });
+    expect(await screen.findByText("The VM is running.")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(router.state.location.search).toBe("");
+  });
+
+  it("does not open the dialog from a link without vm.export", async () => {
+    mockLists({ vm: [WEB], node: [NODE] });
+    server.use(
+      http.get(apiUrl("/vm-exports"), () => HttpResponse.json({ revision: 1, items: [] })),
+    );
+    const { router } = renderPage(<ExportsPage />, {
+      path: "/vm-exports",
+      url: "/vm-exports?export=web",
+      as: OPERATOR,
+    });
+    expect(await screen.findByText("You do not have permission to do this.")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(router.state.location.search).toBe("");
+  });
+
   it("hides the export from users without vm.export (operators)", async () => {
     const user = userEvent.setup();
     mockLists({ vm: [WEB], node: [NODE] });
@@ -202,11 +231,36 @@ describe("exports view", () => {
     const user = userEvent.setup();
     const deleted = setup();
     renderPage(<ExportsPage />, { path: "/vm-exports" });
-    await user.click(await screen.findByRole("button", { name: "Delete web-20261125-090000" }));
+    await user.click(await screen.findByRole("button", { name: "Delete web-20261125-080000" }));
     await user.click(
       within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete" }),
     );
-    await waitFor(() => expect(deleted).toEqual([WRITING.id]));
+    await waitFor(() => expect(deleted).toEqual([READY.id]));
+  });
+
+  it("offers delete only once the export task has finished (the server answers export_busy)", async () => {
+    setup();
+    server.use(
+      http.get(apiUrl("/vm-exports"), () =>
+        HttpResponse.json({
+          revision: 1,
+          items: [
+            READY,
+            WRITING,
+            exportOf("web-20261125-100000", 3, { phase: "pending" }),
+            exportOf("web-20261125-110000", 4, { phase: "failed", error: "disk full" }),
+          ],
+        }),
+      ),
+    );
+    renderPage(<ExportsPage />, { path: "/vm-exports" });
+    const table = await screen.findByRole("table", { name: "Exports" });
+    const del = (name: string) =>
+      within(table).queryByRole("button", { name: `Delete web-20261125-${name}` });
+    expect(del("080000")).toBeInTheDocument();
+    expect(del("110000")).toBeInTheDocument();
+    expect(del("090000")).not.toBeInTheDocument();
+    expect(del("100000")).not.toBeInTheDocument();
   });
 
   it("shows no download or delete to users without vm.export", async () => {

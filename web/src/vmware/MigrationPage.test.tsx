@@ -340,3 +340,74 @@ it("shows no actions to users who may not create VMs", async () => {
   await userEvent.setup().click(screen.getByRole("button", { name: "Open db01" }));
   expect(screen.queryByRole("button", { name: "Revert…" })).not.toBeInTheDocument();
 });
+
+it("marks a warm VM whose sync stopped and offers Retry to continue it", async () => {
+  const user = userEvent.setup();
+  // stop_after_days가 지나면 `syncing`인 채로 다음 동기화가 없다 — 서버의 다시 하기가 잇는다.
+  const stopped = migrationItem("old01", 4, {
+    state: "syncing",
+    rounds: 9,
+    warnings: ["synchronization stopped after 14 days without cutover (retry to continue)"],
+  });
+  const posted = setup([WEB, stopped]);
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  expect(await within(table).findByRole("row", { name: /old01/ })).toHaveTextContent(
+    "Sync stopped",
+  );
+  expect(within(table).getByRole("row", { name: /web01/ })).not.toHaveTextContent("Sync stopped");
+  // 도는 동기화에는 다시 하기가 없다(서버가 409로 답한다).
+  await user.click(screen.getByRole("button", { name: "Open web01" }));
+  expect(
+    within(screen.getByRole("dialog", { name: "web01" })).queryByRole("button", { name: "Retry" }),
+  ).not.toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  await user.click(screen.getByRole("button", { name: "Open old01" }));
+  await user.click(
+    within(screen.getByRole("dialog", { name: "old01" })).getByRole("button", { name: "Retry" }),
+  );
+  await waitFor(() => expect(posted).toEqual([{ path: `${stopped.id}/retry`, body: null }]));
+});
+
+it("cancels every chosen VM even if one fails, then reads the list again", async () => {
+  const user = userEvent.setup();
+  const posted = setup([WEB, APP]);
+  let reads = 0;
+  server.use(
+    http.get(apiUrl("/vmware-vms"), () => {
+      reads++;
+      return HttpResponse.json({ revision: 1, items: [WEB, APP] });
+    }),
+    http.post(apiUrl("/vmware-vms/:key/cancel"), ({ params }) => {
+      posted.push({ path: `${String(params.key)}/cancel`, body: null });
+      return params.key === APP.id
+        ? HttpResponse.json(
+            { code: "vmware_vm_state", message: "app01 is finished" },
+            { status: 409 },
+          )
+        : HttpResponse.json({ item: WEB });
+    }),
+  );
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  await within(table).findByRole("row", { name: /web01/ });
+  await user.click(within(table).getByRole("checkbox", { name: "Select app01" }));
+  await user.click(within(table).getByRole("checkbox", { name: "Select web01" }));
+  const before = reads;
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  // 확인 단추(뒤쪽) — 앞쪽 "Cancel"은 대화상자를 닫는다.
+  const confirm = within(screen.getByRole("alertdialog")).getAllByRole("button", {
+    name: "Cancel",
+  });
+  await user.click(confirm[confirm.length - 1]!);
+  // 표 차례(app01 먼저)대로 — app01이 실패해도 web01은 취소한다.
+  await waitFor(() =>
+    expect(posted.map((p) => p.path)).toEqual([`${APP.id}/cancel`, `${WEB.id}/cancel`]),
+  );
+  expect(await screen.findByText(/app01 is finished/)).toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+  expect(reads).toBeGreaterThan(before);
+  // 취소한 것은 고른 것에서 빠지고, 실패한 것은 남는다.
+  expect(within(table).getByRole("checkbox", { name: "Select web01" })).not.toBeChecked();
+  expect(within(table).getByRole("checkbox", { name: "Select app01" })).toBeChecked();
+});

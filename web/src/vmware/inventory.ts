@@ -7,6 +7,7 @@ import type {
   InvVm,
   ItemState,
   MigrationItem,
+  MigrationPhase,
   PreflightLevel,
   Rules,
 } from "@/vmware/api";
@@ -440,6 +441,22 @@ export function canCutover(item: MigrationItem): boolean {
  */
 export function rollbackFailed(item: MigrationItem): boolean {
   return item.status.state === "failed" && item.status.cutover_step !== undefined;
+}
+
+/** 오래 전환하지 않아 동기화가 멈춘 따뜻한 항목(`syncing`인데 다음 동기화가 없음 — `stop_after_days`). 다시 하기로 잇는다. */
+export function syncStopped(item: MigrationItem): boolean {
+  return item.status.state === "syncing" && item.status.next_sync_at === undefined;
+}
+
+/**
+ * 다시 하기를 서버가 받는 항목(`retry_item`과 같다): 계획이 `running`·`paused`이고 항목이 `failed`이거나 동기화가 멈췄다.
+ * 도는 Task가 있으면 서버가 409 `migration_busy`로 답한다(화면은 모른다).
+ */
+export function canRetry(phase: MigrationPhase, item: MigrationItem): boolean {
+  return (
+    (phase === "running" || phase === "paused") &&
+    (item.status.state === "failed" || syncStopped(item))
+  );
 }
 
 /** 취소할 수 있는 항목(설계 §10.3 — `pending`~`syncing`·`failed`·`rolled-back`) */
