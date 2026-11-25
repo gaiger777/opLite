@@ -368,7 +368,7 @@ orbivisorctl volume download noble --pool nas --source-format qcow2 \
   SUMS를 바꾸는 사이에 받으면 불일치로 실패한다 — 다시 받으면 된다.
 
 **링크 확인.** `.github/workflows/catalog.yml`이 주 1회(와 수동) 내장 항목마다 이미지 URL이 답하는지와 체크섬 파일에 그
-이미지의 줄이 있는지 본다(받지는 않음, `cargo test -p oplctl --features catalog-it --test catalog`). 바깥 서버 사정으로
+이미지의 줄이 있는지 본다(받지는 않음, `cargo test -p orbivisorctl --features catalog-it --test catalog`). 바깥 서버 사정으로
 푸시 CI를 깨지 않게 따로 돈다. 실패하면 `BUILTIN`을 고친다.
 
 **넣지 않은 것(나중).** 카탈로그 원격 피드·구독, 원격 클러스터 사이 템플릿 동기화, 체크섬 파일의 GPG 서명 확인.

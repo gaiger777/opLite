@@ -1,0 +1,2045 @@
+//! 스냅샷 Task 실행: 실행 중인 VM(Mock 하이퍼바이저)의 만들기·삭제, 부모와 현재 위치, 실패 정리,
+//! 디스크 없는 VM 되돌리기, 시작할 때의 고아 정리, 실행 중인 VM의 블록(LVM, ZFS, RBD) 스냅샷과 크기
+//! 늘리기. 디스크 파일을 다루는 경우는 `snapshot_disks`.
+
+mod common;
+
+use std::sync::{Arc, Mutex};
+
+use common::{Client, Env, FakeStorage, vm_request};
+use orbivisor_driver::{DriverError, Hypervisor, RuntimeStatus, uefi_vars_path};
+use orbivisor_qemu::QmpError;
+use orbivisor_types::backup::{Backup, BackupPhase, BackupSpec};
+use orbivisor_types::node::NodeSpec;
+use orbivisor_types::resource::Resource;
+use orbivisor_types::runtime::{ImageFormat, VmRuntimeSpec};
+use orbivisor_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
+use orbivisor_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
+use orbivisor_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
+use orbivisor_types::vm::{Arch, HaState, PowerState, VmHa, VmPhase, VmSpec};
+use reqwest::StatusCode;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+/// 풀 `local`과 바로 Ready인 qcow2 볼륨 `root`를 저장소에 직접 만든다(파일은 없다. Mock
+/// 하이퍼바이저는 파일을 열지 않는다).
+async fn pool_and_root(env: &Env) {
+    let pool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: orbivisor_types::storage::PoolBackend::Dir {
+                path: env.dir.path().join("pool"),
+            },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+            folder: None,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
+    let mut volume = Resource::new(
+        "root",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+            content: Default::default(),
+            base: None,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+}
+
+/// 디스크 `disks`를 붙인 VM을 만들고 켠다.
+async fn running_vm(admin: &Client, name: &str, disks: &[&str]) -> Uuid {
+    let mut req = vm_request(name);
+    req["spec"]["disks"] = disks
+        .iter()
+        .map(|v| json!({ "volume": v, "bus": "virtio-blk" }))
+        .collect();
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let task = admin.act(name, "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    vm["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// 스냅샷을 요청하고 Task가 끝날 때까지 기다린다.
+async fn snapshot(admin: &Client, vm: &str, body: Value) -> Value {
+    let (status, task) = admin.post(&format!("/vms/{vm}/snapshots"), body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await
+}
+
+fn find(env: &Env, vm: Uuid, name: &str) -> Option<Snapshot> {
+    let (_, items) = env.cluster.list::<SnapshotSpec>().unwrap();
+    items
+        .into_iter()
+        .find(|s| s.spec.vm == vm && s.spec.name == name)
+}
+
+fn get(env: &Env, vm: Uuid, name: &str) -> Snapshot {
+    find(env, vm, name).unwrap_or_else(|| panic!("snapshot {name} not found"))
+}
+
+fn position(env: &Env, vm: Uuid) -> Option<Uuid> {
+    env.cluster
+        .get::<VmSpec>(vm)
+        .unwrap()
+        .unwrap()
+        .status
+        .snapshot
+}
+
+fn vars_copy(env: &Env, vm: Uuid, snapshot: Uuid) -> std::path::PathBuf {
+    env.dir
+        .path()
+        .join(format!("state/vm/{vm}/snapshots/{snapshot}.vars"))
+}
+
+fn succeeded(task: &Value) {
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+}
+
+#[tokio::test]
+async fn running_vm_snapshots_chain_and_move_the_position() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    // QEMU 드라이버가 처음 시작할 때 만드는 UEFI 변수 파일
+    let vars = uefi_vars_path(&env.dir.path().join("state"), vm);
+    std::fs::create_dir_all(vars.parent().unwrap()).unwrap();
+    std::fs::write(&vars, b"vars-a").unwrap();
+
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert!(a.status.created_at.is_some());
+    assert!(a.spec.memory);
+    assert_eq!(a.spec.parent, None);
+    assert_eq!(env.hv.snapshots(vm), vec![(a.id.to_string(), true)]);
+    assert_eq!(position(&env, vm), Some(a.id));
+    assert_eq!(std::fs::read(vars_copy(&env, vm, a.id)).unwrap(), b"vars-a");
+
+    // 줄 선 두 만들기: API는 둘 다 a를 부모로 기록하지만, 실행할 때 앞의 것을 부모로 삼는다.
+    let (_, tb) = admin
+        .post(
+            "/vms/web/snapshots",
+            json!({ "name": "b", "memory": false }),
+        )
+        .await;
+    let (_, tc) = admin
+        .post("/vms/web/snapshots", json!({ "name": "c" }))
+        .await;
+    succeeded(&admin.wait_task(&tb).await);
+    succeeded(&admin.wait_task(&tc).await);
+    let (b, c) = (get(&env, vm, "b"), get(&env, vm, "c"));
+    assert_eq!(b.spec.parent, Some(a.id));
+    assert_eq!(c.spec.parent, Some(b.id));
+    assert_eq!(
+        env.hv.snapshots(vm),
+        vec![
+            (a.id.to_string(), true),
+            (b.id.to_string(), false),
+            (c.id.to_string(), true)
+        ]
+    );
+    assert_eq!(position(&env, vm), Some(c.id));
+}
+
+#[tokio::test]
+async fn failed_snapshot_is_removed_but_a_timed_out_one_keeps_its_tag() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+
+    // 작업이 오류로 끝났다: 만든 태그와 리소스를 지운다.
+    env.hv
+        .fail_next_snapshot(DriverError::Qmp(QmpError::JobFailed {
+            id: "j".into(),
+            error: "no space".into(),
+        }));
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "a").is_none());
+    assert!(env.hv.snapshots(vm).is_empty());
+    assert_eq!(position(&env, vm), None);
+
+    // 시간 초과: 작업이 아직 돌 수 있으므로 태그는 두고 리소스만 지운다. 이름은 다시 쓸 수 있다.
+    env.hv
+        .fail_next_snapshot(DriverError::Qmp(QmpError::JobTimeout {
+            id: "j".into(),
+            timeout: std::time::Duration::from_secs(600),
+            stage: "x".into(),
+        }));
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    let id = task["spec"]["op"]["snapshot"].as_str().unwrap();
+    assert!(error.contains(id), "{error}");
+    assert!(find(&env, vm, "a").is_none());
+    assert_eq!(env.hv.snapshots(vm), vec![(id.to_string(), true)]);
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+}
+
+#[tokio::test]
+async fn delete_reparents_children_and_moves_the_position() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    let vars = uefi_vars_path(&env.dir.path().join("state"), vm);
+    std::fs::create_dir_all(vars.parent().unwrap()).unwrap();
+    std::fs::write(&vars, b"vars").unwrap();
+    for name in ["a", "b", "c"] {
+        succeeded(&snapshot(&admin, "web", json!({ "name": name })).await);
+    }
+    let (a, b, c) = (get(&env, vm, "a"), get(&env, vm, "b"), get(&env, vm, "c"));
+
+    let (status, task) = admin.delete("/vms/web/snapshots/b").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert!(find(&env, vm, "b").is_none());
+    assert!(!vars_copy(&env, vm, b.id).exists());
+    assert_eq!(get(&env, vm, "c").spec.parent, Some(a.id));
+    assert_eq!(position(&env, vm), Some(c.id));
+
+    // 현재 위치를 지우면 부모로 옮긴다.
+    let (_, task) = admin.delete("/vms/web/snapshots/c").await;
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(position(&env, vm), Some(a.id));
+    assert_eq!(env.hv.snapshots(vm), vec![(a.id.to_string(), true)]);
+    assert!(vars_copy(&env, vm, a.id).exists());
+
+    // 디스크에서 지우지 못하면 리소스와 관계는 그대로다. 다시 하면 된다.
+    env.hv.fail_next_snapshot(DriverError::Timeout("qmp"));
+    let (_, task) = admin.delete("/vms/web/snapshots/a").await;
+    assert_eq!(admin.wait_task(&task).await["status"]["state"], "failed");
+    assert_eq!(position(&env, vm), Some(a.id));
+    assert!(find(&env, vm, "a").is_some());
+    let (_, task) = admin.delete("/vms/web/snapshots/a").await;
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(position(&env, vm), None);
+    assert!(env.hv.snapshots(vm).is_empty());
+}
+
+#[tokio::test]
+async fn revert_restores_the_spec_of_a_diskless_vm() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    // 디스크가 없으면 설정만 담는다.
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    let cfg = get(&env, vm, "cfg");
+    assert!(!cfg.spec.memory);
+    assert!(env.hv.snapshots(vm).is_empty());
+
+    let node = env.cluster.get::<VmSpec>(vm).unwrap().unwrap().spec.node;
+
+    let (_, current) = admin.get("/vms/bare").await;
+    let mut spec = current["spec"].clone();
+    spec["memory_mib"] = json!(1024);
+    admin.put("/vms/bare", json!({ "spec": spec }), None).await;
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+
+    // 메모리가 없는 스냅샷이므로 꺼진 채 남는다. 노드는 그대로다.
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec.memory_mib, 256);
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert_eq!(got.spec.node, node);
+    assert_eq!(got.status.phase, VmPhase::Stopped);
+    assert_eq!(got.status.snapshot, Some(cfg.id));
+    assert_eq!(env.pid(vm).await, None);
+}
+
+/// 되돌려도 `ha`는 스냅샷 때의 것이 아니라 지금 것을 지킨다(예약처럼).
+#[tokio::test]
+async fn revert_keeps_the_current_ha() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    assert_eq!(get(&env, vm, "cfg").spec.vm_spec.ha, None);
+
+    // 시험 노드는 HA 가능 노드가 아니므로 API를 거치지 않고 바꾼다(reconciler의 status 쓰기와
+    // 부딪치면 다시 읽어 쓴다). 되돌리기는 지금 `ha`로 검증하므로 HA 가능 노드가 필요 없는 잠시 끈
+    // 정책(`ignored`)을 둔다.
+    let policy = VmHa {
+        state: HaState::Ignored,
+        ..Default::default()
+    };
+    loop {
+        let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+        let mut spec = current.spec.clone();
+        spec.ha = Some(policy.clone());
+        match env
+            .cluster
+            .update_spec(vm, Some(current.revision), current.labels, &spec)
+            .await
+        {
+            Err(orbivisor_cluster::ClusterError::Rejected(_)) => continue,
+            r => {
+                r.unwrap();
+                break;
+            }
+        }
+    }
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(
+        env.cluster.get::<VmSpec>(vm).unwrap().unwrap().spec.ha,
+        Some(policy)
+    );
+}
+
+/// 되돌려도 고정(`placement`)은 스냅샷 때의 것이 아니라 지금 것을 지킨다(HA처럼).
+#[tokio::test]
+async fn revert_keeps_the_current_pinning() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    assert_eq!(get(&env, vm, "cfg").spec.vm_spec.placement, None);
+    let (status, body) = admin.get("/vms/bare").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut spec = body["spec"].clone();
+    spec["placement"] = json!({ "pinned": true });
+    let (status, body) = admin
+        .put("/vms/bare", json!({ "spec": spec, "labels": {} }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert!(got.spec.pinned(), "{:?}", got.spec.placement);
+}
+
+#[tokio::test]
+async fn memory_revert_does_not_place_the_vm_on_a_node_of_another_architecture() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "mem" })).await);
+    assert!(get(&env, vm, "mem").spec.memory);
+    // 끄고 배치를 푼다. 그 뒤 이 노드가 다른 arch로 기록됐다.
+    succeeded(&admin.act("web", "stop").await);
+    let (_, current) = admin.get("/vms/web").await;
+    let mut spec = current["spec"].clone();
+    spec["node"] = Value::Null;
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.status.arch = Some(Arch::X86_64);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+
+    let (status, task) = admin
+        .post("/vms/web/snapshots/mem/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("machine type"),
+        "{task}"
+    );
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec.node, None);
+    assert_eq!(got.spec.power, PowerState::Stopped);
+}
+
+#[tokio::test]
+async fn snapshot_tasks_do_not_supersede_a_reboot() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "web", &[]).await;
+    let (_, reboot) = admin.post("/vms/web/actions/reboot", Value::Null).await;
+    // 재부팅이 끄는 동안(게스트는 ACPI를 무시하고, acpi_timeout 뒤 강제로 꺼진다) 같은 VM에
+    // 스냅샷 Task가 만들어진다. 다른 노드에 배정해 여기서는 실행하지 않는다.
+    let task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::SnapshotCreate {
+                snapshot: Uuid::now_v7(),
+            },
+            target: vm,
+            node: Uuid::now_v7(),
+        },
+    );
+    env.cluster.create(&task).await.unwrap();
+    succeeded(&admin.wait_task(&reboot).await);
+}
+
+#[tokio::test]
+async fn unfinished_snapshots_of_this_node_are_removed_at_startup() {
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let slot = ids.clone();
+    let other = Uuid::now_v7();
+    let env = Env::start_with(
+        |_| {},
+        move |cluster| async move {
+            let me = cluster.id().0;
+            let mut ids = Vec::new();
+            for (name, node) in [("mine", me), ("theirs", other)] {
+                let mut vm: orbivisor_types::vm::Vm = Resource::new(name, vm_spec(node));
+                vm.spec.power = PowerState::Stopped;
+                cluster.create(&vm).await.unwrap();
+                // Task를 만들기 전에 API가 있던 opld가 죽었다.
+                let s = pending(vm.id, &vm.spec, "orphan");
+                cluster.create(&s).await.unwrap();
+                ids.push(s.id);
+            }
+            // 이 노드가 만들다 opld가 죽었다. Task는 실패로 끝나고 리소스를 지운다.
+            let vm = cluster.get_by_name::<VmSpec>("mine").unwrap().unwrap();
+            let s = pending(vm.id, &vm.spec, "interrupted");
+            cluster.create(&s).await.unwrap();
+            ids.push(s.id);
+            let mut task: Task = Resource::new(
+                "",
+                TaskSpec {
+                    op: TaskOp::SnapshotCreate { snapshot: s.id },
+                    target: vm.id,
+                    node: me,
+                },
+            );
+            task.name = task.id.to_string();
+            task.status = TaskStatus {
+                state: TaskState::Running,
+                error: None,
+                progress: None,
+            };
+            cluster.create(&task).await.unwrap();
+            // 이 노드에서 돌던 꺼진 VM을 다른 노드로 옮겼다. 디스크는 그 노드에 있다.
+            let mut vm: orbivisor_types::vm::Vm = Resource::new("moved", vm_spec(other));
+            vm.spec.power = PowerState::Stopped;
+            vm.status.node = Some(me);
+            cluster.create(&vm).await.unwrap();
+            let s = pending(vm.id, &vm.spec, "orphan");
+            cluster.create(&s).await.unwrap();
+            ids.push(s.id);
+            *slot.lock().unwrap() = ids;
+        },
+    )
+    .await;
+    let ids = ids.lock().unwrap().clone();
+    // 실행기는 고아를 지운 뒤에 뜬다.
+    assert!(env.cluster.get::<SnapshotSpec>(ids[0]).unwrap().is_none());
+    assert!(env.cluster.get::<SnapshotSpec>(ids[1]).unwrap().is_some());
+    assert!(env.cluster.get::<SnapshotSpec>(ids[3]).unwrap().is_some());
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.cluster.get::<SnapshotSpec>(ids[2]).unwrap().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "interrupted snapshot was kept"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 파일 없는 스토리지로 실행기를 다시 띄운다. 볼륨 `root`·`data`는 1 MiB로 알린다.
+async fn with_fake_storage(env: &mut Env) -> Arc<FakeStorage> {
+    let storage = Arc::new(FakeStorage::default());
+    for name in ["root", "data"] {
+        if let Some(v) = env.cluster.get_by_name::<VolumeSpec>(name).unwrap() {
+            storage.set_size(v.id, v.spec.size_bytes);
+        }
+    }
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    storage
+}
+
+/// 바로 Ready인 qcow2 볼륨을 저장소에 직접 만든다.
+async fn ready_volume(env: &Env, name: &str) -> Uuid {
+    let mut volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+            content: Default::default(),
+            base: None,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+    volume.id
+}
+
+/// 다른 노드에 배정한 Task를 저장소에 직접 만든다. 여기서는 실행하지 않는다.
+async fn foreign_task(env: &Env, op: TaskOp, target: Uuid) {
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op,
+            target,
+            node: Uuid::now_v7(),
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+}
+
+#[tokio::test]
+async fn revert_blocks_power_changes_and_stops_if_started_meanwhile() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let data = ready_volume(&env, "data").await;
+    let storage = with_fake_storage(&mut env).await;
+    let vm = running_vm(&admin, "web", &["root", "data"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "s" })).await);
+
+    storage.pause();
+    let (status, revert) = admin.post("/vms/web/snapshots/s/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{revert}");
+    storage.reached().await;
+
+    // 되돌리는 동안에는 전원도 스펙도 바꿀 수 없다(강제 정지 포함).
+    for path in ["/vms/web/actions/start", "/vms/web/actions/stop?mode=force"] {
+        let (status, body) = admin.post(path, Value::Null).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "vm_busy", "{body}");
+    }
+    let (_, current) = admin.get("/vms/web").await;
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": current["spec"] }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_busy", "{body}");
+
+    // 그 확인을 지나친 요청이 켰다. 남은 디스크는 되돌리지 않고 실패한다.
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let spec = VmSpec {
+        power: PowerState::Running,
+        ..current.spec.clone()
+    };
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    storage.resume();
+    let task = admin.wait_task(&revert).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let reverted: Vec<Uuid> = storage
+        .calls()
+        .into_iter()
+        .filter(|(call, _)| *call == "revert")
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(reverted.len(), 1);
+    assert!(!reverted.contains(&data));
+}
+
+#[tokio::test]
+async fn memory_revert_yields_to_a_later_stop_and_keeps_volume_labels() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "mem" })).await);
+    let launches = env.hv.launches().len();
+
+    storage.pause();
+    let (_, revert) = admin
+        .post("/vms/web/snapshots/mem/revert", Value::Null)
+        .await;
+    storage.reached().await;
+    // 되돌리는 사이 정지 요청이 들어왔고(다른 노드의 API), 볼륨 라벨이 바뀌었고, 파일 크기는
+    // 스냅샷 때의 것이다.
+    foreign_task(&env, TaskOp::VmStop, vm).await;
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let labels = std::collections::BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+    env.cluster
+        .update_spec(root.id, Some(root.revision), labels.clone(), &root.spec)
+        .await
+        .unwrap();
+    storage.set_size(root.id, 2 << 20);
+    storage.resume();
+
+    // 메모리를 불러오며 켜지 않는다. 정지 요청을 덮으면 안 된다.
+    let task = admin.wait_task(&revert).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("superseded"),
+        "{task}"
+    );
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec.power, PowerState::Stopped);
+    assert_eq!(got.status.phase, VmPhase::Stopped);
+    assert_eq!(env.hv.launches().len(), launches);
+    // 디스크는 되돌렸으므로 현재 위치와 크기는 스냅샷 때의 것이고, 라벨은 그대로다.
+    assert_eq!(position(&env, vm), Some(get(&env, vm, "mem").id));
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!((root.spec.size_bytes, root.labels), (2 << 20, labels));
+}
+
+#[tokio::test]
+async fn revert_checks_volumes_attached_meanwhile_before_stopping() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    running_vm(&admin, "web", &["root"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "s" })).await);
+    succeeded(&admin.act("web", "stop").await);
+    let (_, current) = admin.get("/vms/web").await;
+    let mut spec = current["spec"].clone();
+    spec["disks"] = json!([]);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    succeeded(&admin.act("web", "start").await);
+    let vm = env
+        .cluster
+        .get_by_name::<VmSpec>("web")
+        .unwrap()
+        .unwrap()
+        .id;
+    let pid = env.pid(vm).await;
+
+    // API가 확인한 뒤 Task가 돌기 전에 다른 VM이 그 볼륨을 붙였다.
+    env.stop_runner().await;
+    let (status, revert) = admin.post("/vms/web/snapshots/s/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{revert}");
+    let mut req = vm_request("other");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.start_runner_with(storage).await;
+
+    let task = admin.wait_task(&revert).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    // 끄기 전에 그만뒀다.
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(env.pid(vm).await, pid);
+}
+
+#[tokio::test]
+async fn delete_does_not_treat_a_volume_of_another_node_as_gone() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    // 이 노드에 배치된 꺼진 VM
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "stop").await);
+    succeeded(&snapshot(&admin, "web", json!({ "name": "s" })).await);
+
+    // 볼륨 파일이 다른 노드에 있다. 여기서 없는 것으로 보고 지우면 그 노드에 태그가 남는다.
+    let mut root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    root.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(root.id, &root.status)
+        .await
+        .unwrap();
+    let (status, task) = admin.delete("/vms/web/snapshots/s").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "s").is_some());
+    assert!(!storage.calls().iter().any(|(call, _)| *call == "delete"));
+}
+
+#[tokio::test]
+async fn revert_checks_volumes_of_another_node_before_stopping() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "s" })).await);
+    let pid = env.pid(vm).await;
+    let before = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+
+    // 볼륨 파일이 다른 노드에 있다. 이 노드에서는 되돌릴 수 없다.
+    let mut root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    root.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(root.id, &root.status)
+        .await
+        .unwrap();
+    let (status, revert) = admin.post("/vms/web/snapshots/s/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{revert}");
+    let task = admin.wait_task(&revert).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("is on node"),
+        "{task}"
+    );
+    // 끄지도, 스펙을 바꾸지도 않았다.
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec, before.spec);
+    assert_eq!(env.pid(vm).await, pid);
+    assert!(!storage.calls().iter().any(|(call, _)| *call == "revert"));
+}
+
+/// 리뷰 1 I2: 되돌려도 폴더는 지금 것이다(스냅샷 때의 폴더로 옮기면 옮기기 권한 없이 폴더를 바꾸게 된다).
+#[tokio::test]
+async fn revert_keeps_the_current_folder() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    let mut folders = Vec::new();
+    for name in ["dev", "prod"] {
+        let (status, body) = admin
+            .post("/folders", json!({ "name": name, "kind": "vm" }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        folders.push(body["id"].as_str().unwrap().to_string());
+    }
+    let move_to = |folder: String| {
+        let admin = &admin;
+        async move {
+            let (status, body) = admin
+                .post(
+                    &format!("/folders/{folder}/members"),
+                    json!({ "items": [{ "kind": "vm", "key": "bare" }] }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["items"][0]["ok"], true, "{body}");
+        }
+    };
+    move_to(folders[0].clone()).await;
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    move_to(folders[1].clone()).await;
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(
+        got.spec.folder.map(|f| f.to_string()),
+        Some(folders[1].clone())
+    );
+}
+
+#[tokio::test]
+async fn resize_keeps_volume_labels_written_meanwhile() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/volumes/root/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let labels = std::collections::BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+    env.cluster
+        .update_spec(root.id, Some(root.revision), labels.clone(), &root.spec)
+        .await
+        .unwrap();
+    storage.resume();
+
+    succeeded(&admin.wait_task(&task).await);
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!((root.spec.size_bytes, root.labels), (2 << 20, labels));
+}
+
+/// 원하는 상태가 켜짐인데 아직 멈춘 VM(켜는 중)의 디스크는 늘리지 않는다. 꺼진 VM으로 보고
+/// 저장소로 늘리면 그동안 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다. API가 받은 뒤 켰을 수 있어
+/// 실행기가 다시 본다.
+#[tokio::test]
+async fn resize_fails_while_the_vm_is_being_started() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    // 노드가 없는 VM은 reconciler가 다루지 않아 멈춘 채 남는다.
+    let vm: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let spec = VmSpec {
+        power: PowerState::Running,
+        ..current.spec.clone()
+    };
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 2 << 20,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+
+    let done = admin.wait_task(&json!({ "id": task.id })).await;
+    assert_eq!(done["status"]["state"], "failed", "{done}");
+    let error = done["status"]["error"].as_str().unwrap();
+    assert!(error.contains("starting or stopping"), "{error}");
+    assert!(!storage.calls().iter().any(|(c, _)| *c == "resize"));
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!(root.spec.size_bytes, 1 << 20);
+}
+
+#[tokio::test]
+async fn task_failed_by_someone_else_before_it_starts_is_not_run() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+
+    storage.pause();
+    let (status, first) = admin
+        .post("/volumes/root/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    storage.reached().await;
+    // 같은 줄에서 앞의 Task를 기다리는 Task를, 시작하기 전에 다른 쪽(리더의 정리 작업)이 실패로 끝낸다.
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    let mut second: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeResize {
+                size_bytes: 3 << 20,
+            },
+            target: root.id,
+            node: env.node,
+        },
+    );
+    second.name = second.id.to_string();
+    env.cluster.create(&second).await.unwrap();
+    let failed = TaskStatus {
+        state: TaskState::Failed,
+        error: Some(format!("node {} is offline", env.node)),
+        progress: None,
+    };
+    env.cluster
+        .update_status::<TaskSpec>(second.id, &failed)
+        .await
+        .unwrap();
+    storage.resume();
+
+    succeeded(&admin.wait_task(&first).await);
+    // 뒤의 Task가 돌았다면 이미 크기를 바꾸고 끝났을 시간을 기다린다.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let task = env.cluster.get::<TaskSpec>(second.id).unwrap().unwrap();
+    assert_eq!(task.status, failed);
+    let resized = storage
+        .calls()
+        .iter()
+        .filter(|(c, _)| *c == "resize")
+        .count();
+    assert_eq!(resized, 1);
+    let root = env.cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!(root.spec.size_bytes, 2 << 20);
+}
+
+#[tokio::test]
+async fn force_stop_during_a_memory_snapshot_fails_it_and_removes_the_tag() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool_and_root(&env).await;
+    let storage = with_fake_storage(&mut env).await;
+    let vm = running_vm(&admin, "web", &["root"]).await;
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+
+    env.hv.hang_next_snapshot_save();
+    let (status, create) = admin
+        .post("/vms/web/snapshots", json!({ "name": "s" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{create}");
+    tokio::time::timeout(common::WAIT, env.hv.snapshot_save_reached())
+        .await
+        .expect("snapshot save");
+
+    // 만들기 중에도 강제 정지는 받는다(일반 정지는 그대로 막는다). 강제 정지 Task는 같은 VM의
+    // 만들기 Task를 기다리지 않는다. 기다렸다면 VM이 꺼지지 않아 저장도 끝나지 않는다.
+    let (status, body) = admin.post("/vms/web/actions/stop", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_busy", "{body}");
+    succeeded(&admin.act("web", "stop?mode=force").await);
+
+    // QMP가 끊겨 만들기가 실패한다. 꺼진 VM이므로 디스크의 태그는 스토리지로 지우고 리소스도 지운다.
+    let task = admin.wait_task(&create).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "s").is_none());
+    assert!(storage.calls().contains(&("delete", root.id)));
+    assert!(env.hv.snapshots(vm).is_empty());
+    assert_eq!(position(&env, vm), None);
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(current.status.phase, VmPhase::Stopped);
+}
+
+fn vm_spec(node: Uuid) -> VmSpec {
+    let mut spec: VmSpec = serde_json::from_value(vm_request("x")["spec"].clone()).unwrap();
+    spec.node = Some(node);
+    spec
+}
+
+fn pending(vm: Uuid, spec: &VmSpec, name: &str) -> Snapshot {
+    let mut s: Snapshot = Resource::new(
+        "",
+        SnapshotSpec {
+            vm,
+            name: name.into(),
+            parent: None,
+            memory: false,
+            description: String::new(),
+            scheduled: false,
+            vm_spec: spec.clone(),
+            hardware: None,
+        },
+    );
+    s.name = s.id.to_string();
+    s
+}
+
+fn lvm(vg: &str) -> PoolBackend {
+    PoolBackend::LvmThin {
+        vg: vg.into(),
+        thinpool: "tp".into(),
+    }
+}
+
+fn zfs(dataset: &str) -> PoolBackend {
+    PoolBackend::Zfs {
+        dataset: dataset.into(),
+    }
+}
+
+fn rbd(pool: &str) -> PoolBackend {
+    PoolBackend::Rbd {
+        pool: pool.into(),
+        namespace: None,
+        user: None,
+        conf: None,
+    }
+}
+
+/// 볼륨을 `node`가 만든 것으로 기록한다.
+async fn set_volume_node(env: &Env, id: Uuid, node: Uuid) {
+    let mut volume = env.cluster.get::<VolumeSpec>(id).unwrap().unwrap();
+    volume.status.node = Some(node);
+    env.cluster
+        .update_status::<VolumeSpec>(id, &volume.status)
+        .await
+        .unwrap();
+}
+
+/// 블록 풀들(이름, 백엔드, 볼륨 이름)과 각 풀의 바로 Ready인 1 MiB raw 볼륨을 저장소에 직접 만들고,
+/// 파일 없는 스토리지로 실행기를 다시 띄운다(볼륨은 1 MiB로 알린다). id는 볼륨을 적은 순서다.
+async fn block_volumes(
+    env: &mut Env,
+    pools: &[(&str, PoolBackend, &[&str])],
+) -> (Vec<Uuid>, Arc<FakeStorage>) {
+    let storage = Arc::new(FakeStorage::default());
+    let mut ids = Vec::new();
+    for (pool, backend, names) in pools {
+        let spec = StoragePoolSpec {
+            backend: backend.clone(),
+            nodes: vec![],
+            shared: false,
+            backups: false,
+            folder: None,
+        };
+        env.cluster
+            .create(&Resource::new(*pool, spec))
+            .await
+            .unwrap();
+        env.pool_ready(pool).await;
+        for name in names.iter() {
+            let mut volume = Resource::new(
+                *name,
+                VolumeSpec {
+                    pool: (*pool).into(),
+                    size_bytes: 1 << 20,
+                    format: ImageFormat::Raw,
+                    content: Default::default(),
+                    base: None,
+                },
+            );
+            env.cluster.create(&volume).await.unwrap();
+            volume.status.phase = VolumePhase::Ready;
+            volume.status.node = Some(env.node);
+            env.cluster
+                .update_status::<VolumeSpec>(volume.id, &volume.status)
+                .await
+                .unwrap();
+            storage.set_size(volume.id, 1 << 20);
+            ids.push(volume.id);
+        }
+    }
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    (ids, storage)
+}
+
+/// LVM-thin 풀 `thin`과 그 풀의 볼륨 `names`([`block_volumes`])
+async fn lvm_volumes(env: &mut Env, names: &[&str]) -> (Vec<Uuid>, Arc<FakeStorage>) {
+    block_volumes(env, &[("thin", lvm("vg0"), names)]).await
+}
+
+/// 디스크 `disks`를 붙인 VM을 이 노드에서 실행 중으로 만든다. LVM-thin 풀은 macOS에서 쓸 수 없어
+/// reconciler가 띄우지 못하므로 Mock 하이퍼바이저에 직접 띄운 뒤 이 노드에 켜진 것으로 배치한다
+/// (reconciler는 이미 돌고 있는 VM을 그대로 둔다).
+async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str]) -> Uuid {
+    let mut req = vm_request(name);
+    req["spec"]["disks"] = disks
+        .iter()
+        .map(|v| json!({ "volume": v, "bus": "virtio-blk" }))
+        .collect();
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let id: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let current = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    let runtime = VmRuntimeSpec {
+        id,
+        name: name.into(),
+        cpu: current.spec.cpu.clone(),
+        memory_mib: current.spec.memory_mib,
+        firmware: current.spec.firmware,
+        machine: current.spec.machine,
+        disks: vec![],
+        nics: vec![],
+        guest_agent: false,
+        hotplug: None,
+        cdroms: vec![],
+        cloud_init: None,
+        tpm: None,
+        secure_boot: false,
+        freeze_fs: false,
+        firmware_epoch: 0,
+        keep_tpm: false,
+        cpu_resolved: None,
+        numa: None,
+        host_placement: None,
+        pinning: None,
+    };
+    env.hv.start(&runtime, None).await.unwrap();
+    let mut spec = current.spec.clone();
+    spec.node = Some(env.node);
+    spec.power = PowerState::Running;
+    env.cluster
+        .update_spec(id, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.cluster.get::<VmSpec>(id).unwrap().unwrap().status.phase != VmPhase::Running {
+        assert!(std::time::Instant::now() < deadline, "VM did not run");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    id
+}
+
+#[tokio::test]
+async fn running_vm_lvm_snapshot_pauses_it_while_the_disks_are_snapshotted() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+
+    // 첫 디스크를 찍는 동안 VM은 멈춰 있다.
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(storage.calls(), [("create", lvs[0]), ("create", lvs[1])]);
+    // QEMU의 내부 스냅샷은 쓰지 않는다.
+    assert!(env.hv.snapshots(vm).is_empty());
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert!(!a.spec.memory);
+    assert_eq!(position(&env, vm), Some(a.id));
+
+    // 실행 중이어도 스냅샷 LV는 스토리지로 지운다.
+    let (status, task) = admin.delete("/vms/web/snapshots/a").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(
+        storage.calls()[2..],
+        [("delete", lvs[0]), ("delete", lvs[1])]
+    );
+    assert!(find(&env, vm, "a").is_none());
+    assert!(env.pid(vm).await.is_some());
+}
+
+#[tokio::test]
+async fn failed_lvm_snapshot_resumes_the_vm_and_removes_the_lvs_made() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0", "lv1"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+
+    storage.fail_snapshot_create(lvs[1]);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(
+        storage.calls(),
+        [
+            ("create", lvs[0]),
+            ("create", lvs[1]),
+            ("delete", lvs[0]),
+            ("delete", lvs[1]),
+        ]
+    );
+    assert!(find(&env, vm, "a").is_none());
+    assert_eq!(position(&env, vm), None);
+}
+
+/// 한 풀의 찍기가 시간을 넘기면 그 풀의 스냅샷 LV는 아직 만들어지고 있을 수 있으므로 두고, 찍기가
+/// 끝난 풀의 것만 지운다. 다시 돌리지 못했으면 그것도 알린다.
+#[tokio::test]
+async fn timed_out_lvm_snapshot_removes_only_the_lvs_made() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = block_volumes(
+        &mut env,
+        &[
+            ("thin", lvm("vg0"), &["lv0"]),
+            ("thin2", lvm("vg1"), &["lv1"]),
+        ],
+    )
+    .await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0", "lv1"]).await;
+
+    storage.time_out_snapshot_create(lvs[1]);
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 멈춘 동안 QMP로 다룰 수 없게 되어 다시 돌리지 못한다.
+    env.hv.set_unresponsive(vm, true);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.contains("may still"), "{error}");
+    assert!(error.contains("resuming the VM failed"), "{error}");
+    assert_eq!(
+        storage.calls(),
+        [("create", lvs[0]), ("create", lvs[1]), ("delete", lvs[0])]
+    );
+    env.hv.set_unresponsive(vm, false);
+}
+
+/// 같은 풀의 디스크는 한 번에 찍으므로(ZFS는 원자적) 그 묶음이 시간을 넘기면 어느 디스크가
+/// 끝났는지 모른다. 그 풀의 스냅샷은 모두 둔다.
+#[tokio::test]
+async fn timed_out_snapshot_of_one_pool_leaves_all_its_disks() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0", "z1"])]).await;
+    running_block_vm(&env, &admin, "web", &["z0", "z1"]).await;
+
+    storage.time_out_snapshot_create(zvols[1]);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(storage.snapshot_groups(), [vec![zvols[0], zvols[1]]]);
+    assert_eq!(
+        storage.calls(),
+        [("create", zvols[0]), ("create", zvols[1])]
+    );
+}
+
+/// 시간을 넘겨 남긴 태그는 그 스냅샷 리소스가 없으면 뒤에서 `orphan_retry` 간격으로 다시 지운다.
+/// 시간을 넘긴 명령이 아직 돌아 지우기가 일시 오류면 다음 차례에 다시 지운다. 지웠으면 더 하지
+/// 않는다.
+#[tokio::test]
+async fn timed_out_block_snapshot_tags_are_removed_later() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("y", zfs("tank/other"), &["y0"]),
+            ("z", zfs("tank/opl"), &["z0", "z1"]),
+        ],
+    )
+    .await;
+    let retry = std::time::Duration::from_millis(100);
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |config| config.orphan_retry = retry)
+        .await;
+    running_block_vm(&env, &admin, "web", &["y0", "z0", "z1"]).await;
+
+    storage.time_out_snapshot_create(zvols[2]);
+    storage.busy_snapshot_deletes(zvols[2], 1);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    // 끝난 풀의 것은 바로 지우고, 시간을 넘긴 풀의 것은 뒤에서 지운다.
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !(storage.tags(zvols[1]).is_empty() && storage.tags(zvols[2]).is_empty()) {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(retry * 4).await;
+    let deletes = |id: Uuid| {
+        storage
+            .calls()
+            .iter()
+            .filter(|c| **c == ("delete", id))
+            .count()
+    };
+    assert_eq!(
+        (deletes(zvols[0]), deletes(zvols[1]), deletes(zvols[2])),
+        (1, 1, 2)
+    );
+}
+
+/// 남은 태그가 지워질 때까지 기다린다.
+async fn wait_untagged(storage: &FakeStorage, id: Uuid) {
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !storage.tags(id).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 블록 스냅샷 Task가 Task 제한 시간에 걸려 버려지면 명령이 아직 돌다 태그를 남길 수 있다. 리소스를
+/// 지운 뒤 뒤에서 `orphan_retry` 간격으로 그 태그를 지운다.
+#[tokio::test]
+async fn block_snapshot_abandoned_at_the_task_limit_has_its_tags_removed_later() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| {
+        c.timeout = std::time::Duration::from_millis(500);
+        c.orphan_retry = std::time::Duration::from_millis(100);
+    })
+    .await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 버려진 명령이 끝나 태그를 남긴다.
+    let tag = get(&env, vm, "a").id.to_string();
+    storage.set_tags(zvols[0], &[&tag]);
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "a").is_none());
+    wait_untagged(&storage, zvols[0]).await;
+}
+
+/// 블록 스냅샷 Task가 끝나지 않은 채 실행기가 멈췄다 다시 시작하면 Task를 실패로 끝내고 리소스를
+/// 지운 뒤, 남았을 수 있는 태그를 뒤에서 지운다(시작할 때의 정리는 리소스가 아직 있어 두었다).
+#[tokio::test]
+async fn interrupted_block_snapshot_has_its_tags_removed_later() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    env.stop_runner().await;
+    let tag = get(&env, vm, "a").id.to_string();
+    storage.set_tags(zvols[0], &[&tag]);
+    env.start_runner_config(storage.clone(), |c| {
+        c.orphan_retry = std::time::Duration::from_millis(100)
+    })
+    .await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(find(&env, vm, "a").is_none());
+    wait_untagged(&storage, zvols[0]).await;
+}
+
+/// 실행기가 멈추면 뒤에서 태그를 지우던 일도 멈춘다.
+#[tokio::test]
+async fn left_tag_removal_stops_with_the_runner() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let retry = std::time::Duration::from_millis(300);
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| c.orphan_retry = retry)
+        .await;
+    running_block_vm(&env, &admin, "web", &["z0"]).await;
+
+    storage.time_out_snapshot_create(zvols[0]);
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    env.stop_runner().await;
+    tokio::time::sleep(retry * 3).await;
+    assert!(!storage.calls().contains(&("delete", zvols[0])));
+    assert_eq!(storage.tags(zvols[0]).len(), 1);
+}
+
+/// 실행기가 시작하면 이 노드의 블록 풀 볼륨에서 스냅샷 리소스가 없는 Orbivisor 태그(UUID)를 지운다.
+/// 리소스가 있는 태그, Orbivisor 밖의 태그, 다른 노드의 볼륨은 그대로 둔다.
+#[tokio::test]
+async fn block_snapshot_tags_without_snapshots_are_removed_at_startup() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("z", zfs("tank/opl"), &["z0", "z1"]),
+            ("thin", lvm("vg0"), &["lv0"]),
+        ],
+    )
+    .await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+    let a = get(&env, vm, "a").id.to_string();
+    let orphan = Uuid::now_v7().to_string();
+    storage.set_tags(vols[0], &[&a, &orphan, "autosnap_hourly"]);
+    storage.set_tags(vols[1], &[&orphan]);
+    storage.set_tags(vols[2], &[&orphan]);
+    let mut z1 = env.cluster.get::<VolumeSpec>(vols[1]).unwrap().unwrap();
+    z1.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(z1.id, &z1.status)
+        .await
+        .unwrap();
+
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while !storage.tags(vols[2]).is_empty() || storage.tags(vols[0]).len() != 2 {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(storage.tags(vols[0]), [a.as_str(), "autosnap_hourly"]);
+    assert_eq!(storage.tags(vols[1]), [orphan.as_str()]);
+}
+
+/// 백업의 임시 스냅샷 태그(백업 id의 simple 문자열)도 UUID 모양이다. 시작할 때 백업 Task가 끝나지
+/// 않은 `pending` 백업의 태그는 두고, Task가 없는 `pending` 백업, 다 만들었거나 실패한 백업과 없는
+/// 백업의 태그는 지운다.
+#[tokio::test]
+async fn block_tags_of_pending_backups_are_kept_at_startup() {
+    let mut env = Env::start().await;
+    let (vols, storage) = block_volumes(&mut env, &[("thin", lvm("vg0"), &["lv0"])]).await;
+    let spec: VmSpec = serde_json::from_value(vm_request("web")["spec"].clone()).unwrap();
+    // 다른 노드에서 돌고 있는 백업 Task(이 노드의 실행기는 손대지 않는다)
+    let mut n2: orbivisor_types::node::Node = Resource::new(
+        "n2",
+        NodeSpec {
+            sdn: None,
+            host_resources: None,
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    n2.status.online = true;
+    env.cluster.create(&n2).await.unwrap();
+    let mut tags = Vec::new();
+    for (name, phase) in [
+        ("running", BackupPhase::Pending),
+        ("done", BackupPhase::Ready),
+        ("broken", BackupPhase::Failed),
+        ("abandoned", BackupPhase::Pending),
+    ] {
+        let mut backup: Backup = Resource::new(
+            name,
+            BackupSpec {
+                vm: Uuid::now_v7(),
+                vm_name: "web".into(),
+                pool: "thin".into(),
+                vm_spec: spec.clone(),
+                job: None,
+                origin: None,
+                incremental: false,
+                max_chain: None,
+                source: None,
+                store: None,
+            },
+        );
+        env.cluster.create(&backup).await.unwrap();
+        backup.status.phase = phase;
+        env.cluster
+            .update_status::<BackupSpec>(backup.id, &backup.status)
+            .await
+            .unwrap();
+        tags.push(backup.id.simple().to_string());
+        if name == "running" {
+            let op = TaskOp::VmBackup { backup: backup.id };
+            let mut task: Task = Resource::new(
+                "",
+                TaskSpec {
+                    op,
+                    target: backup.spec.vm,
+                    node: n2.id,
+                },
+            );
+            task.name = task.id.to_string();
+            env.cluster.create(&task).await.unwrap();
+            let running = TaskStatus {
+                state: TaskState::Running,
+                error: None,
+                progress: None,
+            };
+            env.cluster
+                .update_status::<TaskSpec>(task.id, &running)
+                .await
+                .unwrap();
+        }
+    }
+    tags.push(Uuid::now_v7().simple().to_string());
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    storage.set_tags(vols[0], &tags);
+
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while storage.tags(vols[0]).len() != 1 {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(storage.tags(vols[0]), [tags[0]]);
+}
+
+/// 실행 중인 VM의 백업은 블록 스냅샷을 위해 VM을 잠깐 멈춘다. 이어서 실행하지 못하면 한 번 더 해 보고,
+/// 그래도 안 되면 오래 걸리는 내보내기를 하지 않고 실패한다: 임시 태그를 지우고 백업은 `failed`다.
+#[tokio::test]
+async fn backup_fails_before_exporting_when_the_paused_vm_cannot_resume() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    let dir = env.dir.path().join("bk");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bk = StoragePoolSpec {
+        backend: PoolBackend::Dir { path: dir },
+        nodes: vec![],
+        shared: false,
+        backups: true,
+        folder: None,
+    };
+    env.cluster.create(&Resource::new("bk", bk)).await.unwrap();
+    env.pool_ready("bk").await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/backups", json!({ "pool": "bk", "name": "b1" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 멈춘 동안 QMP로 다룰 수 없게 되어 다시 돌리지 못한다.
+    env.hv.set_unresponsive(vm, true);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    env.hv.set_unresponsive(vm, false);
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("cannot resume the VM after its temporary snapshot"),
+        "{error}"
+    );
+    assert!(error.contains("retrying failed"), "{error}");
+    // 찍은 임시 태그만 지웠고 디스크는 읽지 않았다.
+    assert_eq!(storage.calls(), [("create", lvs[0]), ("delete", lvs[0])]);
+    let b = env
+        .cluster
+        .get_by_name::<BackupSpec>("b1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.status.phase, BackupPhase::Failed);
+}
+
+/// 공유 블록 풀(RBD)의 볼륨은 어느 노드에서나 보이므로, 시작할 때 남은 태그는 볼륨을 만든 노드가
+/// 아니라 풀을 쓸 수 있는 온라인 노드 가운데 id가 가장 작은 노드가 지운다.
+#[tokio::test]
+async fn shared_block_pool_tags_are_removed_by_one_usable_node_at_startup() {
+    let mut env = Env::start().await;
+    let (vols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("ceph", rbd("rbd"), &["r0"]),
+            ("thin", lvm("vg0"), &["lv0"]),
+        ],
+    )
+    .await;
+    let orphan = Uuid::now_v7().to_string();
+    // 다른 노드(지금은 클러스터에 없다)가 만든 RBD 볼륨도 이 노드가 지운다.
+    set_volume_node(&env, vols[0], Uuid::now_v7()).await;
+    storage.set_tags(vols[0], &[&orphan]);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    wait_untagged(&storage, vols[0]).await;
+
+    // id가 더 작은 온라인 노드도 그 풀을 쓸 수 있으면 그 노드에 맡긴다. 뒤에 만든 이 노드의 LVM
+    // 볼륨이 지워지면 RBD 볼륨은 이미 지나갔다.
+    let mut low: orbivisor_types::node::Node = Resource::new(
+        "low",
+        NodeSpec {
+            sdn: None,
+            host_resources: None,
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    low.id = Uuid::nil();
+    env.cluster.create(&low).await.unwrap();
+    low.status.online = true;
+    env.cluster
+        .update_status::<NodeSpec>(low.id, &low.status)
+        .await
+        .unwrap();
+    common::mark_pool_ready(&env.cluster, low.id, "ceph").await;
+    storage.set_tags(vols[0], &[&orphan]);
+    storage.set_tags(vols[1], &[&orphan]);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+    wait_untagged(&storage, vols[1]).await;
+    assert_eq!(storage.tags(vols[0]), [orphan.as_str()]);
+}
+
+/// 남은 태그 정리는 시작할 때뿐 아니라 `tag_sweep`마다 돈다. 공유 풀(RBD)에서는 만든 지 오래된
+/// 태그만 지운다(다른 노드의 Task가 막 찍은 태그일 수 있다). 노드 로컬 풀은 나이를 보지 않는다.
+#[tokio::test]
+async fn block_tags_are_swept_periodically_sparing_new_shared_tags() {
+    let mut env = Env::start().await;
+    let (vols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("ceph", rbd("rbd"), &["r0"]),
+            ("thin", lvm("vg0"), &["lv0"]),
+        ],
+    )
+    .await;
+    let sweep = std::time::Duration::from_millis(100);
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| c.tag_sweep = sweep)
+        .await;
+    // 실행기가 시작한 뒤에 남은 태그
+    tokio::time::sleep(sweep).await;
+    let (old, new) = (Uuid::now_v7().to_string(), Uuid::now_v7().to_string());
+    storage.mark_fresh(&new);
+    storage.set_tags(vols[0], &[&old, &new]);
+    storage.set_tags(vols[1], &[&new]);
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while storage.tags(vols[0]).len() != 1 || !storage.tags(vols[1]).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "tags were kept");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(sweep * 3).await;
+    assert_eq!(storage.tags(vols[0]), [new.as_str()]);
+}
+
+/// RBD 디스크: 실행 중인 VM을 멈추고 찍으며 메모리는 담지 못한다. 다른 노드가 만든 볼륨도 공유
+/// 풀이라 이 노드에서 찍고, 가장 최근이 아닌 스냅샷으로도(디스크에 더 최근 스냅샷이 있어도)
+/// 되돌린다.
+#[tokio::test]
+async fn rbd_disks_snapshot_anywhere_and_revert_to_any_snapshot() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (vols, storage) = block_volumes(&mut env, &[("ceph", rbd("rbd"), &["r0", "r1"])]).await;
+    set_volume_node(&env, vols[1], Uuid::now_v7()).await;
+    let vm = running_block_vm(&env, &admin, "web", &["r0", "r1"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(storage.snapshot_groups(), [vec![vols[0], vols[1]]]);
+    assert!(env.hv.snapshots(vm).is_empty());
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("rbd disks"),
+        "{body}"
+    );
+
+    succeeded(&snapshot(&admin, "web", json!({ "name": "b" })).await);
+    let (a, b) = (
+        get(&env, vm, "a").id.to_string(),
+        get(&env, vm, "b").id.to_string(),
+    );
+    storage.set_tags(vols[1], &[&a, &b, "backup"]);
+    let (status, task) = admin.post("/vms/web/snapshots/a/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    // 디스크마다 증분 백업의 비트맵을 지운 뒤 되돌린다.
+    let reverts: Vec<_> = storage
+        .calls()
+        .into_iter()
+        .filter(|(call, _)| ["revert", "drop_bitmaps"].contains(call))
+        .collect();
+    assert_eq!(
+        reverts,
+        [
+            ("drop_bitmaps", vols[0]),
+            ("revert", vols[0]),
+            ("drop_bitmaps", vols[1]),
+            ("revert", vols[1])
+        ]
+    );
+    assert_eq!(storage.tags(vols[1]), [a.as_str(), b.as_str(), "backup"]);
+}
+
+/// 실행 중인 VM의 ZFS 스냅샷: VM을 멈추고 같은 풀의 디스크를 한 번에 찍는다. 풀이 다르면 풀마다
+/// 찍는다. 메모리는 담지 못한다.
+#[tokio::test]
+async fn running_vm_zfs_snapshot_takes_each_pool_at_once() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(
+        &mut env,
+        &[
+            ("z", zfs("tank/opl"), &["z0", "z1"]),
+            ("y", zfs("tank/other"), &["y0"]),
+        ],
+    )
+    .await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0", "y0", "z1"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert!(!env.hv.is_paused(vm));
+    assert_eq!(
+        storage.snapshot_groups(),
+        [vec![zvols[0], zvols[1]], vec![zvols[2]]]
+    );
+    assert!(env.hv.snapshots(vm).is_empty());
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert!(!a.spec.memory);
+
+    let (status, body) = admin
+        .post("/vms/web/snapshots", json!({ "name": "m", "memory": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("zfs disks"),
+        "{body}"
+    );
+}
+
+/// ZFS 디스크는 가장 최근 스냅샷으로만 되돌린다. API가 확인한 뒤에도 디스크에 더 최근 스냅샷이
+/// 있으면(Orbivisor 밖에서 만든 것 등) VM을 끄기 전에 그 이름과 함께 실패한다.
+#[tokio::test]
+async fn zfs_revert_checks_the_latest_disk_snapshot_before_stopping() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0", "z1"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0", "z1"]).await;
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+    succeeded(&snapshot(&admin, "web", json!({ "name": "b" })).await);
+    let (a, b) = (
+        get(&env, vm, "a").id.to_string(),
+        get(&env, vm, "b").id.to_string(),
+    );
+    assert_eq!(storage.tags(zvols[1]), [a.as_str(), b.as_str()]);
+    let pid = env.pid(vm).await;
+    let before = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let revert_b = || async {
+        let (status, task) = admin.post("/vms/web/snapshots/b/revert", Value::Null).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        let task = admin.wait_task(&task).await;
+        assert_eq!(task["status"]["state"], "failed", "{task}");
+        task["status"]["error"].as_str().unwrap().to_string()
+    };
+
+    // 자동 스냅샷 도구가 찍은 것
+    storage.set_tags(zvols[1], &[&a, &b, "autosnap_hourly"]);
+    let error = revert_b().await;
+    assert_eq!(
+        error,
+        "volume \"z1\" has a more recent snapshot \"autosnap_hourly\"; zfs disks can only \
+         revert to the latest snapshot"
+    );
+    // Orbivisor의 스냅샷이면 그 이름이다.
+    storage.set_tags(zvols[1], &[&b, &a]);
+    let error = revert_b().await;
+    assert!(error.contains("more recent snapshot \"a\""), "{error}");
+    // UUID 태그인데 스냅샷 자원이 없으면 opld가 뒤에서 치우는 Orbivisor 스냅샷의 남은 것이다.
+    let leftover = Uuid::now_v7().to_string();
+    storage.set_tags(zvols[1], &[&a, &b, &leftover]);
+    let error = revert_b().await;
+    assert_eq!(
+        error,
+        format!(
+            "volume \"z1\" has a more recent snapshot {leftover:?} left by an Orbivisor snapshot that \
+             orbivisord removes in the background (retry later or restart orbivisord); zfs disks can only \
+             revert to the latest snapshot"
+        )
+    );
+    // 되돌릴 스냅샷이 디스크에 없다.
+    storage.set_tags(zvols[1], &[&a]);
+    let error = revert_b().await;
+    assert!(error.contains("has no snapshot \"b\""), "{error}");
+
+    // 끄지도, 스펙을 바꾸지도 않았다.
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(got.spec, before.spec);
+    assert_eq!(env.pid(vm).await, pid);
+    assert!(!storage.calls().iter().any(|(call, _)| *call == "revert"));
+
+    // 가장 최근이면 되돌린다.
+    storage.set_tags(zvols[1], &[&a, &b]);
+    let (status, task) = admin.post("/vms/web/snapshots/b/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let reverts: Vec<_> = storage
+        .calls()
+        .into_iter()
+        .filter(|(call, _)| *call == "revert")
+        .collect();
+    assert_eq!(reverts, [("revert", zvols[0]), ("revert", zvols[1])]);
+}
+
+/// 실행 중인 VM의 ZFS 디스크도 스토리지로 먼저 늘린 뒤 QEMU에 알린다.
+#[tokio::test]
+async fn running_vm_zfs_disk_grows_in_storage_before_qemu() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (zvols, storage) = block_volumes(&mut env, &[("z", zfs("tank/opl"), &["z0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["z0"]).await;
+    storage.round_resizes(4 << 20);
+
+    let (status, task) = admin
+        .post("/volumes/z0/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(storage.calls(), [("resize", zvols[0])]);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
+}
+
+/// 공유 LVM 디스크도 블록 볼륨이므로 스토리지로 먼저 늘린 뒤 QEMU에 알린다.
+#[tokio::test]
+async fn running_vm_lvm_shared_disk_grows_in_storage_before_qemu() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let shared = PoolBackend::LvmShared {
+        vg: "san".into(),
+        iscsi: None,
+    };
+    let (lvs, storage) = block_volumes(&mut env, &[("s", shared, &["s0"])]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["s0"]).await;
+    storage.round_resizes(4 << 20);
+
+    let (status, task) = admin
+        .post("/volumes/s0/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(storage.calls(), [("resize", lvs[0])]);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
+}
+
+#[tokio::test]
+async fn running_vm_lvm_disk_grows_in_storage_before_qemu() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+
+    // LV를 늘리는 동안 QEMU에는 아직 알리지 않았다.
+    storage.pause();
+    let (status, task) = admin
+        .post("/volumes/lv0/resize", json!({ "size_bytes": 2 << 20 }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert_eq!(env.hv.disk_size(vm, 0), None);
+    storage.resume();
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(storage.calls(), [("resize", lvs[0])]);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(2 << 20));
+    let lv0 = env.cluster.get::<VolumeSpec>(lvs[0]).unwrap().unwrap();
+    assert_eq!(lv0.spec.size_bytes, 2 << 20);
+}
+
+/// LVM이 크기를 extent 단위로 올리면 QEMU에도 기록한 크기와 같은 LV의 실제 크기를 알린다.
+#[tokio::test]
+async fn running_vm_lvm_disk_grows_to_the_lv_size() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    storage.round_resizes(4 << 20);
+
+    let (status, task) = admin
+        .post(
+            "/volumes/lv0/resize",
+            json!({ "size_bytes": (2 << 20) + 512 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(env.hv.disk_size(vm, 0), Some(4 << 20));
+    let lv0 = env.cluster.get::<VolumeSpec>(lvs[0]).unwrap().unwrap();
+    assert_eq!(lv0.spec.size_bytes, 4 << 20);
+}
+
+/// LVM 디스크의 VM은 예약이 메모리를 원해도 디스크만 찍는다(메모리를 요청하면 거절되어 예약이
+/// 실패로 남는다).
+#[tokio::test]
+async fn scheduled_lvm_snapshot_leaves_out_memory() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    let current = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    let mut spec = current.spec.clone();
+    spec.snapshot_schedule = Some(orbivisor_types::vm::SnapshotSchedule {
+        every: orbivisor_types::vm::ScheduleEvery::Hourly,
+        keep: 3,
+        memory: true,
+    });
+    env.cluster
+        .update_spec(vm, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+
+    let scheduler = orbivisor_api::SnapshotScheduler::spawn(
+        env.state.clone(),
+        orbivisor_api::SnapshotSchedulerConfig {
+            tick: std::time::Duration::from_millis(50),
+            hour: std::time::Duration::from_secs(3600),
+        },
+    );
+    let deadline = std::time::Instant::now() + common::WAIT;
+    let made = loop {
+        let (_, all) = env.cluster.list::<SnapshotSpec>().unwrap();
+        if let Some(s) = all
+            .into_iter()
+            .find(|s| s.spec.vm == vm && s.spec.scheduled && s.status.phase == SnapshotPhase::Ready)
+        {
+            break s;
+        }
+        let error = env.cluster.get::<VmSpec>(vm).unwrap().unwrap().status;
+        assert_eq!(error.schedule_error, None);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no scheduled snapshot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    scheduler.shutdown().await;
+    assert!(!made.spec.memory);
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    assert!(env.hv.snapshots(vm).is_empty());
+}
+
+/// 멈춘 동안 Task가 시간을 넘겨 버려져도 VM을 다시 돌린다.
+#[tokio::test]
+async fn abandoned_lvm_snapshot_still_resumes_the_vm() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    env.stop_runner().await;
+    env.start_runner_config(storage.clone(), |c| {
+        c.timeout = std::time::Duration::from_millis(500)
+    })
+    .await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    assert!(env.hv.is_paused(vm));
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let deadline = std::time::Instant::now() + common::WAIT;
+    while env.hv.is_paused(vm) {
+        assert!(std::time::Instant::now() < deadline, "VM stayed paused");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    storage.resume();
+}
+
+/// QEMU가 스스로 멈춘 VM(I/O 오류 등)은 멈추지도 이어서 실행하지도 않고 디스크만 찍는다.
+#[tokio::test]
+async fn lvm_snapshot_leaves_a_vm_paused_by_qemu_paused() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    // Mock 하이퍼바이저에서는 멈춘 것처럼 보이게 한다.
+    env.hv.pause(vm).await.unwrap();
+
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    succeeded(&task);
+    assert!(env.hv.is_paused(vm));
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    assert_eq!(get(&env, vm, "a").status.phase, SnapshotPhase::Ready);
+}
+
+/// QEMU가 스스로 멈춘 VM(`io-error` 등, 실행 중도 일시정지도 아닌 상태)은 멈추지도 이어서 실행하지도
+/// 않고 디스크만 찍는다.
+#[tokio::test]
+async fn lvm_snapshot_of_a_vm_stopped_on_io_error_neither_pauses_nor_resumes_it() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    env.hv
+        .set_status(vm, Some(RuntimeStatus::Other("io-error".into())));
+
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    succeeded(&task);
+    assert_eq!(env.hv.pause_calls(vm), Vec::<&str>::new());
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    assert_eq!(get(&env, vm, "a").status.phase, SnapshotPhase::Ready);
+}
+
+/// QMP로 다룰 수 없는 VM은 멈출 수 없으므로 디스크를 건드리기 전에 실패한다.
+#[tokio::test]
+async fn lvm_snapshot_of_an_unresponsive_vm_fails_before_touching_the_disks() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+    env.hv.set_unresponsive(vm, true);
+
+    let task = snapshot(&admin, "web", json!({ "name": "a" })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert!(
+        task["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not responding"),
+        "{task}"
+    );
+    assert_eq!(env.hv.pause_calls(vm), Vec::<&str>::new());
+    assert!(storage.calls().is_empty());
+    assert!(find(&env, vm, "a").is_none());
+}
+
+/// 디스크는 찍었는데 VM을 이어서 실행하지 못하면 스냅샷은 그대로 두고 Task만 실패로 끝낸다.
+#[tokio::test]
+async fn lvm_snapshot_taken_but_not_resumed_is_kept() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (lvs, storage) = lvm_volumes(&mut env, &["lv0"]).await;
+    let vm = running_block_vm(&env, &admin, "web", &["lv0"]).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/vms/web/snapshots", json!({ "name": "a" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 멈춘 동안 QMP를 잃었다.
+    env.hv.set_unresponsive(vm, true);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    env.hv.set_unresponsive(vm, false);
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("snapshot taken; resuming the VM failed:"),
+        "{error}"
+    );
+    assert_eq!(storage.calls(), [("create", lvs[0])]);
+    let a = get(&env, vm, "a");
+    assert_eq!(a.status.phase, SnapshotPhase::Ready);
+    assert_eq!(position(&env, vm), Some(a.id));
+}

@@ -55,25 +55,25 @@ orbivisorctl settings set updates.channel=enterprise  # admin. 구독이 active�
   같거나 새 버전일 때만 된다. 아니면 **409** `cluster_upgrading`("some nodes run an older Orbivisor (node3); …"):
   옛 orbivisord는 이 새 값이 든 설정을 풀지 못한다. 롤링 업그레이드를 끝낸 뒤 쓴다.
 
-**키 발급.** 발급 도구 `opl-license`는 패키지에 넣지 않는다. 발급하는 쪽에서 저장소를 빌드해 쓴다.
+**키 발급.** 발급 도구 `orbivisor-license`는 패키지에 넣지 않는다. 발급하는 쪽에서 저장소를 빌드해 쓴다.
 
 ```bash
-cargo build --release -p opl-api --bin opl-license
+cargo build --release -p orbivisor-api --bin orbivisor-license
 # 발급 키 쌍(한 번). 비밀 키(PKCS#8 base64 한 줄)는 --out 파일(0600, 있으면 거절)에, 공개 키 base64는 표준 출력에
-target/release/opl-license keygen --out license.key
+target/release/orbivisor-license keygen --out license.key
 # 키 발급: 표준 출력에 opl1.… 한 줄(--issued-at <유닉스 초>로 발급 시각을 정할 수 있다. 기본은 지금)
-target/release/opl-license issue --key license.key --id acme-2026 --customer 'Acme Corp' \
+target/release/orbivisor-license issue --key license.key --id acme-2026 --customer 'Acme Corp' \
     --level premium --nodes 3 --days 365
 # 비밀 키 파일의 공개 키(OPL_LICENSE_KEYS의 항목)를 다시 보기
-target/release/opl-license pubkey --key license.key
+target/release/orbivisor-license pubkey --key license.key
 ```
 
-`issue`는 `--nodes`·`--days`가 1 이상인지 먼저 보고("opl-license: --days must be at least 1"), 내용이 키 규칙에 맞지
-않으면 "opl-license: invalid license: id must be …"처럼 멈춘다. `keygen`은 쓰다가 실패하면 만든 파일을 지운다.
+`issue`는 `--nodes`·`--days`가 1 이상인지 먼저 보고("orbivisor-license: --days must be at least 1"), 내용이 키 규칙에 맞지
+않으면 "orbivisor-license: invalid license: id must be …"처럼 멈춘다. `keygen`은 쓰다가 실패하면 만든 파일을 지운다.
 
 빌드 값 `OPL_LICENSE_KEYS`(base64 공개 키를 쉼표로)를 주고 빌드한 orbivisord만 그 키로 서명한 구독 키를 믿는다. 주지
-않으면 저장소의 개발 키(`crates/opl-types/keys/dev-license.pub`) 하나를 믿는데, 그 비밀 키가 시험 견본
-(`crates/opl-types/tests/fixtures/dev-license.key`)으로 저장소에 있어 누구나 키를 만들 수 있다. 그래서 정식 패키지는
+않으면 저장소의 개발 키(`crates/orbivisor-types/keys/dev-license.pub`) 하나를 믿는데, 그 비밀 키가 시험 견본
+(`crates/orbivisor-types/tests/fixtures/dev-license.key`)으로 저장소에 있어 누구나 키를 만들 수 있다. 그래서 정식 패키지는
 반드시 `OPL_LICENSE_KEYS`를 주고(위 "저장소 만들기"처럼 `cargo build`와 `build-deb.sh`에 함께), `build-deb.sh`는 이 값이
 없으면 `OPL_DEV_LICENSE=1`(개발 패키지, CI의 패키지가 이렇다)이 아닌 한 "build-deb: OPL_LICENSE_KEYS is not set; …"로
 멈춘다. 값이 있으면 세 가지를 더 본다: 쉼표로 나눈 항목마다 정규 base64(44자, `=` 끝)로 푼 32바이트 Ed25519 공개

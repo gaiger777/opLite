@@ -36,17 +36,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       # 시험 빌드에만 있는 고리로 리더의 api 실행기를 막는 굶김 시험(QEMU 없음)
-      - run: cargo test -p opld --features starve-it --test starve
+      - run: cargo test -p orbivisord --features starve-it --test starve
       # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
       # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
-      - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
+      - run: cargo test -p orbivisord --features metrics-it --test metrics_history --test alerts
       # 가짜 vSphere(계획 72, 같은 프로세스 — 시스템 도구 없음): 세션·인벤토리·CBT 회차와 게스트 쓰기·티켓 범위 읽기·결함,
       # 원본 연결·찾아보기·이전 계획·미리 확인 API, 전체 복사·CBT 델타 동기화·스케줄러(가짜 스토리지)
-      - run: cargo test -p opl-api --features fake-vsphere --test vsphere --test vmware_api --test vmware_sync --test vmware_cutover
+      - run: cargo test -p orbivisor-api --features fake-vsphere --test vsphere --test vmware_api --test vmware_sync --test vmware_cutover
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)
-        run: cargo test -p opl-cluster --features scale-it --test scale -- --nocapture
+        run: cargo test -p orbivisor-cluster --features scale-it --test scale -- --nocapture
         timeout-minutes: 10
         env:
           OPL_SCALE_NODES: 100
@@ -57,21 +57,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-utils unzip libarchive-tools
-          cargo test -p opl-driver --features storage-it --test dir_storage
-          cargo test -p opl-store --features storage-it --test nbd_qemu -- --nocapture
-          cargo test -p opl-api --features storage-it --test volumes --test downloads
-          cargo test -p opl-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks --test backup_store_tasks --test live_restore_tasks
+          cargo test -p orbivisor-driver --features storage-it --test dir_storage
+          cargo test -p orbivisor-store --features storage-it --test nbd_qemu -- --nocapture
+          cargo test -p orbivisor-api --features storage-it --test volumes --test downloads
+          cargo test -p orbivisor-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks --test backup_store_tasks --test live_restore_tasks
           # VMware 동기화의 실제 qemu-nbd 쓰기 길(계획 72)
-          cargo test -p opl-api --features fake-vsphere,storage-it --test vmware_sync qemu_nbd
+          cargo test -p orbivisor-api --features fake-vsphere,storage-it --test vmware_sync qemu_nbd
           # 파일 복원 zip·tar.gz를 unzip·bsdtar·GNU tar·Python zipfile로 읽어 봄(계획 69)
-          cargo test -p opl-restore --features storage-it --test archive_tools
+          cargo test -p orbivisor-restore --features storage-it --test archive_tools
       # 도우미 VM 에이전트는 정적 musl로 C 툴체인 없이 빌드한다 — C를 쓰는 의존성(cc 빌드 스크립트·ring)이 들어오면 실패(계획 69 §8.2)
       - name: Restore agent has no C dependencies
         if: runner.os == 'Linux'
         run: |
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            if cargo tree -p opl-restore --target "$t" -e normal,build --prefix none | grep -E '^(cc|ring|openssl-sys) '; then
-              echo "opl-restore pulls in a C dependency for $t"; exit 1
+            if cargo tree -p orbivisor-restore --target "$t" -e normal,build --prefix none | grep -E '^(cc|ring|openssl-sys) '; then
+              echo "orbivisor-restore pulls in a C dependency for $t"; exit 1
             fi
           done
 
@@ -186,7 +186,7 @@ jobs:
             bash /work/packaging/tests/repo-test.sh "/work/$DEB" "/work/$TRANS_DEB" "/work/$IMAGE_DEB"
       # 빌드 버전 시험을 OPL_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
       - name: Version tests with OPL_VERSION
-        run: OPL_VERSION=9.9.9~t cargo test -p opl-types -p opld -p oplctl --lib --test version
+        run: OPL_VERSION=9.9.9~t cargo test -p orbivisor-types -p orbivisord -p orbivisorctl --lib --test version
       - uses: actions/upload-artifact@v4
         with:
           name: orbivisor-deb
@@ -406,9 +406,9 @@ jobs:
       - name: QEMU, bridge and E2E tests as root
         run: |
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
-            cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
+            cargo test --features "$FEATURES" -p orbivisor-qemu -p orbivisor-driver -p orbivisor-reconciler -p orbivisord
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it,opld/numa-it,opld/backup-it,opld/fake-vsphere
+          FEATURES: orbivisor-qemu/qemu-it,orbivisor-driver/qemu-it,orbivisor-driver/net-it,orbivisor-reconciler/qemu-it,orbivisord/qemu-it,orbivisord/net-it,orbivisord/web-it,orbivisord/nfs-it,orbivisor-driver/lvm-it,orbivisord/lvm-it,orbivisor-driver/zfs-it,orbivisord/zfs-it,orbivisor-driver/rbd-it,orbivisord/rbd-it,orbivisor-driver/lvm-shared-it,orbivisord/lvm-shared-it,orbivisord/migration-it,orbivisord/ha-it,orbivisor-driver/vtpm-it,orbivisord/vtpm-it,orbivisord/cpu-it,orbivisord/numa-it,orbivisord/backup-it,orbivisord/fake-vsphere
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl
@@ -469,7 +469,7 @@ jobs:
       # LVM(VG oplfixvg)은 root가 만든다. XFS 더러운 로그: 복사본을 붙여 쓰고 fsync한 뒤 로그를 남긴 채 내린다.
       - name: Fixture disks
         run: |
-          sudo crates/opl-restore/tests/fixtures/make-disks.sh "$OPL_RESTORE_FIXTURES"
+          sudo crates/orbivisor-restore/tests/fixtures/make-disks.sh "$OPL_RESTORE_FIXTURES"
           cat "$OPL_RESTORE_FIXTURES/disks.txt"
           sudo cp --sparse=always "$OPL_RESTORE_FIXTURES/xfs.img" "$OPL_RESTORE_FIXTURES/xfs-dirty.img"
           sudo mkdir -p /mnt/oplxfs
@@ -484,13 +484,13 @@ jobs:
       - name: Real helper VM (KVM) and opld E2E (1)-(5)
         run: |
           sudo -E env "PATH=$PATH" OPL_RESTORE_SCOPE=1 OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
-            cargo test -p opl-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
+            cargo test -p orbivisor-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
-            cargo test -p opld --features restore-it --test file_restore -- --nocapture
+            cargo test -p orbivisord --features restore-it --test file_restore -- --nocapture
       - name: Real helper VM with forced TCG
         run: |
           sudo -E env "PATH=$PATH" OPL_RESTORE_ACCEL=tcg CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
-            cargo test -p opl-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
+            cargo test -p orbivisor-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
 
   # Ceph 자동 구성(계획 56): Ceph가 없는 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 mon·mgr, 루프 장치
   # 위 OSD(ceph-volume LVM), RBD 풀을 세워 그 풀의 볼륨으로 VM을 켠다. linux-kvm은 손으로 띄운 Ceph(바깥 Ceph를
@@ -515,7 +515,7 @@ jobs:
       - name: Ceph setup E2E as root
         run: |
           sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
-            cargo test --features opld/ceph-it,opld/qemu-it -p opld --test ceph -- --nocapture
+            cargo test --features orbivisord/ceph-it,orbivisord/qemu-it -p orbivisord --test ceph -- --nocapture
 
   # SDN(OVN) 설치·구성(계획 65): 깨끗한 Ubuntu 24.04 러너에서 orbivisord가 직접 ovn-central·ovn-host·openvswitch-switch를 apt로
   # 받아 NB·SB Raft 클러스터·northd(Orbivisor 단위, 노드 주소의 pssl, 클러스터 CA mTLS)와 chassis를 세우고, 127.0.0.2의
@@ -554,7 +554,7 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             OPL_TEST_CLOUD_IMAGE="$RUNNER_TEMP/ubuntu-24.04-server-cloudimg-amd64.img" \
-            cargo test --features opld/sdn-it -p opld --test sdn -- --nocapture
+            cargo test --features orbivisord/sdn-it -p orbivisord --test sdn -- --nocapture
 
   # 여러 노드 SDN(계획 66 스테이지 6): 러너 하나에 privileged systemd 컨테이너 셋(ci/sdn-node/Dockerfile — OVN·OVS는 넣지 않음)을
   # Orbivisor 노드 셋으로 띄우고, 노드마다 orbivisord가 apt로 OVN을 깔아 실제 NB·SB Raft 셋과 chassis 셋이 된다(커널 모듈만
@@ -583,7 +583,7 @@ jobs:
       - name: Multinode SDN E2E as root
         run: |
           sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" OPL_MULTINODE_IMAGE=opl-sdn-node \
-            cargo test --features opld/sdn-multinode-it -p opld --test sdn_multinode -- --nocapture
+            cargo test --features orbivisord/sdn-multinode-it -p orbivisord --test sdn_multinode -- --nocapture
 
   # 설치 매체와 cloud-init(계획 57)의 실제 게스트: 받아 둔 Alpine virt ISO로 BIOS·UEFI VM이 CD에서 부팅하는지, Ubuntu
   # 24.04 클라우드 이미지에 cloud-init이 호스트 이름·사용자·비밀번호 해시·키·고정 IP를 적용하는지 본다. 게스트 OS가 있어야
@@ -631,17 +631,17 @@ jobs:
           curl -fsSL --retry 3 -O https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso.sha256
           sha256sum -c alpine-virt-3.20.3-x86_64.iso.sha256
       - name: Installer ISO boot and cloud-init in real guests
-        run: cargo test --features opld/install-media-it,opld/qemu-it -p opld --test install_media -- --nocapture
+        run: cargo test --features orbivisord/install-media-it,orbivisord/qemu-it -p orbivisord --test install_media -- --nocapture
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
           OPL_TEST_INSTALL_ISO: ${{ runner.temp }}/alpine-virt-3.20.3-x86_64.iso
       - name: Templates and linked clones in real guests
-        run: cargo test --features opld/templates-it,opld/qemu-it -p opld --test templates -- --nocapture
+        run: cargo test --features orbivisord/templates-it,orbivisord/qemu-it -p orbivisord --test templates -- --nocapture
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
           OPL_TEST_CLOUD_SUMS: ${{ runner.temp }}/SHA256SUMS
       - name: vTPM, Secure Boot and the guest agent in a real guest
-        run: cargo test --features opld/vtpm-it,opld/install-media-it,opld/qemu-it -p opld --test vtpm -- --nocapture
+        run: cargo test --features orbivisord/vtpm-it,orbivisord/install-media-it,orbivisord/qemu-it -p orbivisord --test vtpm -- --nocapture
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
 
@@ -708,7 +708,7 @@ jobs:
           docker exec "$OPL_S3_CONTAINER" weed version
       - name: Backup store E2E against S3 (SeaweedFS)
         timeout-minutes: 60
-        run: cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1
+        run: cargo test -p orbivisord --features s3-it --test backup_s3 -- --nocapture --test-threads=1
       - name: S3 server logs
         if: failure()
         run: |
@@ -743,7 +743,7 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config
       - name: slapd with LDAPS, StartTLS, two users and a group
         run: sudo -E sh .github/scripts/ldap-setup.sh
-      - run: cargo test -p opl-api --features ldap-it --test ldap_it
+      - run: cargo test -p orbivisor-api --features ldap-it --test ldap_it
       - name: slapd log
         if: failure()
         run: sudo journalctl -u slapd --no-pager -n 200
@@ -790,11 +790,11 @@ jobs:
           for _ in $(seq 1 60); do govc about > /dev/null 2>&1 && break; sleep 1; done
           govc about
           govc find / -type m
-      - run: cargo test -p opl-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
+      - run: cargo test -p orbivisor-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
       # 계획 72 스테이지 6: 우리가 내보낸 OVA(storage-it 왕복 시험이 남김)를 vcsim이 govc import.ova로 받는다.
       - name: VM export OVA into vcsim (govc import.ova)
         run: |
-          OPL_EXPORT_OVA_OUT="$RUNNER_TEMP/web.ova" cargo test -p opl-api --features storage-it --test vm_import_tasks \
+          OPL_EXPORT_OVA_OUT="$RUNNER_TEMP/web.ova" cargo test -p orbivisor-api --features storage-it --test vm_import_tasks \
             an_exported_ova_imports_back_with_the_same_disk -- --nocapture
           govc import.ova -pool=/DC0/host/DC0_C0/Resources -ds=LocalDS_0 -name=orbivisor-export "$RUNNER_TEMP/web.ova"
           govc vm.info -json orbivisor-export | jq -e '[.. | strings | select(endswith(".vmdk"))] | length >= 1'
@@ -838,13 +838,13 @@ jobs:
           # AppArmor의 named 프로필은 /etc/bind 밖을 막으므로 복사한 실행 파일로 띄운다.
           cp /usr/sbin/named "$RUNNER_TEMP/named"
           .github/scripts/acme-bind.sh "$RUNNER_TEMP/named" "$RUNNER_TEMP/bind" 15353 >> "$GITHUB_ENV"
-      - run: cargo test -p opl-api --features acme-it --test acme -- --nocapture
+      - run: cargo test -p orbivisor-api --features acme-it --test acme -- --nocapture
       - name: BIND log
         if: failure()
         run: tail -n 100 "$RUNNER_TEMP/bind/named.log" || true
 
   # 계획 73 스테이지 5: Terraform/OpenTofu 공급자(terraform/, Go) — go vet·gofmt·go mod verify·staticcheck·govulncheck·단위와 OpenAPI 스키마 맞춤,
-  # 수용 시험은 opl-devserver(가짜 하이퍼바이저·메모리 스토리지)에 대해 terraform과 tofu(핀한 판, SHA-256) 둘로
+  # 수용 시험은 orbivisor-devserver(가짜 하이퍼바이저·메모리 스토리지)에 대해 terraform과 tofu(핀한 판, SHA-256) 둘로
   terraform:
     strategy:
       fail-fast: false
@@ -885,12 +885,12 @@ jobs:
           unzip -q cli.zip "${{ matrix.cli }}"
           "./${{ matrix.cli }}" version
           echo "TF_ACC_TERRAFORM_PATH=$RUNNER_TEMP/tf/${{ matrix.cli }}" >> "$GITHUB_ENV"
-      - name: opl-devserver and the OpenAPI document
+      - name: orbivisor-devserver and the OpenAPI document
         run: |
-          cargo build -p opld --features devserver --bin opl-devserver
-          cargo test -p opld --features devserver --test devserver
-          cargo run -q -p opl-api --bin opl-api-openapi > "$RUNNER_TEMP/openapi.json"
-          echo "OPL_DEVSERVER=$PWD/target/debug/opl-devserver" >> "$GITHUB_ENV"
+          cargo build -p orbivisord --features devserver --bin orbivisor-devserver
+          cargo test -p orbivisord --features devserver --test devserver
+          cargo run -q -p orbivisor-api --bin orbivisor-api-openapi > "$RUNNER_TEMP/openapi.json"
+          echo "OPL_DEVSERVER=$PWD/target/debug/orbivisor-devserver" >> "$GITHUB_ENV"
           echo "OPL_OPENAPI=$RUNNER_TEMP/openapi.json" >> "$GITHUB_ENV"
       - name: go mod verify, gofmt, go vet, staticcheck, govulncheck
         working-directory: terraform
@@ -903,7 +903,7 @@ jobs:
       - name: Unit tests and schema match (OpenAPI)
         working-directory: terraform
         run: go test ./...
-      - name: Acceptance tests (${{ matrix.cli }} against opl-devserver)
+      - name: Acceptance tests (${{ matrix.cli }} against orbivisor-devserver)
         working-directory: terraform
         run: TF_ACC=1 go test ./internal/provider/ -count=1 -v -timeout 30m
 

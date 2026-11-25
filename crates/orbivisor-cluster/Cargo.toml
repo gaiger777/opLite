@@ -1,0 +1,32 @@
+[package]
+name = "orbivisor-cluster"
+description = "Raft-replicated resource store for Orbivisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# 노드 수백 개를 한 프로세스에 띄우는 규모 시험(tests/scale.rs). 노드 수는 OPL_SCALE_NODES(기본 300).
+scale-it = []
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+lz4_flex.workspace = true
+openraft.workspace = true
+orbivisor-types.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

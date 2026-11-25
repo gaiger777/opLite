@@ -8,7 +8,7 @@ export type RealmView = Schemas["RealmView"];
 export type RealmRequest = Schemas["RealmRequest"];
 export type RealmTestResult = Schemas["RealmTestResult"];
 
-/** 서버의 기본값과 같다(`opl_types::realm`). */
+/** 서버의 기본값과 같다(`orbivisor_types::realm`). */
 export const DEFAULT_USER_FILTER = "(&(objectClass=person)(uid={username}))";
 export const DEFAULT_GROUP_ATTR = "memberOf";
 export const DEFAULT_TIMEOUT_SECS = 10;

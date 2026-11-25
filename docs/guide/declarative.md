@@ -302,7 +302,7 @@ EOF
 ```
 
 `dev_overrides`를 쓰면 `terraform init` 없이 `plan`·`apply`가 그 실행 파일을 쓴다(경고가 한 줄 나온다). 시험해 볼 서버는
-`cargo run -p opld --features devserver --bin opl-devserver`(가짜 하이퍼바이저·메모리 스토리지 노드 하나, 연결 정보 JSON 한 줄 —
+`cargo run -p orbivisord --features devserver --bin orbivisor-devserver`(가짜 하이퍼바이저·메모리 스토리지 노드 하나, 연결 정보 JSON 한 줄 —
 [개발](development.md))이고, 예는 `terraform/examples/web/main.tf`, 리소스 문서는 `terraform/docs/`다.
 
 ```hcl

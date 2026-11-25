@@ -8,7 +8,7 @@ import openapiTS, { astToString } from "openapi-typescript";
 // 어느 디렉터리에서 실행해도 저장소 루트에서 cargo를 돌린다. Cargo.lock은 고치지 않는다.
 const doc = execFileSync(
   "cargo",
-  ["run", "-q", "--locked", "-p", "opl-api", "--bin", "opl-api-openapi"],
+  ["run", "-q", "--locked", "-p", "orbivisor-api", "--bin", "orbivisor-api-openapi"],
   {
     cwd: fileURLToPath(new URL("../../", import.meta.url)),
     encoding: "utf8",

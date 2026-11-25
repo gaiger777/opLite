@@ -1,0 +1,42 @@
+[package]
+name = "orbivisorctl"
+description = "Command-line client for Orbivisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# 크레이트·라이브러리 이름(oplctl)은 두고 바이너리 이름만 제품 이름으로 한다(옛 이름 oplctl은 패키지의 링크).
+autobins = false
+
+[[bin]]
+name = "orbivisorctl"
+path = "src/main.rs"
+
+[features]
+# 내장 이미지 카탈로그의 URL과 체크섬 파일을 실제 서버에 확인하는 시험(계획 58, CI `catalog.yml`). 인터넷이 필요하다.
+catalog-it = []
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+native-tls.workspace = true
+orbivisor-types.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+sha2.workspace = true
+time = { workspace = true, features = ["parsing"] }
+tokio.workspace = true
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true

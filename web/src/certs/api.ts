@@ -68,7 +68,7 @@ export const DNS_KINDS: readonly DnsKind[] = [
   "hook",
 ];
 
-/** HTTP-01 노드 기능(서버 `opl_types::node::HTTP01` — `[api] http_listen`을 켠 노드가 알린다) */
+/** HTTP-01 노드 기능(서버 `orbivisor_types::node::HTTP01` — `[api] http_listen`을 켠 노드가 알린다) */
 export const HTTP01 = "http01";
 
 /**

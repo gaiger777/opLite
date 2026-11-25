@@ -1,0 +1,160 @@
+//! 새 노드가 클러스터에 합류를 요청한다.
+
+use std::time::Duration;
+
+use anyhow::{Context, bail};
+use orbivisor_api::cluster::{JoinRequest, JoinResponse, JoinUrl};
+use orbivisor_peer::pki::{NodeTls, fingerprint, node_key_and_csr};
+use uuid::Uuid;
+
+use crate::config::Config;
+
+/// 받아 줄 노드에 연결하기를 기다리는 시간
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 요청 하나의 제한 시간. 받는 노드는 토큰 삭제, Node 기록, learner 추가 등 쓰기를 여러 번 하고
+/// 쓰기마다 최대 10초를 기다릴 수 있으므로 넉넉히 둔다(승격은 따로 기다린다).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 검증 없이 받는 CA 본문의 최대 크기
+const CA_MAX_BYTES: usize = 64 * 1024;
+
+/// 합류 요청에 실을 링크 목록: 링크가 둘 이상일 때만(링크 하나면 옛 요청 그대로라 옛 노드도 받는다)
+fn join_links(config: &Config) -> Vec<String> {
+    let links = config.cluster_links();
+    if links.len() > 1 { links } else { Vec::new() }
+}
+
+/// 합류 거절 메시지. 옛 API 노드는 모르는 `cluster_addresses`(여러 링크로 합류)를 거절하므로 먼저 올리라고 알린다.
+fn refusal(message: &str) -> String {
+    if message.contains("unknown field") && message.contains("cluster_addresses") {
+        format!(
+            "the node at the join URL runs an older version that does not know several cluster links; \
+             upgrade every node first ({message})"
+        )
+    } else {
+        message.to_string()
+    }
+}
+
+/// 받아들여진 합류
+pub struct Joined {
+    pub cluster: String,
+    pub tls: NodeTls,
+    /// 받아 준 노드의 노드 간 주소. 여기로 투표 멤버 승격을 요청한다.
+    pub via: String,
+}
+
+/// 조인 URL의 노드에 합류를 요청한다. 그 노드의 CA는 인증서 검증 없이 받아 URL의 지문과 맞는지
+/// 확인하고, 그 뒤로는 그 CA만 믿는다. 키는 이 노드에서 만들고 CSR만 보낸다.
+pub async fn request(config: &Config, node: Uuid, url: &JoinUrl) -> anyhow::Result<Joined> {
+    let base = format!("https://{}/api/v1", url.address);
+    let insecure = reqwest::Client::builder()
+        .tls_danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?;
+    let mut resp = insecure
+        .get(format!("{base}/cluster/ca"))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {}", url.address))?;
+    if !resp.status().is_success() {
+        bail!(
+            "cannot read the cluster CA from {}: {}",
+            url.address,
+            resp.status()
+        );
+    }
+    // 검증 없이 받는 본문이므로 크기를 제한한다.
+    let too_big = || anyhow::anyhow!("the cluster CA from {} is larger than 64 KiB", url.address);
+    if resp
+        .content_length()
+        .is_some_and(|n| n > CA_MAX_BYTES as u64)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > CA_MAX_BYTES {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let ca_pem = String::from_utf8(body).context("the cluster CA is not valid UTF-8")?;
+    if fingerprint(&ca_pem)? != url.ca_fingerprint {
+        bail!(
+            "the cluster CA of {} does not match the join URL; check the URL",
+            url.address
+        );
+    }
+    let client = reqwest::Client::builder()
+        .tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes())?])
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?;
+    let (key_pem, csr_pem) = node_key_and_csr()?;
+    let resp = client
+        .post(format!("{base}/cluster/join"))
+        .json(&JoinRequest {
+            token: url.token.clone(),
+            node,
+            name: config.name.clone(),
+            address: config.api_address(),
+            cluster_address: config.cluster_address(),
+            cluster_addresses: join_links(config),
+            csr_pem,
+            witness: config.witness,
+            version: Some(orbivisor_types::version::BUILD.to_string()),
+        })
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {}", url.address))?;
+    if !resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        bail!(
+            "join refused: {}",
+            refusal(body["message"].as_str().unwrap_or("unknown error"))
+        );
+    }
+    let joined: JoinResponse = resp.json().await?;
+    Ok(Joined {
+        cluster: joined.cluster,
+        tls: NodeTls {
+            ca_pem: joined.ca_pem,
+            cert_pem: joined.cert_pem,
+            key_pem,
+        },
+        via: joined.via,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_sends_the_links_only_when_there_are_several() {
+        let config: Config = toml::from_str("name = \"n\"\naddress = \"10.0.0.5\"").unwrap();
+        assert!(join_links(&config).is_empty());
+        let config = Config {
+            cluster_addresses: vec!["10.0.0.5".into(), "10.1.0.5".into()],
+            ..config
+        };
+        assert_eq!(join_links(&config), ["10.0.0.5:8007", "10.1.0.5:8007"]);
+    }
+
+    #[test]
+    fn an_old_api_node_refusing_the_links_asks_to_upgrade() {
+        let old =
+            "invalid JSON body: unknown field `cluster_addresses`, expected one of `token`, `node`";
+        assert!(
+            refusal(old).contains("upgrade every node first"),
+            "{}",
+            refusal(old)
+        );
+        assert_eq!(
+            refusal("invalid or expired join token"),
+            "invalid or expired join token"
+        );
+    }
+}

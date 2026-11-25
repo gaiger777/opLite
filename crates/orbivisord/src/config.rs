@@ -1,0 +1,3643 @@
+use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use orbivisor_api::{
+    AlertEngineConfig, AuditConfig, BackupJobSchedulerConfig, BalancerConfig, ClusterJanitorConfig,
+    Fencer, RemotePollerConfig, ReplicationSchedulerConfig, SnapshotSchedulerConfig,
+    TelemetryConfig, UpdatesConfig, VipAgentConfig,
+};
+use orbivisor_driver::ceph::{
+    CLIENT_PACKAGES, CephHost, CephOptions, CephPaths, DAEMON_PACKAGES, SystemRunner,
+};
+use orbivisor_driver::ovn::{CENTRAL_PACKAGES, HOST_PACKAGES, OvnHost, OvnOptions, OvnPaths};
+use orbivisor_driver::{NetFs, VipAddress};
+use orbivisor_qemu::{Accel, HostProfile, kvm_available};
+use orbivisor_reconciler::HaConfig;
+use orbivisor_reconciler::ha::{DeviceWatchdog, WatchdogOpener};
+use orbivisor_types::node::{Fencing, NodeHa};
+use orbivisor_types::security_group::Cidr;
+use serde::Deserialize;
+
+use crate::metrics::history::{MAX_FLUSH_SECS, MIN_FLUSH_SECS, WriterConfig};
+
+/// `opld --config <path>`로 읽는 TOML 설정.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// 노드 이름. 클러스터 안에서 유일해야 한다.
+    pub name: String,
+    /// 다른 노드와 클라이언트가 이 노드에 닿는 호스트(IP나 DNS 이름). 노드 인증서에 들어가고,
+    /// 클러스터에 알리는 주소(`address:포트`)가 된다. 나중에 바꿀 수 없다.
+    pub address: String,
+    /// 위트니스 노드: VM을 돌리지 않고 선거에 나서지 않는 Raft 투표 멤버. 합류만 할 수 있고, HTTPS
+    /// API를 열지 않으며 `[hypervisor]`·`[pools]`·`[migration]`을 쓰지 않는다(QEMU가 없어도 된다).
+    #[serde(default)]
+    pub witness: bool,
+    /// API(HTTPS)를 받을 소켓 주소
+    #[serde(default = "default_listen")]
+    pub listen: SocketAddr,
+    /// 노드 간 통신(gRPC over mTLS)을 받을 소켓 주소
+    #[serde(default = "default_cluster_listen")]
+    pub cluster_listen: SocketAddr,
+    /// 다른 노드가 이 노드의 노드 간 통신에 닿는 호스트들(IP나 DNS 이름, 포트 없이, 앞이 우선). 포트는
+    /// `cluster_listen`의 포트다. 첫 링크가 끊기면 다음 링크로 넘어간다. 없거나 비면 `address` 하나다. 모두
+    /// 노드 인증서에 들어간다.
+    #[serde(default)]
+    pub cluster_addresses: Vec<String>,
+    /// `oplctl cluster init|join|leave`를 받는 유닉스 소켓. 기본은 `{run_dir}/opld.sock`이다.
+    /// opld를 실행한 사용자만 쓸 수 있다(0600).
+    pub control_socket: Option<PathBuf>,
+    /// 클러스터 저장소, 노드 인증서, VM별 영구 파일, 올린 이미지를 둔다.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
+    /// QEMU 소켓과 pidfile을 두는 휘발성 디렉터리. 유닉스 소켓 경로 길이 제한(104바이트) 때문에 짧아야 한다.
+    #[serde(default = "default_run_dir")]
+    pub run_dir: PathBuf,
+    /// Homebrew QEMU의 펌웨어 디렉터리(macOS). Linux는 Debian 경로를 쓴다(`[hypervisor]`로 바꾼다).
+    #[serde(default = "default_qemu_share_dir")]
+    pub qemu_share_dir: PathBuf,
+    #[serde(default = "default_qemu_img")]
+    pub qemu_img: PathBuf,
+    #[serde(default)]
+    pub hypervisor: HypervisorSection,
+    #[serde(default)]
+    pub reconciler: ReconcilerSection,
+    #[serde(default)]
+    pub schedule: ScheduleSection,
+    #[serde(default)]
+    pub janitor: JanitorSection,
+    #[serde(default)]
+    pub backup: BackupSection,
+    #[serde(default)]
+    pub replication: ReplicationSection,
+    #[serde(default)]
+    pub pools: PoolsSection,
+    #[serde(default)]
+    pub migration: MigrationSection,
+    #[serde(default)]
+    pub ha: HaSection,
+    #[serde(default)]
+    pub network: NetworkSection,
+    #[serde(default)]
+    pub updates: UpdatesSection,
+    #[serde(default)]
+    pub telemetry: TelemetrySection,
+    #[serde(default)]
+    pub audit: AuditSection,
+    #[serde(default)]
+    pub remotes: RemotesSection,
+    #[serde(default)]
+    pub runtime: RuntimeSection,
+    #[serde(default)]
+    pub api: ApiSection,
+    #[serde(default)]
+    pub vip: VipSection,
+    #[serde(default)]
+    pub web: WebSection,
+    #[serde(default)]
+    pub node: NodeSection,
+    #[serde(default)]
+    pub ceph: CephSection,
+    #[serde(default)]
+    pub sdn: SdnSection,
+    #[serde(default)]
+    pub download: DownloadSection,
+    #[serde(default)]
+    pub metrics: MetricsSection,
+    #[serde(default)]
+    pub file_restore: FileRestoreSection,
+    #[serde(default)]
+    pub vmware: VmwareSection,
+    #[serde(default)]
+    pub acme: AcmeSection,
+    /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`·`metrics-it`)에만 있다. 배포 빌드는 `[test]`를 모르는
+    /// 키로 거부한다.
+    #[cfg(any(
+        feature = "starve-it",
+        feature = "ha-it",
+        feature = "migration-it",
+        feature = "qemu-it",
+        feature = "metrics-it"
+    ))]
+    #[serde(default)]
+    pub test: TestSection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HypervisorSection {
+    /// `auto`(macOS는 hvf, Linux는 KVM이 있으면 kvm, 없으면 tcg), `kvm`, `tcg`, `hvf`
+    #[serde(default)]
+    pub accel: AccelSetting,
+    /// QEMU 실행 파일. 기본은 호스트에 맞는 `qemu-system-*`이다.
+    pub qemu_binary: Option<PathBuf>,
+    /// UEFI 펌웨어 코드와 VM마다 복사하는 변수 저장소 원본
+    pub uefi_code: Option<PathBuf>,
+    pub uefi_vars: Option<PathBuf>,
+    /// QEMU를 `systemd-run --scope`로 감싼다(VM마다 cgroup). Linux에서 기본으로 켠다.
+    #[serde(default = "default_systemd_scope")]
+    pub systemd_scope: bool,
+    /// swtpm 실행 파일(계획 59, VM의 TPM). 기본은 `PATH`의 `swtpm`이다.
+    pub swtpm: Option<PathBuf>,
+    /// swtpm_setup 실행 파일(새 TPM의 EK·인증서). 기본은 `PATH`의 `swtpm_setup`이다.
+    pub swtpm_setup: Option<PathBuf>,
+    /// Secure Boot 펌웨어 코드와 MS 키를 등록한 변수 템플릿(둘 다 주거나 둘 다 생략). 기본은 QEMU 펌웨어 descriptor로
+    /// 찾은 것이다.
+    pub secure_boot_code: Option<PathBuf>,
+    pub secure_boot_vars: Option<PathBuf>,
+}
+
+impl Default for HypervisorSection {
+    fn default() -> Self {
+        Self {
+            accel: AccelSetting::default(),
+            qemu_binary: None,
+            uefi_code: None,
+            uefi_vars: None,
+            systemd_scope: default_systemd_scope(),
+            swtpm: None,
+            swtpm_setup: None,
+            secure_boot_code: None,
+            secure_boot_vars: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccelSetting {
+    #[default]
+    Auto,
+    Kvm,
+    Tcg,
+    Hvf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcilerSection {
+    /// ACPI 종료를 요청한 뒤 강제 종료하기까지 기다리는 시간(초)
+    #[serde(default = "default_acpi_timeout")]
+    pub acpi_timeout_secs: u64,
+}
+
+impl Default for ReconcilerSection {
+    fn default() -> Self {
+        Self {
+            acpi_timeout_secs: default_acpi_timeout(),
+        }
+    }
+}
+
+impl ReconcilerSection {
+    pub fn acpi_timeout(&self) -> Duration {
+        Duration::from_secs(self.acpi_timeout_secs)
+    }
+}
+
+/// 예약 스냅샷 작업. 테스트만 줄인다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleSection {
+    /// 예약을 확인하는 간격(초)
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// 주기의 한 시간(초). 매일은 24배, 매주는 168배다.
+    #[serde(default = "default_hour_secs")]
+    pub hour_secs: u64,
+}
+
+impl Default for ScheduleSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick_secs(),
+            hour_secs: default_hour_secs(),
+        }
+    }
+}
+
+impl ScheduleSection {
+    pub fn scheduler_config(&self) -> SnapshotSchedulerConfig {
+        SnapshotSchedulerConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            hour: Duration::from_secs(self.hour_secs),
+        }
+    }
+}
+
+/// 클러스터 정리 작업. 간격·유예는 테스트만 줄인다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JanitorSection {
+    /// 목록을 확인하는 간격(초)
+    #[serde(default = "default_janitor_tick_secs")]
+    pub tick_secs: u64,
+    /// 오프라인 노드의 `pending` Task를 실패로 끝내기까지 기다리는 시간(초)
+    #[serde(default = "default_offline_grace_secs")]
+    pub offline_grace_secs: u64,
+    /// 만든 지 이 날수가 넘은 끝난 Task를 지운다.
+    #[serde(default = "default_task_max_age_days")]
+    pub task_max_age_days: u64,
+    /// 끝난 Task를 이보다 많이 남기지 않는다(넘으면 오래된 것부터 지운다).
+    #[serde(default = "default_task_max_finished")]
+    pub task_max_finished: usize,
+}
+
+impl Default for JanitorSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_janitor_tick_secs(),
+            offline_grace_secs: default_offline_grace_secs(),
+            task_max_age_days: default_task_max_age_days(),
+            task_max_finished: default_task_max_finished(),
+        }
+    }
+}
+
+impl JanitorSection {
+    pub fn janitor_config(&self) -> ClusterJanitorConfig {
+        ClusterJanitorConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            offline_grace: Duration::from_secs(self.offline_grace_secs),
+            task_max_age: Duration::from_secs(self.task_max_age_days * 24 * 3600),
+            task_max_finished: self.task_max_finished,
+            // 고아 스냅샷·끝난 Task의 유예는 설정하지 않는다(기본 30초·10분).
+            ..ClusterJanitorConfig::default()
+        }
+    }
+}
+
+/// 백업 작업 스케줄러(리더)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// 작업을 확인하는 간격(초)
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// 노드마다 동시에 도는 백업 Task의 최대 수
+    #[serde(default = "default_backup_max_concurrent")]
+    pub max_concurrent: usize,
+    /// 저장소 백업(계획 68 §8.5): fleecing을 시작하려면 VM 상태 디렉터리에 남아 있어야 할 공간의 최소(MiB — 디스크 크기
+    /// 합의 10%와 큰 쪽)
+    #[serde(default = "default_fleece_reserve_min_mib")]
+    pub fleece_reserve_min_mib: u64,
+    /// 저장소 백업을 읽는 동안 남은 공간이 이보다 적어지면 읽기를 끊는다(MiB)
+    #[serde(default = "default_fleece_min_free_mib")]
+    pub fleece_min_free_mib: u64,
+    /// 저장소 복원·라이브 복원의 NBD 서버가 둘 풀린 청크 캐시(MiB)
+    #[serde(default = "default_serve_cache_mib")]
+    pub serve_cache_mib: u64,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick_secs(),
+            max_concurrent: default_backup_max_concurrent(),
+            fleece_reserve_min_mib: default_fleece_reserve_min_mib(),
+            fleece_min_free_mib: default_fleece_min_free_mib(),
+            serve_cache_mib: default_serve_cache_mib(),
+        }
+    }
+}
+
+impl BackupSection {
+    pub fn scheduler_config(&self) -> BackupJobSchedulerConfig {
+        BackupJobSchedulerConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            max_concurrent: self.max_concurrent,
+        }
+    }
+}
+
+/// 로컬 디스크 복제(계획 55)의 주기 스케줄러(리더)와 복제 Task
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationSection {
+    /// 주기가 지난 복제 대상을 확인하는 간격(초)
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// 원본 노드마다 동시에 도는 복제 Task의 최대 수
+    #[serde(default = "default_replication_max_concurrent")]
+    pub max_concurrent: usize,
+    /// 복제 Task가 보내는 대역폭 상한(MiB/s, 디스크 수로 나눈다). 0이면 제한 없음
+    #[serde(default)]
+    pub bandwidth_mib: u64,
+}
+
+impl Default for ReplicationSection {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick_secs(),
+            max_concurrent: default_replication_max_concurrent(),
+            bandwidth_mib: 0,
+        }
+    }
+}
+
+impl ReplicationSection {
+    pub fn scheduler_config(&self) -> ReplicationSchedulerConfig {
+        ReplicationSchedulerConfig {
+            tick: Duration::from_secs(self.tick_secs),
+            max_concurrent: self.max_concurrent,
+            ..ReplicationSchedulerConfig::default()
+        }
+    }
+
+    /// 복제 Task의 대역폭 상한(바이트/초). 0이면 없다.
+    pub fn bandwidth(&self) -> Option<u64> {
+        (self.bandwidth_mib > 0).then_some(self.bandwidth_mib << 20)
+    }
+}
+
+/// 노드별 풀 상태 새로 고침(NFS 마운트 포함)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolsSection {
+    /// 풀 상태를 확인하는 간격(초)
+    #[serde(default = "default_pools_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+impl Default for PoolsSection {
+    fn default() -> Self {
+        Self {
+            refresh_secs: default_pools_refresh_secs(),
+        }
+    }
+}
+
+impl PoolsSection {
+    pub fn refresh(&self) -> Duration {
+        Duration::from_secs(self.refresh_secs)
+    }
+}
+
+/// 라이브 마이그레이션(설계 §4)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationSection {
+    /// 받는 쪽 QEMU가 마이그레이션을 받는 포트 범위(`"A-B"`, 둘 다 포함). 노드 사이 방화벽에서
+    /// 열어야 한다.
+    #[serde(
+        default = "default_migration_ports",
+        deserialize_with = "deserialize_port_range"
+    )]
+    pub ports: RangeInclusive<u16>,
+    /// 보내는 대역폭 상한(MiB/s). 0이면 QEMU 기본값이다.
+    #[serde(default)]
+    pub bandwidth_mib: u64,
+    /// 마이그레이션이 이 시간 안에 끝나지 않으면 취소한다(`"30m"`, `"1h30m"`, `"90s"`).
+    #[serde(
+        default = "default_migration_timeout",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub timeout: Duration,
+    /// 노드 로컬 풀의 디스크를 복사하는 마이그레이션에서 디스크 복사가 따라잡기까지의 한도(`"12h"`).
+    /// 메모리 단계는 `timeout`이다.
+    #[serde(
+        default = "default_migration_disk_timeout",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub disk_timeout: Duration,
+}
+
+impl Default for MigrationSection {
+    fn default() -> Self {
+        Self {
+            ports: default_migration_ports(),
+            bandwidth_mib: 0,
+            timeout: default_migration_timeout(),
+            disk_timeout: default_migration_disk_timeout(),
+        }
+    }
+}
+
+/// HA 리스와 자기 펜싱(설계 §3.1). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaSection {
+    /// `watchdog`(opld가 HA VM을 끄고, opld가 멈추면 watchdog가 노드를 재시작), `process`(opld가
+    /// 끄는 것만 — 시험·개발용), `off`(이 노드는 HA VM을 돌리지 않는다). 기본은 Linux `watchdog`,
+    /// macOS `off`다.
+    #[serde(default)]
+    pub fencing: FencingSetting,
+    /// 시간 묶음(설계 §8.1): `fast`(기본, 10초·10초)나 `safe`(30초·30초). 아래 값을 적으면 그것이 이긴다.
+    #[serde(default)]
+    pub profile: HaProfile,
+    /// Linux watchdog 장치(하드웨어 또는 `softdog`)
+    #[serde(default = "default_watchdog_device")]
+    pub watchdog_device: PathBuf,
+    /// 장치에 정하는 제한 시간(초, `WDIOC_SETTIMEOUT`). 없으면 프로필 값이다.
+    #[serde(default)]
+    pub watchdog_timeout_secs: Option<u64>,
+    /// 마지막으로 성공한 리스 갱신 뒤 이만큼 지나면 HA VM을 끈다(초). 없으면 프로필 값이다.
+    #[serde(default)]
+    pub fence_after_secs: Option<u64>,
+    /// 전원 끄기 펜싱의 IPMI 방법이 부르는 `ipmitool`(리더가 노드를 끌 때와 `fence-test`·이웃 확인에 쓴다)
+    #[serde(default = "default_ipmitool")]
+    pub ipmitool: PathBuf,
+    /// HA 검사(`ping` 대상)가 부르는 시스템 `ping`. ICMP 권한은 이 실행 파일의 것을 쓴다.
+    #[serde(default = "default_ping")]
+    pub ping: PathBuf,
+}
+
+impl Default for HaSection {
+    fn default() -> Self {
+        Self {
+            fencing: FencingSetting::default(),
+            profile: HaProfile::default(),
+            watchdog_device: default_watchdog_device(),
+            watchdog_timeout_secs: None,
+            fence_after_secs: None,
+            ipmitool: default_ipmitool(),
+            ping: default_ping(),
+        }
+    }
+}
+
+/// `[ha] profile`: 리스와 watchdog 시간의 묶음
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HaProfile {
+    /// 리스 10초·watchdog 10초(복구 약 22초)
+    #[default]
+    Fast,
+    /// 리스 30초·watchdog 30초(복구 약 62초, 계획 50까지의 기본값)
+    Safe,
+}
+
+impl HaProfile {
+    /// (`fence_after_secs`, `watchdog_timeout_secs`)
+    fn times(self) -> (u64, u64) {
+        match self {
+            Self::Fast => (10, 10),
+            Self::Safe => (30, 30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FencingSetting {
+    Watchdog,
+    Process,
+    Off,
+}
+
+impl Default for FencingSetting {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Watchdog
+        } else {
+            Self::Off
+        }
+    }
+}
+
+/// `watchdog_timeout_secs`의 하한. 1초마다 쓰다듬으므로 한두 번 늦어도 재시작되지 않게 둔다.
+const MIN_WATCHDOG_TIMEOUT_SECS: u64 = 5;
+/// `watchdog_timeout_secs`의 상한(1시간)
+const MAX_WATCHDOG_TIMEOUT_SECS: u64 = 3600;
+/// 리더가 옮기기 전에 더 기다리는 여유(초)
+const RECOVER_MARGIN_SECS: u64 = 2;
+/// 이보다 짧은 `fence_after`면 시작할 때 HA 경고를 본다(옛 기본값, `profile = "safe"`).
+const SAFE_FENCE_AFTER_SECS: u64 = 30;
+/// 핫플러그 Task가 떼기·줄이기에서 게스트를 기다리는 한도(초)
+const HOTPLUG_TIMEOUT_SECS: u64 = 60;
+
+impl HaSection {
+    /// 실제 `fence_after_secs`: 적은 값, 없으면 프로필 값
+    pub fn fence_after_secs(&self) -> u64 {
+        self.fence_after_secs.unwrap_or(self.profile.times().0)
+    }
+
+    /// 노드 전원 끄기 펜싱의 실행기
+    pub fn fencer(&self) -> Fencer {
+        Fencer {
+            ipmitool: self.ipmitool.clone(),
+            ..Fencer::default()
+        }
+    }
+
+    /// 실제 `watchdog_timeout_secs`: 적은 값, 없으면 프로필 값
+    pub fn watchdog_timeout_secs(&self) -> u64 {
+        self.watchdog_timeout_secs.unwrap_or(self.profile.times().1)
+    }
+
+    /// 등록할 때 쓰는 이 노드의 HA 설정. 펜싱이 꺼져 있으면 None이다.
+    pub fn node_ha(&self) -> Option<NodeHa> {
+        let (fencing, watchdog) = match self.fencing {
+            FencingSetting::Off => return None,
+            FencingSetting::Watchdog => (Fencing::Watchdog, self.watchdog_timeout_secs()),
+            FencingSetting::Process => (Fencing::Process, 0),
+        };
+        Some(NodeHa {
+            fencing,
+            recover_after_secs: self
+                .fence_after_secs()
+                .saturating_add(watchdog)
+                .saturating_add(RECOVER_MARGIN_SECS),
+            fence_after_secs: Some(self.fence_after_secs()),
+        })
+    }
+}
+
+impl Config {
+    /// 등록할 때 쓰는 이 노드의 HA 설정([`HaSection::node_ha`]). 시험 빌드(`ha-it`)는 `[test]
+    /// recover_margin_secs`로 여유를 바꾼다.
+    pub fn node_ha(&self) -> Option<NodeHa> {
+        #[cfg(feature = "ha-it")]
+        if let Some(margin) = self.test.recover_margin_secs {
+            return self.ha.node_ha().map(|ha| NodeHa {
+                recover_after_secs: ha.recover_after_secs - RECOVER_MARGIN_SECS + margin,
+                ..ha
+            });
+        }
+        self.ha.node_ha()
+    }
+
+    /// 균형 조정기 설정. 시험 빌드(`migration-it`)는 `[test] placement_interval_secs`로 회차 간격을 줄이고 1초마다
+    /// 확인한다.
+    pub fn balancer_config(&self) -> BalancerConfig {
+        #[cfg(feature = "migration-it")]
+        if let Some(secs) = self.test.placement_interval_secs {
+            return BalancerConfig {
+                tick: Duration::from_secs(1),
+                interval: Duration::from_secs(secs),
+                ..BalancerConfig::default()
+            };
+        }
+        BalancerConfig::default()
+    }
+
+    /// 핫플러그 Task가 떼기·줄이기에서 게스트가 내려 주기를 기다리는 한도(60초). 시험 빌드(`qemu-it`)는 `[test]
+    /// hotplug_timeout_secs`로 바꾼다.
+    pub fn hotplug_timeout(&self) -> Duration {
+        #[cfg(feature = "qemu-it")]
+        if let Some(secs) = self.test.hotplug_timeout_secs {
+            return Duration::from_secs(secs);
+        }
+        Duration::from_secs(HOTPLUG_TIMEOUT_SECS)
+    }
+
+    /// VMware 이전 스케줄러 설정(15초 틱). 시험 빌드(`qemu-it`)는 `[test] vmware_tick_ms`로 줄인다.
+    pub fn vmware_scheduler_config(&self) -> orbivisor_api::VmwareSchedulerConfig {
+        #[cfg(feature = "qemu-it")]
+        if let Some(ms) = self.test.vmware_tick_ms {
+            return orbivisor_api::VmwareSchedulerConfig {
+                tick: Duration::from_millis(ms.max(1)),
+            };
+        }
+        orbivisor_api::VmwareSchedulerConfig::default()
+    }
+
+    /// 따뜻한 이전의 델타 주기 덮어쓰기(없으면 계획의 주기). 시험 빌드(`qemu-it`)만 `[test] vmware_sync_secs`로 준다.
+    pub fn vmware_sync_every(&self) -> Option<Duration> {
+        #[cfg(feature = "qemu-it")]
+        if let Some(secs) = self.test.vmware_sync_secs {
+            return Some(Duration::from_secs(secs.max(1)));
+        }
+        None
+    }
+
+    /// TPM 상태 해시·사본 주기(60초). 시험 빌드(`qemu-it`)는 `[test] firmware_sync_secs`로 바꾼다.
+    pub fn firmware_sync_interval(&self) -> Duration {
+        #[cfg(feature = "qemu-it")]
+        if let Some(secs) = self.test.firmware_sync_secs {
+            return Duration::from_secs(secs);
+        }
+        orbivisor_reconciler::FIRMWARE_SYNC_INTERVAL
+    }
+
+    /// 지표 기록 쓰기 설정(`[metrics] flush_secs`). 시험 빌드(`metrics-it`·`qemu-it`)는 `[test] metrics_flush_secs`·
+    /// `metrics_push_secs`로 주기를 줄인다.
+    pub fn history_writer_config(&self) -> WriterConfig {
+        #[allow(unused_mut)]
+        let mut c = WriterConfig {
+            flush: Duration::from_secs(self.metrics.flush_secs),
+            ..WriterConfig::default()
+        };
+        #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+        {
+            if let Some(secs) = self.test.metrics_flush_secs {
+                c.flush = Duration::from_secs(secs.max(1));
+            }
+            if let Some(secs) = self.test.metrics_push_secs {
+                let d = Duration::from_secs(secs.max(1));
+                (c.scan, c.first_scan, c.after_change) = (d, d, d);
+            }
+        }
+        c
+    }
+
+    /// 경보 엔진 설정(5초 간격, 60초 해제 대기). 시험 빌드(`metrics-it`·`qemu-it`)는 `[test] alert_tick_ms`로 줄인다.
+    pub fn alert_engine_config(&self) -> AlertEngineConfig {
+        #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+        if let Some(ms) = self.test.alert_tick_ms {
+            return AlertEngineConfig::default().with_tick(Duration::from_millis(ms.max(1)));
+        }
+        AlertEngineConfig::default()
+    }
+
+    /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
+    pub fn checker_net(&self) -> NetFs {
+        #[cfg(feature = "ha-it")]
+        if let Some(root) = &self.test.health_root {
+            return NetFs::under(root);
+        }
+        NetFs::default()
+    }
+}
+
+impl HaSection {
+    pub fn fence_after(&self) -> Duration {
+        Duration::from_secs(self.fence_after_secs())
+    }
+
+    /// 리스 갱신 간격: `fence_after`의 10분의 1을 0.2초 이상 2초 이하로 자른 값
+    pub fn renew_interval(&self) -> Duration {
+        (self.fence_after() / 10).clamp(Duration::from_millis(200), Duration::from_secs(2))
+    }
+
+    /// 노드의 `HaGuard` 설정. 펜싱이 꺼져 있으면 None이다.
+    pub fn guard_config(&self) -> Option<HaConfig> {
+        let watchdog: Option<Arc<dyn WatchdogOpener>> = match self.fencing {
+            FencingSetting::Off => return None,
+            FencingSetting::Watchdog => Some(Arc::new(DeviceWatchdog {
+                path: self.watchdog_device.clone(),
+                timeout_secs: self.watchdog_timeout_secs(),
+            })),
+            FencingSetting::Process => None,
+        };
+        Some(HaConfig {
+            fence_after: self.fence_after(),
+            renew_interval: self.renew_interval(),
+            watchdog,
+        })
+    }
+}
+
+/// 노드 네트워크(VXLAN). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSection {
+    /// VXLAN 패킷을 주고받을 이 노드의 주소. 없으면 `address`가 IP면 그것, 이름이면 시작할 때 푼
+    /// 주소(loopback·link-local은 빼고 IPv4 먼저)다.
+    #[serde(default)]
+    pub underlay: Option<IpAddr>,
+}
+
+/// 노드의 APT 업데이트(소스 파일, 업데이트 확인). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesSection {
+    /// 업데이트를 확인한다. 없으면 `apt_get`이 있을 때(Debian) 켜진다.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 업데이트를 확인하는 간격
+    #[serde(
+        default = "default_check_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub check_interval: Duration,
+    /// 시작한 뒤 첫 확인까지 기다리는 시간
+    #[serde(
+        default = "default_first_check",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub first_check: Duration,
+    /// Orbivisor APT 저장소 주소. 비면 빌드 값(`OPL_APT_URL`), 그것도 비면 소스 파일을 쓰지 않는다.
+    #[serde(default)]
+    pub apt_url: String,
+    /// opld가 관리하는 deb822 소스 파일
+    #[serde(default = "default_sources_file")]
+    pub sources_file: PathBuf,
+    #[serde(default = "default_apt_get")]
+    pub apt_get: PathBuf,
+    #[serde(default = "default_systemd_run")]
+    pub systemd_run: PathBuf,
+    #[serde(default = "default_systemctl")]
+    pub systemctl: PathBuf,
+    #[serde(default = "default_dpkg")]
+    pub dpkg: PathBuf,
+    /// 업그레이드 로그를 두는 디렉터리
+    #[serde(default = "default_log_dir")]
+    pub log_dir: PathBuf,
+    /// 업그레이드 유닛 상태를 다시 보는 간격
+    #[serde(
+        default = "default_upgrade_poll",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub poll: Duration,
+}
+
+impl Default for UpdatesSection {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            check_interval: default_check_interval(),
+            first_check: default_first_check(),
+            apt_url: String::new(),
+            sources_file: default_sources_file(),
+            apt_get: default_apt_get(),
+            systemd_run: default_systemd_run(),
+            systemctl: default_systemctl(),
+            dpkg: default_dpkg(),
+            log_dir: default_log_dir(),
+            poll: default_upgrade_poll(),
+        }
+    }
+}
+
+impl UpdatesSection {
+    /// 업데이트를 확인하는지: `enabled`, 없으면 `apt_get`이 있는지
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or_else(|| self.apt_get.exists())
+    }
+
+    /// API의 업데이트 설정. 꺼졌으면 None이다.
+    pub fn updates_config(&self) -> Option<UpdatesConfig> {
+        if !self.enabled() {
+            return None;
+        }
+        let apt_url = if self.apt_url.is_empty() {
+            orbivisor_types::version::APT_URL.to_string()
+        } else {
+            self.apt_url.clone()
+        };
+        Some(UpdatesConfig {
+            check_interval: self.check_interval,
+            first_check: self.first_check,
+            apt_url,
+            sources_file: self.sources_file.clone(),
+            keyring: orbivisor_api::KEYRING.into(),
+            auth_file: orbivisor_api::AUTH_FILE.into(),
+            apt_get: self.apt_get.clone(),
+            systemd_run: self.systemd_run.clone(),
+            systemctl: self.systemctl.clone(),
+            dpkg: self.dpkg.clone(),
+            log_dir: self.log_dir.clone(),
+            poll: self.poll,
+        })
+    }
+}
+
+/// 텔레메트리 리포터(리더). 켜고 끄기와 끝점은 클러스터 설정(`PATCH /settings`)이 정한다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySection {
+    /// 보낼 때가 됐는지 확인하는 간격
+    #[serde(
+        default = "default_telemetry_tick",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub tick: Duration,
+    /// 보고를 보내는 간격
+    #[serde(
+        default = "default_telemetry_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub interval: Duration,
+    /// 보내지 못한 뒤 다시 보내기까지 기다리는 시간
+    #[serde(
+        default = "default_telemetry_retry",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub retry: Duration,
+    /// 시스템 루트에 더해 믿는 CA 인증서(PEM, 여럿이어도 된다). 사설 수집 서버에 쓴다.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+impl Default for TelemetrySection {
+    fn default() -> Self {
+        Self {
+            tick: default_telemetry_tick(),
+            interval: default_telemetry_interval(),
+            retry: default_telemetry_retry(),
+            ca_file: None,
+        }
+    }
+}
+
+impl TelemetrySection {
+    /// API의 리포터 설정. `ca_file`을 읽지 못하거나 인증서가 없으면 오류다.
+    pub fn telemetry_config(&self) -> anyhow::Result<TelemetryConfig> {
+        let mut extra_roots = Vec::new();
+        if let Some(path) = &self.ca_file {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+            let certs = orbivisor_peer::pki::certs(&pem)
+                .map_err(|e| anyhow::anyhow!("telemetry.ca_file {}: {e}", path.display()))?;
+            extra_roots = certs.into_iter().map(|c| c.to_vec()).collect();
+        }
+        Ok(TelemetryConfig {
+            tick: self.tick,
+            interval: self.interval,
+            retry: self.retry,
+            extra_roots,
+            ..TelemetryConfig::default()
+        })
+    }
+}
+
+/// 원격 클러스터 상태 수집(리더). 원격은 API(`/remotes`)로 등록한다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemotesSection {
+    /// 원격마다 상태를 모으는 간격
+    #[serde(
+        default = "default_remotes_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub interval: Duration,
+    /// 모을 때가 됐는지 확인하는 간격
+    #[serde(
+        default = "default_remotes_tick",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub tick: Duration,
+}
+
+impl Default for RemotesSection {
+    fn default() -> Self {
+        Self {
+            interval: default_remotes_interval(),
+            tick: default_remotes_tick(),
+        }
+    }
+}
+
+impl RemotesSection {
+    pub fn poller_config(&self) -> RemotePollerConfig {
+        RemotePollerConfig {
+            tick: self.tick,
+            interval: self.interval,
+        }
+    }
+}
+
+fn default_remotes_interval() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_remotes_tick() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// API(HTTPS)를 앞단 프록시 뒤에 둘 때. 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSection {
+    /// 믿는 프록시의 주소 범위(`"10.0.0.0/8"`, `"fd00::/8"`, `"192.0.2.10"`). 이 주소에서 온 요청만
+    /// `X-Forwarded-For`(감사 로그·로그인 제한의 요청 주소)와 `X-Forwarded-Host`·`X-Forwarded-Proto`(같은
+    /// 출처 검사, OIDC 콜백 주소)를 믿는다. 비어 있으면 아무 헤더도 믿지 않는다.
+    #[serde(default)]
+    pub trusted_proxies: Vec<Cidr>,
+    /// 관리자가 준 API 인증서(PEM, 중간 인증서를 이어 붙여도 됨)와 키 파일. 둘 다 있어야 하고, 있으면 API
+    /// 리스너가 이것을 쓰며 클러스터 CA로 API 인증서를 다시 발급하지 않는다(`api_names`를 따르지 않음).
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    /// ACME HTTP-01 리스너(계획 73 §11.3, 예 `"0.0.0.0:80"`). `/.well-known/acme-challenge/*`에만 답하고(Raft의 도전 값 —
+    /// 이름이 어느 노드를 가리켜도 답한다) 나머지는 https로 308 보낸다(설정 `acme.http_redirect`). 없으면 열지 않는다.
+    #[serde(default)]
+    pub http_listen: Option<SocketAddr>,
+}
+
+impl ApiSection {
+    /// 관리자가 준 API 인증서와 키(PEM). 없으면 None, 읽지 못하면 오류다.
+    pub fn read_tls(&self) -> anyhow::Result<Option<(String, String)>> {
+        let (Some(cert), Some(key)) = (&self.tls_cert, &self.tls_key) else {
+            return Ok(None);
+        };
+        let read = |path: &PathBuf| {
+            std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("cannot read the API TLS file {}: {e}", path.display())
+            })
+        };
+        Ok(Some((read(cert)?, read(key)?)))
+    }
+}
+
+/// 내장 VIP(설계 §4, Linux만). 이 노드가 가질 수 있는 VIP다. 리더가 VIP마다 헬스 체크가 200인 노드 하나를
+/// 골라 주고, 그 노드가 `interface`에 붙인다. 모든 API 노드에 같게 둔다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VipSection {
+    /// VIP(`"192.168.0.200/24"`, IPv4). 접두사는 인터페이스에 붙일 때 쓴다(없으면 `/32`).
+    #[serde(default)]
+    pub addresses: Vec<VipAddress>,
+    /// VIP를 붙일 인터페이스(예: `eth0`, `vmbr0`)
+    pub interface: Option<String>,
+}
+
+impl VipSection {
+    /// VIP 에이전트 설정. VIP가 없으면 None이다.
+    pub fn agent_config(&self) -> Option<VipAgentConfig> {
+        let interface = self.interface.as_ref()?;
+        (!self.addresses.is_empty())
+            .then(|| VipAgentConfig::new(interface.clone(), self.addresses.clone()))
+    }
+}
+
+/// 내장 웹 UI. 끄면 API(`/api/`)만 열고 UI는 따로 둔 포털(`packaging/portal/`)이 준다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSection {
+    #[serde(default = "default_web_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for WebSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_enabled(),
+        }
+    }
+}
+
+fn default_web_enabled() -> bool {
+    true
+}
+
+/// URL에서 받기(`volume download`·`iso download`, 계획 57)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadSection {
+    /// 루프백·링크 로컬(클라우드 메타데이터 169.254.169.254 포함)·사설망 주소에서도 받는다. 기본은 받지 않는다(볼륨
+    /// 쓰기 권한으로 노드 안쪽 서비스에 닿지 않게). 리디렉션의 각 단계에도 같다. 사내 미러가 사설 주소면 켠다.
+    #[serde(default)]
+    pub allow_private: bool,
+}
+
+/// 파일 단위 복원(계획 69 §6·§10.3). 도우미 이미지가 `image_dir`에 있고 검사를 지나야 이 노드가 세션을 받는다
+/// (`NodeStatus.file_restore`). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRestoreSection {
+    /// 도우미 이미지 디렉터리(`<arch>/manifest.json`·커널·initrd). 없으면 Linux `/usr/share/orbivisor/restore`(deb
+    /// `orbivisor-restore-image`), macOS `{data_dir}/restore-image`
+    #[serde(default)]
+    pub image_dir: Option<PathBuf>,
+    /// 노드당 세션 수(0이면 이 노드는 파일 복원을 받지 않는다, 64까지)
+    #[serde(default = "default_fr_max_sessions")]
+    pub max_sessions: u32,
+    /// 도우미 VM 메모리(MiB, 128~16384)와 vCPU(1~16)
+    #[serde(default = "default_fr_memory_mib")]
+    pub memory_mib: u32,
+    #[serde(default = "default_fr_vcpus")]
+    pub vcpus: u32,
+    /// 도우미가 에이전트 인사까지 걸려도 되는 시간(초, 10~3600 — TCG 노드를 생각해 넉넉히)
+    #[serde(default = "default_fr_boot_timeout_secs")]
+    pub boot_timeout_secs: u64,
+    /// 나열·내려받기·되돌려 쓰기가 없으면 세션을 닫는 시간(분, 1 이상)
+    #[serde(default = "default_fr_idle_minutes")]
+    pub idle_minutes: u64,
+    /// 세션 최대 시간(시간, 1~168)
+    #[serde(default = "default_fr_max_hours")]
+    pub max_hours: u64,
+    /// 디스크 덮개(저널 재생이 쓰는 곳) 합계 상한(MiB, 64 이상)
+    #[serde(default = "default_fr_overlay_max_mib")]
+    pub overlay_max_mib: u64,
+    /// 도우미 QEMU가 디스크·소켓을 연 뒤 내려갈 사용자(Linux에서 opld가 root일 때). 빈 값이면 내리지 않는다.
+    #[serde(default = "default_fr_run_as")]
+    pub run_as: String,
+    /// 게스트로 되돌려 쓰기 한 번의 바이트·파일 수 상한
+    #[serde(default = "default_fr_guest_max_bytes")]
+    pub guest_max_bytes: u64,
+    #[serde(default = "default_fr_guest_max_files")]
+    pub guest_max_files: u64,
+    /// 걷기(zip·tar.gz 내려받기, 게스트로 되돌려 쓰기) 한 번의 항목 수 상한(건너뛴 항목도 셈). 경로 이름의 합은 따로
+    /// 256 MiB까지. 넘으면 내려받기는 받은 데까지로 아카이브를 맺고 보고서에 적으며, 되돌려 쓰기는 멈춘다
+    #[serde(default = "default_fr_download_max_entries")]
+    pub download_max_entries: u64,
+}
+
+impl Default for FileRestoreSection {
+    fn default() -> Self {
+        Self {
+            image_dir: None,
+            max_sessions: default_fr_max_sessions(),
+            memory_mib: default_fr_memory_mib(),
+            vcpus: default_fr_vcpus(),
+            boot_timeout_secs: default_fr_boot_timeout_secs(),
+            idle_minutes: default_fr_idle_minutes(),
+            max_hours: default_fr_max_hours(),
+            overlay_max_mib: default_fr_overlay_max_mib(),
+            run_as: default_fr_run_as(),
+            guest_max_bytes: default_fr_guest_max_bytes(),
+            guest_max_files: default_fr_guest_max_files(),
+            download_max_entries: default_fr_download_max_entries(),
+        }
+    }
+}
+
+impl FileRestoreSection {
+    fn validate(&self) -> anyhow::Result<()> {
+        let bad = |key: &str, range: &str| anyhow::anyhow!("file_restore.{key} must be {range}");
+        if self.max_sessions > 64 {
+            return Err(bad("max_sessions", "at most 64"));
+        }
+        if !(128..=16384).contains(&self.memory_mib) {
+            return Err(bad("memory_mib", "between 128 and 16384"));
+        }
+        if !(1..=16).contains(&self.vcpus) {
+            return Err(bad("vcpus", "between 1 and 16"));
+        }
+        if !(10..=3600).contains(&self.boot_timeout_secs) {
+            return Err(bad("boot_timeout_secs", "between 10 and 3600"));
+        }
+        if self.idle_minutes == 0 || self.idle_minutes > 7 * 24 * 60 {
+            return Err(bad("idle_minutes", "between 1 and 10080"));
+        }
+        if !(1..=168).contains(&self.max_hours) {
+            return Err(bad("max_hours", "between 1 and 168"));
+        }
+        if self.overlay_max_mib < 64 || self.overlay_max_mib > 1 << 30 {
+            return Err(bad("overlay_max_mib", "at least 64"));
+        }
+        if self.guest_max_bytes == 0 || self.guest_max_files == 0 || self.download_max_entries == 0
+        {
+            return Err(anyhow::anyhow!(
+                "file_restore.guest_max_bytes, guest_max_files and download_max_entries must be at least 1"
+            ));
+        }
+        let user_ok = self.run_as.is_empty()
+            || (self.run_as.len() <= 32
+                && !self.run_as.starts_with('-')
+                && self
+                    .run_as
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')));
+        if !user_ok {
+            return Err(bad("run_as", "a user name or empty"));
+        }
+        Ok(())
+    }
+}
+
+/// VMware 이전(계획 72 §7.4). 선택 VDDK 길: 운영자가 nbdkit(`vddk` 플러그인)과 VMware VDDK 라이브러리를 깔고 적는다.
+/// 둘 다 없으면 데이터스토어 `/folder` 범위 읽기만 쓴다(vSAN·vVols 디스크는 읽을 수 없다).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmwareSection {
+    /// nbdkit 실행 파일(예: `/usr/sbin/nbdkit`)
+    #[serde(default)]
+    pub nbdkit: Option<PathBuf>,
+    /// VDDK 라이브러리 디렉터리(예: `/opt/vmware-vix-disklib-distrib`). 원본의 `transport.vddk.libdir`가 먼저다.
+    #[serde(default)]
+    pub vddk_libdir: Option<PathBuf>,
+}
+
+impl VmwareSection {
+    fn validate(&self) -> anyhow::Result<()> {
+        for (key, path) in [("nbdkit", &self.nbdkit), ("vddk_libdir", &self.vddk_libdir)] {
+            if path.as_ref().is_some_and(|p| !p.is_absolute()) {
+                anyhow::bail!("vmware.{key} must be an absolute path");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// ACME 인증서(계획 73 §11)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSection {
+    /// DNS-01 전파 확인에 쓸 DNS 서버(`ip:port`). 있으면 이 서버만 권한 서버로 보고 묻는다(사내 DNS·분리 DNS). 없으면
+    /// 영역의 NS를 찾아 모두 묻는다.
+    #[serde(default)]
+    pub dns_resolver: Option<SocketAddr>,
+}
+
+/// 지표 기록(계획 60 §6). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// 지표를 `{data_dir}/metrics`의 기록 파일에 남긴다. 끄면 파일을 쓰지 않고 메모리 1시간만 둔다(SD 카드·USB 부팅
+    /// 노드).
+    #[serde(default = "default_metrics_history")]
+    pub history: bool,
+    /// 기록 파일에 쓰는 주기(초, 60~600). 늘리면 디스크 쓰기가 줄고, 전원이 나가면 그만큼 잃는다.
+    #[serde(default = "default_metrics_flush_secs")]
+    pub flush_secs: u64,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            history: default_metrics_history(),
+            flush_secs: default_metrics_flush_secs(),
+        }
+    }
+}
+
+fn default_metrics_history() -> bool {
+    true
+}
+
+fn default_metrics_flush_secs() -> u64 {
+    crate::metrics::history::DEFAULT_FLUSH_SECS
+}
+
+/// 이 노드에 대한 것
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSection {
+    /// 장애 영역(랙·전원·방 이름). 등록할 때 노드 레이블 `zone`으로 적고, 리더가 투표 멤버를 고를 때 서로 다른
+    /// zone을 먼저 고른다. 앞뒤 공백은 잘라 적는다. 없으면 레이블을 건드리지 않는다(API로 둔 레이블은 그대로).
+    pub zone: Option<String>,
+}
+
+/// Ceph 자동 구성(계획 56)이 이 노드에서 쓰는 값. 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CephSection {
+    /// 관리 Ceph의 클라이언트 설정·`client.orbivisor` 키링을 두는 디렉터리(절대 경로). 등록하는 RBD 풀의 `conf`는
+    /// `{client_dir}/ceph.conf`다.
+    #[serde(default = "default_ceph_client_dir")]
+    pub client_dir: PathBuf,
+    /// 데몬 노드(mon·mgr·OSD)에 까는 꾸러미
+    #[serde(default = "default_ceph_packages")]
+    pub packages: Vec<String>,
+    /// RBD 풀만 쓰는 노드에 까는 꾸러미
+    #[serde(default = "default_ceph_client_packages")]
+    pub client_packages: Vec<String>,
+    /// `apt-get update`·`install` 하나의 시간 한도(초)
+    #[serde(default = "default_ceph_install_timeout_secs")]
+    pub install_timeout_secs: u64,
+    /// 루프 장치도 OSD 디스크로 쓴다(시험용).
+    #[serde(default)]
+    pub allow_loop_devices: bool,
+    /// Ceph 상태를 다시 읽지 않고 돌려주는 시간(초). 0이면 늘 다시 읽는다.
+    #[serde(default = "default_ceph_status_cache_secs")]
+    pub status_cache_secs: u64,
+}
+
+impl Default for CephSection {
+    fn default() -> Self {
+        Self {
+            client_dir: default_ceph_client_dir(),
+            packages: default_ceph_packages(),
+            client_packages: default_ceph_client_packages(),
+            install_timeout_secs: default_ceph_install_timeout_secs(),
+            allow_loop_devices: false,
+            status_cache_secs: default_ceph_status_cache_secs(),
+        }
+    }
+}
+
+impl CephSection {
+    /// 이 노드에서 Ceph를 세우는 단계들(실제 명령). Linux가 아닌 노드도 만들고 Task가 거절한다.
+    pub fn host(&self) -> CephHost {
+        let paths = CephPaths {
+            client_dir: self.client_dir.clone(),
+            ..CephPaths::default()
+        };
+        let options = CephOptions {
+            packages: self.packages.clone(),
+            client_packages: self.client_packages.clone(),
+            install_timeout: Duration::from_secs(self.install_timeout_secs),
+            allow_loop: self.allow_loop_devices,
+            ..CephOptions::default()
+        };
+        CephHost::new(Arc::new(SystemRunner), paths, options)
+    }
+
+    pub fn status_cache(&self) -> Duration {
+        Duration::from_secs(self.status_cache_secs)
+    }
+}
+
+fn default_ceph_client_dir() -> PathBuf {
+    "/etc/opl/ceph".into()
+}
+fn default_ceph_packages() -> Vec<String> {
+    DAEMON_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_ceph_client_packages() -> Vec<String> {
+    CLIENT_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_ceph_install_timeout_secs() -> u64 {
+    30 * 60
+}
+fn default_ceph_status_cache_secs() -> u64 {
+    5
+}
+
+/// SDN(OVN, 계획 65)이 이 노드에서 쓰는 값. 위트니스는 쓰지 않는다. 관리자가 `sdn init`을 하기 전에는 아무것도 하지
+/// 않는다(꾸러미를 찾지도 않는다).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SdnSection {
+    /// OVN 중앙 노드에 까는 꾸러미
+    #[serde(default = "default_sdn_central_packages")]
+    pub central_packages: Vec<String>,
+    /// chassis에 까는 꾸러미
+    #[serde(default = "default_sdn_host_packages")]
+    pub host_packages: Vec<String>,
+    /// `apt-get update`·`install` 하나의 시간 한도(초)
+    #[serde(default = "default_ceph_install_timeout_secs")]
+    pub install_timeout_secs: u64,
+    /// 노드 SDN 에이전트가 바뀐 것이 없어도 다시 맞추고 상태를 읽는 간격(초)
+    #[serde(default = "default_sdn_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+impl Default for SdnSection {
+    fn default() -> Self {
+        Self {
+            central_packages: default_sdn_central_packages(),
+            host_packages: default_sdn_host_packages(),
+            install_timeout_secs: default_ceph_install_timeout_secs(),
+            refresh_secs: default_sdn_refresh_secs(),
+        }
+    }
+}
+
+impl SdnSection {
+    /// 이 노드에서 OVN을 세우는 단계들(실제 명령). 노드 TLS 원본은 `{data_dir}/pki`, `tag`는 클러스터 태그다. Linux가
+    /// 아닌 노드도 만들고 Task가 거절한다.
+    pub fn host(&self, data_dir: &Path, tag: &str) -> OvnHost {
+        let paths = OvnPaths {
+            pki: data_dir.join(orbivisor_peer::pki::PKI_DIR),
+            ..OvnPaths::default()
+        };
+        let options = OvnOptions {
+            central_packages: self.central_packages.clone(),
+            host_packages: self.host_packages.clone(),
+            install_timeout: Duration::from_secs(self.install_timeout_secs),
+            ..OvnOptions::default()
+        };
+        OvnHost::new(Arc::new(SystemRunner), paths, options, tag.to_string())
+    }
+
+    pub fn refresh(&self) -> Duration {
+        Duration::from_secs(self.refresh_secs)
+    }
+}
+
+fn default_sdn_central_packages() -> Vec<String> {
+    CENTRAL_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_sdn_host_packages() -> Vec<String> {
+    HOST_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_sdn_refresh_secs() -> u64 {
+    60
+}
+
+/// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSection {
+    /// API(axum) 실행기의 작업자 스레드 수. 기본은 CPU 수의 절반(최소 2)이다.
+    pub api_threads: Option<usize>,
+    /// reconciler·Task 실행기·스케줄러 등의 실행기의 작업자 스레드 수. 기본은 CPU 수의 절반(최소 2)이다.
+    pub work_threads: Option<usize>,
+}
+
+impl RuntimeSection {
+    pub fn api_threads(&self) -> usize {
+        self.api_threads.unwrap_or_else(default_runtime_threads)
+    }
+
+    pub fn work_threads(&self) -> usize {
+        self.work_threads.unwrap_or_else(default_runtime_threads)
+    }
+}
+
+/// CPU 수의 절반, 최소 2
+fn default_runtime_threads() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cpus / 2).max(2)
+}
+
+/// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4), 호스트 종료 정책 시험, 균형 조정기 간격(마이그레이션 시험),
+/// 핫플러그 기다림(실제 QEMU 시험), 지표 기록 주기(계획 60)
+#[cfg(any(
+    feature = "starve-it",
+    feature = "ha-it",
+    feature = "migration-it",
+    feature = "qemu-it",
+    feature = "metrics-it"
+))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestSection {
+    /// 제어 소켓의 `POST /v1/test/block-api`가 `api` 실행기의 작업자를 모두 막는 시간(밀리초)
+    #[cfg(feature = "starve-it")]
+    #[serde(default)]
+    pub block_api_ms: u64,
+    /// 종료 신호를 받았을 때 systemd에 묻지 않고 이 호스트 종료로 본다(`reboot`·`poweroff`).
+    #[cfg(any(feature = "starve-it", feature = "ha-it"))]
+    #[serde(default)]
+    pub host_shutdown: Option<crate::shutdown::HostShutdown>,
+    /// 등록할 때 알리는 `recover_after_secs`의 여유(초, 기본 2). 늘리면 리더가 리스를 기다리는 대신 전원 끄기
+    /// 펜싱으로 복구하는지 볼 수 있다.
+    #[cfg(feature = "ha-it")]
+    #[serde(default)]
+    pub recover_margin_secs: Option<u64>,
+    /// HA 검사기가 `/sys`·`/proc` 대신 읽는 `{health_root}/sys`·`{health_root}/proc`(가짜 인터페이스 트리)
+    #[cfg(feature = "ha-it")]
+    #[serde(default)]
+    pub health_root: Option<PathBuf>,
+    /// 균형 조정기의 회차 간격(초, 기본 300). 리더가 된 뒤 첫 회차도 이만큼 뒤다.
+    #[cfg(feature = "migration-it")]
+    #[serde(default)]
+    pub placement_interval_secs: Option<u64>,
+    /// 핫플러그 Task가 떼기·줄이기에서 게스트를 기다리는 한도(초, 기본 60). 게스트 OS 없는 VM의 시간 초과 길을 짧게 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub hotplug_timeout_secs: Option<u64>,
+    /// TPM 상태 해시를 다시 보고 사본을 밀어 두는 간격(초, 기본 60, 계획 59). HA·마이그레이션 시험이 사본을 빨리 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub firmware_sync_secs: Option<u64>,
+    /// 지표 기록 주기(초, 1 이상, 계획 60). 재시작 뒤 기록 시험이 빨리 본다. `[metrics] flush_secs`의 범위를 거치지 않는다.
+    #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+    #[serde(default)]
+    pub metrics_flush_secs: Option<u64>,
+    /// VM 기록 밀어 넘기기·정리 주기(초, 1 이상, 기본 600, 계획 60). 첫 정리와 VM이 바뀐 뒤 앞당기는 정리도 이만큼으로
+    /// 줄인다. 마이그레이션 뒤 기록 시험이 빨리 본다.
+    #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+    #[serde(default)]
+    pub metrics_push_secs: Option<u64>,
+    /// 경보 엔진의 평가 간격(밀리초, 1 이상, 기본 5000, 계획 60). 해제 대기(기본 60초)도 같은 비율(12번)로 줄인다. 경보
+    /// 발생·해제 시험이 빨리 본다.
+    #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+    #[serde(default)]
+    pub alert_tick_ms: Option<u64>,
+    /// VMware 이전 스케줄러의 틱(밀리초, 기본 15000, 계획 72). 실제 시험이 복사·회차를 빨리 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub vmware_tick_ms: Option<u64>,
+    /// 따뜻한 이전의 델타 주기(초, 계획의 `sync.interval_min`은 5분 이상, 계획 72). 실제 시험이 회차 둘을 빨리 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub vmware_sync_secs: Option<u64>,
+}
+
+#[cfg(feature = "starve-it")]
+impl TestSection {
+    pub fn block_api(&self) -> Duration {
+        Duration::from_millis(self.block_api_ms)
+    }
+}
+
+/// 감사 로그(`{data_dir}/audit/audit.log`). API를 여는 노드만 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSection {
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    /// 한 파일의 최대 크기(MiB). 넘으면 회전한다.
+    #[serde(default = "default_audit_max_file_mib")]
+    pub max_file_mib: u64,
+    /// 지금 파일을 포함해 남기는 파일 수
+    #[serde(default = "default_audit_max_files")]
+    pub max_files: usize,
+}
+
+impl Default for AuditSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            max_file_mib: default_audit_max_file_mib(),
+            max_files: default_audit_max_files(),
+        }
+    }
+}
+
+impl AuditSection {
+    /// API의 감사 로그 설정. 꺼졌으면 None이다.
+    pub fn audit_config(&self, data_dir: &Path, node: &str) -> Option<AuditConfig> {
+        self.enabled.then(|| AuditConfig {
+            dir: data_dir.join("audit"),
+            node: node.into(),
+            max_file_size: self.max_file_mib << 20,
+            max_files: self.max_files,
+        })
+    }
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+fn default_audit_max_file_mib() -> u64 {
+    16
+}
+fn default_audit_max_files() -> usize {
+    8
+}
+
+fn default_telemetry_tick() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_telemetry_interval() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+fn default_telemetry_retry() -> Duration {
+    Duration::from_secs(3600)
+}
+
+fn default_check_interval() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+fn default_first_check() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_sources_file() -> PathBuf {
+    // 이미 쓴 소스 파일을 이어 관리하도록 제품 이름이 바뀌어도 그대로 둔다.
+    "/etc/apt/sources.list.d/oplite.sources".into()
+}
+fn default_apt_get() -> PathBuf {
+    "/usr/bin/apt-get".into()
+}
+fn default_systemd_run() -> PathBuf {
+    "/usr/bin/systemd-run".into()
+}
+fn default_systemctl() -> PathBuf {
+    "/usr/bin/systemctl".into()
+}
+fn default_dpkg() -> PathBuf {
+    "/usr/bin/dpkg".into()
+}
+fn default_log_dir() -> PathBuf {
+    "/var/log/opl".into()
+}
+fn default_upgrade_poll() -> Duration {
+    Duration::from_secs(2)
+}
+
+/// 노드 underlay를 정하는 방법
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnderlaySource<'a> {
+    /// 설정했거나 `address`가 IP 리터럴이다.
+    Ip(IpAddr),
+    /// `address`가 이름이라 풀어야 한다.
+    Lookup(&'a str),
+}
+
+/// 짧은 HA 시간(`fence_after` < 30초)으로 펜싱하는 노드가 시작할 때 낼 경고(설계 §8.1). 멀쩡한 노드의 잘못된
+/// 펜싱을 막는 것 가운데 끈 것이 있으면 하나씩: 클러스터 링크가 하나(계획 49 다중 링크를 안 씀), watchdog
+/// 펜싱인데 systemd 밖에서 돎(`NOTIFY_SOCKET` 없음 — 멈춘 데몬을 제한 시간 안에 다시 띄울 것이 없다). 실행기
+/// 격리(계획 45)는 끌 수 없으므로 보지 않는다. `notify`는 `NOTIFY_SOCKET`이 있는지다.
+pub fn ha_warnings(config: &Config, notify: bool) -> Vec<String> {
+    let ha = &config.ha;
+    let fence_after = ha.fence_after_secs();
+    if config.witness || ha.fencing == FencingSetting::Off || fence_after >= SAFE_FENCE_AFTER_SECS {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    if config.cluster_links().len() < 2 {
+        warnings.push(format!(
+            "HA fences after {fence_after}s without a lease but this node has a single cluster link; \
+             a short network outage can fence a healthy node. Add a second link (cluster_addresses) \
+             or set [ha] profile = \"safe\""
+        ));
+    }
+    if ha.fencing == FencingSetting::Watchdog && !notify {
+        warnings.push(format!(
+            "HA watchdog fencing with a {}s timeout but orbivisord runs outside systemd (no NOTIFY_SOCKET); \
+             nothing restarts a stuck daemon before the watchdog resets the host. Run it as the systemd \
+             unit or set [ha] profile = \"safe\"",
+            ha.watchdog_timeout_secs()
+        ));
+    }
+    warnings
+}
+
+fn default_ipmitool() -> PathBuf {
+    "ipmitool".into()
+}
+
+fn default_ping() -> PathBuf {
+    "ping".into()
+}
+
+fn default_watchdog_device() -> PathBuf {
+    "/dev/watchdog".into()
+}
+
+fn default_migration_ports() -> RangeInclusive<u16> {
+    60000..=60099
+}
+fn default_migration_timeout() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+fn default_migration_disk_timeout() -> Duration {
+    Duration::from_secs(12 * 3600)
+}
+
+/// `"A-B"`: 0이 아닌 포트 A부터 B까지(A ≤ B)
+fn parse_port_range(s: &str) -> Result<RangeInclusive<u16>, String> {
+    let err =
+        || format!("invalid port range {s:?} (expected \"FIRST-LAST\", e.g. \"60000-60099\")");
+    let (a, b) = s.split_once('-').ok_or_else(err)?;
+    let a: u16 = a.trim().parse().map_err(|_| err())?;
+    let b: u16 = b.trim().parse().map_err(|_| err())?;
+    if a == 0 || a > b {
+        return Err(err());
+    }
+    Ok(a..=b)
+}
+
+/// 숫자와 단위(`h`, `m`, `s`)를 이어 쓴 시간: `"30m"`, `"1h30m"`. 0보다 커야 한다.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let err = || format!("invalid duration {s:?} (e.g. \"30m\", \"1h30m\", \"90s\")");
+    let mut rest = s.trim();
+    let mut secs: u64 = 0;
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).ok_or_else(err)?;
+        let n: u64 = rest[..digits].parse().map_err(|_| err())?;
+        let unit = match rest.as_bytes()[digits] {
+            b'h' => 3600,
+            b'm' => 60,
+            b's' => 1,
+            _ => return Err(err()),
+        };
+        secs = n
+            .checked_mul(unit)
+            .and_then(|v| secs.checked_add(v))
+            .ok_or_else(err)?;
+        rest = &rest[digits + 1..];
+    }
+    if secs == 0 {
+        return Err(err());
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn deserialize_port_range<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<RangeInclusive<u16>, D::Error> {
+    parse_port_range(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_duration<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    parse_duration(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+}
+
+fn default_listen() -> SocketAddr {
+    "0.0.0.0:8006".parse().unwrap()
+}
+fn default_cluster_listen() -> SocketAddr {
+    "0.0.0.0:8007".parse().unwrap()
+}
+fn default_data_dir() -> PathBuf {
+    "/var/lib/opl".into()
+}
+fn default_run_dir() -> PathBuf {
+    "/run/opl".into()
+}
+fn default_qemu_share_dir() -> PathBuf {
+    "/opt/homebrew/share/qemu".into()
+}
+fn default_systemd_scope() -> bool {
+    cfg!(target_os = "linux")
+}
+fn default_qemu_img() -> PathBuf {
+    "qemu-img".into()
+}
+
+impl Config {
+    /// 도우미 이미지 디렉터리(`[file_restore] image_dir`, 없으면 Linux `/usr/share/orbivisor/restore`, macOS
+    /// `{data_dir}/restore-image`)
+    pub fn file_restore_image_dir(&self) -> PathBuf {
+        match &self.file_restore.image_dir {
+            Some(dir) => dir.clone(),
+            None if cfg!(target_os = "macos") => self.data_dir.join("restore-image"),
+            None => "/usr/share/orbivisor/restore".into(),
+        }
+    }
+
+    /// 이 노드의 파일 복원 상태(계획 69): 이미지 자리·도우미 설정·세션 한도. 이미지는 아직 검사하지 않았다.
+    pub fn file_restore_state(
+        &self,
+        host: &HostProfile,
+    ) -> orbivisor_driver::file_restore::FileRestoreState {
+        use orbivisor_driver::file_restore::{ClientOptions, HelperConfig, SessionLimits};
+        let f = &self.file_restore;
+        let helper = HelperConfig {
+            qemu_img: self.qemu_img.clone(),
+            memory_mib: f.memory_mib,
+            vcpus: f.vcpus,
+            boot_timeout: Duration::from_secs(f.boot_timeout_secs),
+            overlay_max: f.overlay_max_mib << 20,
+            run_as: (!f.run_as.is_empty()).then(|| f.run_as.clone()),
+            client: ClientOptions {
+                max_entries: f.download_max_entries,
+                ..ClientOptions::default()
+            },
+        };
+        let limits = SessionLimits {
+            max_sessions: f.max_sessions,
+            idle: Duration::from_secs(f.idle_minutes * 60),
+            max: Duration::from_secs(f.max_hours * 3600),
+            guest_max_bytes: f.guest_max_bytes,
+            guest_max_files: f.guest_max_files,
+        };
+        orbivisor_driver::file_restore::FileRestoreState::new(
+            self.file_restore_image_dir(),
+            host,
+            orbivisor_types::version::BUILD,
+            helper,
+            limits,
+        )
+    }
+
+    /// VMware 이전의 노드 설정(계획 72 `[vmware]`)
+    pub fn vmware(&self) -> orbivisor_api::vmware::VmwareNodeConfig {
+        orbivisor_api::vmware::VmwareNodeConfig {
+            nbdkit: self.vmware.nbdkit.clone(),
+            vddk_libdir: self.vmware.vddk_libdir.clone(),
+        }
+    }
+
+    /// `qemu-nbd`(계획 68 — 꺼진 VM·옛 백업을 저장소로 읽기): `qemu_img`과 같은 디렉터리의 것, 경로 없는 이름이면 PATH
+    pub fn qemu_nbd(&self) -> PathBuf {
+        match self.qemu_img.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(dir) => dir.join("qemu-nbd"),
+            None => "qemu-nbd".into(),
+        }
+    }
+}
+fn default_acpi_timeout() -> u64 {
+    60
+}
+fn default_fr_max_sessions() -> u32 {
+    4
+}
+fn default_fr_memory_mib() -> u32 {
+    512
+}
+fn default_fr_vcpus() -> u32 {
+    2
+}
+fn default_fr_boot_timeout_secs() -> u64 {
+    300
+}
+fn default_fr_idle_minutes() -> u64 {
+    15
+}
+fn default_fr_max_hours() -> u64 {
+    8
+}
+fn default_fr_overlay_max_mib() -> u64 {
+    2048
+}
+fn default_fr_run_as() -> String {
+    "nobody".into()
+}
+fn default_fr_guest_max_bytes() -> u64 {
+    4 << 30
+}
+fn default_fr_guest_max_files() -> u64 {
+    10_000
+}
+fn default_fr_download_max_entries() -> u64 {
+    1_000_000
+}
+fn default_tick_secs() -> u64 {
+    60
+}
+fn default_fleece_reserve_min_mib() -> u64 {
+    2048
+}
+fn default_fleece_min_free_mib() -> u64 {
+    1024
+}
+fn default_serve_cache_mib() -> u64 {
+    orbivisor_store::nbd::serve::DEFAULT_CACHE_MIB
+}
+fn default_hour_secs() -> u64 {
+    3600
+}
+fn default_replication_max_concurrent() -> usize {
+    2
+}
+
+fn default_backup_max_concurrent() -> usize {
+    2
+}
+fn default_janitor_tick_secs() -> u64 {
+    10
+}
+fn default_offline_grace_secs() -> u64 {
+    60
+}
+/// `task_max_age_days`의 상한(100년)
+const MAX_TASK_AGE_DAYS: u64 = 36500;
+fn default_task_max_age_days() -> u64 {
+    7
+}
+fn default_task_max_finished() -> usize {
+    1000
+}
+fn default_pools_refresh_secs() -> u64 {
+    15
+}
+
+/// 다른 노드가 닿을 호스트(`key`의 값)인지: 포트 없는 IP나 호스트 이름. 0.0.0.0이나 ::은 안 된다. 규칙은 API 합류
+/// 검사와 같다([`orbivisor_types::host::valid_host`]).
+fn check_host(key: &str, host: &str) -> anyhow::Result<()> {
+    if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+        anyhow::bail!("{key} must not be an unspecified address (got {host:?})");
+    }
+    if !orbivisor_types::host::valid_host(host) {
+        anyhow::bail!("{key} must be an IP address or a host name without a port (got {host:?})");
+    }
+    Ok(())
+}
+
+/// `host:port`. IPv6 주소는 대괄호로 감싼다.
+fn with_port(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
+impl Config {
+    /// 설정 파일에서 `data_dir`만 읽는다(없으면 기본값). 나머지가 틀려도 된다(`--release-vips`).
+    pub fn data_dir_of(path: &Path) -> anyhow::Result<PathBuf> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let table: toml::Table = toml::from_str(&text)?;
+        match table.get("data_dir") {
+            Some(toml::Value::String(dir)) => Ok(dir.into()),
+            Some(_) => anyhow::bail!("data_dir must be a path"),
+            None => Ok(default_data_dir()),
+        }
+    }
+
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let config: Self = toml::from_str(&text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        orbivisor_types::resource::validate_name(&self.name)?;
+        check_host("address", &self.address)?;
+        for (i, host) in self.cluster_addresses.iter().enumerate() {
+            check_host("cluster_addresses", host)?;
+            if self.cluster_addresses[..i]
+                .iter()
+                .any(|h| orbivisor_types::host::same_host(h, host))
+            {
+                anyhow::bail!("cluster_addresses must not repeat a host (got {host:?} twice)");
+            }
+        }
+        for (key, addr) in [
+            ("listen", self.listen),
+            ("cluster_listen", self.cluster_listen),
+        ] {
+            if addr.port() == 0 {
+                anyhow::bail!("{key} must have a port other than 0 (got {addr})");
+            }
+        }
+        let linux = cfg!(target_os = "linux");
+        match self.hypervisor.accel {
+            AccelSetting::Kvm if !linux => anyhow::bail!("accel = \"kvm\" needs Linux"),
+            AccelSetting::Hvf if linux => anyhow::bail!("accel = \"hvf\" needs macOS"),
+            _ => {}
+        }
+        if self.hypervisor.systemd_scope && !linux {
+            anyhow::bail!("systemd_scope needs Linux; set it to false");
+        }
+        if self.hypervisor.secure_boot_code.is_some() != self.hypervisor.secure_boot_vars.is_some()
+        {
+            anyhow::bail!(
+                "hypervisor.secure_boot_code and hypervisor.secure_boot_vars go together; set both or neither"
+            );
+        }
+        if self.schedule.tick_secs == 0 || self.schedule.hour_secs == 0 {
+            anyhow::bail!("schedule.tick_secs and schedule.hour_secs must be at least 1");
+        }
+        if self.janitor.tick_secs == 0 || self.janitor.offline_grace_secs == 0 {
+            anyhow::bail!("janitor.tick_secs and janitor.offline_grace_secs must be at least 1");
+        }
+        // 0이면 끝난 Task를 곧바로 지워 Task를 기다리는 쪽이 결과를 못 본다.
+        if self.janitor.task_max_age_days == 0 || self.janitor.task_max_finished == 0 {
+            anyhow::bail!(
+                "janitor.task_max_age_days and janitor.task_max_finished must be at least 1"
+            );
+        }
+        // 날수를 초로 바꿀 때 넘치지 않도록 100년까지만 받는다.
+        if self.janitor.task_max_age_days > MAX_TASK_AGE_DAYS {
+            anyhow::bail!("janitor.task_max_age_days must be at most {MAX_TASK_AGE_DAYS}");
+        }
+        if self.backup.tick_secs == 0 || self.backup.max_concurrent == 0 {
+            anyhow::bail!("backup.tick_secs and backup.max_concurrent must be at least 1");
+        }
+        if self.backup.serve_cache_mib < 8 || self.backup.serve_cache_mib > 1 << 20 {
+            anyhow::bail!("backup.serve_cache_mib must be between 8 and 1048576");
+        }
+        if self.replication.tick_secs == 0 || self.replication.max_concurrent == 0 {
+            anyhow::bail!(
+                "replication.tick_secs and replication.max_concurrent must be at least 1"
+            );
+        }
+        if self.pools.refresh_secs == 0 {
+            anyhow::bail!("pools.refresh_secs must be at least 1");
+        }
+        if !(MIN_FLUSH_SECS..=MAX_FLUSH_SECS).contains(&self.metrics.flush_secs) {
+            anyhow::bail!(
+                "metrics.flush_secs must be {MIN_FLUSH_SECS}-{MAX_FLUSH_SECS} (got {})",
+                self.metrics.flush_secs
+            );
+        }
+        if self.ceph.install_timeout_secs == 0 {
+            anyhow::bail!("ceph.install_timeout_secs must be at least 1");
+        }
+        if self.sdn.install_timeout_secs == 0 {
+            anyhow::bail!("sdn.install_timeout_secs must be at least 1");
+        }
+        if self.sdn.refresh_secs == 0 {
+            anyhow::bail!("sdn.refresh_secs must be at least 1");
+        }
+        // 등록하는 RBD 풀의 `conf`가 된다(절대 경로, `,:=` 없음).
+        let client_dir = self.ceph.client_dir.to_string_lossy();
+        if !self.ceph.client_dir.is_absolute()
+            || client_dir
+                .chars()
+                .any(|c| c.is_control() || ",:=".contains(c))
+        {
+            anyhow::bail!(
+                "ceph.client_dir must be an absolute path without ',', ':' or '=' (got {client_dir:?})"
+            );
+        }
+        // 감사 로그를 읽을 때 파일을 통째로 메모리에 올리므로 256 MiB까지만 받는다.
+        if self.audit.max_file_mib == 0
+            || self.audit.max_files == 0
+            || self.audit.max_file_mib > 256
+        {
+            anyhow::bail!(
+                "audit.max_file_mib must be between 1 and 256 and audit.max_files at least 1"
+            );
+        }
+        if self.runtime.api_threads == Some(0) || self.runtime.work_threads == Some(0) {
+            anyhow::bail!("runtime.api_threads and runtime.work_threads must be at least 1");
+        }
+        if self.api.tls_cert.is_some() != self.api.tls_key.is_some() {
+            anyhow::bail!("api.tls_cert and api.tls_key must be given together");
+        }
+        if self.ha.fence_after_secs() == 0 {
+            anyhow::bail!("ha.fence_after_secs must be at least 1");
+        }
+        if self.ha.fencing == FencingSetting::Watchdog {
+            if !(MIN_WATCHDOG_TIMEOUT_SECS..=MAX_WATCHDOG_TIMEOUT_SECS)
+                .contains(&self.ha.watchdog_timeout_secs())
+            {
+                anyhow::bail!(
+                    "ha.watchdog_timeout_secs must be between {MIN_WATCHDOG_TIMEOUT_SECS} and {MAX_WATCHDOG_TIMEOUT_SECS}"
+                );
+            }
+            if !linux {
+                anyhow::bail!("ha.fencing = \"watchdog\" needs Linux; use \"process\" or \"off\"");
+            }
+        }
+        // 다른 노드가 VXLAN 패킷을 보낼 주소이므로 0.0.0.0이나 ::은 안 된다.
+        if let Some(ip) = self.network.underlay
+            && ip.is_unspecified()
+        {
+            anyhow::bail!("network.underlay must not be an unspecified address (got {ip})");
+        }
+        self.validate_vip(linux)?;
+        self.file_restore.validate()?;
+        self.vmware.validate()?;
+        if let Some(a) = self.api.http_listen
+            && (a.port() == self.listen.port() || a.port() == self.cluster_listen.port())
+        {
+            anyhow::bail!("api.http_listen must use a port other than listen and cluster_listen");
+        }
+        if self.node.zone.as_ref().is_some_and(|z| z.trim().is_empty()) {
+            anyhow::bail!("node.zone must not be empty");
+        }
+        // 알리는 주소는 `address`에 포트만 붙이므로 포트가 같으면 둘을 구별할 수 없다.
+        if self.listen.port() == self.cluster_listen.port() {
+            anyhow::bail!(
+                "listen and cluster_listen must use different ports (got {} for both)",
+                self.listen.port()
+            );
+        }
+        Ok(())
+    }
+
+    /// `[vip]`: Linux만, 위트니스는 안 됨, 인터페이스가 있어야 하고 같은 IP를 두 번 쓰지 않는다.
+    fn validate_vip(&self, linux: bool) -> anyhow::Result<()> {
+        let vip = &self.vip;
+        if vip.addresses.is_empty() {
+            return Ok(());
+        }
+        if !linux {
+            anyhow::bail!("vip.addresses needs Linux");
+        }
+        if self.witness {
+            anyhow::bail!("a witness has no API and cannot hold a VIP; remove [vip]");
+        }
+        let ok = vip.interface.as_deref().is_some_and(|i| {
+            (1..=15).contains(&i.len())
+                && i.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+        });
+        if !ok {
+            anyhow::bail!("vip.interface must name the network interface for vip.addresses");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for a in &vip.addresses {
+            if !seen.insert(a.ip) {
+                anyhow::bail!("vip.addresses lists {} more than once", a.ip);
+            }
+        }
+        Ok(())
+    }
+
+    /// 이 호스트에서 QEMU를 실행하는 방법. `accel = "kvm"`인데 `/dev/kvm`을 열 수 없으면 오류다.
+    pub fn host_profile(&self) -> anyhow::Result<HostProfile> {
+        let h = &self.hypervisor;
+        let mut profile = HostProfile::native(&self.qemu_share_dir);
+        match h.accel {
+            AccelSetting::Auto => {}
+            AccelSetting::Kvm if !kvm_available() => {
+                anyhow::bail!("accel = \"kvm\" but /dev/kvm cannot be opened")
+            }
+            AccelSetting::Kvm => profile.accel = Accel::Kvm,
+            AccelSetting::Tcg => profile.accel = Accel::Tcg,
+            AccelSetting::Hvf => profile.accel = Accel::Hvf,
+        }
+        if let Some(binary) = &h.qemu_binary {
+            profile.qemu_binary = binary.clone();
+        }
+        if let Some(code) = &h.uefi_code {
+            profile.uefi_code = code.clone();
+        }
+        if let Some(vars) = &h.uefi_vars {
+            profile.uefi_vars_template = vars.clone();
+        }
+        if let (Some(code), Some(vars)) = (&h.secure_boot_code, &h.secure_boot_vars) {
+            profile.secure_boot = Some(orbivisor_qemu::FirmwarePair {
+                code: code.clone(),
+                vars_template: vars.clone(),
+            });
+        }
+        Ok(profile)
+    }
+
+    /// swtpm 실행 파일(`[hypervisor] swtpm`·`swtpm_setup`, 없으면 `PATH`의 이름)
+    pub fn swtpm(&self) -> orbivisor_driver::SwtpmConfig {
+        let mut swtpm = orbivisor_driver::SwtpmConfig::default();
+        if let Some(path) = &self.hypervisor.swtpm {
+            swtpm.swtpm = path.clone();
+        }
+        if let Some(path) = &self.hypervisor.swtpm_setup {
+            swtpm.swtpm_setup = path.clone();
+        }
+        swtpm
+    }
+
+    /// 클러스터에 알리는 API 주소
+    pub fn api_address(&self) -> String {
+        with_port(&self.address, self.listen.port())
+    }
+
+    /// 클러스터에 알리는 노드 간 통신 주소(Raft 멤버십의 노드 주소): 첫 링크
+    pub fn cluster_address(&self) -> String {
+        with_port(self.cluster_hosts()[0], self.cluster_listen.port())
+    }
+
+    /// 노드 간 통신 링크(`host:port`, 앞이 우선): `cluster_addresses`, 없으면 `address` 하나
+    pub fn cluster_links(&self) -> Vec<String> {
+        self.cluster_hosts()
+            .into_iter()
+            .map(|host| with_port(host, self.cluster_listen.port()))
+            .collect()
+    }
+
+    /// 링크의 호스트들(늘 하나 이상, [`cluster_links`](Self::cluster_links)와 같은 순서)
+    pub fn cluster_hosts(&self) -> Vec<&str> {
+        if self.cluster_addresses.is_empty() {
+            vec![self.address.as_str()]
+        } else {
+            self.cluster_addresses.iter().map(String::as_str).collect()
+        }
+    }
+
+    /// 링크가 여럿인데 `cluster_listen`이 한 주소만 들으면 시작할 때 낼 경고. 다른 링크로 오는 연결을 받지
+    /// 못할 수 있다.
+    pub fn links_warning(&self) -> Option<String> {
+        (self.cluster_links().len() > 1 && !self.cluster_listen.ip().is_unspecified()).then(|| {
+            format!(
+                "cluster_addresses has several links but cluster_listen ({}) listens on one address; \
+                 use 0.0.0.0 or :: to accept every link",
+                self.cluster_listen
+            )
+        })
+    }
+
+    /// 마이그레이션을 받는 QEMU가 들을 호스트: 노드 간 통신을 받는 IP(`cluster_listen`, 기본
+    /// `0.0.0.0`). `address`는 원본이 접속하는 이름일 뿐 이 기계의 주소로 풀리지 않을 수 있다(예:
+    /// `/etc/hosts`의 `127.0.1.1`).
+    pub fn migration_listen_host(&self) -> String {
+        self.cluster_listen.ip().to_string()
+    }
+
+    /// 노드 인증서의 이름: 알리는 호스트, 모든 링크의 호스트, 같은 기계에서 쓰는 이름(겹친 것은 하나로)
+    pub fn cert_names(&self) -> Vec<String> {
+        let mut names = vec![self.address.clone()];
+        let hosts = self.cluster_hosts();
+        for name in hosts.into_iter().chain(["localhost", "127.0.0.1", "::1"]) {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.into());
+            }
+        }
+        names
+    }
+
+    /// underlay를 정하는 방법: `[network] underlay`, 없으면 `address`
+    pub fn underlay_source(&self) -> UnderlaySource<'_> {
+        if let Some(ip) = self.network.underlay {
+            return UnderlaySource::Ip(ip);
+        }
+        match self.address.parse::<IpAddr>() {
+            Ok(ip) => UnderlaySource::Ip(ip),
+            Err(_) => UnderlaySource::Lookup(&self.address),
+        }
+    }
+
+    /// Node status에 기록할 underlay. 이름을 풀지 못하면 경고하고 None이다(이 노드에 VXLAN 장치를
+    /// 만들지 않는다).
+    pub async fn underlay(&self) -> Option<IpAddr> {
+        self.underlay_with(|host| async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            Ok(addrs.map(|a| a.ip()).collect())
+        })
+        .await
+    }
+
+    /// `underlay`와 같되 이름 풀기(`lookup`)를 받는다(시험이 DNS에 기대지 않게). 이름 풀기는
+    /// [`UNDERLAY_LOOKUP_TIMEOUT`]까지만 기다린다(등록이 DNS에 묶이지 않게).
+    async fn underlay_with<F, Fut>(&self, lookup: F) -> Option<IpAddr>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
+    {
+        let host = match self.underlay_source() {
+            UnderlaySource::Ip(ip) => return Some(ip),
+            UnderlaySource::Lookup(host) => host,
+        };
+        let found = tokio::time::timeout(UNDERLAY_LOOKUP_TIMEOUT, lookup(host.to_string()))
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
+        match found {
+            Ok(addrs) => match pick_underlay(addrs) {
+                Some(ip) => Some(ip),
+                None => {
+                    tracing::warn!(
+                        host,
+                        "address has no usable IP (only loopback or link-local); set [network] underlay for VXLAN"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    host,
+                    error = %e,
+                    "cannot resolve address; set [network] underlay for VXLAN"
+                );
+                None
+            }
+        }
+    }
+
+    pub fn control_socket(&self) -> PathBuf {
+        self.control_socket
+            .clone()
+            .unwrap_or_else(|| self.run_dir.join("opld.sock"))
+    }
+}
+
+/// underlay 이름 풀기([`Config::underlay`])를 기다리는 최대 시간
+const UNDERLAY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 이름을 푼 주소 가운데 underlay로 쓸 것. 다른 노드가 닿을 수 없는 loopback·link-local·미지정 주소는
+/// 빼고(예: `/etc/hosts`의 `127.0.1.1`), IPv4를 먼저, 없으면 IPv6의 첫 주소다.
+fn pick_underlay(addrs: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    let usable: Vec<IpAddr> = addrs
+        .into_iter()
+        .filter(|ip| {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && match ip {
+                    IpAddr::V4(v4) => !v4.is_link_local(),
+                    IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+                }
+        })
+        .collect();
+    let v4 = usable.iter().find(|ip| ip.is_ipv4());
+    v4.or(usable.first()).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Config {
+        toml::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn fills_defaults() {
+        let c = parse("name = \"node1\"\naddress = \"10.0.0.5\"");
+        assert!(!c.witness);
+        assert_eq!(c.listen, "0.0.0.0:8006".parse().unwrap());
+        assert_eq!(c.api_address(), "10.0.0.5:8006");
+        assert_eq!(c.cluster_address(), "10.0.0.5:8007");
+        assert_eq!(c.data_dir, Path::new("/var/lib/opl"));
+        assert_eq!(c.control_socket(), Path::new("/run/opl/opld.sock"));
+        assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
+        let schedule = c.schedule.scheduler_config();
+        assert_eq!(schedule.tick, Duration::from_secs(60));
+        assert_eq!(schedule.hour, Duration::from_secs(3600));
+        let janitor = c.janitor.janitor_config();
+        assert_eq!(janitor.tick, Duration::from_secs(10));
+        assert_eq!(janitor.offline_grace, Duration::from_secs(60));
+        assert_eq!(janitor.orphan_grace, Duration::from_secs(30));
+        assert_eq!(janitor.task_max_age, Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(janitor.task_max_finished, 1000);
+        assert_eq!(janitor.finished_grace, Duration::from_secs(600));
+        let backup = c.backup.scheduler_config();
+        assert_eq!(backup.tick, Duration::from_secs(60));
+        assert_eq!(backup.max_concurrent, 2);
+        let replication = c.replication.scheduler_config();
+        assert_eq!(replication.tick, Duration::from_secs(60));
+        assert_eq!(replication.max_concurrent, 2);
+        assert_eq!(replication.minute, Duration::from_secs(60));
+        assert_eq!(c.replication.bandwidth(), None);
+        assert_eq!(c.pools.refresh(), Duration::from_secs(15));
+        assert!(c.metrics.history);
+        assert_eq!(c.history_writer_config().flush, Duration::from_secs(60));
+        assert_eq!(c.history_writer_config().scan, Duration::from_secs(600));
+        assert_eq!(c.migration.ports, 60000..=60099);
+        assert_eq!(c.migration.bandwidth_mib, 0);
+        assert_eq!(c.migration.timeout, Duration::from_secs(30 * 60));
+        assert_eq!(c.migration.disk_timeout, Duration::from_secs(12 * 3600));
+        assert_eq!(c.hypervisor.accel, AccelSetting::Auto);
+        assert_eq!(c.hypervisor.systemd_scope, cfg!(target_os = "linux"));
+        assert_eq!(
+            c.cert_names(),
+            ["10.0.0.5", "localhost", "127.0.0.1", "::1"]
+        );
+    }
+
+    #[test]
+    fn metrics_history_can_be_turned_off_and_its_flush_is_bounded() {
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[metrics]\nhistory = false\nflush_secs = 600");
+        assert!(!c.metrics.history);
+        assert_eq!(c.history_writer_config().flush, Duration::from_secs(600));
+        c.validate().unwrap();
+        for secs in [59, 601] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[metrics]\nflush_secs = {secs}"
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("metrics.flush_secs"), "{err}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[metrics]\nkeep = 1").is_err()
+        );
+    }
+
+    #[test]
+    fn witness_is_a_top_level_flag() {
+        let c = parse(
+            "name = \"w\"\naddress = \"h\"\nwitness = true\n[hypervisor]\nqemu_binary = \"/nonexistent/qemu\"",
+        );
+        assert!(c.witness);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_keys_and_missing_address() {
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\nlisten_addr = \"x\"").is_err()
+        );
+        assert!(toml::from_str::<Config>("name = \"n\"").is_err());
+        let c = parse("name = \"n\"\naddress = \"h\"\n[reconciler]\nacpi_timeout_secs = 5");
+        assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn validates_name_and_address() {
+        let with = |name: &str, address: &str| Config {
+            name: name.into(),
+            address: address.into(),
+            ..parse("name = \"n\"\naddress = \"h\"")
+        };
+        assert!(with("node1", "10.0.0.5").validate().is_ok());
+        assert!(with("node1", "node1.lan").validate().is_ok());
+        assert!(with("node1", "::1").validate().is_ok());
+        assert!(with("Node_1", "10.0.0.5").validate().is_err());
+        for bad in ["", "10.0.0.5:8006", "a b", "[::1]"] {
+            assert!(with("node1", bad).validate().is_err(), "{bad}");
+        }
+        assert_eq!(with("n", "::1").api_address(), "[::1]:8006");
+        for bad in ["0.0.0.0", "::"] {
+            assert!(with("node1", bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cluster_links_default_to_the_address_and_keep_their_order() {
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.cluster_links(), ["10.0.0.5:8007"]);
+        assert_eq!(c.links_warning(), None);
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"\ncluster_addresses = []");
+        assert_eq!(c.cluster_links(), ["10.0.0.5:8007"]);
+        // `address`가 목록에 없어도 된다. 첫 링크가 알리는 클러스터 주소다.
+        let c = parse(
+            "name = \"n\"\naddress = \"node1.lan\"\ncluster_listen = \"0.0.0.0:9007\"\n\
+             cluster_addresses = [\"10.1.0.5\", \"fd00::5\", \"10.0.0.5\"]",
+        );
+        c.validate().unwrap();
+        assert_eq!(
+            c.cluster_links(),
+            ["10.1.0.5:9007", "[fd00::5]:9007", "10.0.0.5:9007"]
+        );
+        assert_eq!(c.cluster_address(), "10.1.0.5:9007");
+        assert_eq!(c.api_address(), "node1.lan:8006");
+        assert_eq!(c.links_warning(), None);
+        assert_eq!(
+            c.cert_names(),
+            [
+                "node1.lan",
+                "10.1.0.5",
+                "fd00::5",
+                "10.0.0.5",
+                "localhost",
+                "127.0.0.1",
+                "::1"
+            ]
+        );
+        // 한 주소만 들으면 경고한다(막지는 않는다).
+        let c = Config {
+            cluster_listen: "10.1.0.5:9007".parse().unwrap(),
+            ..c
+        };
+        c.validate().unwrap();
+        assert!(c.links_warning().unwrap().contains("10.1.0.5:9007"));
+    }
+
+    #[test]
+    fn cert_names_do_not_repeat_hosts() {
+        let c = parse(
+            "name = \"n\"\naddress = \"127.0.0.1\"\ncluster_addresses = [\"127.0.0.2\", \"127.0.0.1\"]",
+        );
+        assert_eq!(
+            c.cert_names(),
+            ["127.0.0.1", "127.0.0.2", "localhost", "::1"]
+        );
+    }
+
+    #[test]
+    fn validates_cluster_addresses() {
+        let with = |hosts: &[&str]| Config {
+            cluster_addresses: hosts.iter().map(|h| h.to_string()).collect(),
+            ..parse("name = \"n\"\naddress = \"h\"")
+        };
+        assert!(with(&["10.0.0.5", "node1-b.lan", "::1"]).validate().is_ok());
+        for bad in [
+            &["10.0.0.5:8007"][..],
+            &["[::1]"],
+            &[""],
+            &["a b"],
+            &["0.0.0.0"],
+            &["::"],
+            &["10.0.0.5", "10.0.0.5"],
+            // 같은 주소의 다른 표기, 대소문자만 다른 이름
+            &["fd00::5", "fd00:0::5"],
+            &["node1.lan", "NODE1.lan"],
+            // API 합류가 받지 않는 호스트
+            &["224.0.0.1"],
+            &["node1.lan."],
+            &["-a.lan"],
+        ] {
+            assert!(with(bad).validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn migration_listens_on_the_cluster_listen_ip() {
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        assert_eq!(c.migration_listen_host(), "0.0.0.0");
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\ncluster_listen = \"10.0.0.5:8007\"");
+        assert_eq!(c.migration_listen_host(), "10.0.0.5");
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\ncluster_listen = \"[::]:8007\"");
+        assert_eq!(c.migration_listen_host(), "::");
+    }
+
+    #[test]
+    fn validates_ports() {
+        let ok = parse("name = \"n\"\naddress = \"h\"");
+        assert!(ok.validate().is_ok());
+        let same = Config {
+            cluster_listen: "127.0.0.1:8006".parse().unwrap(),
+            ..ok.clone()
+        };
+        assert!(same.validate().is_err());
+        let zero = Config {
+            listen: "0.0.0.0:0".parse().unwrap(),
+            ..ok.clone()
+        };
+        assert!(zero.validate().is_err());
+        let zero = Config {
+            cluster_listen: "0.0.0.0:0".parse().unwrap(),
+            ..ok
+        };
+        assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_section_shortens_periods_but_not_to_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[schedule]\ntick_secs = 1\nhour_secs = 2");
+        assert!(c.validate().is_ok());
+        let schedule = c.schedule.scheduler_config();
+        assert_eq!(schedule.tick, Duration::from_secs(1));
+        assert_eq!(schedule.hour, Duration::from_secs(2));
+        for bad in ["tick_secs = 0", "hour_secs = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[schedule]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[schedule]\ntick = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn janitor_section_shortens_periods_but_not_to_zero() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[janitor]\ntick_secs = 1\noffline_grace_secs = 2",
+        );
+        assert!(c.validate().is_ok());
+        let janitor = c.janitor.janitor_config();
+        assert_eq!(janitor.tick, Duration::from_secs(1));
+        assert_eq!(janitor.offline_grace, Duration::from_secs(2));
+        for bad in ["tick_secs = 0", "offline_grace_secs = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[janitor]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[janitor]\ngrace = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn janitor_section_sets_task_retention_but_not_to_zero() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[janitor]\ntask_max_age_days = 2\ntask_max_finished = 50",
+        );
+        assert!(c.validate().is_ok());
+        let janitor = c.janitor.janitor_config();
+        assert_eq!(janitor.task_max_age, Duration::from_secs(2 * 24 * 3600));
+        assert_eq!(janitor.task_max_finished, 50);
+        let c = parse("name = \"n\"\naddress = \"h\"\n[janitor]\ntask_max_age_days = 36500");
+        assert!(c.validate().is_ok());
+        for bad in [
+            "task_max_age_days = 0",
+            "task_max_finished = 0",
+            "task_max_age_days = 36501",
+        ] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[janitor]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn backup_section_sets_the_tick_and_the_limit_but_not_to_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[backup]\ntick_secs = 1\nmax_concurrent = 4");
+        assert!(c.validate().is_ok());
+        let backup = c.backup.scheduler_config();
+        assert_eq!(backup.tick, Duration::from_secs(1));
+        assert_eq!(backup.max_concurrent, 4);
+        for bad in ["tick_secs = 0", "max_concurrent = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[backup]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[backup]\ntick = 1").is_err()
+        );
+    }
+
+    #[test]
+    fn backup_section_sets_the_store_backup_limits() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.backup.fleece_reserve_min_mib, 2048);
+        assert_eq!(c.backup.fleece_min_free_mib, 1024);
+        assert_eq!(c.backup.serve_cache_mib, 256);
+        assert_eq!(c.qemu_nbd(), PathBuf::from("qemu-nbd"));
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\nqemu_img = \"/opt/q/bin/qemu-img\"\n[backup]\nfleece_reserve_min_mib = 512\nfleece_min_free_mib = 64\nserve_cache_mib = 32",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.backup.fleece_reserve_min_mib, 512);
+        assert_eq!(c.backup.fleece_min_free_mib, 64);
+        assert_eq!(c.backup.serve_cache_mib, 32);
+        assert_eq!(c.qemu_nbd(), PathBuf::from("/opt/q/bin/qemu-nbd"));
+        let c = parse("name = \"n\"\naddress = \"h\"\n[backup]\nserve_cache_mib = 4");
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn replication_section_sets_the_tick_limit_and_bandwidth_but_not_zero_limits() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[replication]\ntick_secs = 5\nmax_concurrent = 3\nbandwidth_mib = 100",
+        );
+        assert!(c.validate().is_ok());
+        let replication = c.replication.scheduler_config();
+        assert_eq!(replication.tick, Duration::from_secs(5));
+        assert_eq!(replication.max_concurrent, 3);
+        assert_eq!(c.replication.bandwidth(), Some(100 << 20));
+        for bad in ["tick_secs = 0", "max_concurrent = 0"] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[replication]\n{bad}"
+            ));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[replication]\nevery = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sdn_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        c.validate().unwrap();
+        let host = c.sdn.host(Path::new("/var/lib/opl"), "abc");
+        assert_eq!(host.paths().pki, Path::new("/var/lib/opl/pki"));
+        assert_eq!(host.paths().etc, Path::new("/etc/opl/ovn"));
+        assert_eq!(host.paths().var_lib, Path::new("/var/lib/opl/ovn"));
+        assert_eq!(host.options().central_packages, CENTRAL_PACKAGES);
+        assert_eq!(host.options().host_packages, HOST_PACKAGES);
+        assert_eq!(host.options().install_timeout, Duration::from_secs(1800));
+        assert!(!host.options().any_os);
+        assert_eq!(host.tag(), "abc");
+        assert_eq!(c.sdn.refresh(), Duration::from_secs(60));
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[sdn]\ncentral_packages = [\"ovn\"]\nhost_packages = []\n\
+             install_timeout_secs = 60\nrefresh_secs = 5",
+        );
+        c.validate().unwrap();
+        let host = c.sdn.host(Path::new("/d"), "t");
+        assert_eq!(host.options().central_packages, ["ovn"]);
+        assert!(host.options().host_packages.is_empty());
+        assert_eq!(c.sdn.refresh(), Duration::from_secs(5));
+        for bad in ["install_timeout_secs = 0", "refresh_secs = 0", "x = 1"] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[sdn]\n{bad}");
+            let parsed: Result<Config, _> = toml::from_str(&text);
+            assert!(parsed.map_or(true, |c| c.validate().is_err()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ceph_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        c.validate().unwrap();
+        let host = c.ceph.host();
+        assert_eq!(host.paths().client_dir, Path::new("/etc/opl/ceph"));
+        assert_eq!(host.paths().etc_ceph, Path::new("/etc/ceph"));
+        assert_eq!(host.options().packages, DAEMON_PACKAGES);
+        assert_eq!(host.options().client_packages, CLIENT_PACKAGES);
+        assert_eq!(host.options().install_timeout, Duration::from_secs(1800));
+        assert!(!host.options().allow_loop);
+        assert!(!host.options().any_os);
+        assert_eq!(c.ceph.status_cache(), Duration::from_secs(5));
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ceph]\nclient_dir = \"/srv/ceph\"\n\
+             packages = [\"ceph\"]\nclient_packages = []\ninstall_timeout_secs = 60\n\
+             allow_loop_devices = true\nstatus_cache_secs = 0",
+        );
+        c.validate().unwrap();
+        let host = c.ceph.host();
+        assert_eq!(host.client_conf(), Path::new("/srv/ceph/ceph.conf"));
+        assert_eq!(host.options().packages, ["ceph"]);
+        assert!(host.options().client_packages.is_empty());
+        assert_eq!(host.options().install_timeout, Duration::from_secs(60));
+        assert!(host.options().allow_loop);
+        assert_eq!(c.ceph.status_cache(), Duration::ZERO);
+
+        for bad in [
+            "install_timeout_secs = 0",
+            "client_dir = \"etc/ceph\"",
+            "client_dir = \"/etc/a:b\"",
+        ] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[ceph]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[ceph]\nconf = \"/x\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pools_section_sets_the_refresh_interval_but_not_to_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh_secs = 2");
+        assert!(c.validate().is_ok());
+        assert_eq!(c.pools.refresh(), Duration::from_secs(2));
+        let c = parse("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh_secs = 0");
+        assert!(c.validate().is_err());
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[pools]\nrefresh = 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn updates_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        let u = &c.updates;
+        assert_eq!(u.enabled, None);
+        assert_eq!(u.check_interval, Duration::from_secs(24 * 3600));
+        assert_eq!(u.first_check, Duration::from_secs(60));
+        assert_eq!(u.apt_url, "");
+        assert_eq!(
+            u.sources_file,
+            Path::new("/etc/apt/sources.list.d/oplite.sources")
+        );
+        assert_eq!(u.apt_get, Path::new("/usr/bin/apt-get"));
+        assert_eq!(u.systemd_run, Path::new("/usr/bin/systemd-run"));
+        assert_eq!(u.systemctl, Path::new("/usr/bin/systemctl"));
+        assert_eq!(u.dpkg, Path::new("/usr/bin/dpkg"));
+        assert_eq!(u.log_dir, Path::new("/var/log/opl"));
+        assert_eq!(u.poll, Duration::from_secs(2));
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[updates]\nenabled = true\ncheck_interval = \"6h\"\n\
+             first_check = \"1s\"\napt_url = \"https://apt.example.com/orbivisor\"\n\
+             sources_file = \"/tmp/x.sources\"\napt_get = \"/opt/apt-get\"\npoll = \"1m30s\"",
+        );
+        let config = c.updates.updates_config().unwrap();
+        assert_eq!(config.check_interval, Duration::from_secs(6 * 3600));
+        assert_eq!(config.first_check, Duration::from_secs(1));
+        assert_eq!(config.apt_url, "https://apt.example.com/orbivisor");
+        assert_eq!(config.sources_file, Path::new("/tmp/x.sources"));
+        assert_eq!(
+            config.auth_file,
+            Path::new("/etc/apt/auth.conf.d/oplite.conf")
+        );
+        assert_eq!(config.apt_get, Path::new("/opt/apt-get"));
+        assert_eq!(config.poll, Duration::from_secs(90));
+        // 비어 있으면 빌드 값을 쓴다.
+        let c = parse("name = \"n\"\naddress = \"h\"\n[updates]\nenabled = true");
+        assert_eq!(
+            c.updates.updates_config().unwrap().apt_url,
+            orbivisor_types::version::APT_URL
+        );
+
+        for bad in [
+            "check_interval = \"0s\"",
+            "first_check = \"soon\"",
+            "poll = 2",
+            "interval = \"1h\"",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "name = \"n\"\naddress = \"h\"\n[updates]\n{bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn updates_are_enabled_when_apt_get_exists_unless_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let apt_get = dir.path().join("apt-get");
+        let with = |extra: &str| {
+            parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[updates]\napt_get = \"{}\"\n{extra}",
+                apt_get.display()
+            ))
+        };
+        assert!(!with("").updates.enabled());
+        assert!(with("").updates.updates_config().is_none());
+        assert!(with("enabled = true").updates.enabled());
+        std::fs::write(&apt_get, "").unwrap();
+        assert!(with("").updates.enabled());
+        assert!(with("").updates.updates_config().is_some());
+        assert!(!with("enabled = false").updates.enabled());
+        assert!(with("enabled = false").updates.updates_config().is_none());
+    }
+
+    #[test]
+    fn audit_section_defaults_and_rejects_zero() {
+        let c = parse("name = \"n1\"\naddress = \"h\"\ndata_dir = \"/d\"");
+        assert_eq!(c.audit, AuditSection::default());
+        let a = c.audit.audit_config(&c.data_dir, &c.name).unwrap();
+        assert_eq!(a.dir, Path::new("/d/audit"));
+        assert_eq!(a.node, "n1");
+        assert_eq!(a.max_file_size, 16 << 20);
+        assert_eq!(a.max_files, 8);
+
+        let c = parse("name = \"n\"\naddress = \"h\"\n[audit]\nmax_file_mib = 1\nmax_files = 2");
+        c.validate().unwrap();
+        // 읽을 때 파일을 통째로 메모리에 올리므로 256 MiB까지
+        parse("name = \"n\"\naddress = \"h\"\n[audit]\nmax_file_mib = 256")
+            .validate()
+            .unwrap();
+        let a = c.audit.audit_config(&c.data_dir, &c.name).unwrap();
+        assert_eq!((a.max_file_size, a.max_files), (1 << 20, 2));
+        let off = parse("name = \"n\"\naddress = \"h\"\n[audit]\nenabled = false");
+        assert!(off.audit.audit_config(&off.data_dir, &off.name).is_none());
+
+        for bad in ["max_file_mib = 0", "max_files = 0", "max_file_mib = 257"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[audit]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[audit]\ndir = \"/x\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_section_defaults_to_half_the_cpus_and_rejects_zero() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.runtime, RuntimeSection::default());
+        let cpus = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(c.runtime.api_threads(), (cpus / 2).max(2));
+        assert_eq!(c.runtime.work_threads(), (cpus / 2).max(2));
+
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[runtime]\napi_threads = 1\nwork_threads = 6");
+        c.validate().unwrap();
+        assert_eq!((c.runtime.api_threads(), c.runtime.work_threads()), (1, 6));
+
+        for bad in ["api_threads = 0", "work_threads = 0"] {
+            let c = parse(&format!("name = \"n\"\naddress = \"h\"\n[runtime]\n{bad}"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        // core는 고정이다.
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[runtime]\ncore_threads = 4")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn api_tls_files_go_together() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert!(c.api.read_tls().unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("api.crt");
+        let key = dir.path().join("api.key");
+        std::fs::write(&cert, "CERT").unwrap();
+        std::fs::write(&key, "KEY").unwrap();
+        let text = |files: &str| format!("name = \"n\"\naddress = \"h\"\n[api]\n{files}");
+        let both = format!(
+            "tls_cert = {:?}\ntls_key = {:?}",
+            cert.display().to_string(),
+            key.display().to_string()
+        );
+        let c = parse(&text(&both));
+        c.validate().unwrap();
+        assert_eq!(
+            c.api.read_tls().unwrap(),
+            Some(("CERT".to_string(), "KEY".to_string()))
+        );
+        let only = format!("tls_cert = {:?}", cert.display().to_string());
+        let err = parse(&text(&only)).validate().unwrap_err().to_string();
+        assert!(err.contains("together"), "{err}");
+        // 읽지 못하면 오류
+        std::fs::remove_file(&key).unwrap();
+        let err = parse(&text(&both)).api.read_tls().unwrap_err().to_string();
+        assert!(err.contains("api.key"), "{err}");
+    }
+
+    #[test]
+    fn api_section_lists_trusted_proxies() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert!(c.api.trusted_proxies.is_empty());
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[api]\ntrusted_proxies = [\"10.0.0.0/8\", \"fd00::/8\", \"192.0.2.10\"]",
+        );
+        let shown: Vec<String> = c
+            .api
+            .trusted_proxies
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(shown, ["10.0.0.0/8", "fd00::/8", "192.0.2.10/32"]);
+        for bad in ["\"10.0.0.1/8\"", "\"proxy.lan\"", "\"10.0.0.0/33\""] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[api]\ntrusted_proxies = [{bad}]");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn data_dir_is_read_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opld.toml");
+        // 다른 키가 틀려도 data_dir만 읽는다.
+        std::fs::write(
+            &path,
+            "data_dir = \"/d\"\nunknown = 1\n[vip]\naddresses = 5",
+        )
+        .unwrap();
+        assert_eq!(Config::data_dir_of(&path).unwrap(), Path::new("/d"));
+        std::fs::write(&path, "name = \"n\"").unwrap();
+        assert_eq!(
+            Config::data_dir_of(&path).unwrap(),
+            Path::new("/var/lib/opl")
+        );
+        std::fs::write(&path, "data_dir = 5").unwrap();
+        assert!(Config::data_dir_of(&path).is_err());
+        assert!(Config::data_dir_of(&dir.path().join("none")).is_err());
+    }
+
+    #[test]
+    fn download_section() {
+        assert!(
+            !parse("name = \"n\"\naddress = \"h\"")
+                .download
+                .allow_private
+        );
+        let c = parse("name = \"n\"\naddress = \"h\"\n[download]\nallow_private = true");
+        assert!(c.download.allow_private);
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[download]\nprivate = true")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn node_zone() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.node.zone, None);
+        let c = parse("name = \"n\"\naddress = \"h\"\n[node]\nzone = \"rack-a\"");
+        assert_eq!(c.node.zone.as_deref(), Some("rack-a"));
+        c.validate().unwrap();
+        let c = parse("name = \"n\"\naddress = \"h\"\n[node]\nzone = \" \"");
+        assert!(c.validate().unwrap_err().to_string().contains("node.zone"));
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[node]\nrack = \"a\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vip_and_web_sections() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert!(c.vip.addresses.is_empty());
+        assert!(c.vip.agent_config().is_none());
+        assert!(c.web.enabled);
+        c.validate().unwrap();
+
+        let text = "name = \"n\"\naddress = \"h\"\n[vip]\naddresses = [\"192.168.0.200/24\", \"192.168.0.201\"]\ninterface = \"eth0\"\n[web]\nenabled = false";
+        let c = parse(text);
+        assert!(!c.web.enabled);
+        let agent = c.vip.agent_config().unwrap();
+        assert_eq!(agent.interface, "eth0");
+        let shown: Vec<String> = agent.addresses.iter().map(|a| a.to_string()).collect();
+        assert_eq!(shown, ["192.168.0.200/24", "192.168.0.201/32"]);
+        // macOS는 VIP를 지원하지 않는다.
+        assert_eq!(c.validate().is_ok(), cfg!(target_os = "linux"));
+        if cfg!(target_os = "linux") {
+            let with = |extra: &str| {
+                let c: Config = toml::from_str(&format!(
+                    "name = \"n\"\naddress = \"h\"\n{extra}\n[vip]\naddresses = [\"10.0.0.5/24\"]"
+                ))
+                .unwrap();
+                c.validate()
+            };
+            assert!(with("").is_err(), "no interface");
+            assert!(with("witness = true").is_err());
+            let mut dup = parse(text);
+            dup.vip.addresses.push("192.168.0.200/25".parse().unwrap());
+            assert!(dup.validate().is_err());
+            let mut bad = parse(text);
+            bad.vip.interface = Some("eth 0".into());
+            assert!(bad.validate().is_err());
+        } else {
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("needs Linux"), "{err}");
+        }
+        for bad in ["\"fd00::1/64\"", "\"10.0.0.5/0\"", "\"eth0\""] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[vip]\naddresses = [{bad}]");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    /// `[test]`는 시험 빌드에만 있다.
+    #[test]
+    fn the_test_section_exists_only_in_starve_builds() {
+        let parsed =
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[test]\nblock_api_ms = 15000");
+        #[cfg(feature = "starve-it")]
+        assert_eq!(parsed.unwrap().test.block_api(), Duration::from_secs(15));
+        #[cfg(not(feature = "starve-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] recover_margin_secs`는 `ha-it` 빌드에만 있고 알리는 `recover_after_secs`의 여유를 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_recover_margin_only_in_ha_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\n";
+        assert_eq!(parse(text).node_ha().unwrap().recover_after_secs, 12);
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nrecover_margin_secs = 300"));
+        #[cfg(feature = "ha-it")]
+        {
+            let ha = parsed.unwrap().node_ha().unwrap();
+            assert_eq!(ha.recover_after_secs, 310);
+            assert_eq!(ha.fence_after_secs, Some(10));
+        }
+        #[cfg(not(feature = "ha-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] placement_interval_secs`는 `migration-it` 빌드에만 있고 균형 조정기의 회차 간격을 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_placement_interval_only_in_migration_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(
+            parse(text).balancer_config().interval,
+            Duration::from_secs(300)
+        );
+        let parsed =
+            toml::from_str::<Config>(&format!("{text}[test]\nplacement_interval_secs = 5"));
+        #[cfg(feature = "migration-it")]
+        {
+            let config = parsed.unwrap().balancer_config();
+            assert_eq!(config.interval, Duration::from_secs(5));
+            assert_eq!(config.tick, Duration::from_secs(1));
+        }
+        #[cfg(not(feature = "migration-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] hotplug_timeout_secs`는 `qemu-it` 빌드에만 있고 핫플러그 Task의 기다림을 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_hotplug_timeout_only_in_qemu_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(parse(text).hotplug_timeout(), Duration::from_secs(60));
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nhotplug_timeout_secs = 5"));
+        #[cfg(feature = "qemu-it")]
+        assert_eq!(parsed.unwrap().hotplug_timeout(), Duration::from_secs(5));
+        #[cfg(not(feature = "qemu-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] vmware_tick_ms`·`vmware_sync_secs`는 `qemu-it` 빌드에만 있고 VMware 이전 스케줄러 틱과 델타 주기를 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_vmware_timers_only_in_qemu_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(
+            parse(text).vmware_scheduler_config().tick,
+            Duration::from_secs(15)
+        );
+        assert_eq!(parse(text).vmware_sync_every(), None);
+        let parsed = toml::from_str::<Config>(&format!(
+            "{text}[test]\nvmware_tick_ms = 500\nvmware_sync_secs = 3"
+        ));
+        #[cfg(feature = "qemu-it")]
+        {
+            let c = parsed.unwrap();
+            assert_eq!(c.vmware_scheduler_config().tick, Duration::from_millis(500));
+            assert_eq!(c.vmware_sync_every(), Some(Duration::from_secs(3)));
+        }
+        #[cfg(not(feature = "qemu-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] firmware_sync_secs`는 `qemu-it` 빌드에만 있고 TPM 상태 해시·사본 주기를 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_firmware_sync_only_in_qemu_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(
+            parse(text).firmware_sync_interval(),
+            Duration::from_secs(60)
+        );
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nfirmware_sync_secs = 2"));
+        #[cfg(feature = "qemu-it")]
+        assert_eq!(
+            parsed.unwrap().firmware_sync_interval(),
+            Duration::from_secs(2)
+        );
+        #[cfg(not(feature = "qemu-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] host_shutdown`은 `starve-it`·`ha-it` 빌드에만 있다.
+    #[test]
+    fn the_test_section_fakes_a_host_shutdown_only_in_test_builds() {
+        let parsed = toml::from_str::<Config>(
+            "name = \"n\"\naddress = \"h\"\n[test]\nhost_shutdown = \"reboot\"",
+        );
+        #[cfg(any(feature = "starve-it", feature = "ha-it"))]
+        {
+            assert_eq!(
+                parsed.unwrap().test.host_shutdown,
+                Some(crate::shutdown::HostShutdown::Reboot)
+            );
+            assert_eq!(
+                parse("name = \"n\"\naddress = \"h\"").test.host_shutdown,
+                None
+            );
+        }
+        #[cfg(not(any(feature = "starve-it", feature = "ha-it")))]
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn telemetry_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.telemetry, TelemetrySection::default());
+        let t = c.telemetry.telemetry_config().unwrap();
+        assert_eq!(t.tick, Duration::from_secs(60));
+        assert_eq!(t.interval, Duration::from_secs(24 * 3600));
+        assert_eq!(t.retry, Duration::from_secs(3600));
+        assert_eq!(t.timeout, Duration::from_secs(30));
+        assert!(t.extra_roots.is_empty());
+
+        // ca_file의 인증서를 모두(DER로) 믿는다.
+        let dir = tempfile::tempdir().unwrap();
+        let ca_file = dir.path().join("ca.pem");
+        let a = orbivisor_peer::pki::ClusterCa::generate("a")
+            .unwrap()
+            .cert_pem;
+        let b = orbivisor_peer::pki::ClusterCa::generate("b")
+            .unwrap()
+            .cert_pem;
+        std::fs::write(&ca_file, format!("{a}{b}")).unwrap();
+        let c = parse(&format!(
+            "name = \"n\"\naddress = \"h\"\n[telemetry]\ntick = \"1s\"\ninterval = \"6h\"\n\
+             retry = \"10m\"\nca_file = \"{}\"",
+            ca_file.display()
+        ));
+        let t = c.telemetry.telemetry_config().unwrap();
+        assert_eq!(t.tick, Duration::from_secs(1));
+        assert_eq!(t.interval, Duration::from_secs(6 * 3600));
+        assert_eq!(t.retry, Duration::from_secs(600));
+        assert_eq!(
+            t.extra_roots,
+            vec![
+                orbivisor_peer::pki::first_cert(&a).unwrap().to_vec(),
+                orbivisor_peer::pki::first_cert(&b).unwrap().to_vec()
+            ]
+        );
+
+        // 읽지 못하거나 인증서가 없는 파일은 시작 오류다.
+        let with_ca = |path: &Path| {
+            parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[telemetry]\nca_file = \"{}\"",
+                path.display()
+            ))
+        };
+        let missing = dir.path().join("missing.pem");
+        let err = with_ca(&missing).telemetry.telemetry_config().unwrap_err();
+        assert!(err.to_string().contains("missing.pem"), "{err}");
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "not a certificate\n").unwrap();
+        assert!(with_ca(&empty).telemetry.telemetry_config().is_err());
+
+        for bad in ["interval = \"0s\"", "retry = \"1d\"", "endpoint = \"x\""] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "name = \"n\"\naddress = \"h\"\n[telemetry]\n{bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn remotes_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.remotes, RemotesSection::default());
+        let p = c.remotes.poller_config();
+        assert_eq!(p.interval, Duration::from_secs(30));
+        assert_eq!(p.tick, Duration::from_secs(5));
+        let c = parse("name = \"n\"\naddress = \"h\"\n[remotes]\ninterval = \"2s\"\ntick = \"1s\"");
+        let p = c.remotes.poller_config();
+        assert_eq!(p.interval, Duration::from_secs(2));
+        assert_eq!(p.tick, Duration::from_secs(1));
+        for bad in ["interval = \"0s\"", "tick = \"x\"", "url = \"https://h\""] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "name = \"n\"\naddress = \"h\"\n[remotes]\n{bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn hypervisor_section_picks_and_overrides_the_profile() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"tcg\"\n\
+             qemu_binary = \"/opt/qemu/bin/qemu-system-x86_64\"\nsystemd_scope = false",
+        );
+        assert!(c.validate().is_ok());
+        let p = c.host_profile().unwrap();
+        assert_eq!(p.accel, Accel::Tcg);
+        assert_eq!(p.qemu_binary, Path::new("/opt/qemu/bin/qemu-system-x86_64"));
+
+        // 다른 OS의 가속기와 macOS의 systemd 스코프는 거부한다.
+        let other = if cfg!(target_os = "linux") {
+            "hvf"
+        } else {
+            "kvm"
+        };
+        let c = parse(&format!(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"{other}\"\nsystemd_scope = false"
+        ));
+        assert!(c.validate().is_err());
+        if !cfg!(target_os = "linux") {
+            let c = parse("name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = true");
+            assert!(c.validate().is_err());
+        }
+        assert!(
+            toml::from_str::<Config>(
+                "name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"xen\""
+            )
+            .is_err()
+        );
+    }
+
+    /// swtpm 경로와 Secure Boot 펌웨어(둘 다 주거나 둘 다 생략)를 고칠 수 있다.
+    #[test]
+    fn hypervisor_section_sets_swtpm_and_secure_boot_firmware() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = false");
+        assert_eq!(c.swtpm(), orbivisor_driver::SwtpmConfig::default());
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = false\n\
+             swtpm = \"/opt/swtpm/bin/swtpm\"\nswtpm_setup = \"/opt/swtpm/bin/swtpm_setup\"\n\
+             secure_boot_code = \"/fw/code.secboot.fd\"\nsecure_boot_vars = \"/fw/vars.ms.fd\"",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.swtpm().swtpm, Path::new("/opt/swtpm/bin/swtpm"));
+        assert_eq!(
+            c.swtpm().swtpm_setup,
+            Path::new("/opt/swtpm/bin/swtpm_setup")
+        );
+        let sb = c.host_profile().unwrap().secure_boot.unwrap();
+        assert_eq!(sb.code, Path::new("/fw/code.secboot.fd"));
+        assert_eq!(sb.vars_template, Path::new("/fw/vars.ms.fd"));
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = false\n\
+             secure_boot_code = \"/fw/code.secboot.fd\"",
+        );
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("set both or neither"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_hypervisor_section() {
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[hypervisor]\nacel = \"kvm\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_kvm_needs_dev_kvm() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[hypervisor]\naccel = \"kvm\"");
+        // `/dev/kvm`이 있는 호스트(Linux CI)에서는 KVM을 쓰고, 없으면 오류다.
+        match c.host_profile() {
+            Ok(p) => {
+                assert!(kvm_available());
+                assert_eq!(p.accel, Accel::Kvm);
+            }
+            Err(e) => {
+                assert!(!kvm_available());
+                assert!(e.to_string().contains("/dev/kvm"), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn ha_section_defaults_by_os() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        c.validate().unwrap();
+        assert_eq!(c.ha.watchdog_device, Path::new("/dev/watchdog"));
+        // `[ha]`가 없으면 `fast` 프로필이다.
+        assert_eq!(c.ha.profile, HaProfile::Fast);
+        assert_eq!(c.ha.watchdog_timeout_secs(), 10);
+        assert_eq!(c.ha.fence_after_secs(), 10);
+        assert_eq!(c.ha.fence_after(), Duration::from_secs(10));
+        assert_eq!(c.ha.renew_interval(), Duration::from_secs(1));
+        if cfg!(target_os = "linux") {
+            assert_eq!(c.ha.fencing, FencingSetting::Watchdog);
+            assert_eq!(
+                c.ha.node_ha(),
+                Some(NodeHa {
+                    fencing: Fencing::Watchdog,
+                    recover_after_secs: 22,
+                    fence_after_secs: Some(10),
+                })
+            );
+        } else {
+            assert_eq!(c.ha.fencing, FencingSetting::Off);
+            assert_eq!(c.ha.node_ha(), None);
+        }
+    }
+
+    #[test]
+    fn ha_section_sets_fencing_and_recover_after() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nfence_after_secs = 2",
+        );
+        c.validate().unwrap();
+        // process는 watchdog 제한 시간을 더하지 않는다.
+        assert_eq!(
+            c.ha.node_ha(),
+            Some(NodeHa {
+                fencing: Fencing::Process,
+                recover_after_secs: 4,
+                fence_after_secs: Some(2),
+            })
+        );
+        let c = parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"off\"");
+        c.validate().unwrap();
+        assert_eq!(c.ha.node_ha(), None);
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"watchdog\"\n\
+             watchdog_device = \"/dev/watchdog1\"\nwatchdog_timeout_secs = 10\nfence_after_secs = 20",
+        );
+        assert_eq!(c.ha.watchdog_device, Path::new("/dev/watchdog1"));
+        assert_eq!(
+            c.ha.node_ha(),
+            Some(NodeHa {
+                fencing: Fencing::Watchdog,
+                recover_after_secs: 32,
+                fence_after_secs: Some(20),
+            })
+        );
+        // watchdog 장치는 Linux에만 있다.
+        assert_eq!(c.validate().is_ok(), cfg!(target_os = "linux"));
+        for bad in [
+            "fencing = \"ipmi\"",
+            "fence_after = 1",
+            "profile = \"fastest\"",
+        ] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[ha]\n{bad}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    /// 프로필의 시간과 `recover_after`(fence_after + watchdog(watchdog 펜싱만) + 2초). 적은 값이 프로필을 이긴다.
+    #[test]
+    fn ha_profiles_set_the_times_and_explicit_values_win() {
+        let ha = |text: &str| parse(&format!("name = \"n\"\naddress = \"h\"\n[ha]\n{text}")).ha;
+        let recover = |h: &HaSection| h.node_ha().unwrap().recover_after_secs;
+        let fast = ha("fencing = \"watchdog\"");
+        assert_eq!(fast.profile, HaProfile::Fast);
+        assert_eq!(
+            (fast.fence_after_secs(), fast.watchdog_timeout_secs()),
+            (10, 10)
+        );
+        assert_eq!(recover(&fast), 22);
+        assert_eq!(fast.renew_interval(), Duration::from_secs(1));
+        assert_eq!(recover(&ha("fencing = \"process\"")), 12);
+        let safe = ha("fencing = \"watchdog\"\nprofile = \"safe\"");
+        assert_eq!(safe.profile, HaProfile::Safe);
+        assert_eq!(
+            (safe.fence_after_secs(), safe.watchdog_timeout_secs()),
+            (30, 30)
+        );
+        assert_eq!(recover(&safe), 62);
+        assert_eq!(safe.renew_interval(), Duration::from_secs(2));
+        assert_eq!(
+            safe.node_ha().unwrap().fence_after_secs,
+            Some(30),
+            "the node records its fence_after"
+        );
+        let mixed = ha("fencing = \"watchdog\"\nprofile = \"safe\"\nfence_after_secs = 5");
+        assert_eq!(
+            (mixed.fence_after_secs(), mixed.watchdog_timeout_secs()),
+            (5, 30)
+        );
+        assert_eq!(recover(&mixed), 37);
+        let mixed = ha("fencing = \"watchdog\"\nwatchdog_timeout_secs = 20");
+        assert_eq!(
+            (mixed.fence_after_secs(), mixed.watchdog_timeout_secs()),
+            (10, 20)
+        );
+        // safe의 watchdog 30초도 범위 안이고, 펜싱이 꺼지면 시간과 관계없이 없다.
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nprofile = \"safe\"");
+        c.validate().unwrap();
+        assert_eq!(ha("fencing = \"off\"\nprofile = \"safe\"").node_ha(), None);
+    }
+
+    /// 전원 끄기 펜싱의 `ipmitool`은 PATH의 것이 기본이고 바꿀 수 있다(펜싱이 꺼진 노드도 이웃 확인에 쓴다).
+    #[test]
+    fn ha_ipmitool_defaults_to_the_path() {
+        let ha = |text: &str| parse(&format!("name = \"n\"\naddress = \"h\"\n{text}")).ha;
+        assert_eq!(ha("").fencer().ipmitool, PathBuf::from("ipmitool"));
+        let custom = ha("[ha]\nfencing = \"off\"\nipmitool = \"/opt/ipmi/bin/ipmitool\"");
+        assert_eq!(
+            custom.fencer().ipmitool,
+            PathBuf::from("/opt/ipmi/bin/ipmitool")
+        );
+        assert_eq!(
+            custom.fencer().timeout,
+            orbivisor_api::power_fence::FENCE_CALL_TIMEOUT
+        );
+    }
+
+    /// HA 검사의 `ping`은 PATH의 것이 기본이고 바꿀 수 있다.
+    #[test]
+    fn ha_ping_defaults_to_the_path() {
+        let ha = |text: &str| parse(&format!("name = \"n\"\naddress = \"h\"\n{text}")).ha;
+        assert_eq!(ha("").ping, PathBuf::from("ping"));
+        assert_eq!(
+            ha("[ha]\nping = \"/usr/local/bin/ping\"").ping,
+            PathBuf::from("/usr/local/bin/ping")
+        );
+    }
+
+    /// HA 검사기는 `/sys`·`/proc`를 읽고, `[test] health_root`는 `ha-it` 빌드에만 있어 그 아래 가짜 트리로 바꾼다.
+    #[test]
+    fn the_checker_reads_the_health_root_only_in_ha_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(parse(text).checker_net(), NetFs::default());
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nhealth_root = \"/tmp/hc\""));
+        #[cfg(feature = "ha-it")]
+        assert_eq!(parsed.unwrap().checker_net(), NetFs::under("/tmp/hc"));
+        #[cfg(not(feature = "ha-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// 짧은 시간으로 펜싱하면 다중 링크가 없을 때, watchdog인데 systemd 밖일 때 경고한다. `safe`·30초 이상,
+    /// 펜싱 꺼짐, 위트니스는 경고하지 않는다.
+    #[test]
+    fn ha_warnings_flag_fast_fencing_without_safeguards() {
+        let one = "name = \"n\"\naddress = \"h\"\n";
+        let two =
+            "name = \"n\"\naddress = \"h\"\ncluster_addresses = [\"10.1.0.1\", \"10.2.0.1\"]\n";
+        let warnings = |base: &str, ha: &str, notify: bool| {
+            let c = parse(&format!("{base}[ha]\n{ha}"));
+            let w = ha_warnings(&c, notify);
+            (
+                w.iter().any(|w| w.contains("single cluster link")),
+                w.iter().any(|w| w.contains("NOTIFY_SOCKET")),
+                w.len(),
+            )
+        };
+        let watchdog = "fencing = \"watchdog\"";
+        let process = "fencing = \"process\"";
+        for (base, ha, notify, want) in [
+            (one, watchdog, true, (true, false, 1)),
+            (one, watchdog, false, (true, true, 2)),
+            (two, watchdog, true, (false, false, 0)),
+            (two, watchdog, false, (false, true, 1)),
+            (one, process, false, (true, false, 1)),
+            (two, process, false, (false, false, 0)),
+            (
+                one,
+                "fencing = \"watchdog\"\nprofile = \"safe\"",
+                false,
+                (false, false, 0),
+            ),
+            (
+                one,
+                "fencing = \"watchdog\"\nfence_after_secs = 30",
+                false,
+                (false, false, 0),
+            ),
+            (
+                one,
+                "fencing = \"watchdog\"\nprofile = \"safe\"\nfence_after_secs = 29",
+                false,
+                (true, true, 2),
+            ),
+            (one, "fencing = \"off\"", false, (false, false, 0)),
+        ] {
+            assert_eq!(
+                warnings(base, ha, notify),
+                want,
+                "{base}{ha} notify={notify}"
+            );
+        }
+        let c = parse(&format!("{one}witness = true\n[ha]\n{watchdog}"));
+        assert!(ha_warnings(&c, false).is_empty());
+        // 경고는 safe 프로필을 권한다.
+        let c = parse(&format!("{one}[ha]\n{watchdog}"));
+        assert!(
+            ha_warnings(&c, false)
+                .iter()
+                .all(|w| w.contains("profile = \"safe\""))
+        );
+    }
+
+    #[test]
+    fn ha_section_validates_times() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nfence_after_secs = 0",
+        );
+        assert!(c.validate().is_err());
+        // 꺼져 있어도 fence_after는 검사한다.
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"off\"\nfence_after_secs = 0");
+        assert!(c.validate().is_err());
+        // 제한 시간은 5초 이상이다. 장치를 1초마다 쓰다듬으므로 너무 짧으면 쓰다듬기 한 번만 늦어도
+        // 노드가 재시작된다. Linux가 아니면 범위 안이어도 장치가 없어 실패한다.
+        for (timeout, ok) in [
+            (0, false),
+            (4, false),
+            (5, true),
+            (3600, true),
+            (3601, false),
+        ] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"watchdog\"\nwatchdog_timeout_secs = {timeout}"
+            ));
+            match c.validate() {
+                Ok(()) => assert!(ok && cfg!(target_os = "linux"), "{timeout}"),
+                Err(e) => assert_eq!(
+                    e.to_string().contains("watchdog_timeout_secs"),
+                    !ok,
+                    "{timeout}: {e}"
+                ),
+            }
+        }
+        // watchdog가 아니면 장치 제한 시간은 쓰지 않으므로 보지 않는다.
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[ha]\nfencing = \"process\"\nwatchdog_timeout_secs = 0",
+        );
+        c.validate().unwrap();
+    }
+
+    /// 펜싱이 꺼져 있으면 guard가 없고, process는 watchdog 없이, watchdog는 장치와 함께 만든다.
+    #[test]
+    fn guard_config_follows_the_fencing() {
+        let mut ha = HaSection {
+            fencing: FencingSetting::Off,
+            fence_after_secs: Some(5),
+            ..HaSection::default()
+        };
+        assert!(ha.guard_config().is_none());
+        ha.fencing = FencingSetting::Process;
+        let config = ha.guard_config().unwrap();
+        assert_eq!(config.fence_after, Duration::from_secs(5));
+        assert_eq!(config.renew_interval, Duration::from_millis(500));
+        assert!(config.watchdog.is_none());
+        ha.fencing = FencingSetting::Watchdog;
+        assert!(ha.guard_config().unwrap().watchdog.is_some());
+    }
+
+    #[test]
+    fn renew_interval_is_a_tenth_of_fence_after_within_bounds() {
+        let interval = |secs| {
+            HaSection {
+                fence_after_secs: Some(secs),
+                ..HaSection::default()
+            }
+            .renew_interval()
+        };
+        assert_eq!(interval(1), Duration::from_millis(200));
+        assert_eq!(interval(2), Duration::from_millis(200));
+        assert_eq!(interval(5), Duration::from_millis(500));
+        assert_eq!(interval(20), Duration::from_secs(2));
+        assert_eq!(interval(30), Duration::from_secs(2));
+        assert_eq!(interval(u64::MAX), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn migration_section_parses_ports_and_timeout() {
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[migration]\nports = \"61000-61009\"\n\
+             bandwidth_mib = 100\ntimeout = \"1h30m\"\ndisk_timeout = \"2h\"",
+        );
+        assert_eq!(c.migration.ports, 61000..=61009);
+        assert_eq!(c.migration.bandwidth_mib, 100);
+        assert_eq!(c.migration.timeout, Duration::from_secs(5400));
+        assert_eq!(c.migration.disk_timeout, Duration::from_secs(7200));
+        let one = parse(
+            "name = \"n\"\naddress = \"h\"\n[migration]\nports = \"60000-60000\"\ntimeout = \"90s\"",
+        );
+        assert_eq!(one.migration.ports, 60000..=60000);
+        assert_eq!(one.migration.timeout, Duration::from_secs(90));
+        for bad in [
+            "ports = \"60099-60000\"",
+            "ports = \"0-10\"",
+            "ports = \"60000\"",
+            "ports = \"60000-70000\"",
+            "ports = \"a-b\"",
+            "timeout = \"0s\"",
+            "timeout = \"30\"",
+            "timeout = \"500ms\"",
+            "timeout = \"m\"",
+            "timeout = \"\"",
+            "disk_timeout = \"0s\"",
+            "disk_timeout = \"12\"",
+            "bandwidth = 1",
+        ] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[migration]\n{bad}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn underlay_comes_from_the_setting_or_the_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 설정이 address보다 앞선다.
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"\n[network]\nunderlay = \"10.1.0.5\"");
+        c.validate().unwrap();
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("10.1.0.5")));
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\n[network]\nunderlay = \"fd00::5\"");
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("fd00::5")));
+        // 없으면 address: IPv4·IPv6 리터럴은 그대로, 이름은 푼다.
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.network, NetworkSection::default());
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("10.0.0.5")));
+        let c = parse("name = \"n\"\naddress = \"::1\"");
+        assert_eq!(c.underlay_source(), UnderlaySource::Ip(ip("::1")));
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        assert_eq!(c.underlay_source(), UnderlaySource::Lookup("node1.lan"));
+        for bad in [
+            "underlay = \"node1.lan\"",
+            "underlay = \"10.0.0.5:4789\"",
+            "mtu = 1450",
+        ] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[network]\n{bad}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{bad}");
+        }
+        for bad in ["0.0.0.0", "::"] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[network]\nunderlay = \"{bad}\""
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("network.underlay"), "{err}");
+        }
+    }
+
+    #[test]
+    fn resolved_underlay_skips_local_addresses_and_prefers_ipv4() {
+        let pick = |addrs: &[&str]| pick_underlay(addrs.iter().map(|a| a.parse().unwrap()));
+        // `/etc/hosts`의 127.0.1.1 같은 loopback, link-local, 0.0.0.0은 다른 노드가 닿을 수 없다.
+        assert_eq!(pick(&["127.0.1.1"]), None);
+        assert_eq!(pick(&["169.254.1.1", "fe80::1", "::", "0.0.0.0"]), None);
+        assert_eq!(pick(&[]), None);
+        assert_eq!(
+            pick(&["::1", "10.0.0.5"]),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            pick(&["fe80::1", "2001:db8::5"]),
+            Some("2001:db8::5".parse().unwrap())
+        );
+        // IPv4가 먼저다.
+        assert_eq!(
+            pick(&["2001:db8::5", "10.0.0.5", "10.0.0.6"]),
+            Some("10.0.0.5".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn underlay_resolves_a_name_or_is_none() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 이름 풀기를 바꿔 끼워 DNS에 기대지 않는다.
+        let lookup = |result: std::io::Result<Vec<IpAddr>>| {
+            move |host: String| {
+                assert_eq!(host, "node1.lan");
+                std::future::ready(result)
+            }
+        };
+        let no_lookup =
+            |_: String| -> std::future::Ready<std::io::Result<Vec<IpAddr>>> { panic!("lookup") };
+        let c = parse("name = \"n\"\naddress = \"10.0.0.5\"");
+        assert_eq!(c.underlay().await, Some(ip("10.0.0.5")));
+        // 리터럴과 설정은 풀지 않는다. 리터럴은 loopback이어도 그대로 쓴다.
+        let c = parse("name = \"n\"\naddress = \"127.0.0.1\"");
+        assert_eq!(c.underlay_with(no_lookup).await, Some(ip("127.0.0.1")));
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"\n[network]\nunderlay = \"10.1.0.5\"");
+        assert_eq!(c.underlay_with(no_lookup).await, Some(ip("10.1.0.5")));
+        // 이름은 풀어서 쓸 수 있는 주소를 고른다. loopback만 나오거나 풀지 못하면 None이다.
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        assert_eq!(
+            c.underlay_with(lookup(Ok(vec![ip("127.0.1.1"), ip("10.0.0.7")])))
+                .await,
+            Some(ip("10.0.0.7"))
+        );
+        assert_eq!(
+            c.underlay_with(lookup(Ok(vec![ip("127.0.1.1")]))).await,
+            None
+        );
+        assert_eq!(
+            c.underlay_with(lookup(Err(std::io::Error::other("no such host"))))
+                .await,
+            None
+        );
+    }
+
+    /// 이름 풀기가 답하지 않으면 2초 뒤 풀지 못한 것으로 본다(등록이 DNS에 묶이지 않게).
+    #[tokio::test(start_paused = true)]
+    async fn underlay_gives_up_a_slow_lookup() {
+        let c = parse("name = \"n\"\naddress = \"node1.lan\"");
+        let started = tokio::time::Instant::now();
+        let hang = |_: String| std::future::pending::<std::io::Result<Vec<IpAddr>>>();
+        assert_eq!(c.underlay_with(hang).await, None);
+        assert_eq!(started.elapsed(), UNDERLAY_LOOKUP_TIMEOUT);
+    }
+
+    /// 계획 69 `[file_restore]`: 기본값, 도우미·세션 설정으로 옮기기, 범위 검사
+    #[test]
+    fn file_restore_section() {
+        let c = parse("name = \"n\"\naddress = \"h\"\ndata_dir = \"/d\"");
+        assert_eq!(c.file_restore, FileRestoreSection::default());
+        let expected: PathBuf = if cfg!(target_os = "macos") {
+            "/d/restore-image".into()
+        } else {
+            "/usr/share/orbivisor/restore".into()
+        };
+        assert_eq!(c.file_restore_image_dir(), expected);
+        let host = HostProfile::debian(orbivisor_types::vm::Arch::Aarch64, Accel::Tcg);
+        let st = c.file_restore_state(&host);
+        assert_eq!(st.helper.memory_mib, 512);
+        assert_eq!(st.helper.vcpus, 2);
+        assert_eq!(st.helper.boot_timeout, Duration::from_secs(300));
+        assert_eq!(st.helper.overlay_max, 2048 << 20);
+        assert_eq!(st.helper.run_as.as_deref(), Some("nobody"));
+        assert_eq!(st.helper.client.max_entries, 1_000_000);
+        assert_eq!(st.limits.max_sessions, 4);
+        assert_eq!(st.limits.idle, Duration::from_secs(900));
+        assert_eq!(st.limits.max, Duration::from_secs(8 * 3600));
+        assert_eq!(st.limits.guest_max_bytes, 4 << 30);
+        assert_eq!(st.limits.guest_max_files, 10_000);
+        assert_eq!(st.accel, "tcg");
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[file_restore]\nimage_dir = \"/img\"\nrun_as = \"\"\nmax_sessions = 0",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.file_restore_image_dir(), PathBuf::from("/img"));
+        assert_eq!(c.file_restore_state(&host).helper.run_as, None);
+
+        for bad in [
+            "memory_mib = 64",
+            "vcpus = 0",
+            "boot_timeout_secs = 5",
+            "idle_minutes = 0",
+            "max_hours = 0",
+            "overlay_max_mib = 1",
+            "max_sessions = 65",
+            "download_max_entries = 0",
+            "run_as = \"-x\"",
+            "run_as = \"a b\"",
+        ] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[file_restore]\n{bad}"
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.starts_with("file_restore."), "{bad}: {err}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[file_restore]\nnope = 1")
+                .is_err()
+        );
+    }
+
+    /// 계획 72 `[vmware]`: 기본은 비어 있고(VDDK 길 없음), 절대 경로만 받는다.
+    #[test]
+    fn vmware_section() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(
+            c.vmware(),
+            orbivisor_api::vmware::VmwareNodeConfig::default()
+        );
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[vmware]\nnbdkit = \"/usr/sbin/nbdkit\"\nvddk_libdir = \"/opt/vddk\"",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.vmware().nbdkit, Some(PathBuf::from("/usr/sbin/nbdkit")));
+        assert_eq!(
+            c.vmware().libdir_for(None),
+            Some(PathBuf::from("/opt/vddk"))
+        );
+        let c = parse("name = \"n\"\naddress = \"h\"\n[vmware]\nnbdkit = \"nbdkit\"");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.starts_with("vmware.nbdkit"), "{err}");
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[vmware]\nnope = 1").is_err()
+        );
+    }
+}

@@ -25,4 +25,4 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
       - name: Built-in catalog URLs and checksum files
-        run: cargo test -p oplctl --features catalog-it --test catalog -- --nocapture
+        run: cargo test -p orbivisorctl --features catalog-it --test catalog -- --nocapture

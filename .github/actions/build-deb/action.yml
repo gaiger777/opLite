@@ -40,7 +40,7 @@ runs:
         WS_VERSION=$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)
         echo "OPL_VERSION=${WS_VERSION}~ci${{ github.run_number }}" >> "$GITHUB_ENV"
     - shell: bash
-      run: cargo build --release -p opld --features web-ui -p oplctl
+      run: cargo build --release -p orbivisord --features web-ui -p orbivisorctl
     # CI 패키지는 저장소의 개발 구독 키를 믿는 개발 패키지다(정식 빌드는 OPL_LICENSE_KEYS를 준다).
     - id: deb
       shell: bash

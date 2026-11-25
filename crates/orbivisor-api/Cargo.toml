@@ -1,0 +1,120 @@
+[package]
+name = "orbivisor-api"
+description = "REST API, tasks and authentication for Orbivisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# qemu-img로 볼륨을 만드는 API 테스트 (macOS: brew install qemu, Debian/Ubuntu: apt install qemu-utils)
+storage-it = []
+# 실제 OpenLDAP(slapd)로 LDAP 영역을 확인하는 테스트. 디렉터리는 .github/scripts/ldap-setup.sh가 만들고
+# OPL_TEST_LDAP_* 환경 변수로 알린다.
+ldap-it = []
+# 시험·데모용 가짜 vSphere(vCenter·ESXi SOAP·데이터스토어 `/folder`·호스트 티켓, 계획 72). orbivisor-api·opld 시험과 실행 파일
+# `fake-vsphere`가 켠다. 배포 빌드에는 없다.
+fake-vsphere = []
+# govmomi vcsim(GitHub `vmware-sim` 작업)을 상대로 SOAP 꼴을 보는 시험. vcsim 주소는 OPL_TEST_VCSIM_URL로 알린다.
+vcsim-it = ["fake-vsphere"]
+# Pebble(Let's Encrypt의 시험 CA)·pebble-challtestsrv로 실제 ACME 흐름을 보는 시험(GitHub `acme` 작업, 계획 73). 실행 파일
+# 자리는 OPL_TEST_PEBBLE_DIR, RFC 2136은 OPL_TEST_BIND·OPL_TEST_BIND_KEY로 알린다.
+acme-it = []
+
+[[bin]]
+name = "fake-vsphere"
+path = "src/bin/fake-vsphere.rs"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vsphere"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vmware_api"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vmware_sync"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vmware_cutover"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vcsim"
+required-features = ["vcsim-it"]
+
+[[test]]
+name = "acme"
+required-features = ["acme-it"]
+
+[dependencies]
+argon2.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+# OIDC: JWT·JWKS의 base64url
+base64.workspace = true
+# WebAuthn(패스키) CBOR(계획 62)
+ciborium.workspace = true
+clap.workspace = true
+fs4.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ldap3.workspace = true
+# 알림 메일(SMTP)
+lettre.workspace = true
+libc.workspace = true
+orbivisor-cluster.workspace = true
+orbivisor-driver.workspace = true
+orbivisor-peer.workspace = true
+orbivisor-reconciler.workspace = true
+# 백업 저장소(계획 68): 형식·백엔드·GC·검증·NBD
+orbivisor-store.workspace = true
+# 파일 복원(계획 69): 통신 규약 이름·사건과 zip·tar.gz 흘려 쓰기
+orbivisor-restore.workspace = true
+# 파일 복원 내려받기 흐름의 조각
+bytes.workspace = true
+orbivisor-types = { workspace = true, features = ["openapi"] }
+# OIDC 토큰 교환의 폼 본문
+reqwest = { workspace = true, features = ["form"] }
+# OIDC: ID 토큰 서명 확인, 상태 쿠키의 HKDF·HMAC, 무작위 값
+ring.workspace = true
+roxmltree.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+# 가짜 vSphere의 자체 서명 인증서(기능 fake-vsphere), ACME 인증서 키·CSR(계획 73)
+rcgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# 감사 로그 읽기의 RFC 3339 시각, ACME 갱신 창·만료 시각
+time = { workspace = true, features = ["parsing", "formatting"] }
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+uuid.workspace = true
+# ACME 사슬의 일련번호·만료·AKI(ARI 인증서 id, 계획 73)
+x509-parser.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+# 시험용 가짜 LDAP 서버의 BER
+lber.workspace = true
+openraft.workspace = true
+orbivisor-qemu.workspace = true
+orbivisor-store = { workspace = true, features = ["fake-s3", "test-util"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true

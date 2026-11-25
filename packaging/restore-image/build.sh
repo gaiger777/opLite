@@ -24,7 +24,7 @@
 #
 # 재현: deb은 debian.lock의 SHA-256과 같아야 하고(어긋나면 실패), cpio는 imagetool.py가 직접 쓴다(소유자 0, 시각 0,
 #   정렬, 차례 inode — 장치 노드도 루트 없이). 같은 입력이면 같은 바이트다(zstd 판이 같을 때).
-# 에이전트: --agent가 없으면 빌드한다 — `cargo build --release -p opl-restore --bin orbivisor-restore-agent
+# 에이전트: --agent가 없으면 빌드한다 — `cargo build --release -p orbivisor-restore --bin orbivisor-restore-agent
 #   --target <arch>-unknown-linux-musl`, 링커 rust-lld(C 툴체인 없이 교차 빌드, `rustup target add <타깃>`).
 # 판: 기본은 워크스페이스 판(Cargo.toml). 이미지 판 = `orbivisor <판> lock-<debian.lock SHA-256 앞 12자>`.
 # 받은 deb은 --cache(기본 ${XDG_CACHE_HOME:-~/.cache}/orbivisor-restore-image)에 두고 다시 쓴다(해시는 늘 다시 봄).
@@ -95,8 +95,8 @@ sha256() {
 if [ -z "$VERSION" ]; then
 	VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)
 fi
-PROTO=$(sed -n 's/^pub const PROTO_VERSION: u32 = \([0-9]*\);/\1/p' "$ROOT/crates/opl-restore/src/proto.rs")
-[ -n "$PROTO" ] || die "PROTO_VERSION not found in crates/opl-restore/src/proto.rs"
+PROTO=$(sed -n 's/^pub const PROTO_VERSION: u32 = \([0-9]*\);/\1/p' "$ROOT/crates/orbivisor-restore/src/proto.rs")
+[ -n "$PROTO" ] || die "PROTO_VERSION not found in crates/orbivisor-restore/src/proto.rs"
 LOCK_SHA=$(sha256 "$LOCK")
 IMAGE_VERSION="orbivisor $VERSION lock-${LOCK_SHA:0:12}"
 
@@ -180,7 +180,7 @@ if [ -z "$AGENT" ] && [ -z "$TEST_GUEST" ]; then
 	LINKER_VAR="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
 	echo "build-restore-image: building the agent for $TARGET"
 	(cd "$ROOT" && env "$LINKER_VAR=${!LINKER_VAR:-rust-lld}" cargo build --release --locked \
-		-p opl-restore --bin orbivisor-restore-agent --target "$TARGET") ||
+		-p orbivisor-restore --bin orbivisor-restore-agent --target "$TARGET") ||
 		die "building the agent failed (rustup target add $TARGET)"
 	AGENT="${CARGO_TARGET_DIR:-$ROOT/target}/$TARGET/release/orbivisor-restore-agent"
 fi

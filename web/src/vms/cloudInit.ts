@@ -7,7 +7,7 @@ export type IpConfig = Schemas["IpConfig"];
 
 /** 서버가 응답에서 저장된 비밀번호(해시) 대신 보이는 값(`PASSWORD_MASK`). 되보내면 저장된 해시를 둔다. */
 export const PASSWORD_MASK = "********";
-/** 서버의 상한(`opl_types::cloud_init`) */
+/** 서버의 상한(`orbivisor_types::cloud_init`) */
 export const MAX_SSH_KEYS = 32;
 const MAX_SSH_KEYS_BYTES = 16 * 1024;
 const MAX_PASSWORD_BYTES = 256;

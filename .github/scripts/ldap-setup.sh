@@ -1,7 +1,7 @@
 #!/bin/sh
 # CI `ldap` 작업의 시험 디렉터리: Ubuntu의 slapd(OpenLDAP)를 debconf로 설정하고, 시험 CA가 서명한
 # 서버 인증서로 LDAPS(636)와 StartTLS(389)를 켜고, memberOf 오버레이 아래 사용자 둘과 그룹 하나를
-# 넣는다. opl-api의 `ldap-it` 시험(tests/ldap_it.rs)이 이 디렉터리를 쓴다.
+# 넣는다. orbivisor-api의 `ldap-it` 시험(tests/ldap_it.rs)이 이 디렉터리를 쓴다.
 # 값은 시험과 같은 OPL_TEST_LDAP_* 환경 변수에서 읽는다(없으면 아래 기본값).
 # 경고: 이 기계의 slapd 설정과 디렉터리(데이터베이스)를 지우고 새로 만든다. 그래서 CI(CI=true)가
 # 아니면 OPL_LDAP_SETUP_WIPE=1을 주어야 돈다.

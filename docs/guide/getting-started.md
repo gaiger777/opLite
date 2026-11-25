@@ -19,23 +19,23 @@ address = "127.0.0.1"          # 다른 노드와 클라이언트가 이 노드�
 data_dir = "/tmp/opl/node1"
 run_dir = "/tmp/opl/run1"
 TOML
-cargo run -p opld -- --config /tmp/opl/node1.toml &       # 제어 소켓: /tmp/opl/run1/opld.sock
-cargo run -p oplctl -- cluster init --name dev --socket /tmp/opl/run1/opld.sock
+cargo run -p orbivisord -- --config /tmp/opl/node1.toml &       # 제어 소켓: /tmp/opl/run1/opld.sock
+cargo run -p orbivisorctl -- cluster init --name dev --socket /tmp/opl/run1/opld.sock
 # 출력된 admin 비밀번호와 CA 지문으로 로그인한다(API: https://127.0.0.1:8006).
-cargo run -p oplctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sha256:...
+cargo run -p orbivisorctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sha256:...
 mkdir -p /tmp/opl/pool
-cargo run -p oplctl -- pool create local --path /tmp/opl/pool
-cargo run -p oplctl -- volume create root --pool local --size 1G
-cargo run -p oplctl -- vm create web --memory 512 --disk root --nic user --start
-cargo run -p oplctl -- vm console web            # 출력된 vnc:// 주소를 VNC 뷰어로 연다
-cargo run -p oplctl -- vm snapshot create web before --description "업데이트 전"   # 실행 중이면 메모리 포함(--no-memory: 디스크만)
-cargo run -p oplctl -- vm snapshot list web      # 나무 모양, 현재 위치 *
-cargo run -p oplctl -- vm clone web web-copy --snapshot before   # 스냅샷에서 새 VM(꺼진 VM은 --snapshot 없이 지금 상태)
-cargo run -p oplctl -- vm snapshot revert web before
-cargo run -p oplctl -- vm snapshot delete web before
-cargo run -p oplctl -- vm snapshot schedule web --every daily --keep 7   # 예약 스냅샷(--memory, 끄기 --off)
-cargo run -p oplctl -- vm snapshot schedule web  # 지금 예약과 마지막 예약 실패
-cargo run -p oplctl -- volume resize root --size 2G   # 늘리기만, 실행 중에도 된다
+cargo run -p orbivisorctl -- pool create local --path /tmp/opl/pool
+cargo run -p orbivisorctl -- volume create root --pool local --size 1G
+cargo run -p orbivisorctl -- vm create web --memory 512 --disk root --nic user --start
+cargo run -p orbivisorctl -- vm console web            # 출력된 vnc:// 주소를 VNC 뷰어로 연다
+cargo run -p orbivisorctl -- vm snapshot create web before --description "업데이트 전"   # 실행 중이면 메모리 포함(--no-memory: 디스크만)
+cargo run -p orbivisorctl -- vm snapshot list web      # 나무 모양, 현재 위치 *
+cargo run -p orbivisorctl -- vm clone web web-copy --snapshot before   # 스냅샷에서 새 VM(꺼진 VM은 --snapshot 없이 지금 상태)
+cargo run -p orbivisorctl -- vm snapshot revert web before
+cargo run -p orbivisorctl -- vm snapshot delete web before
+cargo run -p orbivisorctl -- vm snapshot schedule web --every daily --keep 7   # 예약 스냅샷(--memory, 끄기 --off)
+cargo run -p orbivisorctl -- vm snapshot schedule web  # 지금 예약과 마지막 예약 실패
+cargo run -p orbivisorctl -- volume resize root --size 2G   # 늘리기만, 실행 중에도 된다
 ```
 
 실행 중인 VM에도 디스크·NIC를 붙이고 뗄 수 있다(`vm disk add`, `vm nic add` — macOS 노드에서 vCPU·메모리 바꾸기는 다음
@@ -53,10 +53,10 @@ cluster_listen = "127.0.0.1:8017"
 data_dir = "/tmp/opl/node2"
 run_dir = "/tmp/opl/run2"
 TOML
-cargo run -p opld -- --config /tmp/opl/node2.toml &
-cargo run -p oplctl -- cluster join "$(cargo run -q -p oplctl -- cluster join-token)" \
+cargo run -p orbivisord -- --config /tmp/opl/node2.toml &
+cargo run -p orbivisorctl -- cluster join "$(cargo run -q -p orbivisorctl -- cluster join-token)" \
     --socket /tmp/opl/run2/opld.sock
-cargo run -p oplctl -- cluster status
+cargo run -p orbivisorctl -- cluster status
 ```
 
 API 문서(OpenAPI)는 `https://127.0.0.1:8006/api/v1/openapi.json`에 있다.
@@ -111,7 +111,7 @@ sudo apt install xorriso libssl-dev pkg-config     # 그리고 Rust, Node.js 22�
 # 1. 패키지. 버전은 바이너리(--version)와 패키지에 같은 값을 쓴다(다르면 build-deb.sh가 멈춘다).
 pnpm -C web install --frozen-lockfile && pnpm -C web build
 #    구독 공개 키(OPL_LICENSE_KEYS) 없이 빌드하면 저장소의 개발 키를 믿는 개발 패키지다("구독과 텔레메트리").
-OPL_VERSION=0.1.0 cargo build --release -p opld --features web-ui -p oplctl
+OPL_VERSION=0.1.0 cargo build --release -p orbivisord --features web-ui -p orbivisorctl
 OPL_DEV_LICENSE=1 packaging/deb/build-deb.sh 0.1.0 dist   # dist/orbivisor_0.1.0_amd64.deb와 전환 패키지("이름 바꾸기")
 # 2. netinst. 판과 SHA-256은 packaging/iso/debian.lock에 있고, build-iso.sh가 해시를 확인한다.
 #    그 판보다 새 판이 나와 URL이 404면 같은 파일을 cdimage/archive/<판>/amd64/iso-cd/에서 받는다.
@@ -304,9 +304,9 @@ gpg --export "$KEY_ID" > oplite-archive-keyring.gpg
 # 패키지: 저장소 주소(바이너리에)와 공개 키(/usr/share/keyrings/oplite-archive-keyring.gpg).
 # 구독 공개 키 OPL_LICENSE_KEYS는 바이너리와 build-deb.sh에 함께 준다("구독과 텔레메트리"). export하지 않고
 # 두 명령 앞에만 준다: 같은 셸의 cargo test가 개발 키로 서명한 시험 키를 풀지 못해 실패한다.
-KEYS=<opl-license keygen이 출력한 공개 키>
+KEYS=<orbivisor-license keygen이 출력한 공개 키>
 OPL_LICENSE_KEYS=$KEYS OPL_VERSION=0.2.0 OPL_APT_URL=https://apt.example.com/oplite \
-    cargo build --release -p opld --features web-ui -p oplctl
+    cargo build --release -p orbivisord --features web-ui -p orbivisorctl
 # 파일 복원 도우미 이미지(백업 "파일 단위 복원"): OPL_RESTORE_IMAGE_DIR을 주면 build-deb.sh가 셋째 패키지
 # orbivisor-restore-image(같은 판)도 만든다.
 packaging/restore-image/build.sh --arch x86_64 --version 0.2.0 --out dist/restore-image/x86_64
@@ -379,8 +379,8 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
   안내의 `oplctl` 명령은 링크로 그대로 된다. 바꾸려면 노드에서(root) 한 번:
   `sed 's/opLite/Orbivisor/; s/oplctl/orbivisorctl/g' /etc/issue.d/oplite.issue > /etc/issue.d/orbivisor.issue && rm /etc/issue.d/oplite.issue`
 - **그대로 둔 내부 이름.** 바꾸면 노드 위의 상태나 다른 노드와 맞지 않게 되는 이름은 옛 이름에서 왔어도 그대로다:
-  데이터·설정·런타임 경로(`/var/lib/opl`, `/etc/opl`, `/run/opl`, `/var/log/opl`), 크레이트 이름(`cargo build -p opld`,
-  `-p oplctl`), VM scope `opl-vm-<id>.scope`와 업그레이드 유닛 `opl-upgrade-<작업>`, 장치 이름(브리지 `oplv<VNI>`, VXLAN
+  데이터·설정·런타임 경로(`/var/lib/opl`, `/etc/opl`, `/run/opl`, `/var/log/opl`), 크레이트 이름(`cargo build -p orbivisord`,
+  `-p orbivisorctl`), VM scope `opl-vm-<id>.scope`와 업그레이드 유닛 `opl-upgrade-<작업>`, 장치 이름(브리지 `oplv<VNI>`, VXLAN
   `oplx<VNI>`, LV·zvol·RBD `opl-…`), nft 테이블 `opl_<태그>`, 백업 비트맵, 쿠키 `opl_session`, 토큰·키 접두사(`opl_`,
   `oplj_`, `opl1.`, `opl-join://`, 로그인 토큰 이름 `oplctl-`), 감사 로그 대상 `opl_audit`, 지금 클러스터 CA의 CN
   ("opLite cluster X CA" — 새로 만드는 클러스터만 "Orbivisor cluster X CA"). 롤링 업그레이드 중에는 옛 노드의 오류

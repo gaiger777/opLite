@@ -18,8 +18,8 @@ import (
 )
 
 // Acceptance tests (TF_ACC=1) run real terraform — or tofu with TF_ACC_TERRAFORM_PATH and
-// TF_ACC_PROVIDER_HOST=registry.opentofu.org — against opl-devserver (OPL_DEVSERVER = its path:
-// `cargo build -p opld --features devserver --bin opl-devserver`), which TestMain starts once. With
+// TF_ACC_PROVIDER_HOST=registry.opentofu.org — against orbivisor-devserver (OPL_DEVSERVER = its path:
+// `cargo build -p orbivisord --features devserver --bin orbivisor-devserver`), which TestMain starts once. With
 // OPL_SERVER/OPL_TOKEN/OPL_CA_PEM already set the tests use that server instead.
 
 var factories = map[string]func() (tfprotov6.ProviderServer, error){
@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("OPL_SERVER") == "" {
 		var err error
 		if stop, err = startDevserver(); err != nil {
-			fmt.Fprintln(os.Stderr, "opl-devserver:", err)
+			fmt.Fprintln(os.Stderr, "orbivisor-devserver:", err)
 			os.Exit(1)
 		}
 	}
@@ -61,7 +61,7 @@ func TestMain(m *testing.M) {
 func startDevserver() (func(), error) {
 	bin := os.Getenv("OPL_DEVSERVER")
 	if bin == "" {
-		return nil, fmt.Errorf("set OPL_DEVSERVER to the opl-devserver binary (cargo build -p opld --features devserver --bin opl-devserver)")
+		return nil, fmt.Errorf("set OPL_DEVSERVER to the orbivisor-devserver binary (cargo build -p orbivisord --features devserver --bin orbivisor-devserver)")
 	}
 	cmd := exec.Command(bin, "--exit-on-stdin-eof")
 	stdin, err := cmd.StdinPipe()

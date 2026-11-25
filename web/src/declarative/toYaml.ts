@@ -1,6 +1,6 @@
 // 매니페스트를 YAML로 쓰는 작은 쓰개(계획 73 §13 웹 "YAML로 내보내기"). 웹은 YAML을 읽지 않으므로 읽개는 없다. 쓴 글은
 // CLI(`orbivisorctl apply -f`, serde-saphyr)가 같은 값으로 읽어야 한다 — 고정 파일 `__fixtures__/yaml.json`을 웹 시험이
-// 쓰고 CLI 교차 시험(`crates/oplctl/src/web_cross.rs`)이 읽어 맞춰 본다. 꼴은 CLI `export`와 같게 문서마다 `---`로 시작한다.
+// 쓰고 CLI 교차 시험(`crates/orbivisorctl/src/web_cross.rs`)이 읽어 맞춰 본다. 꼴은 CLI `export`와 같게 문서마다 `---`로 시작한다.
 
 /** 따옴표 없이 써도 문자열로 읽히는 글: 낱말·경로·이름(`web01`·`/prod/web`·`orbivisor.io/apply-set`·`x86-64-v2`) */
 const PLAIN = /^[A-Za-z_/][A-Za-z0-9_./@+-]*(?: [A-Za-z0-9_./@+()-]+)*$/;

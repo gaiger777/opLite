@@ -5,7 +5,7 @@ import { expect, type Page, test } from "@playwright/test";
 // 계획 72: 가상 머신 › 가져오기의 VMware 보기로 따뜻한 이전을 끝까지 한다 — 원본 더하기(지문을 보고 믿기) → 마법사(나무에서
 // web01 고르기·네트워크 둘·기본 풀·켜지 않기·미리 확인) → 시작 → 동기화 중 → 전환 → 끝남·실제 내린 시간 → VM 링크. 그 VM을 메뉴의
 // "OVA로 내보내기…"로 내보내 내려받은 파일이 ustar(OVA)인지 본다. 가짜 vSphere·클러스터·풀은 Rust 테스트
-// (`crates/opld/tests/web.rs`)가 준비하고 끝난 뒤 원본·대상을 확인한다.
+// (`crates/orbivisord/tests/web.rs`)가 준비하고 끝난 뒤 원본·대상을 확인한다.
 const user = process.env.OPL_USER ?? "admin";
 const password = process.env.OPL_PASSWORD ?? "";
 const pool = process.env.OPL_POOL ?? "";

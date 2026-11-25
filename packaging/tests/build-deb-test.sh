@@ -242,9 +242,9 @@ if [ "$code" -eq 1 ] && [ ! -e "$WORK/out" ]; then
 else
 	fail "OPL_DEV_LICENSE=0: 종료 코드 $code"
 fi
-# 정식 키: opl-license keygen과 같은 형식(base64 32바이트)의 개발 키가 아닌 키 둘
+# 정식 키: orbivisor-license keygen과 같은 형식(base64 32바이트)의 개발 키가 아닌 키 둘
 RELEASE_KEYS='Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyM=,mR8vT2wX4yZ6aB8cD0eF2gH4iJ6kL8mN0oP2qR4sT6U='
-DEV_KEY=$(cat "$DEB_DIR/../../crates/opl-types/keys/dev-license.pub")
+DEV_KEY=$(cat "$DEB_DIR/../../crates/orbivisor-types/keys/dev-license.pub")
 fake_bins 0.1.0 0.1.0 "$RELEASE_KEYS"
 OPL_LICENSE_KEYS=$RELEASE_KEYS OPL_DEV_LICENSE='' run 0.1.0
 if [ "$code" -eq 0 ] && [ -f "$WORK/out/orbivisor_0.1.0_amd64.deb" ] && [ -f "$WORK/out/oplite_0.1.0_amd64.deb" ]; then

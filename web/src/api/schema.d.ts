@@ -5087,7 +5087,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 이벤트는 `opl_cluster::watch::WatchEvent`의 JSON이다. 이어 받을 수 없게 되면
+         * 이벤트는 `orbivisor_cluster::watch::WatchEvent`의 JSON이다. 이어 받을 수 없게 되면
          *     `{"type":"error","code":"expired"|"lagged"|"closed"}`를 보내고 닫는다. 클라이언트는 목록을
          *     다시 읽고 새로 구독한다.
          * @description 계획 62: 폴더를 따르는 종류(VM·볼륨·풀·네트워크·스냅샷·백업·가져오기·Task·폴더)와 grant는 이벤트마다 볼 수 있는

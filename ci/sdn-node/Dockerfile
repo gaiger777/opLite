@@ -1,6 +1,6 @@
 # 여러 노드 SDN 시험(계획 66 스테이지 6, CI `sdn-multinode`)의 Orbivisor 노드 하나: systemd가 PID 1인 privileged 컨테이너.
 # OVN·OVS는 넣지 않는다 — orbivisord(`sdn init`·`sdn central add`·`sdn chassis install`)가 apt로 깐다. orbivisord 바이너리와
-# 설정·데이터 디렉터리는 시험이 바인드 마운트한다(`crates/opld/tests/sdn_multinode.rs`).
+# 설정·데이터 디렉터리는 시험이 바인드 마운트한다(`crates/orbivisord/tests/sdn_multinode.rs`).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

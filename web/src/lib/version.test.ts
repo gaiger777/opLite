@@ -1,6 +1,6 @@
 import { compareVersions } from "@/lib/version";
 
-// opl_types::version의 비교 표와 같다.
+// orbivisor_types::version의 비교 표와 같다.
 it.each([
   ["1.2.3", "1.2.3", 0],
   ["1.01", "1.1", 0],

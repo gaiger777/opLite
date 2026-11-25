@@ -1,4 +1,4 @@
-// hard 배치 규칙 예상(계획 71 설계 §10.2): VM을 이 노드에 두면 어기는 hard 규칙의 이름. 서버 `opl-api` `placement.rs`의
+// hard 배치 규칙 예상(계획 71 설계 §10.2): VM을 이 노드에 두면 어기는 hard 규칙의 이름. 서버 `orbivisor-api` `placement.rs`의
 // `hard_violations`를 그대로 따라 셈한다(같은 입력 → 같은 이름, 시험이 서버 시험 표를 옮겨 맞춘다). 빌더의 노드 부품과
 // 지도 끌어 옮기기가 함께 쓰는 "예상"이고, 최종은 서버(만들기·옮기기의 409 `placement_rule`)다.
 import type { HaGroup, Node, PlacementRule, Vm } from "@/api/types";

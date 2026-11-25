@@ -4,7 +4,7 @@
 # 쓰는 법: packaging/deb/build-deb.sh <version> <out dir>
 # (OPL_RESTORE_IMAGE_DIR가 있으면 셋째 패키지 orbivisor-restore-image_<version>_amd64.deb도 — 아래)
 # 바이너리(orbivisord, orbivisorctl)는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
-#   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p opld --features web-ui -p oplctl
+#   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p orbivisord --features web-ui -p orbivisorctl
 # 바이너리 위치는 기본 target/release이고 OPL_BIN_DIR로 바꾼다.
 # OPL_APT_KEY(APT 저장소 공개 키 파일, armor가 아닌 gpg --export)가 있으면
 # /usr/share/keyrings/oplite-archive-keyring.gpg로 싣는다.
@@ -40,7 +40,7 @@ ROOT=$(cd "$DEB_DIR/../.." && pwd)
 BIN_DIR=${OPL_BIN_DIR:-$ROOT/target/release}
 
 if [ -n "${OPL_LICENSE_KEYS:-}" ]; then
-	DEV_KEY=$(cat "$ROOT/crates/opl-types/keys/dev-license.pub")
+	DEV_KEY=$(cat "$ROOT/crates/orbivisor-types/keys/dev-license.pub")
 	set -f
 	old_ifs=$IFS
 	IFS=,
@@ -79,7 +79,7 @@ for bin in orbivisord orbivisorctl; do
 	got=$("$BIN_DIR/$bin" --version)
 	if [ "$got" != "$bin $VERSION" ]; then
 		echo "build-deb: $BIN_DIR/$bin --version이 '$got'이다(기대 '$bin $VERSION')." >&2
-		echo "build-deb: OPL_VERSION=$VERSION cargo build --release -p opld --features web-ui -p oplctl 로 다시 빌드한다" >&2
+		echo "build-deb: OPL_VERSION=$VERSION cargo build --release -p orbivisord --features web-ui -p orbivisorctl 로 다시 빌드한다" >&2
 		exit 1
 	fi
 done

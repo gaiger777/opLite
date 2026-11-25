@@ -10,16 +10,16 @@ license = "Apache-2.0"
 repository = "https://github.com/gaiger777/opLite"
 
 [workspace.dependencies]
-opl-types = { path = "crates/opl-types" }
-opl-qemu = { path = "crates/opl-qemu" }
-opl-cluster = { path = "crates/opl-cluster" }
-opl-peer = { path = "crates/opl-peer" }
-opl-driver = { path = "crates/opl-driver" }
-opl-reconciler = { path = "crates/opl-reconciler" }
-opl-api = { path = "crates/opl-api" }
-oplctl = { path = "crates/oplctl" }
-opl-store = { path = "crates/opl-store" }
-opl-restore = { path = "crates/opl-restore" }
+orbivisor-types = { path = "crates/orbivisor-types" }
+orbivisor-qemu = { path = "crates/orbivisor-qemu" }
+orbivisor-cluster = { path = "crates/orbivisor-cluster" }
+orbivisor-peer = { path = "crates/orbivisor-peer" }
+orbivisor-driver = { path = "crates/orbivisor-driver" }
+orbivisor-reconciler = { path = "crates/orbivisor-reconciler" }
+orbivisor-api = { path = "crates/orbivisor-api" }
+orbivisorctl = { path = "crates/orbivisorctl" }
+orbivisor-store = { path = "crates/orbivisor-store" }
+orbivisor-restore = { path = "crates/orbivisor-restore" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # 계획 73: 매니페스트 YAML(oplctl만 — 서버는 JSON만 읽는다). 안전한 Rust 파서(serde_yaml·unsafe-libyaml은 유지 중단)
@@ -91,6 +91,6 @@ lber = "0.5.1"
 lettre = { version = "0.11.24", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "ring", "rustls-native-certs"] }
 
 # 시험 빌드에서도 redb는 최적화한다. 최적화하지 않으면 커밋마다 페이지를 0으로 채우는 데 시간을 써서 노드를
-# 수백 개 띄우는 규모 시험(opl-cluster scale-it)의 쓰기 지연을 그것이 차지한다.
+# 수백 개 띄우는 규모 시험(orbivisor-cluster scale-it)의 쓰기 지연을 그것이 차지한다.
 [profile.dev.package.redb]
 opt-level = 3

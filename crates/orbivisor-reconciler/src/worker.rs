@@ -1,0 +1,2463 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use orbivisor_cluster::types::Rejection;
+use orbivisor_cluster::{Cluster, ClusterError};
+use orbivisor_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use orbivisor_types::backup_store::LiveRestorePhase;
+use orbivisor_types::cpu::ResolvedCpu;
+use orbivisor_types::firmware::{
+    TpmSource, firmware_copy_nodes, move_firmware_node, tpm_is_current, tpm_source,
+    tpm_unavailable, vars_source,
+};
+use orbivisor_types::hotplug::{self, Step};
+use orbivisor_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
+use orbivisor_types::numa::ResolvedNuma;
+use orbivisor_types::placement::HaGroupSpec;
+use orbivisor_types::runtime::{RuntimeTpm, VmRuntimeSpec};
+use orbivisor_types::snapshot::SnapshotSpec;
+use orbivisor_types::storage::{StoragePoolSpec, VolumeSpec};
+use orbivisor_types::vm::{
+    AgentShutdown, Firmware, HaEvict, HaState, PendingChange, PendingReason, PowerState,
+    RestartPolicy, RunningHardware, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
+};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use uuid::Uuid;
+
+use crate::backoff::{FailureTracker, Next};
+use crate::config::ReconcilerConfig;
+use crate::cpu::{CpuContext, CpuRefusal};
+use crate::firmware::FirmwareCopy;
+use crate::ha::ArmError;
+use crate::host_alloc::{Claim, Shape};
+use crate::reconciler::{Held, Restores};
+use crate::replicas;
+use crate::resolve::{
+    ResolveError, apply_disk_moves, apply_hardware, running_spec, runtime_spec, set_disks_shared,
+};
+
+/// 실행 중이던 VM이 사라졌을 때 그 이유를 알리는 종료 이벤트를 기다리는 시간.
+/// 이벤트보다 재동기화가 먼저 오면, 게스트가 스스로 끈 VM을 다시 켰다가 끄게 된다.
+/// QEMU 드라이버는 QMP 연결이 끊긴 뒤 프로세스가 끝나기를 최대 5초(`EXIT_GRACE`) 기다린 다음에
+/// 크래시를 알리므로 그보다 길게 잡는다. 짧으면 느리게 끝난 크래시를 두 번 세게 된다.
+const EVENT_GRACE: Duration = Duration::from_secs(6);
+
+/// 라이브 복원 Task가 VM을 켤 준비를 하는 동안(또는 실패·취소 중) reconciler가 남기는 까닭(계획 68)
+pub const LIVE_RESTORE_NOT_STARTED: &str = "waiting for the live restore task to prepare the VM";
+
+/// 켜라고 한 템플릿(계획 58)을 켜지 않았을 때의 status
+pub const TEMPLATE_NOT_STARTED: &str =
+    "the VM is a template and is never started; deploy a VM from it or convert it back";
+
+/// HA VM을 켜거나 이어서 실행하기 전에 리스를 기다리는 동안의 status
+const HA_WAITING: &str = "waiting for the cluster majority before starting an HA VM";
+/// 리스를 잃어 HA VM을 끈 뒤 리스를 기다리는 동안의 status
+const HA_FENCED: &str = "fenced: lost the cluster majority";
+/// 펜싱이 꺼진 노드(`[ha] fencing = "off"`)의 HA VM status
+const HA_UNAVAILABLE: &str = "HA is not available on this node";
+/// 다른 프로세스가 디스크 이미지를 잠가 두어 다시 시도하는 동안의 status
+const IMAGE_LOCKED: &str = "disk image is locked by another process; retrying";
+/// 방화벽이 없는 노드(nftables 없음, macOS)에서 보안 그룹을 건 NIC가 있는 VM을 켜려 할 때의 오류
+const NO_FIREWALL: &str = "failed to start: firewall: this node has no firewall (nftables)";
+/// 남은 마이그레이션을 취소하지 못해(남은 디스크 미러) 표시를 남긴 채 다시 하는 연속 실패 수. 이만큼
+/// 실패하면 경고 뒤 표시를 지운다([`Worker::clear_migration`]).
+const CANCEL_ATTEMPTS: u32 = 3;
+/// HA 검사로 끈 VM의 파일 볼륨을 내보내기(`fsync`)를 기다리는 시간([`Worker::sync_disks`]). 멈춘 NFS에서는
+/// 끝나지 않으므로 넘으면 다음 단계에서 다시 본다(그동안 리더는 시간이 지나면 노드 전원을 끈다).
+const EVICT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 작업자를 깨우는 이유.
+#[derive(Debug)]
+pub(crate) enum Trigger {
+    /// spec이 바뀌었거나 전체 재동기화. 원하는 상태와 실제 상태를 다시 맞춘다.
+    Sync,
+    /// 하이퍼바이저가 알린 수명 이벤트
+    Event(EventKind),
+    /// 원하는 상태가 stopped인 VM을 ACPI 응답을 기다리지 않고 곧바로 끈다.
+    ForceStop,
+    /// 앞의 단계를 마쳤음을 알린다(`ReconcilerHandle::begin_migration`).
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+/// HA VM을 켜거나 멈춘 QEMU를 이어서 실행하기 직전(느린 디스크 해석 뒤)에 다시 본 결과
+/// ([`Worker::ha_recheck`])
+enum Recheck {
+    Go,
+    /// 리스가 끝났다. 실패로 세지 않고 다시 본다(status에 남길 이유).
+    NotFresh(&'static str),
+    /// 그 사이 다른 노드로 배정됐거나 원하는 상태가 stopped가 됐거나 지워졌다(다시 읽은 VM). 켜지 않고
+    /// status도 쓰지 않은 채 다시 맞춘다.
+    Changed(Option<Box<Vm>>),
+}
+
+/// [`Worker::start`]의 결과
+enum Start {
+    Started,
+    /// 켜지 않았다(백오프, 포기, 리스 기다림).
+    NotStarted,
+    /// HA VM이 그 사이 바뀌었다([`Recheck::Changed`]).
+    Changed(Option<Box<Vm>>),
+}
+
+/// 멈춘 QEMU를 이어서 실행하지 못한 이유
+enum ContinueError {
+    /// QMP로 다룰 수 없거나 참조를 풀지 못했다.
+    Unresponsive(String),
+    /// HA VM의 리스가 끝났다([`Recheck::NotFresh`]).
+    NotFresh(&'static str),
+    /// HA VM이 그 사이 바뀌었다([`Recheck::Changed`]).
+    Changed(Option<Box<Vm>>),
+}
+
+/// 게스트 감시(`ha.guest_watch`)의 상태. 이 QEMU(`pid`)에서 에이전트가 한 번이라도 답한 뒤에야 센다.
+struct GuestAgent {
+    /// 감시하는 QEMU. 바뀌면(새로 띄움) 처음부터 다시 본다.
+    pid: u32,
+    /// 이 QEMU에서 에이전트가 한 번이라도 답했다. 게스트가 다시 부팅하면(`Reset`) 지운다.
+    answered_once: bool,
+    /// 답이 없는 시간을 세는 기준(마지막 답). None이면 다음 확인부터 센다(일시 정지·재개 이벤트·마이그레이션 보류
+    /// 뒤).
+    seen_at: Option<Instant>,
+    /// 다음으로 에이전트를 부를 때
+    next_ping: Instant,
+}
+
+/// 게스트 정보 수집(계획 59 §8)의 상태. 이 QEMU(`pid`)에서 에이전트가 답했는지는 에이전트 종료를 고를 때도 쓴다.
+struct GuestPoll {
+    /// 모으는 QEMU. 바뀌면(새로 띄움) 앞 정보를 지우고 처음부터 다시 모은다.
+    pid: u32,
+    /// 이 QEMU에서 에이전트가 한 번이라도 답했다.
+    answered: bool,
+    /// 다음으로 모을 때
+    next: Instant,
+}
+
+/// 이 노드의 TPM 상태 파일을 마지막으로 본 모습과 그 SHA-256
+struct TpmSeen {
+    /// 파일을 알아보는 열쇠(크기, mtime, inode, ctime). swtpm은 임시 파일을 rename하므로 inode가, 같은 초 안의 같은
+    /// 크기 쓰기는 ctime(나노초)이 바뀐 것을 알린다(리뷰 1 M2).
+    key: FileKey,
+    sha256: String,
+}
+
+/// [`TpmSeen`]의 파일 열쇠
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileKey {
+    len: u64,
+    modified: std::time::SystemTime,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl FileKey {
+    fn of(meta: &std::fs::Metadata) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified()?,
+            ino: meta.ino(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StepError {
+    #[error(transparent)]
+    Cluster(#[from] ClusterError),
+    #[error(transparent)]
+    Driver(#[from] DriverError),
+}
+
+/// VM 하나를 맡는 작업자. 이 VM에 대한 드라이버 호출은 모두 이 태스크에서만 일어난다.
+///
+/// 매번 로컬 저장소에서 VM을 다시 읽고 실제 상태를 조회해 맞추므로(level-triggered),
+/// 같은 트리거를 여러 번 받아도 안전하다. 이벤트는 "게스트가 스스로 꺼졌다"처럼 실제 상태만
+/// 봐서는 알 수 없는 사실을 알릴 때만 쓴다.
+pub(crate) struct Worker {
+    id: Uuid,
+    cluster: Arc<Cluster>,
+    hv: Arc<dyn Hypervisor>,
+    config: Arc<ReconcilerConfig>,
+    /// 다음 시작에 불러올 스냅샷 태그(`ReconcilerHandle::restore_on_start`)
+    restores: Restores,
+    /// 마이그레이션 Task가 다루는 중인 VM. 들어 있으면 이 작업자는 아무것도 하지 않는다.
+    held: Held,
+    /// 진행 중인 ACPI 종료 요청을 보낸 시각. 강제 종료로 넘어갈 시점을 정한다.
+    /// 원하는 상태가 다시 running으로 바뀌면 취소하므로, 새 종료는 늘 ACPI부터 다시 시작한다.
+    stop_requested: Option<Instant>,
+    /// 이 작업자가 마지막으로 종료를 요청한(ACPI 또는 강제) 시각. 뒤이은 종료 이벤트가 우리
+    /// 요청의 결과인지 가린다. 요청을 취소했거나 원하는 상태가 다시 running으로 바뀌어도
+    /// 게스트(또는 강제 종료)는 요청대로 꺼질 수 있으므로 `acpi_timeout` 동안 유효하다.
+    stopped_by_us: Option<Instant>,
+    /// 다음 단계에서 ACPI 응답을 기다리지 않고 강제 종료한다. 원하는 상태가 stopped일 때만 켜고,
+    /// 그 뒤 running으로 바뀌면 reconcile이 끈다.
+    force_requested: bool,
+    failures: FailureTracker,
+    /// 백오프 중이면 이 시각까지 시작하지 않는다. status에 보일 이유를 함께 둔다.
+    backoff: Option<(Instant, String)>,
+    /// spec.power를 stopped로 바꿔야 한다(게스트 종료, 재시작 포기). 안쪽 값은 status에 남길 오류다.
+    /// 쓰기에 실패하면 남겨 두었다가 다음 단계에서 다시 쓴다.
+    power_off: Option<Option<String>>,
+    /// HA VM이 이 노드에서 `max_restart`보다 많이 크래시했다. 다시 켜지 않고 리더에게 다른 노드로 옮겨 달라고
+    /// 한다(`status.ha.relocate_from`). 안쪽 값은 status에 남길 오류다. 요청이 저장소에 보이면 지운다.
+    relocate: Option<String>,
+    /// 작업자가 스스로 다시 켜는 VM(크래시, 호스트 SIGTERM, 게스트 감시)이 꺼지기 전에 쓰던 CPU(리뷰 2 #4). 보류된 새
+    /// CPU를 이 노드가 켤 수 없으면 이것으로 다시 켜고 바뀜은 보류로 남긴다 — 사용자가 하지 않은 전원 껐다 켜기 때문에
+    /// VM이 꺼진 채 남지 않게. 켜지면, 또는 원하는 상태가 stopped가 되면 지운다.
+    restart_cpu: Option<ResolvedCpu>,
+    /// 작업자가 스스로 다시 켜는 VM이 꺼지기 전에 쓰던 게스트 NUMA 모양(계획 64). 보류된 새 모양을 이 노드에 맞출 수
+    /// 없으면 이것으로 다시 켠다(`restart_cpu`와 같다).
+    restart_numa: Option<ResolvedNuma>,
+    /// 마지막으로 조회했을 때 VM이 실행 중이었는지
+    was_running: bool,
+    /// 사라진 VM의 종료 이벤트를 이 시각까지 기다린다.
+    awaiting_event: Option<Instant>,
+    /// 디스크 볼륨이 켜져 있을 수 있다(시작하려고 켰거나 VM이 도는 것을 봤다). QEMU가 끝난 것을
+    /// 확인하면 끈다([`Worker::deactivate_disks`]).
+    disks_active: bool,
+    /// 라이브 마이그레이션이 디스크 볼륨을 원본·대상이 함께 쓰게 해 두었을 수 있다(받은 VM을
+    /// 넘겨받았거나, 남은 마이그레이션을 되돌렸거나, 마이그레이션 Task가 보류했다 풀었다). VM이 도는
+    /// 동안 다시 이 노드만 쓰게 한다([`Worker::exclusive_disks`], 성공할 때까지). 저장소에 남지 않는
+    /// 상태이므로 이 작업자가 직접 켜서 시작한 것이 아니면 참으로 시작한다(opld 재시작이나 넘겨받기
+    /// 뒤 이미 도는 VM에 다시 붙으면 한 번 배타로 바꾼다, 멱등).
+    disks_shared: bool,
+    /// 보류 중에 받은 마지막 수명 이벤트(원본 QEMU의 크래시 등). 보류가 풀리면 처리한다.
+    held_event: Option<EventKind>,
+    /// 리스를 잃어 이 HA VM을 껐다. 다시 켜거나 원하는 상태가 stopped가 되면 지운다.
+    fenced: bool,
+    /// guard에 도는 HA VM으로 알려 두었다([`Worker::report_running`]).
+    ha_running: bool,
+    /// 남은 마이그레이션의 취소가 잇달아 실패한 수([`Worker::clear_migration`])
+    cancel_failures: u32,
+    /// 시간 안에 끝나지 않은 디스크 내보내기([`Worker::sync_disks`]). 끝날 때까지 새로 띄우지 않는다.
+    syncing: Option<JoinHandle<Result<(), String>>>,
+    /// 게스트 감시 상태([`Worker::guest_hung`]). 감시하지 않거나 QEMU가 없으면 None.
+    agent: Option<GuestAgent>,
+    /// 이 작업자가 켠 QEMU의 하드웨어(계획 54). status에 기록이 없는 도는 VM에 쓴다. QEMU가 없으면 None.
+    started: Option<RunningHardware>,
+    /// 이 노드의 TPM 상태 파일을 마지막으로 본 모습(계획 59). 같으면 해시를 다시 셈하지 않는다.
+    tpm_seen: Option<TpmSeen>,
+    /// 다음으로 TPM 상태의 해시를 보고 펌웨어 사본을 밀어 둘 때([`Worker::sync_firmware`]). VM이 켜지거나 멈추면
+    /// 곧바로 본다.
+    firmware_sync_at: Instant,
+    /// 게스트 정보 수집 상태([`Worker::poll_guest`]). 에이전트 채널이 없거나 QEMU가 없으면 None.
+    guest: Option<GuestPoll>,
+    wake_at: Option<Instant>,
+}
+
+impl Worker {
+    /// 보안 그룹을 건 단순 네트워크 NIC가 있는지(노드 방화벽이 걸러야 하는 VM). 네트워크를 읽지 못하면 모든 NIC를 단순
+    /// NIC로 본다(규칙을 넣는 쪽).
+    fn simple_firewall(&self, vm: &Vm) -> bool {
+        let networks = self
+            .cluster
+            .list::<orbivisor_types::network::NetworkSpec>()
+            .map(|(_, n)| n)
+            .unwrap_or_default();
+        vm.spec.has_simple_firewall(&networks)
+    }
+
+    pub(crate) fn new(
+        id: Uuid,
+        cluster: Arc<Cluster>,
+        hv: Arc<dyn Hypervisor>,
+        config: Arc<ReconcilerConfig>,
+        restores: Restores,
+        held: Held,
+    ) -> Self {
+        Self {
+            id,
+            cluster,
+            hv,
+            config,
+            restores,
+            held,
+            stop_requested: None,
+            stopped_by_us: None,
+            force_requested: false,
+            failures: FailureTracker::default(),
+            backoff: None,
+            power_off: None,
+            relocate: None,
+            restart_cpu: None,
+            restart_numa: None,
+            was_running: false,
+            awaiting_event: None,
+            disks_active: false,
+            disks_shared: true,
+            held_event: None,
+            fenced: false,
+            ha_running: false,
+            cancel_failures: 0,
+            syncing: None,
+            agent: None,
+            started: None,
+            tpm_seen: None,
+            firmware_sync_at: Instant::now(),
+            guest: None,
+            wake_at: None,
+        }
+    }
+
+    /// 보내는 쪽이 모두 사라지면 남은 트리거를 처리하고 끝난다. `previous`는 같은 VM을 맡았던
+    /// 작업자다. 같은 VM에 대한 드라이버 호출이 겹치지 않도록 그것이 끝난 뒤에 시작한다.
+    pub(crate) async fn run(
+        mut self,
+        previous: Option<JoinHandle<()>>,
+        mut rx: mpsc::UnboundedReceiver<Trigger>,
+    ) {
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        loop {
+            let trigger = match self.wake_at {
+                Some(at) => tokio::select! {
+                    t = rx.recv() => t,
+                    () = tokio::time::sleep_until(at) => Some(Trigger::Sync),
+                },
+                None => rx.recv().await,
+            };
+            let Some(trigger) = trigger else {
+                self.exit().await;
+                return;
+            };
+            // 트리거는 차례로 처리하므로 앞의 단계는 이미 끝났다. 마이그레이션 Task가 디스크를
+            // 공유로 바꿀 수 있으므로 보류가 풀린 뒤 다시 배타로 바꾼다.
+            if let Trigger::Barrier(done) = trigger {
+                self.disks_shared = true;
+                let _ = done.send(());
+                continue;
+            }
+            self.wake_at = None;
+            if let Err(e) = self.step(trigger).await {
+                tracing::warn!(vm = %self.id, error = %e, "reconcile failed; will retry");
+                self.wake(Instant::now() + self.config.retry_interval);
+            }
+        }
+    }
+
+    /// 작업자가 끝난다. VM이 이 노드에서 빠졌고(삭제, 다른 노드로 옮김) QEMU도 없으면 도는 HA VM에서
+    /// 뺀다. QEMU가 아직 돌면 남겨 리스가 끝났을 때 watchdog가 시간을 지키게 한다. reconciler가 멈춰
+    /// 끝날 때는 그대로 둔다. VM은 계속 돌고, guard는 정상 종료 때 이 목록으로 watchdog를 멈출지 정한다.
+    async fn exit(&self) {
+        // 게스트 정보는 다시 맡는 작업자가 다시 모은다(VM이 이 노드를 떠났으면 지운 채로 둔다).
+        if let Some(sink) = &self.config.guest_info {
+            sink.remove(self.id);
+        }
+        let Some(guard) = &self.config.ha else { return };
+        match self.cluster.get::<VmSpec>(self.id) {
+            Ok(Some(vm)) if vm.spec.node == Some(self.config.node) => {}
+            Ok(_) => match self.hv.inspect(self.id).await {
+                Ok(None) => guard.set_running(self.id, false),
+                Ok(Some(_)) => {}
+                Err(e) => tracing::warn!(vm = %self.id, error = %e, "cannot inspect VM"),
+            },
+            Err(e) => tracing::warn!(vm = %self.id, error = %e, "cannot read VM"),
+        }
+    }
+
+    fn wake(&mut self, at: Instant) {
+        self.wake_at = Some(self.wake_at.map_or(at, |w| w.min(at)));
+    }
+
+    async fn step(&mut self, trigger: Trigger) -> Result<(), StepError> {
+        // 마이그레이션 Task가 status와 QEMU를 다룬다. 끝나면(`end_migration`) 다시 깨운다. 그동안
+        // QEMU가 끝났으면(크래시 등) 보류가 풀린 뒤 그 이벤트대로 다룬다(재시작 정책).
+        if self.held.lock().unwrap().contains(&self.id) {
+            if let Trigger::Event(kind) = trigger
+                && !self.guest_event(kind)
+            {
+                self.held_event = Some(kind);
+            }
+            // 마이그레이션 Task가 다루는 동안은 게스트 감시 시간을 세지 않는다.
+            if let Some(agent) = &mut self.agent {
+                agent.seen_at = None;
+            }
+            return Ok(());
+        }
+        let node = self.config.node;
+        let vm = self.cluster.get::<VmSpec>(self.id)?;
+        let Some(mut vm) = vm.filter(|vm| vm.spec.node == Some(node)) else {
+            // 다른 노드로 옮겼다(보낸 원본이 꺼진 이벤트).
+            self.held_event = None;
+            self.unassigned().await?;
+            return Ok(());
+        };
+        // 남은 마이그레이션을 정리하는 쓰기는 과반수가 있어야 하므로 그 전에 끈다.
+        self.fence(&vm).await?;
+        if vm.status.migration.is_some() || vm.status.phase == VmPhase::Migrating {
+            match self.clear_migration(&vm).await? {
+                Some(current) => {
+                    self.disks_shared = true;
+                    vm = current;
+                }
+                // 그 사이 바뀌었다. 다시 읽어 맞춘다.
+                None => {
+                    self.wake(Instant::now());
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(kind) = self.held_event.take() {
+            self.on_event(&vm, kind);
+        }
+        if vm.spec.power == PowerState::Stopped {
+            self.restart_cpu = None;
+            self.restart_numa = None;
+        }
+        match trigger {
+            Trigger::Event(kind) => self.on_event(&vm, kind),
+            // running을 원할 때 온 명령은 버린다. 남겨 두면 나중의 종료가 ACPI 없이 강제 종료된다.
+            Trigger::ForceStop if vm.spec.power == PowerState::Stopped => {
+                self.force_requested = true
+            }
+            Trigger::ForceStop => {}
+            Trigger::Sync | Trigger::Barrier(_) => {}
+        }
+        if self.power_off.is_none() {
+            let mut status = match self.evict(&vm).await? {
+                Some(status) => status,
+                None => {
+                    let mut status = self.reconcile(&mut vm).await?;
+                    self.sync_firmware(&vm, &mut status).await;
+                    status
+                }
+            };
+            drop_stale_evict(&mut status, node, &vm.spec);
+            if self.power_off.is_none() {
+                if status != vm.status {
+                    self.write_status(status, vm).await?;
+                }
+                return Ok(());
+            }
+        }
+        self.write_power_off(vm).await
+    }
+
+    /// 게스트 이벤트를 게스트 감시에 반영한다(게스트 이벤트였으면 true). 재부팅·종료 시작(`Reset`)이면 에이전트가
+    /// 다시 답할 때까지 감시하지 않고, 일시 정지·재개(`PauseChanged`)면 답이 없는 시간을 다음 확인부터 다시 센다.
+    fn guest_event(&mut self, kind: EventKind) -> bool {
+        if !kind.is_guest() {
+            return false;
+        }
+        if let Some(agent) = &mut self.agent {
+            if kind == EventKind::Reset {
+                agent.answered_once = false;
+            }
+            agent.seen_at = None;
+        }
+        true
+    }
+
+    fn on_event(&mut self, vm: &Vm, kind: EventKind) {
+        if self.guest_event(kind) {
+            return;
+        }
+        let now = Instant::now();
+        if kind != EventKind::Started {
+            self.was_running = false;
+            self.awaiting_event = None;
+            self.stop_requested = None;
+        }
+        let requested = match kind {
+            EventKind::Started | EventKind::Reset | EventKind::PauseChanged => return,
+            EventKind::Stopped { .. } | EventKind::Crashed => self
+                .stopped_by_us
+                .take()
+                .is_some_and(|at| now < at + self.config.acpi_timeout),
+        };
+        // 원하던 대로 꺼졌다. 강제 종료의 결과로 Crashed가 와도 실패로 세지 않는다.
+        if vm.spec.power == PowerState::Stopped {
+            return;
+        }
+        match kind {
+            // 우리가 요청한 종료가, 원하는 상태가 다시 running으로 바뀐 뒤에 끝났다. 다시 시작한다.
+            // 강제 종료의 결과로 Crashed가 와도 크래시로 보지 않는다.
+            _ if requested => {}
+            // 게스트가 스스로 꺼졌다(설계 5.3). `guest_initiated`는 opld가 요청한 ACPI 종료에서도
+            // true이므로 우리가 요청했는지로 먼저 가린다.
+            EventKind::Stopped {
+                guest_initiated: true,
+            } => self.power_off = Some(None),
+            // 우리가 요청하지 않았고 게스트의 결정도 아니다(호스트의 SIGTERM 등). 원하는 상태는
+            // 그대로 두므로 실패로 세지 않고 다시 시작한다.
+            EventKind::Stopped {
+                guest_initiated: false,
+            } => self.keep_restart_cpu(vm),
+            // HA VM(`started`)은 재시작 정책과 관계없이 다시 켜고, 횟수를 넘으면 옮겨 달라고 한다.
+            EventKind::Crashed => {
+                self.keep_restart_cpu(vm);
+                match (self.ha_restarts(vm), vm.spec.restart) {
+                    (Some(max), _) => self.record_crash(max, "VM crashed"),
+                    // 라이브 복원 중인 VM(계획 68 §11.4)은 정책과 관계없이 같은 배선으로 다시 켠다(오버레이에 게스트가 쓴
+                    // 것이 있다 — mirror는 처음부터 다시).
+                    (None, _) if vm.status.live_restore.is_some() => {
+                        self.record_failure("VM crashed".into())
+                    }
+                    (None, RestartPolicy::Never) => {
+                        self.power_off = Some(Some("VM crashed".into()))
+                    }
+                    (None, RestartPolicy::OnFailure) => self.record_failure("VM crashed".into()),
+                }
+            }
+            EventKind::Started | EventKind::Reset | EventKind::PauseChanged => {}
+        }
+    }
+
+    /// 작업자가 스스로 다시 켤 VM의 켤 때 CPU를 기억한다([`Worker::restart_cpu`]). 계획 63 전 기록(해석 없음)이면
+    /// 없다.
+    fn keep_restart_cpu(&mut self, vm: &Vm) {
+        self.restart_cpu = vm
+            .status
+            .hardware
+            .as_ref()
+            .and_then(|hw| hw.cpu_resolved.clone());
+        self.restart_numa = vm.status.hardware.as_ref().and_then(|hw| hw.numa.clone());
+    }
+
+    /// 리스가 끝났으면(stale) 이 노드에서 도는 HA VM을 강제로 끈다(설계 §3.3). 그 사이 리더가 다른
+    /// 노드에서 켤 수 있다. 우리가 요청한 종료로 표시하므로 실패로 세지 않고 원하는 상태도 바꾸지
+    /// 않는다. 원하는 상태가 stopped여도 끈다(끄는 중에 과반수 쪽에서 다시 running으로 바뀌었을 수 있다).
+    async fn fence(&mut self, vm: &Vm) -> Result<(), StepError> {
+        if !vm.spec.ha_active() || !self.config.ha.as_ref().is_some_and(|g| g.stale()) {
+            return Ok(());
+        }
+        if self.hv.inspect(self.id).await?.is_none() {
+            return Ok(());
+        }
+        tracing::warn!(vm = %self.id, "HA lease lost; force stopping the VM");
+        self.stopped_by_us = Some(Instant::now());
+        self.stop_requested = None;
+        self.force_requested = false;
+        self.hv.stop(self.id, StopMode::Force).await?;
+        // 우리가 껐으므로 종료 이벤트를 기다리지 않는다.
+        self.was_running = false;
+        self.fenced = true;
+        Ok(())
+    }
+
+    /// HA 검사 `restart_elsewhere`(설계 §8.2): 리더가 이 노드에 VM을 끄라고 했다(`status.ha.evict`). 도는 QEMU를
+    /// 곧바로 SIGKILL로 끄고(I/O가 멈춘 QEMU는 QMP에 답하지 않는다) 파일 볼륨의 이 노드 캐시를 내보낸 뒤
+    /// ([`Self::sync_disks`] — NFS의 늦은 쓰기가 다른 노드의 VM 이미지를 덮지 않게) 디스크 볼륨을 끄고(공유 LVM의
+    /// 배타 활성을 풀어야 다른 노드가 켠다) 요청을 거두며 리더에게 옮겨 달라고 한다(`relocate_from`, phase Failed).
+    /// 그 뒤는 재시작 횟수를 넘긴 VM과 같다(켜지 않고 리더가 옮긴다). 우리가 끈 것으로 표시해 크래시로 세지 않고
+    /// 원하는 상태는 바꾸지 않는다. 끄지 못하거나(SIGKILL에도 끝나지 않는 QEMU) 내보내기·디스크 끄기가 실패하면
+    /// 오류만 남기고(껐으면 phase Failed) 요청은 둔 채 다시 해 본다(그동안 리더는 시간이 지나면 노드 전원을 끈다).
+    /// 요청이 이 노드에 대한 것이고 켜기로 된 HA VM이 아니면 None이다.
+    async fn evict(&mut self, vm: &Vm) -> Result<Option<VmStatus>, StepError> {
+        let node = self.config.node;
+        let Some(evict) = vm
+            .status
+            .ha
+            .as_ref()
+            .and_then(|ha| ha.evict.as_ref())
+            .filter(|e| {
+                e.from == node && vm.spec.power == PowerState::Running && vm.spec.ha_active()
+            })
+        else {
+            return Ok(None);
+        };
+        let mut status = vm.status.clone();
+        status.node = Some(node);
+        if self.hv.inspect(self.id).await?.is_some() {
+            tracing::warn!(vm = %self.id, check = %evict.check, "HA check failed on this node; killing the VM so that it restarts elsewhere");
+            // 이 작업자가 켜지 않은 VM(opld 재시작 뒤 첫 단계)도 끈 뒤 디스크 볼륨을 끈다.
+            self.disks_active = true;
+            self.stopped_by_us = Some(Instant::now());
+            self.stop_requested = None;
+            self.force_requested = false;
+            if let Err(e) = self.hv.stop(self.id, StopMode::Kill).await {
+                tracing::warn!(vm = %self.id, error = %e, "cannot stop the VM for a failed HA check; will retry");
+                status.last_error = Some(format!(
+                    "cannot stop the VM for HA check {}: {e}",
+                    evict.check
+                ));
+                self.wake(Instant::now() + self.config.retry_interval);
+                return Ok(Some(status));
+            }
+            // 우리가 껐으므로 종료 이벤트를 기다리지 않는다.
+            self.was_running = false;
+        }
+        // QEMU는 끝났다(요청이 남아 다시 해 보는 동안에도).
+        status.phase = VmPhase::Failed;
+        status.pid = None;
+        status.hardware = None;
+        if let Err(e) = self.sync_disks(vm).await {
+            tracing::warn!(vm = %self.id, error = %e, "cannot flush the disks of the VM stopped for a failed HA check; will retry");
+            status.last_error = Some(format!(
+                "cannot flush the disks for HA check {}: {e}; will retry",
+                evict.check
+            ));
+            self.wake(Instant::now() + self.config.retry_interval);
+            return Ok(Some(status));
+        }
+        if !self.deactivate_disks(vm).await {
+            // 다음 단계에서 다시 끈다.
+            self.disks_active = true;
+            status.last_error = Some(format!(
+                "cannot deactivate the disks for HA check {}; will retry",
+                evict.check
+            ));
+            self.wake(Instant::now() + self.config.retry_interval);
+            return Ok(Some(status));
+        }
+        self.awaiting_event = None;
+        self.agent = None;
+        self.relocate = None;
+        self.backoff = None;
+        self.report_running(vm, false);
+        status.last_error = Some(format!(
+            "HA check {} failed on this node; restarting elsewhere",
+            evict.check
+        ));
+        let mut ha = status.ha.take().unwrap_or_default();
+        ha.relocate_from = Some(node);
+        ha.evict = None;
+        status.ha = Some(ha);
+        Ok(Some(status))
+    }
+
+    /// 삭제되었거나 다른 노드로 배정되었다. 돌고 있더라도 멋대로 끄지 않는다. 단 도는 HA VM으로 알린
+    /// VM은 리스가 끝났으면 강제로 끈다(그 사이 리더가 다른 노드에서 켤 수 있다). QEMU가 없을 때만 도는
+    /// HA VM에서 뺀다.
+    async fn unassigned(&mut self) -> Result<(), StepError> {
+        self.started = None;
+        self.forget_guest();
+        let mut actual = self.hv.inspect(self.id).await?;
+        let fenced = actual.is_some()
+            && self.ha_running
+            && self.config.ha.as_ref().is_some_and(|g| g.stale());
+        if fenced {
+            tracing::warn!(vm = %self.id, "HA lease lost; force stopping the VM assigned elsewhere");
+            self.stopped_by_us = Some(Instant::now());
+            self.hv.stop(self.id, StopMode::Force).await?;
+            self.was_running = false;
+            actual = self.hv.inspect(self.id).await?;
+        }
+        match actual {
+            // 방금 강제로 껐다. 그대로 둔다는 로그를 남기지 않는다.
+            Some(_) if fenced => {}
+            Some(_) => {
+                tracing::warn!(vm = %self.id, "VM is running but not assigned to this node; leaving it alone");
+            }
+            None => {
+                if let Some(guard) = &self.config.ha {
+                    guard.set_running(self.id, false);
+                }
+                self.ha_running = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// HA VM을 켜거나 멈춘 QEMU를 이어서 실행해도 되는지 본다: 리스가 살아 있고 watchdog가 켜져
+    /// 있어야 한다. 안 되면 status에 남길 이유를 돌려주고, 펜싱이 있는 노드면 잠시 뒤 다시 본다
+    /// (실패로 세지 않는다). 리스가 바뀌면 reconciler가 따로 깨운다.
+    fn ha_blocked(&mut self, vm: &Vm) -> Option<String> {
+        if !vm.spec.ha_active() {
+            return None;
+        }
+        let Some(guard) = &self.config.ha else {
+            return Some(HA_UNAVAILABLE.into());
+        };
+        let ready = if guard.fresh() {
+            guard.arm().map_err(|e| e.to_string())
+        } else if self.fenced {
+            Err(HA_FENCED.into())
+        } else {
+            Err(HA_WAITING.into())
+        };
+        let reason = ready.err()?;
+        self.wake(Instant::now() + self.config.retry_interval);
+        Some(reason)
+    }
+
+    /// 이 노드에서 HA VM이 도는지 guard에 알린다.
+    fn report_running(&mut self, vm: &Vm, running: bool) {
+        if let Some(guard) = &self.config.ha {
+            self.ha_running = vm.spec.ha_active() && running;
+            guard.set_running(self.id, self.ha_running);
+        }
+    }
+
+    fn record_failure(&mut self, reason: String) {
+        let now = Instant::now();
+        match self.failures.record(now, &self.config.restart) {
+            Next::RetryAfter(delay) => {
+                self.backoff = Some((now + delay, format!("{reason}; retrying in {delay:?}")));
+            }
+            Next::GiveUp => {
+                let n = self.config.restart.max_failures;
+                self.power_off = Some(Some(format!("{reason}; gave up after {n} failures")));
+            }
+        }
+    }
+
+    /// 크래시한 이 VM을 HA 정책으로 다시 켤 때 그 `max_restart`. `started` HA VM이고 모든 노드가
+    /// `ha-placement`를 알릴 때만이다(옛 리더는 `relocate_from`을 모른다). 아니면 재시작 정책을 따른다.
+    /// 노드 목록은 크래시 때만 읽는다.
+    fn ha_restarts(&self, vm: &Vm) -> Option<u8> {
+        let ha = vm
+            .spec
+            .ha
+            .as_ref()
+            .filter(|ha| ha.state == HaState::Started)?;
+        ha_placement_everywhere(&self.cluster).then_some(ha.max_restart)
+    }
+
+    /// HA VM의 크래시를 센다. `window` 안의 첫 크래시는 기다리지 않고 곧바로 다시 켠다(같은 노드 빠른 재시작),
+    /// 둘째부터는 백오프다. `max`번 넘게 크래시하면 다시 켜지 않고 옮겨 달라고 한다.
+    fn record_crash(&mut self, max: u8, reason: &str) {
+        let now = Instant::now();
+        let limit = usize::from(max) + 1;
+        match self
+            .failures
+            .record_first_free(now, &self.config.restart, limit)
+        {
+            Next::RetryAfter(delay) if delay.is_zero() => self.backoff = None,
+            Next::RetryAfter(delay) => {
+                self.backoff = Some((now + delay, format!("{reason}; retrying in {delay:?}")));
+            }
+            Next::GiveUp => {
+                tracing::warn!(vm = %self.id, crashes = limit, "HA VM crashed too often on this node; asking HA to move it");
+                self.backoff = None;
+                self.relocate = Some(format!(
+                    "VM crashed {limit} times on this node; asking HA to move it"
+                ));
+            }
+        }
+    }
+
+    /// 게스트 감시: `started` HA VM의 정책에 `guest_watch`가 있으면 도는 VM의 게스트 에이전트를
+    /// `guest_ping_interval`마다 부른다. 이 QEMU에서 한 번 답한 에이전트가 정책의 시간 넘게 답하지 않으면 true다
+    /// (다시 켤 때). VM이 실행 중(`running`)이 아닌 동안(일시 정지·스냅샷·마이그레이션)은 세지 않는다. 채널이 없는
+    /// VM(실행 중에 감시를 켬)은 부르기가 실패하므로 감시하지 않는다.
+    async fn guest_hung(&mut self, vm: &Vm, state: &ActualState) -> bool {
+        let Some(limit) = guest_watch(vm) else {
+            self.agent = None;
+            return false;
+        };
+        let now = Instant::now();
+        let mut agent = self
+            .agent
+            .take()
+            .filter(|a| a.pid == state.pid)
+            .unwrap_or(GuestAgent {
+                pid: state.pid,
+                answered_once: false,
+                seen_at: None,
+                next_ping: now,
+            });
+        let mut hung = false;
+        if state.status != RuntimeStatus::Running {
+            agent.seen_at = None;
+        }
+        if now >= agent.next_ping {
+            agent.next_ping = now + self.config.guest_ping_interval;
+            if state.status == RuntimeStatus::Running {
+                let answered = match self.hv.guest_ping(self.id).await {
+                    Ok(answered) => answered,
+                    Err(e) => {
+                        tracing::debug!(vm = %self.id, error = %e, "cannot ping the guest agent");
+                        false
+                    }
+                };
+                let now = Instant::now();
+                if answered {
+                    agent.answered_once = true;
+                    agent.seen_at = Some(now);
+                } else if agent.answered_once {
+                    let since = *agent.seen_at.get_or_insert(now);
+                    hung = now.duration_since(since) >= limit;
+                }
+            }
+        }
+        self.wake(agent.next_ping);
+        self.agent = Some(agent);
+        hung
+    }
+
+    /// 게스트가 멈췄다: 강제로 끄고 크래시 한 번으로 센다(창 안 첫 번째면 곧바로 다시 켜고, `max_restart`를
+    /// 넘으면 다른 노드로 옮겨 달라고 한다). 우리가 요청한 종료로 표시해 뒤따르는 종료 이벤트는 세지 않는다.
+    async fn restart_hung(&mut self, vm: &Vm, mut status: VmStatus) -> Result<VmStatus, StepError> {
+        let secs = guest_watch(vm).unwrap_or_default().as_secs();
+        tracing::warn!(vm = %self.id, secs, "guest agent stopped answering; restarting the VM");
+        let reason = format!("guest agent did not answer for {secs}s");
+        self.keep_restart_cpu(vm);
+        self.stopped_by_us = Some(Instant::now());
+        self.stop_requested = None;
+        self.force_requested = false;
+        self.hv.stop(self.id, StopMode::Force).await?;
+        self.was_running = false;
+        self.agent = None;
+        match self.ha_restarts(vm) {
+            Some(max) => self.record_crash(max, &reason),
+            None => self.record_failure(reason.clone()),
+        }
+        status.phase = VmPhase::Starting;
+        status.pid = None;
+        status.hardware = None;
+        status.last_error = Some(format!("{reason}; restarting"));
+        self.wake(Instant::now());
+        Ok(status)
+    }
+
+    /// 원하는 상태를 향해 한 걸음 움직이고, 기록해야 할 status를 돌려준다. 그 전에 status를 먼저
+    /// 기록했으면 `vm`을 다시 읽은 것으로 바꾼다.
+    async fn reconcile(&mut self, vm: &mut Vm) -> Result<VmStatus, StepError> {
+        let mut actual = self.hv.inspect(self.id).await?;
+        if let Some(state) = &actual
+            && state.status == postmigrate()
+            && !(vm.status.node == Some(self.config.node)
+                && matches!(
+                    vm.status.phase,
+                    VmPhase::Running | VmPhase::Migrating | VmPhase::Starting
+                ))
+        {
+            // 확정은 늘 status.node를 대상으로 바꾼다. 이 노드에서 돌던 VM이 아니면 다른 노드로 확정된
+            // 마이그레이션의 원본이 정리되지 않고 남은 것이다(그 뒤 VM이 이 노드로 다시 옮겨졌다). 멈춘
+            // 메모리는 그 사이 바뀐 디스크와 맞지 않으므로 이어서 실행하지 않고 끈 뒤 새로 시작한다.
+            // 리스를 기다리는 HA VM의 원본은 이 작업자가 Starting으로 적어 둔 것이다(아래). 기다리는
+            // 동안 HA가 꺼져도 같은 원본이므로 HA 여부는 보지 않는다.
+            tracing::warn!(vm = %self.id, "stopping the stale source of a migration committed elsewhere");
+            self.stopped_by_us = Some(Instant::now());
+            if !self.hv.stop_migrated(self.id).await? {
+                self.hv.stop(self.id, StopMode::Force).await?;
+            }
+            actual = self.hv.inspect(self.id).await?;
+        }
+        self.report_running(vm, actual.is_some());
+        if actual.is_none() {
+            self.agent = None;
+            self.forget_guest();
+        }
+        let mut status = vm.status.clone();
+        status.node = Some(self.config.node);
+        // QEMU가 없으면 실행 중 하드웨어도 없다(다시 켜면 새로 정한다 — 보류가 적용된다).
+        if actual.is_none() {
+            self.started = None;
+            status.hardware = None;
+            // 이 노드의 pCPU·hugepages 예약도 푼다(계획 64).
+            self.config.host_alloc.release(self.id);
+        }
+        let now = Instant::now();
+        if std::mem::replace(&mut self.was_running, actual.is_some()) && actual.is_none() {
+            self.awaiting_event = Some(now + EVENT_GRACE);
+            // 멈춘 VM의 TPM 상태를 곧바로 해시로 남긴다(계획 59 §5).
+            self.firmware_sync_at = now;
+        }
+        if actual.is_some() {
+            self.disks_active = true;
+            // 이 노드의 QEMU가 이 노드의 변수 파일을 쓰고 있다(다시 붙음, 넘겨받은 마이그레이션 포함).
+            self.own_firmware(vm, &mut status);
+        }
+        match (vm.spec.power, actual) {
+            (PowerState::Running, Some(state)) => {
+                // 진행 중인 종료 요청을 취소한다. 게스트가 이미 받은 요청대로 꺼지면
+                // `stopped_by_us`로 가려 다시 시작한다.
+                self.stop_requested = None;
+                self.force_requested = false;
+                status.phase = VmPhase::Running;
+                status.pid = Some(state.pid);
+                status.last_error = None;
+                // 기록이 없으면 이 작업자가 켠 하드웨어를 쓴다. 다시 붙은 VM(opld 재시작)은 켤 때 실행 디렉터리에
+                // 남긴 기록을, 그것도 없으면(계획 54 전에 켬) 핫플러그 배치가 없는 것으로 본다.
+                if status.hardware.is_none() {
+                    status.hardware = Some(
+                        self.started
+                            .clone()
+                            .or_else(|| self.hv.saved_hardware(self.id))
+                            .unwrap_or_else(|| RunningHardware::legacy(&vm.spec)),
+                    );
+                }
+                // 받은 마이그레이션(계획 64): 기록의 배치가 원본 노드의 것이면 받는 쪽이 고른 배치로 바꾼다.
+                let me = self.config.node;
+                if let Some(hw) = &mut status.hardware
+                    && hw.host_placement.as_ref().is_some_and(|p| p.node != me)
+                    && let Some(mine) = self
+                        .hv
+                        .saved_hardware(self.id)
+                        .and_then(|saved| saved.host_placement)
+                        .filter(|p| p.node == me)
+                {
+                    hw.host_placement = Some(mine);
+                }
+                let busy = matches!(state.status, RuntimeStatus::Busy(_));
+                if let RuntimeStatus::Busy(op) = &state.status {
+                    // QMP를 붙잡는 작업(메모리 스냅샷 등) 중이다. 응답 없음이 아니므로 다시 붙거나 이어서
+                    // 실행하지 않고 오류도 남기지 않는다. 작업이 끝나면 다시 본다.
+                    tracing::debug!(vm = %self.id, op, "VM is busy; checking again later");
+                    self.wake(now + self.config.retry_interval);
+                } else if state.status != RuntimeStatus::Running
+                    && let Some(reason) = self.ha_blocked(vm)
+                {
+                    // 멈춘 HA VM(넘겨받은 마이그레이션 등)은 리스가 있어야 이어서 실행한다.
+                    status.phase = VmPhase::Starting;
+                    status.last_error = Some(reason);
+                } else if state.status != RuntimeStatus::Running {
+                    // opld가 기동 도중(cont 전)이나 스냅샷으로 멈춘 채 죽었거나 QMP로 다룰 수 없다.
+                    // 붙어 있으면 디스크를 다시 해석하지 않고(LVM이 응답하지 않을 수 있다) 이어서
+                    // 실행하고, 아니면 start()가 다시 붙는다. 실패해도 돌고 있는 VM이므로 끄거나
+                    // 실패로 세지 않는다.
+                    let unresponsive = |e: DriverError| ContinueError::Unresponsive(e.to_string());
+                    let mut continued = if state.status == postmigrate() {
+                        // 마이그레이션을 보내고 멈춘 원본인데 이 노드에서 돌던 VM이고(위에서 가렸다)
+                        // 표시가 없고(위에서 지웠다) 마이그레이션 Task도 다루지 않는다(보류가 아니다). 확정 쓰기는 표시가
+                        // 있는 revision에서만 적용되므로 이제 확정될 수 없다: 이어서 실행한다(되돌리기의
+                        // 재개 실패, 되돌린 뒤 끝난 마이그레이션).
+                        tracing::warn!(vm = %self.id, "resuming the source of a migration that was not committed");
+                        self.hv.resume(self.id).await.map_err(unresponsive)
+                    } else {
+                        // 멈춘 VM을 이어서 실행하거나 다시 붙기 전에 방화벽 규칙을 넣는다.
+                        match self.sync_firewall(vm).await {
+                            Err(e) => Err(e),
+                            Ok(()) => match self.hv.resume_left_stopped(self.id).await {
+                                Ok(true) => Ok(()),
+                                Ok(false) => self.reattach(vm).await,
+                                Err(e) => Err(unresponsive(e)),
+                            },
+                        }
+                    };
+                    // 이 노드로 마이그레이션을 받아 멈춰 있는 QEMU다(확정되어 이 노드에 배정됐다).
+                    // 받는 중 표시가 있을 때만 이어서 실행하고 표시를 지운다.
+                    if continued.is_ok() && state.status == RuntimeStatus::Paused {
+                        // 복제본으로 옮겨 왔으면(계획 55) 옛 원본으로 뒤집힌 복제의 비트맵을 이어서 실행하기 전에 둔다.
+                        let reversed =
+                            replicas::reversed_bitmap(&self.cluster, &*self.hv, vm).await;
+                        continued = self
+                            .hv
+                            .finish_incoming(self.id, reversed.as_deref())
+                            .await
+                            .map_err(unresponsive);
+                        self.disks_shared |= continued.is_ok();
+                        if continued.is_ok() && reversed.is_some() {
+                            replicas::become_primary(&self.config.replica_dir, self.id).await;
+                        }
+                    }
+                    match continued {
+                        Ok(()) => {}
+                        Err(ContinueError::Unresponsive(e)) => {
+                            tracing::warn!(vm = %self.id, error = %e, "VM is unresponsive; will retry");
+                            status.last_error = Some(format!("VM is unresponsive: {e}"));
+                            self.wake(now + self.config.retry_interval);
+                        }
+                        Err(ContinueError::NotFresh(reason)) => {
+                            status.phase = VmPhase::Starting;
+                            status.last_error = Some(reason.into());
+                            self.wake(now + self.config.retry_interval);
+                        }
+                        // 켜지 않고 status도 쓰지 않는다. 다시 읽어 맞춘다.
+                        Err(ContinueError::Changed(current)) => {
+                            if let Some(current) = current {
+                                *vm = *current;
+                            }
+                            self.wake(Instant::now());
+                            return Ok(vm.status.clone());
+                        }
+                    }
+                }
+                if self.disks_shared && status.last_error.is_none() && !busy {
+                    self.exclusive_disks(vm).await;
+                }
+                if vm.spec.ha_active() && status.last_error.is_none() {
+                    self.attach_ha(&mut status);
+                }
+                if self.guest_hung(vm, &state).await {
+                    return self.restart_hung(vm, status).await;
+                }
+                self.poll_guest(vm, &state).await;
+            }
+            // 방금까지 돌던 VM이 사라졌다. 왜 꺼졌는지(게스트 종료, 크래시) 이벤트로 안 뒤에 움직인다.
+            // 기다려도 오지 않으면(이벤트 유실) 원하는 상태대로 다시 시작한다.
+            (PowerState::Running, None)
+                if self.awaiting_event.is_some_and(|deadline| now < deadline) =>
+            {
+                self.wake(self.awaiting_event.unwrap());
+            }
+            (PowerState::Running, None) => {
+                self.awaiting_event = None;
+                self.force_requested = false;
+                self.deactivate_disks(vm).await;
+                // 라이브 복원(계획 68 §11.3) 중인 VM은 Task가 배선(백업 → 오버레이)을 둔 뒤에만 켠다 — 드라이버가 그 배선으로
+                // 켠다. 준비 중·실패·취소 요청이거나 배선이 없으면 켜지 않는다(대상 볼륨은 아직 다 옮기지 않았다). 갈아타는
+                // 중(`Pivoting`)에 죽었으면 켜지 않는다: 대상이 완전하므로 Task가 배선을 치우고 끝내면 보통 VM으로 켠다 —
+                // 배선으로 켜면 게스트가 오버레이에만 쓰고 Task가 그것을 지운다(리뷰 1 I3).
+                if let Some(lr) = &vm.status.live_restore {
+                    let ready = !lr.cancel
+                        && !matches!(
+                            lr.phase,
+                            LiveRestorePhase::Starting
+                                | LiveRestorePhase::Pivoting
+                                | LiveRestorePhase::Failed
+                        )
+                        && self.hv.live_restore_wired(self.id);
+                    if !ready {
+                        self.backoff = None;
+                        status.phase = VmPhase::Starting;
+                        status.pid = None;
+                        status.last_error = Some(LIVE_RESTORE_NOT_STARTED.into());
+                        return Ok(status);
+                    }
+                } else if self.hv.live_restore_wired(self.id) {
+                    // 끝난(또는 지운) 라이브 복원의 배선이 남았다. 보통 VM으로 켜도록 치운다.
+                    tracing::warn!(vm = %self.id, "removing a live restore wiring left behind");
+                    if let Err(e) = self.hv.set_live_restore(self.id, None).await {
+                        tracing::warn!(vm = %self.id, error = %e, "cannot remove the live restore wiring");
+                    }
+                }
+                // 템플릿(계획 58)은 스펙과 상관없이 켜지 않는다. API가 켜기를 막지만, 막기 전의 쓰기나 저장소를
+                // 직접 고친 경우를 막는다(켜면 연결 복제의 기반 디스크가 바뀐다).
+                if vm.spec.template {
+                    tracing::warn!(vm = %self.id, "not starting a template");
+                    self.backoff = None;
+                    status.phase = VmPhase::Stopped;
+                    status.pid = None;
+                    status.last_error = Some(TEMPLATE_NOT_STARTED.into());
+                    return Ok(status);
+                }
+                // 옮겨 달라고 했다. 리더가 옮기거나(spec의 노드), 포기하거나(power stopped), 사용자가 끌
+                // 때까지 켜지 않는다. 저장소에 요청이 있으면 리더가 쓴 status를 덮지 않는다.
+                let node = self.config.node;
+                if vm.status.ha.as_ref().and_then(|ha| ha.relocate_from) == Some(node) {
+                    self.relocate = None;
+                    self.backoff = None;
+                    return Ok(vm.status.clone());
+                }
+                if let Some(error) = self.relocate.clone() {
+                    self.backoff = None;
+                    status.phase = VmPhase::Failed;
+                    status.pid = None;
+                    status.last_error = Some(error);
+                    status.ha = Some(VmHaStatus {
+                        relocate_from: Some(node),
+                        ..status.ha.unwrap_or_default()
+                    });
+                    return Ok(status);
+                }
+                // 다시 켠다: 지난 옮기기 요청과 HA 오류를 지운다(옮긴 기록은 남긴다).
+                clear_ha(&mut status, |ha| {
+                    ha.relocate_from = None;
+                    ha.error = None;
+                });
+                if self.backoff.as_ref().is_some_and(|(at, _)| *at <= now) {
+                    self.backoff = None;
+                }
+                if let Some(reason) = self.ha_blocked(vm) {
+                    status.phase = if self.config.ha.is_some() {
+                        VmPhase::Starting
+                    } else {
+                        VmPhase::Stopped
+                    };
+                    status.pid = None;
+                    status.last_error = Some(reason);
+                    return Ok(status);
+                }
+                if self.backoff.is_none() {
+                    // 켜는 동안(Starting 기록, 디스크 해석, 변수 받아 오기) 리스가 끝나면 watchdog가
+                    // 시간을 지키도록 도는 HA VM으로 먼저 알린다. 켜지 못하면 뺀다.
+                    self.report_running(vm, true);
+                    let started = self.start_stopped(vm, &mut status).await;
+                    if !self.was_running {
+                        self.report_running(vm, false);
+                    }
+                    if let Some(current) = started? {
+                        return Ok(current);
+                    }
+                }
+                if let Some((at, reason)) = self.backoff.clone() {
+                    self.wake(at);
+                    status.phase = VmPhase::Starting;
+                    status.pid = None;
+                    status.last_error = Some(reason);
+                }
+            }
+            (PowerState::Stopped, Some(state)) => {
+                self.backoff = None;
+                self.relocate = None;
+                match self.stop_requested {
+                    _ if self.force_requested => {
+                        self.hv.stop(self.id, StopMode::Force).await?;
+                        self.force_requested = false;
+                        self.stop_requested = None;
+                        self.stopped_by_us = Some(Instant::now());
+                        status.phase = VmPhase::Stopped;
+                        status.pid = None;
+                        status.hardware = None;
+                        return Ok(status);
+                    }
+                    // QMP를 붙잡는 작업(메모리 스냅샷 등) 중이면 ACPI 요청도 닿지 않는다. 요청을 보내지도
+                    // acpi_timeout을 세지도 않고(끝나면 ACPI부터 다시) 강제 종료로 넘어가지 않는다. 사용자가
+                    // 요청한 강제 정지(위)와 HA 리스를 잃은 강제 종료(`fence`)는 그대로 한다.
+                    _ if matches!(state.status, RuntimeStatus::Busy(_)) => {
+                        tracing::info!(vm = %self.id, status = ?state.status, "VM is busy; stopping it after the operation");
+                        self.stop_requested = None;
+                        self.wake(now + self.config.retry_interval);
+                    }
+                    None => {
+                        // 요청이 실패해도(QMP로 다룰 수 없는 VM) acpi_timeout 뒤 강제 종료한다. 에이전트로 끄기로 했고
+                        // 에이전트가 이 QEMU에서 답한 적이 있으면 에이전트로 끈다(안 되면 드라이버가 ACPI로 넘어간다).
+                        let mode = self.stop_mode(vm, state.pid);
+                        self.stop_requested = Some(now);
+                        self.stopped_by_us = Some(now);
+                        self.wake(now + self.config.acpi_timeout);
+                        if let Err(e) = self.hv.stop(self.id, mode).await {
+                            tracing::warn!(vm = %self.id, error = %e, ?mode, "shutdown request failed; will force after timeout");
+                        }
+                    }
+                    Some(at) if now >= at + self.config.acpi_timeout => {
+                        tracing::warn!(vm = %self.id, "guest ignored ACPI shutdown; forcing");
+                        self.hv.stop(self.id, StopMode::Force).await?;
+                        self.stop_requested = None;
+                        self.stopped_by_us = Some(Instant::now());
+                        status.phase = VmPhase::Stopped;
+                        status.pid = None;
+                        status.hardware = None;
+                        return Ok(status);
+                    }
+                    Some(at) => self.wake(at + self.config.acpi_timeout),
+                }
+                status.phase = VmPhase::Stopping;
+                status.pid = Some(state.pid);
+            }
+            (PowerState::Stopped, None) => {
+                self.fenced = false;
+                self.stop_requested = None;
+                self.force_requested = false;
+                self.awaiting_event = None;
+                self.deactivate_disks(vm).await;
+                self.backoff = None;
+                self.relocate = None;
+                self.failures.clear();
+                // 꺼진 VM은 옮길 것이 없다. HA 오류는 사용자가 다시 켤 때까지 보인다.
+                clear_ha(&mut status, |ha| ha.relocate_from = None);
+                // 포기해서 멈춘 VM은 사용자가 다시 시작할 때까지 Failed로 남긴다.
+                if status.phase != VmPhase::Failed {
+                    status.phase = VmPhase::Stopped;
+                }
+                status.pid = None;
+            }
+        }
+        Ok(status)
+    }
+
+    /// 멈춘 VM을 켠다(Starting 기록, [`Worker::start`]). 켰으면 `was_running`이다. 켜지 않고 그대로
+    /// 돌려줄 status가 있으면 Some이다.
+    async fn start_stopped(
+        &mut self,
+        vm: &mut Vm,
+        status: &mut VmStatus,
+    ) -> Result<Option<VmStatus>, StepError> {
+        if vm.status.phase == VmPhase::Running {
+            // 저장된 phase가 Running인 채 다시 켜면(QEMU가 스스로 끝났다) 그사이 API·Task
+            // 실행기가 실행 중 VM으로 보고 디스크를 늘린다(공유 LVM은 늘린 부분을 0으로 채우기
+            // 전에 QEMU가 연다). 디스크를 해석하기 전에 Starting을 먼저 기록해, 먼저 들어온
+            // 크기 늘리기 Task는 resolve가 보고 나중 것은 API·실행기가 거절하게 한다. 기록하지
+            // 못해도(예: 과반수 없음 — 그동안은 Task도 만들 수 없다) VM은 다시 켠다(설계 10절
+            // 불변식 4). 기록이 시간 초과로 실패한 사이 과반수가 돌아오면 좁은 틈이 남는다.
+            // HA VM은 켜지 않고 다시 시도한다: 과반수가 없으면 리더가 다른 노드에서 켤 수 있다.
+            let mut starting = status.clone();
+            starting.phase = VmPhase::Starting;
+            starting.pid = None;
+            match self.write_status(starting, vm.clone()).await {
+                Ok(()) => match self.cluster.get::<VmSpec>(self.id)? {
+                    // 그 사이 다른 노드로 옮겨졌다. 켜지 않고(status도 쓰지 않고) 다시 읽어 맞춘다.
+                    Some(current) if current.spec.node != Some(self.config.node) => {
+                        *vm = current;
+                        self.wake(Instant::now());
+                        return Ok(Some(vm.status.clone()));
+                    }
+                    Some(current) => *vm = current,
+                    None => return Ok(Some(status.clone())),
+                },
+                Err(e) if vm.spec.ha_active() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(vm = %self.id, error = %e, "cannot record starting phase; restarting anyway");
+                }
+            }
+        }
+        match self.start(vm).await? {
+            Start::Started => {}
+            Start::NotStarted => return Ok(None),
+            // 켜지 않고 status도 쓰지 않는다. 다시 읽어 맞춘다.
+            Start::Changed(current) => {
+                if let Some(current) = current {
+                    *vm = *current;
+                }
+                self.wake(Instant::now());
+                return Ok(Some(vm.status.clone()));
+            }
+        }
+        // 이제 돌고 있다. 곧바로 꺼져도 이벤트보다 먼저 온 재동기화가 다시 시작하지
+        // 않고 이벤트를 기다리게 한다.
+        self.was_running = true;
+        self.fenced = false;
+        self.report_running(vm, true);
+        // 새로 만든 TPM(`fresh`)이나 받아 온 상태의 해시를 곧바로 남긴다.
+        self.firmware_sync_at = Instant::now();
+        // 이 노드의 변수 파일(받아 왔거나 로컬, 없으면 템플릿)로 켰다.
+        self.own_firmware(vm, status);
+        match self.hv.inspect(self.id).await? {
+            Some(state) => {
+                status.phase = VmPhase::Running;
+                status.pid = Some(state.pid);
+                status.last_error = None;
+                status.hardware = self
+                    .started
+                    .clone()
+                    .map(|hw| self.changed_while_starting(vm, hw));
+            }
+            // 시작하자마자 꺼졌다. 뒤따르는 이벤트에서 다시 맞춘다.
+            None => {
+                self.was_running = false;
+                let deadline = Instant::now() + EVENT_GRACE;
+                self.awaiting_event = Some(deadline);
+                self.wake(deadline);
+                status.phase = VmPhase::Starting;
+                status.pid = None;
+            }
+        }
+        Ok(None)
+    }
+
+    /// VM을 시작한다. 시작하지 못하고 실패를 기록했으면(백오프 또는 포기) `NotStarted`. HA VM의 리스가
+    /// 그 사이 끝났으면 실패로 세지 않고 잠시 뒤 다시 본다(백오프, `NotStarted`). HA VM이 그 사이
+    /// 바뀌었으면 `Changed`.
+    async fn start(&mut self, vm: &Vm) -> Result<Start, StepError> {
+        // HA 복구가 이 노드의 복제본으로 켜라고 했으면 디스크를 풀기 전에 복제본을 승격한다. 쓸 복제본이 없으면 켜지
+        // 않는다(다른 노드의 디스크 기록을 그대로 둔다). 일시 오류(받는 QEMU 끄기, 합치기, 클러스터)는 실패로 세지 않고
+        // 잠시 뒤 다시 해 본다.
+        let c = &self.config;
+        match replicas::promote(
+            &self.cluster,
+            &*self.hv,
+            &*c.storage,
+            &c.replica_dir,
+            vm,
+            c.node,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(replicas::PromoteError::Transient(e)) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot promote the replicas of the VM yet; retrying");
+                let delay = self.config.retry_interval;
+                self.backoff = Some((
+                    Instant::now() + delay,
+                    format!("cannot promote the replicas: {e}; retrying in {delay:?}"),
+                ));
+                return Ok(Start::NotStarted);
+            }
+            Err(e @ replicas::PromoteError::Unusable(_)) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot promote the replicas of the VM; not starting");
+                self.restores.lock().unwrap().remove(&self.id);
+                self.power_off = Some(Some(format!("failed to start: {e}")));
+                return Ok(Start::NotStarted);
+            }
+        }
+        let mut spec = match self.resolve(vm).await {
+            Ok(spec) => spec,
+            Err(ResolveError::Cluster(e)) => return Err(e.into()),
+            // 풀이 이 노드에서 아직 준비되지 않았거나(NFS 서버가 멈춤, 마운트 전 등) 디스크를 늘리는
+            // 중이다. 끝나면 시작할 수 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다.
+            Err(
+                e @ (ResolveError::PoolUnavailable(..)
+                | ResolveError::VolumeResizing(_)
+                | ResolveError::VolumeFlattening(_)),
+            ) => {
+                let delay = self.config.retry_interval;
+                self.backoff = Some((
+                    Instant::now() + delay,
+                    format!("{e}; retrying in {delay:?}"),
+                ));
+                return Ok(Start::NotStarted);
+            }
+            // 참조가 틀렸거나, 이 노드가 지원하지 않는 풀(NFS on macOS)이거나, 저장소가 볼륨을
+            // 내주지 못했다. spec을 고치거나 VM을 옮겨야 하므로 다시 시도하지 않는다.
+            Err(e) => {
+                self.restores.lock().unwrap().remove(&self.id);
+                self.power_off = Some(Some(e.to_string()));
+                return Ok(Start::NotStarted);
+            }
+        };
+        self.disks_active = true;
+        // 방금 이 노드에서 켰다(배타).
+        self.disks_shared = false;
+        // TPM 상태를 얻지 못하면(지금 것을 가진 노드가 모두 오프라인) 실패로 세지 않고 켜지 않은 채 다시 본다.
+        let (tpm, keep_tpm) = match self.prepare_firmware(vm).await {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                tracing::warn!(vm = %self.id, error = %reason, "TPM state unavailable; not starting");
+                self.deactivate_disks(vm).await;
+                self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
+                return Ok(Start::NotStarted);
+            }
+        };
+        // 켜기 문턱을 지난 뒤 여기까지 오는 사이 리스가 끝났거나 VM이 바뀌었을 수 있다.
+        match self.ha_recheck(vm)? {
+            Recheck::Go => {}
+            // 실패로 세지 않고 다시 본다.
+            Recheck::NotFresh(reason) => {
+                self.deactivate_disks(vm).await;
+                self.backoff = Some((Instant::now() + self.config.retry_interval, reason.into()));
+                return Ok(Start::NotStarted);
+            }
+            Recheck::Changed(current) => {
+                self.deactivate_disks(vm).await;
+                return Ok(Start::Changed(current));
+            }
+        }
+        // 보안 그룹을 건 단순 네트워크 NIC가 있으면 켜기 직전에 지금 클러스터 상태로 이 노드의 방화벽 규칙을 넣는다.
+        // 넣지 못하면 켜지 않는다(방화벽 없이 도는 순간이 없게). SDN NIC의 그룹은 OVN ACL이다(계획 66 §11.4).
+        if self.simple_firewall(vm) {
+            let Some(gate) = &self.config.firewall else {
+                self.deactivate_disks(vm).await;
+                self.restores.lock().unwrap().remove(&self.id);
+                self.power_off = Some(Some(NO_FIREWALL.into()));
+                return Ok(Start::NotStarted);
+            };
+            if let Err(e) = gate.sync().await {
+                tracing::warn!(vm = %self.id, error = %e, "cannot apply the firewall rules; not starting");
+                self.deactivate_disks(vm).await;
+                self.record_failure(format!("failed to start: firewall: {e}"));
+                return Ok(Start::NotStarted);
+            }
+        }
+        // 실패해도 다시 쓰지 않는다.
+        let restore = self.restores.lock().unwrap().remove(&self.id);
+        let mut hardware = match &restore {
+            Some(tag) => self.snapshot_hardware(vm, tag),
+            None => self.hardware_at_start(vm),
+        };
+        // 새로 켜면 지금 기준·숨김 목록으로 CPU를 해석해 기록한다(계획 63). 메모리 스냅샷은 담을 때의 CPU 그대로이되,
+        // 이 노드가 그 CPU를 켤 수 없으면 QEMU가 실패하기 전에 까닭을 남긴다(리뷰 1 M4).
+        let cpu = match &restore {
+            None => match self.cpu_at_start(vm) {
+                Ok(resolved) => {
+                    hardware.cpu_resolved = resolved;
+                    Ok(())
+                }
+                // 작업자가 스스로 다시 켜는 VM: 보류된 새 CPU를 이 노드가 켤 수 없으면 쓰던 CPU로 켠다(리뷰 2 #4).
+                Err(CpuRefusal::Cannot(reason)) => match self.restart_fallback(&reason) {
+                    Some(previous) => {
+                        hardware.cpu_resolved = Some(previous);
+                        Ok(())
+                    }
+                    None => Err(CpuRefusal::Cannot(reason)),
+                },
+                Err(e) => Err(e),
+            },
+            Some(_) => self.cpu_restorable(&hardware),
+        };
+        // 게스트 NUMA 모양과 이 노드의 pCPU·호스트 노드·hugepages(계획 64): 노드 할당기가 고르고 예약한다.
+        let claim = cpu.and_then(|()| self.numa_at_start(vm, restore.is_some(), &hardware));
+        let pinning = match claim {
+            Ok(claim) => {
+                hardware.numa = claim.numa;
+                hardware.host_placement = claim.placement;
+                // 앞 모양으로 다시 켰거나 스냅샷의 모양이면 스펙과 다른 것이 보류다.
+                hardware.pending.retain(|p| p.field != "numa");
+                hardware
+                    .pending
+                    .extend(orbivisor_types::numa::pending_change(&vm.spec, &hardware));
+                Ok(claim.pinning)
+            }
+            Err(e) => Err(e),
+        };
+        let pinning = match pinning {
+            Ok(pinning) => pinning,
+            Err(CpuRefusal::Waiting(reason)) => {
+                tracing::warn!(vm = %self.id, reason = %reason, "CPU or NUMA placement not ready; not starting");
+                self.deactivate_disks(vm).await;
+                self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
+                return Ok(Start::NotStarted);
+            }
+            Err(CpuRefusal::Cannot(reason)) => {
+                self.deactivate_disks(vm).await;
+                tracing::warn!(vm = %self.id, reason = %reason, "cannot start the VM's CPU or NUMA layout on this node");
+                // VM 상태는 노드 이름을 볼 수 없는 사용자도 읽는다(리뷰 2 #6).
+                let reason = crate::cpu::without_node_name(&reason);
+                self.power_off = Some(Some(format!("failed to start: {reason}")));
+                return Ok(Start::NotStarted);
+            }
+        };
+        apply_hardware(&mut spec, &hardware, &vm.spec);
+        spec.pinning = pinning;
+        // 켜기 규칙으로 얻은 TPM 상태로 켠다(스냅샷 하드웨어에만 TPM이 있으면 이 노드의 상태 그대로).
+        if spec.tpm.is_some() {
+            spec.tpm = Some(tpm.unwrap_or(RuntimeTpm {
+                fresh: false,
+                epoch: vm.status.firmware_epoch,
+            }));
+        }
+        spec.keep_tpm = keep_tpm;
+        let started = self.hv.start(&spec, restore.as_deref()).await;
+        if started.is_err() {
+            self.deactivate_disks(vm).await;
+            self.config.host_alloc.release(self.id);
+        }
+        match (started, restore) {
+            (Ok(()), _) => {
+                // 기록 없이 다시 붙을 때(opld 재시작) 켠 모양을 알 수 있게 실행 디렉터리에 남긴다.
+                if let Err(e) = self.hv.save_hardware(self.id, &hardware) {
+                    tracing::warn!(vm = %self.id, error = %e, "cannot save the hardware record of the started VM");
+                }
+                self.started = Some(hardware);
+                self.restart_cpu = None;
+                self.restart_numa = None;
+                Ok(Start::Started)
+            }
+            // 태그 없이 다시 시도하면 스냅샷이 아닌 처음부터 부팅하게 되므로 일시 오류라도 멈춘다.
+            (Err(e), Some(tag)) => {
+                self.power_off = Some(Some(format!("failed to restore snapshot {tag}: {e}")));
+                Ok(Start::NotStarted)
+            }
+            // 다른 프로세스가 이미지를 잠가 두었다(죽은 노드의 NFS 임대 등, 설계 §4.3). 풀리면 켤 수
+            // 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다. 사용자는 정지로 멈출 수 있다.
+            (Err(e @ DriverError::ImageLocked(_)), None) => {
+                tracing::warn!(vm = %self.id, error = %e, "disk image is locked; will retry");
+                self.backoff = Some((
+                    Instant::now() + self.config.retry_interval,
+                    IMAGE_LOCKED.into(),
+                ));
+                Ok(Start::NotStarted)
+            }
+            (Err(e), None) if e.is_transient() => {
+                self.record_failure(format!("failed to start: {e}"));
+                Ok(Start::NotStarted)
+            }
+            (Err(e), None) => {
+                self.power_off = Some(Some(format!("failed to start: {e}")));
+                Ok(Start::NotStarted)
+            }
+        }
+    }
+
+    /// 켜는 동안 바뀐 스펙을 켠 하드웨어 `hw`의 보류로 남긴다. 그동안 API는 QEMU가 없는 VM으로 보고 핫플러그 Task 없이
+    /// 받았으므로, 켤 때 쓴 스펙(`vm`)과 지금 저장된 스펙의 vCPU·메모리·펌웨어·머신·CD-ROM(드라이브 수·매체·부팅
+    /// 순서)·cloud-init이 다르면 다음 재시작(`restart`) 때 적용할 것으로 적는다(실행 중에 할 수 있는 것 — vCPU·메모리·CD
+    /// 매체 — 은 `vm hotplug`로도 된다).
+    fn changed_while_starting(&self, vm: &Vm, mut hw: RunningHardware) -> RunningHardware {
+        let Ok(Some(now)) = self.cluster.get::<VmSpec>(self.id) else {
+            return hw;
+        };
+        if !hotplug::hardware_changed(&vm.spec, &now.spec) {
+            return hw;
+        }
+        let caps = self
+            .cluster
+            .get::<NodeSpec>(self.config.node)
+            .ok()
+            .flatten()
+            .and_then(|n| n.status.hotplug)
+            .unwrap_or_default();
+        let plan = hotplug::plan_resources(now.id, &now.name, &now.spec, &hw, caps);
+        let late = |field: &str, running: u32, wanted: u32| PendingChange {
+            field: field.into(),
+            running: running.to_string(),
+            wanted: wanted.to_string(),
+            reason: PendingReason::Restart,
+            detail: Some(
+                "changed while the VM was starting; restart it or run `vm hotplug`".into(),
+            ),
+        };
+        let mut pending = plan.pending;
+        for step in plan.steps {
+            match step {
+                Step::SetVcpus(n) => pending.push(late("vcpus", hw.vcpus(), u32::from(n))),
+                Step::SetMemory { .. } => {
+                    pending.push(late("memory_mib", hw.memory_now(), now.spec.memory_mib))
+                }
+                _ => {}
+            }
+        }
+        // CD-ROM 매체는 실행 중에 바꿀 수 있고, 드라이브 수는 다시 켜야 바뀐다.
+        let medium = |iso: &Option<String>| iso.clone().unwrap_or_else(|| "empty".into());
+        if now.spec.cdroms.len() != hw.cdroms.len() {
+            pending.push(PendingChange {
+                field: "cdroms".into(),
+                running: hw.cdroms.len().to_string(),
+                wanted: now.spec.cdroms.len().to_string(),
+                reason: PendingReason::Restart,
+                detail: Some("changed while the VM was starting; restart it".into()),
+            });
+        } else {
+            for (i, (want, run)) in now.spec.cdroms.iter().zip(&hw.cdroms).enumerate() {
+                if want.iso != run.iso {
+                    pending.push(PendingChange {
+                        field: format!("cdroms[{i}]"),
+                        running: medium(&run.iso),
+                        wanted: medium(&want.iso),
+                        reason: PendingReason::Restart,
+                        detail: Some("changed while the VM was starting; run `vm hotplug`".into()),
+                    });
+                }
+            }
+        }
+        hw.pending = pending;
+        hw
+    }
+
+    /// 이 노드에서 켤 VM의 하드웨어(계획 54): 모든 노드가 `hotplug`를 알릴 때만 핫플러그 배치를 두고, 이 노드의
+    /// 능력(`NodeStatus.hotplug`)으로 vCPU·메모리 상한을 정한다. 노드 목록을 읽지 못하면 배치 없이 켠다.
+    fn hardware_at_start(&self, vm: &Vm) -> RunningHardware {
+        let nodes = self
+            .cluster
+            .list::<NodeSpec>()
+            .map(|(_, nodes)| nodes)
+            .unwrap_or_default();
+        let caps = nodes
+            .iter()
+            .find(|n| n.id == self.config.node)
+            .and_then(|n| n.status.hotplug)
+            .unwrap_or_default();
+        RunningHardware::at_start(vm.id, &vm.name, &vm.spec, caps, all_have(&nodes, HOTPLUG)).0
+    }
+
+    /// 이 노드에서 켤 VM의 CPU(계획 63): 클러스터 기준·숨김 목록·이 노드의 카탈로그로 해석하고 켤 수 있는지 본다.
+    /// 문맥이 없으면(업그레이드 중, 노드의 아키텍처·가속기를 모름) None이다(명령줄이 모델만 편다, 기록은 지금과 같다).
+    fn cpu_at_start(&self, vm: &Vm) -> Result<Option<ResolvedCpu>, CpuRefusal> {
+        let ctx = CpuContext::load(&self.cluster, self.config.node)
+            .map_err(|e| CpuRefusal::Waiting(format!("cannot read the CPU settings: {e}")))?;
+        ctx.map(|ctx| ctx.start(&vm.spec.cpu)).transpose()
+    }
+
+    /// 이 노드에서 켤 VM의 게스트 NUMA 모양·배치·고정(계획 64 §10): 새로 켜면 스펙에서, 메모리 스냅샷은 담을 때의
+    /// 모양(`hardware.numa`) 그대로 호스트 쪽만 고른다. 작업자가 스스로 다시 켜는데 보류된 새 모양이 이 노드에 맞지
+    /// 않으면 꺼지기 전의 모양으로 켠다(소켓·메모리가 그대로일 때, 바뀜은 보류로 남는다).
+    fn numa_at_start(
+        &self,
+        vm: &Vm,
+        restore: bool,
+        hardware: &RunningHardware,
+    ) -> Result<Claim, CpuRefusal> {
+        let alloc = &self.config.host_alloc;
+        if restore {
+            // 메모리 스냅샷은 꽂은 메모리 없이 담는다(`matches_boot`).
+            let shape = Shape::Fixed(hardware.numa.as_ref(), &hardware.cpu, &[]);
+            return alloc.claim(&self.cluster, self.id, shape);
+        }
+        // 이 노드가 메모리 핫플러그 없이 켜면(`hardware_at_start`가 상한을 두지 않음) 상한 = 메모리인 모양으로 고른다 —
+        // `any`가 2M에 묶이지 않는다(리뷰 2 N9, 스케줄러·장부의 `hotplug::start_spec`과 같다).
+        let mut spec = vm.spec.clone();
+        if spec.max_memory_mib.is_some() && hardware.max_memory_mib() <= hardware.memory_mib {
+            spec.max_memory_mib = Some(spec.memory_mib);
+        }
+        match alloc.claim(&self.cluster, self.id, Shape::Spec(&spec, &hardware.cpu)) {
+            Err(CpuRefusal::Cannot(reason)) => {
+                let previous = self.restart_numa.as_ref().filter(|n| {
+                    n.nodes.iter().map(|g| g.sockets.len()).sum::<usize>()
+                        == usize::from(hardware.cpu.sockets)
+                        && n.nodes.iter().map(|g| g.memory_mib).sum::<u32>() == hardware.memory_mib
+                });
+                let Some(previous) = previous else {
+                    return Err(CpuRefusal::Cannot(reason));
+                };
+                let claim = alloc
+                    .claim(
+                        &self.cluster,
+                        self.id,
+                        Shape::Fixed(Some(previous), &hardware.cpu, &[]),
+                    )
+                    .map_err(|_| CpuRefusal::Cannot(reason.clone()))?;
+                tracing::warn!(vm = %self.id, reason = %reason, numa = %orbivisor_types::numa::describe(Some(previous)), "restarting the VM with the NUMA layout it ran with; the new layout stays pending");
+                Ok(claim)
+            }
+            r => r,
+        }
+    }
+
+    /// 작업자가 스스로 다시 켜는데(크래시·호스트 SIGTERM·게스트 감시) 지금 스펙·기준·숨김 목록의 CPU를 이 노드가
+    /// 켤 수 없으면(`reason`) 꺼지기 전에 쓰던 CPU를 돌려준다(리뷰 2 #4). 그 CPU도 이 노드가 켤 수 있어야 하고 숨김
+    /// 이름을 새로 드러내지 않아야 한다(그 사이 QEMU를 올렸을 수 있다). 보류 `cpu`는 검사 루프가 다시 적는다 — 다음
+    /// 사용자 전원 껐다 켜기(다른 노드로 옮긴 뒤)가 새 CPU를 쓴다.
+    fn restart_fallback(&self, reason: &str) -> Option<ResolvedCpu> {
+        let previous = self.restart_cpu.clone()?;
+        let ctx = CpuContext::load(&self.cluster, self.config.node).ok()??;
+        if ctx.check(&previous).is_err()
+            || ctx
+                .check_exposed(&previous, "when the VM restarts")
+                .is_err()
+        {
+            return None;
+        }
+        tracing::warn!(
+            vm = %self.id,
+            reason = %reason,
+            cpu = %previous.describe(),
+            "restarting the VM with the CPU it ran with; the new CPU stays pending"
+        );
+        Some(previous)
+    }
+
+    /// 메모리 스냅샷이 담을 때 기록한 CPU를 이 노드가 켤 수 있는지(리뷰 1 M4). 기록이 없으면(계획 63 전) 모델만
+    /// 펴므로 보지 않는다. 기다리면 풀리는 것(카탈로그가 아직 없음)은 막지 않는다 — 스냅샷 태그는 이번 켜기에만 있다.
+    /// 다만 켤 때 뺀 숨김 이름이 있으면 이 노드의 카탈로그로 드러나지 않음을 확인해야 켠다(리뷰 2 #1).
+    fn cpu_restorable(&self, hardware: &RunningHardware) -> Result<(), CpuRefusal> {
+        let Some(resolved) = &hardware.cpu_resolved else {
+            return Ok(());
+        };
+        let Ok(Some(ctx)) = CpuContext::load(&self.cluster, self.config.node) else {
+            return Ok(());
+        };
+        if let Err(CpuRefusal::Cannot(reason)) = ctx.check(resolved) {
+            return Err(CpuRefusal::Cannot(format!(
+                "{reason}; the memory snapshot was taken with that CPU"
+            )));
+        }
+        // 담을 때 그 노드의 QEMU가 몰라 뺀 숨김 이름을 이 노드의 QEMU가 알면 되돌린 게스트에 드러난다(리뷰 2 #1).
+        // 카탈로그를 모르면 확인할 수 없으니 막는다(기다리면 스냅샷 태그가 사라진다).
+        ctx.check_exposed(resolved, "when the memory snapshot is restored")
+            .map_err(CpuRefusal::Cannot)
+    }
+
+    /// 메모리 스냅샷 `tag`(스냅샷 id)를 불러오며 켤 하드웨어: 메모리를 담을 때 도는 QEMU와 같은 장치여야 하므로
+    /// 스냅샷에 적은 하드웨어로 켠다. 적지 않은 스냅샷(계획 54 전, 롤링 업그레이드 중)은 핫플러그 배치 없이 스냅샷의
+    /// 스펙으로 켠다(담을 때의 CPU 모델 — 리뷰 1 M4). 스냅샷을 찾지 못하면 지금 스펙이다.
+    fn snapshot_hardware(&self, vm: &Vm, tag: &str) -> RunningHardware {
+        match tag
+            .parse::<Uuid>()
+            .ok()
+            .and_then(|id| self.cluster.get::<SnapshotSpec>(id).ok().flatten())
+        {
+            Some(s) => s
+                .spec
+                .hardware
+                .unwrap_or_else(|| RunningHardware::legacy(&s.spec.vm_spec)),
+            None => RunningHardware::legacy(&vm.spec),
+        }
+    }
+
+    /// HA VM을 켜거나 이어서 실행하기 직전에 다시 본다: 리스가 살아 있어야 하고, 로컬 저장소의 VM이
+    /// 여전히 이 노드에 배정되어 있고 원하는 상태가 running이어야 한다. 리스가 살아 있으면 그 갱신
+    /// 인덱스까지 이 노드에 적용되어 있으므로 과반수 쪽의 쓰기(다른 노드로의 복구 등)를 본다. HA가 아닌
+    /// VM은 늘 `Go`다.
+    fn ha_recheck(&self, vm: &Vm) -> Result<Recheck, ClusterError> {
+        if !vm.spec.ha_active() {
+            return Ok(Recheck::Go);
+        }
+        if !self.config.ha.as_ref().is_some_and(|g| g.fresh()) {
+            let reason = if self.fenced { HA_FENCED } else { HA_WAITING };
+            return Ok(Recheck::NotFresh(reason));
+        }
+        Ok(match self.cluster.get::<VmSpec>(self.id)? {
+            Some(current)
+                if current.spec.node == Some(self.config.node)
+                    && current.spec.power == PowerState::Running =>
+            {
+                Recheck::Go
+            }
+            current => Recheck::Changed(current.map(Box::new)),
+        })
+    }
+
+    /// 이미 도는 HA VM에 붙는다: watchdog를 켠다(opld를 다시 시작한 뒤 등). 리스가 살아 있지 않으면
+    /// 리스가 바뀔 때 다시 본다. 펜싱이 꺼진 노드면 끄지 않고 그 사실만 남긴다.
+    fn attach_ha(&mut self, status: &mut VmStatus) {
+        let Some(guard) = &self.config.ha else {
+            status.last_error = Some(HA_UNAVAILABLE.into());
+            return;
+        };
+        match guard.arm() {
+            Ok(()) | Err(ArmError::NotFresh) => {}
+            Err(e) => {
+                status.last_error = Some(e.to_string());
+                self.wake(Instant::now() + self.config.retry_interval);
+            }
+        }
+    }
+
+    /// 멈춘 UEFI VM을 새로 켜기 전에, 변수 파일을 가진 노드(`firmware_node`)가 다른 노드면 거기서
+    /// 받아 와 이 노드의 파일을 바꾼다(설계 §5). 받지 못하면(그 노드가 오프라인이다, 파일이 없다 등)
+    /// 경고만 남기고 이 노드의 파일(없으면 템플릿)로 켠다. 도는 VM에 다시 붙거나 마이그레이션을
+    /// 넘겨받을 때는 부르지 않는다(QEMU가 이미 이 노드의 파일을 쓴다).
+    async fn fetch_firmware(&self, vm: &Vm) {
+        let (Some(fetcher), Some(node)) = (&self.config.firmware, vm.status.firmware_node) else {
+            return;
+        };
+        if vm.spec.firmware != Firmware::Uefi || node == self.config.node {
+            return;
+        }
+        match fetcher.fetch(self.id, node).await {
+            Ok(()) => tracing::info!(vm = %self.id, from = %node, "fetched UEFI variables"),
+            Err(e) => {
+                tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
+            }
+        }
+    }
+
+    /// 멈춘 VM을 새로 켜기 전에 펌웨어 파일을 맞춘다(계획 59 §5의 켜기 규칙). TPM이 없는 VM은 UEFI 변수만 받아 온다
+    /// ([`Self::fetch_firmware`], 받지 못해도 켠다). TPM VM은 [`tpm_source`]를 따른다.
+    ///
+    /// - 이 노드의 상태가 지금 것이면(`tpm_node`이거나 해시가 같음) 그것으로 켜고, 변수는 지금처럼 받아 온다.
+    /// - 아니면 `tpm_node`, 그다음 온라인 사본 노드에서 TPM 상태(해시 확인)를 받는다. 변수는 `firmware_node`가 온라인이면
+    ///   거기서, 아니면 TPM 상태를 준 노드에서 받는다(그 노드는 회차가 다른 변수를 주지 않는다).
+    /// - 기록된 TPM 상태가 없으면 새로 만든다(`fresh`, 이 노드에 파일이 있으면 그대로 쓴다).
+    /// - 그 밖이면 켜지 않는다: 남길 문구를 돌려준다(몰래 새 TPM으로 켜지 않는다).
+    ///
+    /// 둘째 값은 드라이버가 회차가 바뀐 이 노드의 파일을 지울 때 TPM 상태를 남길지다([`tpm_is_current`], 리뷰 2).
+    async fn prepare_firmware(&mut self, vm: &Vm) -> Result<(Option<RuntimeTpm>, bool), String> {
+        let me = self.config.node;
+        let local = match self.config.state_dir.clone() {
+            Some(dir) if vm.spec.firmware == Firmware::Uefi => {
+                self.tpm_hash(&dir).await.unwrap_or_else(|e| {
+                    tracing::warn!(vm = %self.id, error = %e, "cannot read the TPM state on this node");
+                    None
+                })
+            }
+            _ => None,
+        };
+        let keep = tpm_is_current(&vm.status, me, local.as_deref());
+        if !vm.spec.tpm {
+            self.fetch_firmware(vm).await;
+            return Ok((None, keep));
+        }
+        let epoch = vm.status.firmware_epoch;
+        let nodes = self
+            .cluster
+            .list::<NodeSpec>()
+            .map(|(_, nodes)| nodes)
+            .unwrap_or_default();
+        let from = match tpm_source(vm, me, local.as_deref(), &nodes) {
+            TpmSource::Local => {
+                self.fetch_firmware(vm).await;
+                return Ok((
+                    Some(RuntimeTpm {
+                        fresh: false,
+                        epoch,
+                    }),
+                    keep,
+                ));
+            }
+            TpmSource::Fresh => {
+                self.fetch_firmware(vm).await;
+                return Ok((Some(RuntimeTpm { fresh: true, epoch }), keep));
+            }
+            TpmSource::Unavailable(reason) => return Err(reason),
+            TpmSource::Fetch(from) => from,
+        };
+        let hash = vm.status.tpm_sha256.clone().unwrap_or_default();
+        if let Some(fetcher) = &self.config.firmware {
+            for node in from {
+                match fetcher.fetch_tpm(self.id, node, &hash, epoch).await {
+                    Ok(()) => {
+                        tracing::info!(vm = %self.id, from = %node, "fetched the TPM state");
+                        if vm.spec.firmware == Firmware::Uefi
+                            && let Some(vars) = vars_source(vm, me, node, &nodes)
+                            && let Err(e) = fetcher.fetch(self.id, vars).await
+                        {
+                            tracing::warn!(vm = %self.id, from = %vars, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
+                        }
+                        return Ok((
+                            Some(RuntimeTpm {
+                                fresh: false,
+                                epoch,
+                            }),
+                            true,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch the TPM state");
+                    }
+                }
+            }
+        }
+        let holder = vm.status.tpm_node.filter(|id| *id != me).map(|id| {
+            nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map_or_else(|| id.to_string(), |n| n.name.clone())
+        });
+        Err(tpm_unavailable(&vm.name, holder.as_deref()))
+    }
+
+    /// 이 노드에 있는 VM의 TPM 상태 파일의 SHA-256. 없으면 None이다. 크기·mtime·inode·ctime이 지난번과 같으면 다시 셈하지
+    /// 않는다.
+    async fn tpm_hash(&mut self, dir: &std::path::Path) -> std::io::Result<Option<String>> {
+        use sha2::{Digest, Sha256};
+        let path = orbivisor_driver::tpm_state_path(dir, self.id);
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.tpm_seen = None;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let key = FileKey::of(&meta)?;
+        if let Some(seen) = &self.tpm_seen
+            && seen.key == key
+        {
+            return Ok(Some(seen.sha256.clone()));
+        }
+        let sha256 = hex::encode(Sha256::digest(tokio::fs::read(&path).await?));
+        self.tpm_seen = Some(TpmSeen {
+            key,
+            sha256: sha256.clone(),
+        });
+        Ok(Some(sha256))
+    }
+
+    /// TPM VM의 상태 파일을 가진 노드(`firmware_node`가 이 노드)에서 해시를 기록하고 사본을 밀어 둔다(계획 59 §5).
+    /// VM이 도는 동안은 `firmware_sync_interval`마다, 멈추거나 켜면 곧바로 본다. 해시가 바뀌면 `tpm_sha256`을 쓰고
+    /// `firmware_copies`를 비운 뒤 사본 대상([`firmware_copy_nodes`])에 다시 밀어 둔다. 꺼진 VM은 사본이 모두 있으면
+    /// 깨우지 않는다(파일이 바뀌지 않는다).
+    async fn sync_firmware(&mut self, vm: &Vm, status: &mut VmStatus) {
+        let node = self.config.node;
+        let tpm = vm.spec.tpm || status.hardware.as_ref().is_some_and(|hw| hw.tpm);
+        if !tpm || vm.spec.node != Some(node) || status.tpm_node != Some(node) {
+            return;
+        }
+        let Some(dir) = self.config.state_dir.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < self.firmware_sync_at {
+            if self.was_running {
+                self.wake(self.firmware_sync_at);
+            }
+            return;
+        }
+        self.firmware_sync_at = now + self.config.firmware_sync_interval;
+        match self.tpm_hash(&dir).await {
+            Ok(Some(hash)) if status.tpm_sha256.as_deref() != Some(hash.as_str()) => {
+                tracing::info!(vm = %self.id, sha256 = %hash, "recording the TPM state");
+                status.tpm_sha256 = Some(hash);
+                status.firmware_copies.clear();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot read the TPM state on this node");
+            }
+        }
+        let complete = self.push_copies(vm, status).await;
+        if self.was_running || !complete {
+            self.wake(self.firmware_sync_at);
+        }
+    }
+
+    /// 아직 사본이 없는 사본 대상에 이 노드의 펌웨어 파일을 밀어 두고 `firmware_copies`에 더한다. 모두 있으면 true다.
+    async fn push_copies(&self, vm: &Vm, status: &mut VmStatus) -> bool {
+        let (Some(fetcher), Some(hash)) = (&self.config.firmware, status.tpm_sha256.clone()) else {
+            return true;
+        };
+        // 사본은 변수와 TPM 상태를 함께 둔다. 이 노드의 변수가 지금 것일 때만 민다.
+        if status.firmware_node != Some(self.config.node) {
+            return true;
+        }
+        let Ok((_, nodes)) = self.cluster.list::<NodeSpec>() else {
+            return false;
+        };
+        let group = vm
+            .spec
+            .ha
+            .as_ref()
+            .and_then(|ha| ha.group.as_deref())
+            .and_then(|name| self.cluster.get_by_name::<HaGroupSpec>(name).ok().flatten());
+        let mut current = vm.clone();
+        current.status = status.clone();
+        let targets = firmware_copy_nodes(&current, &nodes, group.as_ref().map(|g| &g.spec));
+        let mut complete = true;
+        for to in targets {
+            if status.firmware_copies.contains(&to) {
+                continue;
+            }
+            let copy = FirmwareCopy {
+                vm: self.id,
+                to,
+                sha256: hash.clone(),
+                epoch: status.firmware_epoch,
+                secure_boot: vm.spec.secure_boot,
+            };
+            match fetcher.push(&copy).await {
+                Ok(()) => {
+                    tracing::info!(vm = %self.id, to = %to, "pushed a firmware copy");
+                    status.firmware_copies.push(to);
+                }
+                Err(e) => {
+                    tracing::warn!(vm = %self.id, to = %to, error = %e, "cannot push a firmware copy; will retry");
+                    complete = false;
+                }
+            }
+        }
+        complete
+    }
+
+    /// 게스트 정보 수집(계획 59 §8): 에이전트 채널이 있는 VM의 에이전트에서 `guest_info_interval`마다 정보를 모아 캐시에
+    /// 둔다. 답하지 않으면 앞 정보를 그대로 둔다. VM이 실행 중이 아닌 동안(일시 정지 등)은 묻지 않는다.
+    async fn poll_guest(&mut self, vm: &Vm, state: &ActualState) {
+        if !vm.spec.agent_channel() {
+            self.forget_guest();
+            return;
+        }
+        let now = Instant::now();
+        let mut poll = match self.guest.take() {
+            Some(poll) if poll.pid == state.pid => poll,
+            stale => {
+                // 새 QEMU다: 앞 QEMU의 정보와 답한 기록을 버린다.
+                if stale.is_some()
+                    && let Some(sink) = &self.config.guest_info
+                {
+                    sink.remove(self.id);
+                }
+                GuestPoll {
+                    pid: state.pid,
+                    answered: false,
+                    next: now,
+                }
+            }
+        };
+        if now >= poll.next {
+            poll.next = now + self.config.guest_info_interval;
+            if state.status == RuntimeStatus::Running {
+                match self.hv.guest_info(self.id).await {
+                    Ok(info) => {
+                        poll.answered = true;
+                        if let Some(sink) = &self.config.guest_info {
+                            sink.put(self.id, info);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(vm = %self.id, error = %e, "cannot read guest information");
+                    }
+                }
+            }
+        }
+        self.wake(poll.next);
+        self.guest = Some(poll);
+    }
+
+    /// QEMU가 없거나 이 노드를 떠났다: 게스트 정보를 지운다.
+    fn forget_guest(&mut self) {
+        if self.guest.take().is_some()
+            && let Some(sink) = &self.config.guest_info
+        {
+            sink.remove(self.id);
+        }
+    }
+
+    /// 도는 VM(`pid`)을 끌 방법: `guest_agent.shutdown`이 에이전트이고 에이전트가 이 QEMU에서 답한 적이 있으면(게스트 정보
+    /// 수집이나 게스트 감시) 에이전트, 아니면 ACPI다.
+    fn stop_mode(&self, vm: &Vm, pid: u32) -> StopMode {
+        let agent = vm
+            .spec
+            .guest_agent
+            .is_some_and(|g| g.shutdown == AgentShutdown::Agent);
+        let answered = self
+            .guest
+            .as_ref()
+            .is_some_and(|g| g.pid == pid && g.answered)
+            || self
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.pid == pid && a.answered_once);
+        if agent && answered {
+            StopMode::Agent
+        } else {
+            StopMode::Acpi
+        }
+    }
+
+    /// UEFI VM이 이 노드의 변수 파일로 돈다: 이 노드를 `firmware_node`로 남긴다. BIOS VM은 그대로 둔다. 다른 노드에서
+    /// TPM VM이면 이 노드가 `tpm_node`이고, 다른 노드에서 넘어왔으면 펌웨어 사본은 비운다(계획 59 §10, 해시 기록 뒤 다시
+    /// 밀어 둔다). TPM을 끈 채 돌면 `tpm_node`와 사본은 그대로다([`move_firmware_node`]).
+    fn own_firmware(&self, vm: &Vm, status: &mut VmStatus) {
+        if vm.spec.firmware == Firmware::Uefi {
+            let tpm = vm.spec.tpm || status.hardware.as_ref().is_some_and(|hw| hw.tpm);
+            move_firmware_node(status, self.config.node, tpm);
+        }
+    }
+
+    /// 켜져 있을 수 있는 디스크 볼륨을 끈다(QEMU가 끝난 뒤). 끄지 못하면 경고만 남긴다(켜진 채 남은
+    /// 볼륨은 Task 실행기의 정리가 다시 끈다). 모두 껐으면(끌 것이 없었으면) true다.
+    async fn deactivate_disks(&mut self, vm: &Vm) -> bool {
+        // 끄면 공유도 풀린다.
+        self.disks_shared = false;
+        if !std::mem::take(&mut self.disks_active) {
+            return true;
+        }
+        let mut done = true;
+        for disk in &vm.spec.disks {
+            let found = self
+                .cluster
+                .get_by_name::<VolumeSpec>(&disk.volume)
+                .and_then(|volume| {
+                    let Some(volume) = volume else {
+                        return Ok(None);
+                    };
+                    let pool = self
+                        .cluster
+                        .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?;
+                    Ok(pool.map(|pool| (volume, pool)))
+                });
+            let (volume, pool) = match found {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+                    done = false;
+                    continue;
+                }
+            };
+            if let Err(e) = self
+                .config
+                .storage
+                .deactivate_volume(&pool, volume.id, volume.spec.format)
+                .await
+            {
+                tracing::warn!(vm = %self.id, volume = %disk.volume, error = %e, "cannot deactivate volume");
+                done = false;
+            }
+        }
+        done
+    }
+
+    /// 끈 VM의 디스크 볼륨에 남은 이 노드의 쓰기를 내보낸다([`orbivisor_driver::Storage::sync_volume`] — 파일 풀은
+    /// `fsync`, 블록 장치는 할 일 없음). [`EVICT_SYNC_TIMEOUT`] 안에 끝나지 않으면 오류이고, 그 작업은 끝날 때까지
+    /// 새로 띄우지 않는다(멈춘 NFS에서 쌓이지 않게). 앞서 시간을 넘긴 작업이 그 사이 성공했으면 그것으로 된다.
+    async fn sync_disks(&mut self, vm: &Vm) -> Result<(), String> {
+        if let Some(task) = self.syncing.take() {
+            if !task.is_finished() {
+                self.syncing = Some(task);
+                return Err("still flushing from an earlier attempt".into());
+            }
+            if let Ok(Ok(())) = task.await {
+                return Ok(());
+            }
+        }
+        let mut volumes = Vec::new();
+        for disk in &vm.spec.disks {
+            let volume = self
+                .cluster
+                .get_by_name::<VolumeSpec>(&disk.volume)
+                .map_err(|e| e.to_string())?;
+            let Some(volume) = volume else {
+                continue;
+            };
+            let pool = self
+                .cluster
+                .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
+                .map_err(|e| e.to_string())?;
+            if let Some(pool) = pool {
+                volumes.push((pool, volume.id, volume.spec.format));
+            }
+        }
+        let storage = self.config.storage.clone();
+        let mut task = tokio::spawn(async move {
+            for (pool, id, format) in volumes {
+                storage
+                    .sync_volume(&pool, id, format)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+        match tokio::time::timeout(EVICT_SYNC_TIMEOUT, &mut task).await {
+            Ok(Ok(synced)) => synced,
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => {
+                self.syncing = Some(task);
+                Err(format!("not done within {}s", EVICT_SYNC_TIMEOUT.as_secs()))
+            }
+        }
+    }
+
+    /// 도는 VM의 디스크 볼륨을 다시 이 노드만 쓰게 한다(공유 LVM은 배타 잠금). 마이그레이션의 다른
+    /// 쪽 노드가 아직 볼륨을 끄지 않았으면(원본이 정리 전이다) 잠시 뒤 다시 한다. 그동안에도 VM은
+    /// 돈다.
+    async fn exclusive_disks(&mut self, vm: &Vm) {
+        match set_disks_shared(&self.cluster, vm, &*self.config.storage, false).await {
+            Ok(()) => self.disks_shared = false,
+            Err(e @ (ResolveError::PoolUnavailable(..) | ResolveError::Cluster(_))) => {
+                tracing::info!(vm = %self.id, error = %e, "disks are still shared with another node; will retry");
+                self.wake(Instant::now() + self.config.retry_interval);
+            }
+            Err(e) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot make disks exclusive to this node again");
+                self.disks_shared = false;
+            }
+        }
+    }
+
+    /// 끝나지 않은 채 남은 마이그레이션 표시(`Migrating`, `status.migration`)를 지운다. 이 노드의
+    /// 마이그레이션 Task가 다루지 않는 VM이므로, 원본 opld가 확정 전에 죽었거나(원본 노드) 확정 뒤
+    /// 넘겨받는 중이다(대상 노드). 읽은 revision으로만 쓰므로 그 사이 확정되었으면(남은 확정 쓰기가
+    /// 먼저 적용됨) 쓰지 않고 `None`이다. 쓰기 전에 이 노드의 QEMU가
+    /// 아직 보내고 있으면 취소하고(나중에 끝나 원본이 멈추지 않게, 남은 디스크 미러도 치운다 — 실패하면
+    /// 표시를 남긴 채 오류로 돌아가 다음에 다시 한다. 다만 QEMU에 붙지 못했거나(`NotAttached`) 이 VM에서
+    /// [`CANCEL_ATTEMPTS`]번 잇달아 실패하면 경고 뒤 표시를 지운다: 남은 미러는 대상의 정리가 받는 QEMU를
+    /// 끄면 실패하고 다음 미러·백업 정리가 치운다. 확정 쓰기는 마이그레이션이 끝난 뒤에만 오므로 끝나지
+    /// 않은 마이그레이션을 취소해도 확정과 겹치지 않는다), 쓰고 나서 마이그레이션을 보내고 멈춰 있으면
+    /// (`postmigrate`, 취소하는 사이에 끝난 경우 포함) 이어서 실행한다(HA VM은 reconcile이 리스를 확인한
+    /// 뒤에). 대상의 QEMU는 확정 뒤에만
+    /// 돌므로 두 QEMU가 함께 돌지 않는다. 다시 읽은 VM을 돌려준다.
+    /// 이 노드로 확정된 마이그레이션이 디스크를 복사했으면 표시를 지우기 전에 볼륨 기록을 옮긴
+    /// 위치로 고친다(`apply_disk_moves`, 멱등). 못 고치면 오류로 돌아가 다시 하고, 그동안 디스크를
+    /// 해석하지 않는다.
+    async fn clear_migration(&mut self, vm: &Vm) -> Result<Option<Vm>, StepError> {
+        apply_disk_moves(&self.cluster, vm).await?;
+        if let Err(e) = self.hv.cancel_migration(self.id).await {
+            self.cancel_failures += 1;
+            if !matches!(e, DriverError::NotAttached(_)) && self.cancel_failures < CANCEL_ATTEMPTS {
+                return Err(e.into());
+            }
+            tracing::warn!(vm = %self.id, error = %e, "cannot cancel a migration left behind; clearing its mark anyway (the target's cleanup ends leftover disk mirrors)");
+        }
+        self.cancel_failures = 0;
+        let mut status = vm.status.clone();
+        status.migration = None;
+        if status.phase == VmPhase::Migrating {
+            status.phase = VmPhase::Running;
+        }
+        match self
+            .cluster
+            .update_status_checked::<VmSpec>(self.id, vm.revision, &status)
+            .await
+        {
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => return Ok(None),
+            r => r?,
+        };
+        // HA VM은 reconcile이 리스와 watchdog를 확인한 뒤 이어서 실행한다(이 노드에서 도는 VM의 원본).
+        if !vm.spec.ha_active()
+            && let Some(state) = self.hv.inspect(self.id).await?
+            && state.status == postmigrate()
+        {
+            tracing::warn!(vm = %self.id, "resuming the source of a migration that did not complete");
+            self.hv.resume(self.id).await?;
+        }
+        let vm = self.cluster.get::<VmSpec>(self.id)?;
+        Ok(vm.filter(|vm| vm.spec.node == Some(self.config.node)))
+    }
+
+    /// VM의 런타임 정의. 디스크 볼륨을 활성화한다.
+    async fn resolve(&self, vm: &Vm) -> Result<VmRuntimeSpec, ResolveError> {
+        let c = &self.config;
+        runtime_spec(&self.cluster, vm, c.node, &c.mount_root, &*c.storage).await
+    }
+
+    /// 살아 있는 VM에 다시 붙거나 이어서 실행한다(`start`는 멱등이다). 참조 해석 오류도 돌려준다.
+    /// 방화벽 규칙은 부르는 쪽이 먼저 넣는다([`Worker::sync_firewall`]).
+    /// QEMU가 이미 디스크를 열었으므로 크기 늘리기 Task를 기다리지 않는다. HA VM은 디스크를 해석한 뒤
+    /// 다시 본다([`Worker::ha_recheck`]).
+    async fn reattach(&self, vm: &Vm) -> Result<(), ContinueError> {
+        let c = &self.config;
+        let unresponsive = |e: &dyn std::fmt::Display| ContinueError::Unresponsive(e.to_string());
+        let spec = running_spec(&self.cluster, vm, c.node, &c.mount_root, &*c.storage)
+            .await
+            .map_err(|e| unresponsive(&e))?;
+        match self.ha_recheck(vm) {
+            Ok(Recheck::Go) => {}
+            Ok(Recheck::NotFresh(reason)) => return Err(ContinueError::NotFresh(reason)),
+            Ok(Recheck::Changed(current)) => return Err(ContinueError::Changed(current)),
+            Err(e) => return Err(unresponsive(&e)),
+        }
+        self.hv
+            .start(&spec, None)
+            .await
+            .map_err(|e| unresponsive(&e))
+    }
+
+    /// 보안 그룹을 건 NIC가 있으면 멈춘 채 남은 VM을 이어서 실행하거나 다시 붙기 전에 방화벽 규칙을
+    /// 넣는다. 넣지 못하면 이어서 실행하지 않고 다음 차례에 다시 본다.
+    async fn sync_firewall(&self, vm: &Vm) -> Result<(), ContinueError> {
+        if !self.simple_firewall(vm) {
+            return Ok(());
+        }
+        let unresponsive = |e: &dyn std::fmt::Display| ContinueError::Unresponsive(e.to_string());
+        let Some(gate) = &self.config.firewall else {
+            return Err(unresponsive(
+                &"firewall: this node has no firewall (nftables)",
+            ));
+        };
+        gate.sync()
+            .await
+            .map_err(|e| unresponsive(&format!("firewall: {e}")))
+    }
+
+    /// `vm`을 읽은 뒤 계산한 status를 기록한다. `snapshot`(현재 스냅샷 위치)과 `schedule_error`는
+    /// Task 실행기·예약 작업이 쓰는 값이므로 저장소의 것을 지킨다: revision을 확인하며 쓰고, 그 사이
+    /// 누가 썼으면 다시 읽어 그 값으로 다시 쓴다. `firmware_node`도 이 작업자가 바꾸지 않았으면
+    /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). `rule_violations`는 리더가 쓰므로 늘, `ha`(HA 기록)는
+    /// 이 작업자가 바꾼 필드만 저장소의 값 위에 다시 적용한다([`merge_ha`]). 나머지 필드는 전처럼 이 작업자가
+    /// 계산한 값으로 덮는다. 실행 중 하드웨어 기록(`hardware`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다
+    /// (핫플러그 Task가 쓴다). 복제 상태(`replication`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다(복제 Task와
+    /// 리더가 쓴다). 복제본으로 한 HA 복구 기록(`last_recovery`)은 리더만 쓰므로 늘 저장소의 것이다.
+    async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
+        let keep_firmware = status.firmware_node == vm.status.firmware_node;
+        let keep_tpm_node = status.tpm_node == vm.status.tpm_node;
+        // TPM 해시와 사본은 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다(사본 밀어 두기·마이그레이션 확정·초기화가
+        // 쓴다). 그 사이 초기화됐으면(회차가 바뀜) 이 작업자가 바꿨어도 저장소의 것이다. 회차는 늘 저장소의 것이다.
+        let keep_tpm = status.tpm_sha256 == vm.status.tpm_sha256
+            && status.firmware_copies == vm.status.firmware_copies;
+        let read_epoch = vm.status.firmware_epoch;
+        let keep_hardware = status.hardware == vm.status.hardware;
+        let keep_replication = status.replication == vm.status.replication;
+        let read_ha = vm.status.ha.clone().unwrap_or_default();
+        let mine = status.ha.clone().unwrap_or_default();
+        loop {
+            status.snapshot = vm.status.snapshot;
+            status.schedule_error = vm.status.schedule_error.clone();
+            if keep_firmware {
+                status.firmware_node = vm.status.firmware_node;
+            }
+            if keep_tpm || vm.status.firmware_epoch != read_epoch {
+                status.tpm_sha256 = vm.status.tpm_sha256.clone();
+                status.firmware_copies = vm.status.firmware_copies.clone();
+            }
+            if keep_tpm_node || vm.status.firmware_epoch != read_epoch {
+                status.tpm_node = vm.status.tpm_node;
+            }
+            status.firmware_epoch = vm.status.firmware_epoch;
+            if keep_hardware {
+                status.hardware = vm.status.hardware.clone();
+            }
+            if keep_replication {
+                status.replication = vm.status.replication.clone();
+            }
+            status.rule_violations = vm.status.rule_violations.clone();
+            status.last_recovery = vm.status.last_recovery;
+            // 라이브 복원 상태는 그 Task만 쓴다(계획 68).
+            status.live_restore = vm.status.live_restore.clone();
+            status.ha = merge_ha(&read_ha, &mine, vm.status.ha.clone());
+            match self
+                .cluster
+                .update_status_checked::<VmSpec>(self.id, vm.revision, &status)
+                .await
+            {
+                Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {
+                    match self.cluster.get::<VmSpec>(self.id)? {
+                        Some(current) if current.spec.node == Some(self.config.node) => {
+                            vm = current
+                        }
+                        // 지워졌거나 그 사이 다른 노드로 옮겨졌다(HA 복구 등). 그 노드의 status를
+                        // 덮지 않는다.
+                        _ => return Ok(()),
+                    }
+                }
+                r => return r.map(|_| ()).map_err(Into::into),
+            }
+        }
+    }
+
+    /// spec.power를 stopped로 바꾸고 status를 기록한다. 둘 다 성공해야 끝난다.
+    async fn write_power_off(&mut self, mut vm: Vm) -> Result<(), StepError> {
+        let error = self.power_off.clone().flatten();
+        if vm.spec.power == PowerState::Running {
+            let mut spec = vm.spec.clone();
+            spec.power = PowerState::Stopped;
+            // 이 단계에서 읽은 뒤 spec이 바뀌었으면 RevisionMismatch로 거부된다. 다음 단계에서
+            // 다시 읽은 revision으로 쓰므로, 그 사이 사용자가 바꾼 spec.power도 stopped로 덮어쓴다.
+            // status는 방금 쓴 revision으로 곧바로 이어 쓴다.
+            vm.revision = self
+                .cluster
+                .update_spec(self.id, Some(vm.revision), vm.labels.clone(), &spec)
+                .await?;
+        }
+        let status = VmStatus {
+            phase: if error.is_some() {
+                VmPhase::Failed
+            } else {
+                VmPhase::Stopped
+            },
+            node: Some(self.config.node),
+            pid: None,
+            last_error: error,
+            snapshot: vm.status.snapshot,
+            schedule_error: vm.status.schedule_error.clone(),
+            migration: None,
+            firmware_node: vm.status.firmware_node,
+            rule_violations: vm.status.rule_violations.clone(),
+            ha: vm.status.ha.clone(),
+            hardware: None,
+            replication: vm.status.replication.clone(),
+            last_recovery: vm.status.last_recovery,
+            tpm_sha256: vm.status.tpm_sha256.clone(),
+            firmware_copies: vm.status.firmware_copies.clone(),
+            firmware_epoch: vm.status.firmware_epoch,
+            tpm_node: vm.status.tpm_node,
+            live_restore: vm.status.live_restore.clone(),
+        };
+        self.write_status(status, vm).await?;
+        self.power_off = None;
+        self.backoff = None;
+        self.failures.clear();
+        Ok(())
+    }
+}
+
+/// status의 HA 기록을 고친다. 기본값이 되면 기록을 뺀다.
+fn clear_ha(status: &mut VmStatus, change: impl FnOnce(&mut VmHaStatus)) {
+    if let Some(ha) = status.ha.as_mut() {
+        change(ha);
+        if *ha == VmHaStatus::default() {
+            status.ha = None;
+        }
+    }
+}
+
+/// 처음 읽은 HA 기록 `read`에서 이 작업자가 바꾼 필드(`mine`과 다른 필드)만 저장소의 값 `stored` 위에 다시
+/// 적용한다. 그 사이 리더가 쓴 값(포기한 오류 문구 등)은 이 작업자가 그 필드를 바꾸지 않았으면 남는다.
+fn merge_ha(
+    read: &VmHaStatus,
+    mine: &VmHaStatus,
+    stored: Option<VmHaStatus>,
+) -> Option<VmHaStatus> {
+    let mut ha = stored.unwrap_or_default();
+    if mine.relocate_from != read.relocate_from {
+        ha.relocate_from = mine.relocate_from;
+    }
+    if mine.relocations != read.relocations {
+        ha.relocations = mine.relocations.clone();
+    }
+    if mine.error != read.error {
+        ha.error = mine.error.clone();
+    }
+    if mine.evict != read.evict {
+        ha.evict = mine.evict.clone();
+    }
+    (ha != VmHaStatus::default()).then_some(ha)
+}
+
+/// 끄기 요청(`ha.evict`)이 지난 것이면 지운다: 다른 노드에 내린 요청(리더가 그 노드에 있을 때만 쓰므로 VM이 그
+/// 사이 옮겨졌다 — 전원 끄기 뒤 복구 등)이거나 원하는 상태가 stopped거나(사용자가 껐다) HA가 꺼졌다.
+fn drop_stale_evict(status: &mut VmStatus, node: Uuid, spec: &VmSpec) {
+    let stale =
+        |e: &HaEvict| e.from != node || spec.power == PowerState::Stopped || !spec.ha_active();
+    if status
+        .ha
+        .as_ref()
+        .and_then(|ha| ha.evict.as_ref())
+        .is_some_and(stale)
+    {
+        clear_ha(status, |ha| ha.evict = None);
+    }
+}
+
+/// `started` HA VM의 게스트 감시 시간(`ha.guest_watch`). 없으면 감시하지 않는다.
+fn guest_watch(vm: &Vm) -> Option<Duration> {
+    let ha = vm
+        .spec
+        .ha
+        .as_ref()
+        .filter(|ha| ha.state == HaState::Started)?;
+    ha.guest_watch
+        .map(|w| Duration::from_secs(u64::from(w.timeout_secs)))
+}
+
+/// 모든 노드(위트니스·관찰 노드 포함)가 `ha-placement`를 알린다. 읽지 못하면 아니라고 본다.
+fn ha_placement_everywhere(cluster: &Cluster) -> bool {
+    cluster.list::<NodeSpec>().is_ok_and(|(_, nodes)| {
+        nodes
+            .iter()
+            .all(|n| n.status.features.iter().any(|f| f == HA_PLACEMENT))
+    })
+}
+
+fn postmigrate() -> RuntimeStatus {
+    RuntimeStatus::Other("postmigrate".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 크기·mtime이 같아도 다른 파일로 바뀌면(rename) TPM 해시 캐시의 열쇠가 다르다(리뷰 1 M2).
+    #[test]
+    fn the_tpm_hash_key_sees_a_replaced_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tpm2-00.permall");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let first = std::fs::metadata(&path).unwrap();
+        let before = FileKey::of(&first).unwrap();
+        let other = tmp.path().join("new");
+        std::fs::write(&other, b"bbbb").unwrap();
+        let file = std::fs::File::options().write(true).open(&other).unwrap();
+        file.set_modified(first.modified().unwrap()).unwrap();
+        drop(file);
+        std::fs::rename(&other, &path).unwrap();
+        let after = FileKey::of(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert_eq!((after.len, after.modified), (before.len, before.modified));
+        assert_ne!(after, before);
+    }
+
+    /// 리더가 포기하며 오류를 쓴 사이 이 작업자가 꺼진 VM의 요청만 지웠으면 리더의 오류와 기록을 지킨다.
+    #[test]
+    fn merging_ha_reapplies_only_the_fields_this_worker_changed() {
+        let node = Uuid::now_v7();
+        let read = VmHaStatus {
+            relocate_from: Some(node),
+            relocations: vec![10],
+            relocated_from: None,
+            error: None,
+            evict: None,
+        };
+        let mine = VmHaStatus {
+            relocate_from: None,
+            ..read.clone()
+        };
+        let leader = VmHaStatus {
+            relocate_from: None,
+            relocations: vec![10],
+            relocated_from: Some(Uuid::now_v7()),
+            error: Some("gave up after 1 relocations".into()),
+            evict: None,
+        };
+        assert_eq!(
+            merge_ha(&read, &mine, Some(leader.clone())),
+            Some(leader.clone())
+        );
+        // 처음 쓸 때(저장소가 읽은 그대로)는 이 작업자의 값이다.
+        assert_eq!(
+            merge_ha(&read, &mine, Some(read.clone())),
+            Some(mine.clone())
+        );
+        // 이 작업자가 바꾸지 않았으면 저장소의 값 그대로다(없으면 없음).
+        assert_eq!(merge_ha(&read, &read, Some(leader.clone())), Some(leader));
+        assert_eq!(merge_ha(&read, &read, None), None);
+        // 모두 기본으로 돌아가면 쓰지 않는다.
+        let empty = VmHaStatus {
+            relocate_from: Some(node),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_ha(&empty, &VmHaStatus::default(), Some(empty.clone())),
+            None
+        );
+    }
+
+    /// 끄기 요청(`evict`)을 거둔 것도 이 작업자의 변경으로 다시 적용하고, 그 사이 리더가 쓴 오류는 지킨다.
+    #[test]
+    fn merging_ha_reapplies_a_withdrawn_evict_request() {
+        let node = Uuid::now_v7();
+        let read = VmHaStatus {
+            evict: Some(HaEvict {
+                from: node,
+                check: "stor".into(),
+                reason: "HA check stor failed: down".into(),
+                at: 1,
+            }),
+            ..Default::default()
+        };
+        let mine = VmHaStatus {
+            relocate_from: Some(node),
+            evict: None,
+            ..Default::default()
+        };
+        let leader = VmHaStatus {
+            error: Some("HA check other failed".into()),
+            ..read.clone()
+        };
+        assert_eq!(
+            merge_ha(&read, &mine, Some(leader)),
+            Some(VmHaStatus {
+                relocate_from: Some(node),
+                error: Some("HA check other failed".into()),
+                ..Default::default()
+            })
+        );
+        // 거두지 않았으면 저장소의 요청을 지킨다.
+        assert_eq!(merge_ha(&read, &read, Some(read.clone())), Some(read));
+    }
+}

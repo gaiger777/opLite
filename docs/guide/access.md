@@ -18,7 +18,7 @@ Node.js 22.12 이상과 pnpm이 필요하다.
 ```bash
 pnpm -C web install
 pnpm -C web build                                   # web/dist
-cargo build -p opld --release --features web-ui     # web/dist를 바이너리에 넣는다
+cargo build -p orbivisord --release --features web-ui     # web/dist를 바이너리에 넣는다
 ```
 
 브라우저는 클러스터 CA를 모르므로 처음 접속하면 인증서 경고가 뜬다. CA를 내려받아

@@ -1689,7 +1689,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-api"
+name = "option-ext"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orbivisor-api"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -1712,14 +1718,14 @@ dependencies = [
  "lettre",
  "libc",
  "openraft",
- "opl-cluster",
- "opl-driver",
- "opl-peer",
- "opl-qemu",
- "opl-reconciler",
- "opl-restore",
- "opl-store",
- "opl-types",
+ "orbivisor-cluster",
+ "orbivisor-driver",
+ "orbivisor-peer",
+ "orbivisor-qemu",
+ "orbivisor-reconciler",
+ "orbivisor-restore",
+ "orbivisor-store",
+ "orbivisor-types",
  "proptest",
  "rcgen",
  "reqwest",
@@ -1745,7 +1751,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-cluster"
+name = "orbivisor-cluster"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1754,7 +1760,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "openraft",
- "opl-types",
+ "orbivisor-types",
  "redb",
  "serde",
  "serde_json",
@@ -1766,7 +1772,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-driver"
+name = "orbivisor-driver"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1774,10 +1780,10 @@ dependencies = [
  "fs4",
  "hex",
  "libc",
- "opl-qemu",
- "opl-restore",
- "opl-store",
- "opl-types",
+ "orbivisor-qemu",
+ "orbivisor-restore",
+ "orbivisor-store",
+ "orbivisor-types",
  "rcgen",
  "rustix",
  "rustls",
@@ -1795,7 +1801,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-peer"
+name = "orbivisor-peer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1806,9 +1812,9 @@ dependencies = [
  "hex",
  "hyper",
  "openraft",
- "opl-cluster",
- "opl-driver",
- "opl-types",
+ "orbivisor-cluster",
+ "orbivisor-driver",
+ "orbivisor-types",
  "rcgen",
  "rustls",
  "rustls-pki-types",
@@ -1829,12 +1835,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-qemu"
+name = "orbivisor-qemu"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "insta",
- "opl-types",
+ "orbivisor-types",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -1843,16 +1849,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-reconciler"
+name = "orbivisor-reconciler"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
  "openraft",
- "opl-cluster",
- "opl-driver",
- "opl-qemu",
- "opl-types",
+ "orbivisor-cluster",
+ "orbivisor-driver",
+ "orbivisor-qemu",
+ "orbivisor-types",
  "redb",
  "rustix",
  "serde",
@@ -1866,12 +1872,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-restore"
+name = "orbivisor-restore"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "flate2",
- "opl-types",
+ "orbivisor-types",
  "proptest",
  "rustix",
  "serde",
@@ -1881,7 +1887,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-store"
+name = "orbivisor-store"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -1897,7 +1903,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lz4_flex",
- "opl-types",
+ "orbivisor-types",
  "proptest",
  "rcgen",
  "ring",
@@ -1918,7 +1924,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opl-types"
+name = "orbivisor-types"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
@@ -1934,7 +1940,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oplctl"
+name = "orbivisorctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1942,7 +1948,7 @@ dependencies = [
  "futures-util",
  "hex",
  "native-tls",
- "opl-types",
+ "orbivisor-types",
  "rcgen",
  "reqwest",
  "rpassword",
@@ -1960,7 +1966,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opld"
+name = "orbivisord"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1971,15 +1977,15 @@ dependencies = [
  "hex",
  "libc",
  "openraft",
- "opl-api",
- "opl-cluster",
- "opl-driver",
- "opl-peer",
- "opl-qemu",
- "opl-reconciler",
- "opl-store",
- "opl-types",
- "oplctl",
+ "orbivisor-api",
+ "orbivisor-cluster",
+ "orbivisor-driver",
+ "orbivisor-peer",
+ "orbivisor-qemu",
+ "orbivisor-reconciler",
+ "orbivisor-store",
+ "orbivisor-types",
+ "orbivisorctl",
  "rcgen",
  "reqwest",
  "rust-embed",
@@ -1996,12 +2002,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
-
-[[package]]
-name = "option-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "password-hash"

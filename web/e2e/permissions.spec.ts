@@ -4,7 +4,7 @@ import { expect, type Page, test } from "@playwright/test";
 
 // 계획 62: 전역 역할이 없는 사용자(alice, 그룹으로 /teamA operator)는 VM 목록·폴더 트리·팔레트에 자기 폴더만
 // 보고, + 만들기가 그 폴더를 골라 둔다. 인증 앱을 켜면 로그인에 둘째 단계가 생긴다. 클러스터·폴더·VM·사용자·grant는
-// Rust 테스트(`crates/opld/tests/web.rs`)가 준비한다.
+// Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비한다.
 const user = process.env.OPL_USER ?? "";
 const password = process.env.OPL_PASSWORD ?? "";
 if (!user || !password) {

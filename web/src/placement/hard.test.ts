@@ -1,4 +1,4 @@
-// 서버 `opl-api` `placement.rs`의 `hard_violations` 시험 표를 옮긴 것(같은 입력 → 같은 어김 이름).
+// 서버 `orbivisor-api` `placement.rs`의 `hard_violations` 시험 표를 옮긴 것(같은 입력 → 같은 어김 이름).
 import type { Node, PlacementRule, Vm } from "@/api/types";
 import { haGroup, NODE, placementRule, vm } from "@/test/fixtures";
 import { hardViolations, type RuleSubject, subjectOf } from "@/placement/hard";

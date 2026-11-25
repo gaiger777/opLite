@@ -135,7 +135,7 @@ it("speaks the notes in Korean", () => {
 
 /**
  * 대표 상태 열둘(설계 §7.6 교차 시험): 웹이 짓는 CLI 명령과 `POST /vms`(또는 배포) 본문을 고정 파일로 남긴다. Rust 시험
- * (`crates/oplctl`)이 이 파일의 명령을 CLI 파서에 넣어 가짜 API가 받은 본문이 웹의 본문과 같은지 본다. 파일이 다르면
+ * (`crates/orbivisorctl`)이 이 파일의 명령을 CLI 파서에 넣어 가짜 API가 받은 본문이 웹의 본문과 같은지 본다. 파일이 다르면
  * 실패한다 — 바꿀 때는 `UPDATE_FIXTURES=1 pnpm -C web test src/vmBuilder`.
  */
 const CASES: [string, () => BuilderState][] = [

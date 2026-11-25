@@ -1,0 +1,174 @@
+[package]
+name = "orbivisord"
+description = "Orbivisor node daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# 크레이트 이름(-p orbivisord)은 두고 설치하는 바이너리 이름만 제품 이름으로 한다(옛 이름 opld는 패키지의 링크).
+autobins = false
+
+[[bin]]
+name = "orbivisord"
+path = "src/main.rs"
+
+# 개발·시험 서버(계획 73 §10.3 — Terraform 수용 시험·웹 데모). 배포 빌드에는 없다.
+[[bin]]
+name = "orbivisor-devserver"
+path = "src/bin/orbivisor-devserver.rs"
+required-features = ["devserver"]
+
+[features]
+# 실제 QEMU로 CLI부터 콘솔, kill -9 뒤 재연결까지 확인하는 E2E 테스트.
+# macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다.
+qemu-it = []
+# VM NIC를 Linux 브리지에 잇는 E2E 테스트(qemu-it와 함께). Linux에서 root와 iproute2가 필요하다(방화벽
+# E2E는 nftables도).
+net-it = []
+# 웹 UI(web/dist)를 바이너리에 넣는다. 먼저 `pnpm -C web build`로 만든다. 디버그 빌드는 없어도 되고
+# 안내 페이지를 준다.
+web-ui = []
+# 실제 NFS 풀을 마운트하는 E2E 테스트. Linux에서 root, NFS 클라이언트(nfs-common), qemu-img와
+# 127.0.0.1에 내보낸 디렉터리(`OPL_TEST_NFS_EXPORT`)가 필요하다.
+nfs-it = []
+# 실제 LVM-thin 풀의 볼륨으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root, lvm2,
+# qemu-io와 테스트가 LV를 만들고 지워도 되는 VG/thin pool(`OPL_TEST_LVM=VG/THINPOOL`)이 필요하다.
+lvm-it = []
+# 실제 ZFS 풀의 볼륨(zvol)으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root,
+# zfsutils-linux, qemu-io와 테스트가 zvol을 만들고 지워도 되는 데이터셋(`OPL_TEST_ZFS=POOL/DATASET`)이 필요하다.
+zfs-it = []
+# 실제 Ceph RBD 풀의 볼륨(RBD 이미지)으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서 root,
+# ceph-common, qemu-block-extra, qemu-io, `client.admin`으로 접속할 수 있는 ceph.conf·키링과 테스트가
+# 이미지를 만들고 지워도 되는 Ceph 풀(`OPL_TEST_RBD=POOL`)이 필요하다.
+rbd-it = []
+# 실제 공유 LVM 풀(lvmlockd 공유 VG)의 볼륨으로 VM을 띄우는 E2E 테스트. qemu-it의 준비물에 더해 Linux에서
+# root, lvm2-lockd와 sanlock(또는 dlm), qemu-io와 테스트가 LV를 만들고 지워도 되는 공유 VG
+# (`OPL_TEST_LVM_SHARED=VG`)가 필요하다. `OPL_TEST_ISCSI=PORTAL,TARGET`이 있으면 VG가 그 iSCSI 타깃의
+# LUN 위에 있다고 보고, 시험 전에 잠금을 멈추고 로그아웃해 opld가 다시 로그인하게 한다.
+lvm-shared-it = []
+# 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
+# `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
+web-it = ["qemu-it", "web-ui", "fake-vsphere"]
+# 시험 안에 가짜 vSphere(orbivisor-api `fake-vsphere`)를 띄워 실제 opld로 VMware 이전을 보는 E2E(계획 72 `tests/vmware_migration.rs`,
+# qemu-it와 함께 — qemu-img가 필요하다)와 브라우저 E2E(`web-it`가 켠다). 배포 빌드에는 없다.
+fake-vsphere = ["orbivisor-api/fake-vsphere"]
+# Orbivisor가 Ceph를 설치·구성하는 E2E(계획 56): Ceph가 없는 깨끗한 호스트에서 orbivisord가 apt로 Ceph 꾸러미를
+# 받아 mon·mgr을 세우고, 시험이 만든 루프 장치에 OSD를 만들고(시험 끝에 뗀다), RBD 풀을 등록해 VM을 켠다.
+# qemu-it와 함께 켜고, Linux(Ubuntu 24.04)에서 root, apt가 닿는 네트워크와 qemu-block-extra가 필요하다. 호스트에
+# Ceph 꾸러미와 데몬을 남기므로 CI 러너에서만 돌린다.
+ceph-it = []
+# 실제 게스트로 설치 매체와 cloud-init을 보는 E2E(계획 57): 설치 ISO(`OPL_TEST_INSTALL_ISO`, Alpine virt)로 BIOS·UEFI VM이
+# CD에서 부팅하는지, 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04 qcow2)에 cloud-init이 적용되는지 본다.
+# qemu-it와 함께 켜고, KVM이 있는 x86_64 Linux와 ovmf, 인터넷에서 받아 둔 두 파일이 필요하다(CI `install-media` 작업).
+install-media-it = []
+# 실제 게스트로 템플릿·연결 복제를 보는 E2E(계획 58): 받아 둔 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04 qcow2)를
+# 관리자 카탈로그 항목으로 받아 템플릿을 만들고, 연결 복제 둘이 cloud-init으로 켜져 보고하는지, 평탄화한 VM이 다시 켜지는지
+# 본다. qemu-it와 함께 켜고, KVM이 있는 x86_64 Linux와 ovmf가 필요하다(CI `install-media` 작업).
+templates-it = []
+# 실제 swtpm으로 vTPM을 보는 E2E(계획 59): TPM VM의 상태 만들기·해시 기록·초기화(`vtpm.rs`), migration-it와 함께
+# 켜면 두 노드 사이 TPM 상태 옮기기·받아 오기(`migration.rs`), ha-it와 함께 켜면 사본 노드로의 HA 복구(`ha.rs`).
+# qemu-it의 준비물에 더해 swtpm·swtpm-tools(Linux CI `linux-kvm`)가 필요하다. install-media-it와 함께 켜면 받아 둔
+# Ubuntu 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`)를 TPM·Secure Boot·게스트 에이전트로 켜는 실제 게스트 시험도 돈다
+# (KVM이 있는 x86_64 Linux와 Secure Boot 키를 넣은 ovmf, CI `install-media` 작업).
+vtpm-it = ["qemu-it"]
+# 한 호스트의 opld 둘로 실행 중인 VM을 공유 풀 위에서 옮기고 노드마다 다른 로컬 디렉터리 풀 사이로 디스크를
+# 복사하며 옮기는 라이브 마이그레이션 E2E. qemu-it의 준비물과 qemu-img, qemu-io가 필요하다. nfs-it·rbd-it·
+# lvm-shared-it와 함께 켜면 그 풀로도 옮기고, lvm-it·zfs-it와 함께 켜면 디렉터리 → 그 블록 풀 → 디렉터리로
+# 디스크를 복사하며 왕복한다(그 시험의 준비물).
+migration-it = []
+# 한 호스트의 opld 둘(프로세스 펜싱)과 위트니스로 죽은 노드의 HA VM을 리더가 다른 노드에서 켜는지 보는
+# E2E. qemu-it의 준비물과 qemu-img가 필요하다.
+# 제어 소켓의 `POST /v1/test/isolate`·`/v1/test/heal`로 노드 간 통신을 끊고 잇는다(orbivisor-peer `fault-it`).
+ha-it = ["orbivisor-peer/fault-it"]
+# 시험 빌드에만 있는 굶김 시험 고리: 설정 `[test] block_api_ms`와 제어 소켓의 `POST /v1/test/block-api`
+# (`api` 실행기의 작업자를 모두 막음)·`GET /v1/test/raft`(리더·임기·리스 나이). 배포 빌드에는 넣지 않는다.
+# opld 셋으로 리더의 `api` 실행기를 막아도 HA 리스와 Raft 리더가 그대로인지 보는 시험(QEMU 없음).
+starve-it = []
+# 시험 빌드에만 있는 지표 기록·경보 고리(계획 60): 설정 `[test] metrics_flush_secs`·`metrics_push_secs`로 기록·밀어 넘기기
+# 주기를, `alert_tick_ms`로 경보 평가 간격과 해제 대기를 줄인다. QEMU 없이 재시작 뒤 기록과 경보 발생·해제를 보는 시험이
+# 쓴다(qemu-it에도 같은 고리가 있다).
+metrics-it = []
+# 실제 QEMU로 CPU 모델·플래그를 보는 E2E(계획 63): 노드 탐침의 카탈로그, 숨긴 플래그가 vCPU에서 꺼졌는지(QMP `qom-get`),
+# 실행 중 붙인 vCPU와 마이그레이션 받는 쪽도 같은지, 노드가 못 주는 플래그를 켜면 `enforce`로 켜지 않는지. 제어 소켓에
+# 시험 고리(`/v1/test/vm-cpu`·`cpu-mask`·`vcpu-props`)를 더한다. qemu-it의 준비물이 필요하고, x86_64 시험은 KVM이 있는
+# Linux(CI `linux-kvm`), 이 Mac(aarch64)은 TCG로 명명 모델과 `sve` 숨기기만 본다.
+cpu-it = ["qemu-it"]
+# 실제 Linux 호스트의 NUMA 토폴로지 탐침(계획 64): 이 호스트의 `/sys`를 읽어 찍고, 2M hugepages를 실행 중 예약했다가
+# 되돌리며(`nr_hugepages` 쓰기), 다른 프로세스의 스레드 친화를 건다. root와 `OPL_TEST_NUMA_SYS=1`이 있을 때만 `/sys`에 쓴다
+# (CI `linux-kvm`). 실제 VM 시험(`tests/numa.rs`, 스테이지 4)은 전용 VM의 vCPU·에뮬레이터 스레드 고정과 스코프 cpuset,
+# 2M hugepages 백엔드, 공유 VM, 실행 중 붙인 vCPU, 한 호스트의 opld 둘 사이 마이그레이션 뒤 다시 고정을 본다(설정은
+# `node resources`·`vm create --cpu-policy` 명령으로). qemu-it의 준비물이 필요하다.
+numa-it = []
+# Orbivisor가 OVN을 설치·구성하는 E2E(계획 65): OVN이 없는 깨끗한 호스트에서 orbivisord가 apt로 `ovn-central`·`ovn-host`·
+# `openvswitch-switch`를 받아 노드 하나에 NB·SB Raft 클러스터와 northd(Orbivisor 단위, 노드 주소의 `pssl`만, 클러스터 CA mTLS)를
+# 세우고 chassis로 구성한다(`sdn-init`). 같은 호스트에 `ovsdb-server` 한 쌍을 127.0.0.2로 띄워 두 번째 중앙의 합류·떠나기를
+# 실제 ovsdb로 본다. Task와 SDN 네트워크, 노드 physnet·공급자 네트워크·라우터·유동 IP(계획 66)는 API와 orbivisorctl로
+# 만든다. 부하 분산·NIC QoS·단순 → SDN 옮기기·OVN 잠금(계획 67)도 API와 orbivisorctl(`lb`·`vm nic-qos`·`network migrate`·
+# `sdn lockdown`)로 — 실제 LB 트래픽·건강 검사 넘김·바깥 VIP·QoS 속도 측정(iperf3)·단순 NIC tc·옮기기 다리를 본다.
+# Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하고, 호스트에 OVN 꾸러미와 데몬을 남기므로 CI 러너(`ovn` 작업)에서만 돌린다.
+sdn-it = []
+# 실제 QEMU로 백업 저장소(계획 68)에 백업·복원·라이브 복원하는 E2E(`tests/backup_store.rs` — orbivisorctl로). qemu-it의 준비물과
+# qemu-img·qemu-io·qemu-nbd가 필요하다(CI `linux-kvm`).
+backup-it = ["qemu-it"]
+# S3 호환 저장소(CI: SeaweedFS)로 백업 저장소 E2E(`tests/backup_s3.rs`): HTTP·사용자 CA HTTPS, GC와 백업 동시, 저장소 멈춤(docker pause) 도중의 백업·
+# 라이브 복원, 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·넘겨받기). backup-it의 준비물에 더해 환경 변수 `OPL_S3_ENDPOINT`·
+# `OPL_S3_TLS_ENDPOINT`·`OPL_S3_CA`·`OPL_S3_ACCESS_KEY`·`OPL_S3_SECRET_KEY`·`OPL_S3_CONTAINER`(멈춤 시험의 docker 컨테이너
+# 이름)가 필요하다(CI `backup-s3` 작업).
+s3-it = ["backup-it"]
+# 실제 도우미 이미지로 파일 단위 복원(계획 69)을 보는 E2E(`tests/file_restore.rs` — orbivisorctl `backup files`): 암호화 저장소 백업과
+# 옛 풀 증분 체인을 열어 나열·파일·zip·tar.gz를 고정물과 견주고, 닫기·도우미 `kill -9`·opld 다시 시작 뒤 남은 것이 없는지 본다.
+# backup-it의 준비물에 더해 도우미 이미지 디렉터리(`OPL_RESTORE_IMAGE_DIR` — packaging/restore-image/build.sh)와 고정물 디스크
+# (`OPL_RESTORE_FIXTURES` — crates/orbivisor-restore/tests/fixtures/make-disks.sh의 ext4.img·ext4-dirty.img·expected.sha256), unzip과 tar가
+# 필요하다. 둘 중 하나가 없으면 시험을 건너뛴다.
+restore-it = ["backup-it"]
+# 여러 노드 SDN E2E(계획 66 스테이지 6): 한 호스트에 privileged systemd 컨테이너 셋(`ci/sdn-node/Dockerfile`)으로 Orbivisor
+# 노드 셋을 띄워 실제 OVN Raft 셋·Geneve·SNAT·분산·중앙 유동 IP·게이트웨이 넘김·죽은 중앙 내쫓기·두 chassis 마이그레이션을
+# orbivisorctl로 본다. Linux에서 root, docker와 이미지, 커널 모듈 openvswitch·geneve, tcpdump가 필요하고 호스트에 도커 망·
+# 브리지를 잠시 만든다(CI `sdn-multinode` 작업).
+sdn-multinode-it = []
+
+# 노드 하나·가짜 하이퍼바이저·메모리 스토리지로 API를 내는 실행 파일 `orbivisor-devserver`(계획 73 — Terraform 공급자 수용 시험,
+# GitHub `terraform` 작업). 배포 빌드에는 없다.
+devserver = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+libc.workspace = true
+openraft.workspace = true
+orbivisor-api.workspace = true
+orbivisor-cluster.workspace = true
+orbivisor-driver.workspace = true
+orbivisor-peer.workspace = true
+orbivisor-qemu.workspace = true
+orbivisor-reconciler.workspace = true
+# `orbivisord backup-serve` 헬퍼(계획 68)
+orbivisor-store.workspace = true
+orbivisor-types.workspace = true
+reqwest.workspace = true
+rust-embed.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+orbivisorctl.workspace = true
+orbivisor-store = { workspace = true, features = ["test-util"] }
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -35,12 +35,12 @@ RULES=(
 	'packaging/repo/build-repo.sh|Origin·Label은 제품 이름이 바뀌어도 opLite'
 	'packaging/tests/build-repo-test.sh|Origin·Label은 일부러 opLite'
 	# 시험 IdP의 client_id·aud(시험 자료)
-	'crates/opl-api/src/oidc.rs|"oplite"'
-	'crates/opl-api/tests/common/idp.rs|"oplite"|`oplite`'
-	'crates/opl-api/tests/oidc_login.rs|oplite:client-secret'
-	'crates/opl-api/tests/realms.rs|"oplite"'
-	'crates/opl-types/src/realm.rs|"oplite"'
-	'crates/oplctl/src/cli.rs|"oplite"|client id: oplite'
+	'crates/orbivisor-api/src/oidc.rs|"oplite"'
+	'crates/orbivisor-api/tests/common/idp.rs|"oplite"|`oplite`'
+	'crates/orbivisor-api/tests/oidc_login.rs|oplite:client-secret'
+	'crates/orbivisor-api/tests/realms.rs|"oplite"'
+	'crates/orbivisor-types/src/realm.rs|"oplite"'
+	'crates/orbivisorctl/src/cli.rs|"oplite"|client id: oplite'
 	'web/src/realms/RealmsPage.test.tsx|"oplite"'
 	# 전환 패키지를 만들고 시험하는 파일에만 있는 모양(전환 패키지의 문서 디렉터리, 옛 V0 트리 등)
 	'packaging/deb/build-deb.sh|usr/share/doc/oplite'
@@ -142,12 +142,12 @@ expect() {
 	if leftover "$2" "$3"; then got=left; fi
 	if [ "$got" = "$1" ]; then ok "규칙 $1: $2: $3"; else fail "규칙 $2: $3 → $got (기대 $1)"; fi
 }
-expect clean crates/opld/src/config.rs '"/etc/apt/sources.list.d/oplite.sources".into()'
+expect clean crates/orbivisord/src/config.rs '"/etc/apt/sources.list.d/oplite.sources".into()'
 expect clean packaging/tests/repo-test.sh "grep -qx 'Origin: opLite' \"\$REPO/dists/trixie/Release\""
-expect clean crates/oplctl/src/cli.rs '            "oplite",'
+expect clean crates/orbivisorctl/src/cli.rs '            "oplite",'
 expect clean packaging/deb/build-deb.sh 'TRANS_DEB="$OUT_DIR/oplite_${VERSION}_amd64.deb"'
-expect left crates/oplctl/src/cli.rs 'about = "opLite command-line client"'
-expect left crates/opl-api/src/oidc.rs 'oplite.sources and opLite'
+expect left crates/orbivisorctl/src/cli.rs 'about = "opLite command-line client"'
+expect left crates/orbivisor-api/src/oidc.rs 'oplite.sources and opLite'
 expect left packaging/deb/build-deb.sh 'Description: opLite node'
 expect left web/src/App.tsx '"oplite"'
 expect clean packaging/deb/control.in 'Breaks: oplite (<< @VERSION@)'

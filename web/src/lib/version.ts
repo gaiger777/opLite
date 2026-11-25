@@ -60,7 +60,7 @@ function split(v: string): [string, string, string] {
 }
 
 /**
- * 두 버전을 Debian 규칙으로 비교한다(`opl_types::version::compare`와 같다): `[에포크:]업스트림[-리비전]`,
+ * 두 버전을 Debian 규칙으로 비교한다(`orbivisor_types::version::compare`와 같다): `[에포크:]업스트림[-리비전]`,
  * `~`는 끝보다도 낮다. 형식에 맞지 않는 문자열도 같은 규칙으로 비교한다.
  */
 export function compareVersions(a: string, b: string): number {

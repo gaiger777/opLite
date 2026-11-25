@@ -1,10 +1,10 @@
 import { defineConfig, devices } from "@playwright/test";
 
 // 실제 opld(QEMU)에 붙는 E2E. opld와 준비는 Rust 테스트가 한다:
-// `pnpm -C web build && cargo test -p opld --features web-it --test web`
+// `pnpm -C web build && cargo test -p orbivisord --features web-it --test web`
 if (!process.env.OPL_URL) {
   throw new Error(
-    "Set OPL_URL to a running opld (run through `cargo test -p opld --features web-it --test web`).",
+    "Set OPL_URL to a running opld (run through `cargo test -p orbivisord --features web-it --test web`).",
   );
 }
 

@@ -1,0 +1,720 @@
+//! 방화벽 에이전트. 클러스터의 모든 VM에서 보안 그룹을 건 NIC를 모아 이 노드의 nftables 테이블
+//! `bridge opl_<태그>` 하나로 넣는다(VM이 어느 노드에 있든 — 마이그레이션·복구로 언제 올지 모른다).
+//! 워커가 VM을 켜기 직전에 부르는 확인([`FirewallGate`])도 같은 일을 한다.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use async_trait::async_trait;
+use orbivisor_cluster::Cluster;
+use orbivisor_cluster::watch::{Watch, WatchEvent};
+use orbivisor_driver::{Firewall, FirewallNic, ruleset};
+use orbivisor_reconciler::FirewallGate;
+use orbivisor_types::network::{Network, NetworkSpec, tap_name};
+use orbivisor_types::resource::Kind;
+use orbivisor_types::security_group::{SecurityGroup, SecurityGroupSpec, nic_policy};
+use orbivisor_types::vm::{NicSpec, Vm, VmSpec};
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinHandle;
+
+use crate::config::Config;
+use crate::host::Host;
+
+/// 바뀐 것이 없어도 규칙을 다시 넣는 간격(누가 테이블을 지웠거나 바꿨을 때)
+const FIREWALL_REFRESH: Duration = Duration::from_secs(60);
+/// VM·SecurityGroup이 바뀌면 이만큼 모아 한 번에 넣는다.
+const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// 클러스터의 방화벽 NIC(보안 그룹을 건 NIC). tap은 그 NIC의 tap 이름, 규칙은 NIC의 그룹 순서·그룹
+/// 안 순서로 펼친 것이다. MAC이 없는 NIC는 건너뛰고(아직 켤 수 없다), 없는 그룹은 규칙이 없는 것으로
+/// 보되 그 NIC의 규칙 끝에 나가기 차단을 더한다(들어오기·나가기 모두 앞 규칙에 맞는 것만 통한다).
+/// 실행 중인 VM은 스펙의 NIC에 더해 도는 QEMU에 아직 붙은 NIC(`status.hardware.nics`, MAC으로 맞춤 — 스펙에서
+/// 뺐지만 게스트가 아직 내려 주지 않은 것)도 기록된 보안 그룹으로 막는다. 같은 순번(같은 tap)에 스펙의 다른 NIC가
+/// 있으면 tap은 QEMU에 붙은 NIC의 것이므로 기록된 NIC가 이긴다. SDN(OVN) 네트워크(`networks`에서 `sdn`인 것)의 NIC는
+/// 건너뛴다: 그 tap은 OVS 포트라 Linux 브리지 nftables 훅을 타지 않는다(계획 66부터 SDN NIC의 그룹은 리더 `OvnSync`가
+/// OVN ACL로 건다). 펼치기는 OVN 쪽과 같은 [`nic_policy`]다.
+pub fn firewall_nics(
+    vms: &[Vm],
+    groups: &[SecurityGroup],
+    networks: &[Network],
+) -> Vec<FirewallNic> {
+    let sdn: BTreeSet<&str> = networks
+        .iter()
+        .filter(|n| n.spec.is_sdn())
+        .map(|n| n.name.as_str())
+        .collect();
+    let mut nics = Vec::new();
+    for vm in vms {
+        let running = vm.status.hardware.iter().flat_map(|hw| {
+            hw.nics
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| !vm.spec.nics.iter().any(|s| s.mac == n.mac))
+        });
+        // 그 순번의 tap을 QEMU의 다른 NIC가 쓰고 있다(아직 붙지 않은 스펙의 NIC).
+        let taken = |i: usize, nic: &NicSpec| {
+            vm.status
+                .hardware
+                .as_ref()
+                .and_then(|hw| hw.nics.get(i))
+                .is_some_and(|h| h.mac != nic.mac)
+        };
+        let wanted = vm
+            .spec
+            .nics
+            .iter()
+            .enumerate()
+            .filter(|(i, nic)| !taken(*i, nic));
+        for (i, nic) in wanted.chain(running) {
+            if nic.security_groups.is_empty() || sdn.contains(nic.network.as_str()) {
+                continue;
+            }
+            let Some(mac) = nic.mac else {
+                continue;
+            };
+            nics.push(FirewallNic {
+                tap: tap_name(vm.id, i),
+                mac,
+                rules: nic_policy(&nic.security_groups, groups).rules,
+            });
+        }
+    }
+    nics
+}
+
+/// 지금 클러스터 상태로 규칙 글을 만들어 넣는다. 에이전트 루프와 워커의 시작 직전 확인이 함께 쓰며
+/// 한 번에 하나씩만 넣는다.
+pub struct FirewallRules {
+    cluster: Arc<Cluster>,
+    firewall: Arc<dyn Firewall>,
+    tag: String,
+    /// 마지막으로 넣은 글. 이 잠금이 넣기를 직렬화한다.
+    last: Mutex<Option<String>>,
+}
+
+impl FirewallRules {
+    /// 위트니스가 아니고 이 노드에 방화벽(nftables)이 있을 때만 있다.
+    pub fn new(
+        cluster: Arc<Cluster>,
+        config: &Config,
+        host: &Host,
+        tag: String,
+    ) -> Option<Arc<Self>> {
+        if config.witness {
+            return None;
+        }
+        let firewall = host.firewall.clone()?;
+        Some(Arc::new(Self {
+            cluster,
+            firewall,
+            tag,
+            last: Mutex::new(None),
+        }))
+    }
+
+    /// 규칙 글을 만들어 넣는다. `force`가 아니면 마지막으로 넣은 글과 같을 때 건너뛴다. 넣었으면 true.
+    async fn apply(&self, force: bool) -> anyhow::Result<bool> {
+        let mut last = self.last.lock().await;
+        const READ: &str = "cannot read cluster state for the firewall";
+        let (_, vms) = self.cluster.list::<VmSpec>().context(READ)?;
+        let (_, groups) = self.cluster.list::<SecurityGroupSpec>().context(READ)?;
+        let (_, networks) = self.cluster.list::<NetworkSpec>().context(READ)?;
+        let text = ruleset(&self.tag, &firewall_nics(&vms, &groups, &networks));
+        if !force && last.as_deref() == Some(text.as_str()) {
+            return Ok(false);
+        }
+        // 실패하면 다음 차례에 같은 글이어도 다시 넣는다.
+        *last = None;
+        self.firewall
+            .apply(&text)
+            .await
+            .context("cannot apply the firewall rules")?;
+        *last = Some(text);
+        Ok(true)
+    }
+
+    /// 이 클러스터의 테이블을 지운다(클러스터에서 빠질 때).
+    async fn clear(&self) -> anyhow::Result<()> {
+        let mut last = self.last.lock().await;
+        *last = None;
+        self.firewall.apply(&ruleset(&self.tag, &[])).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl FirewallGate for FirewallRules {
+    /// 바뀐 것이 없어 보여도 다시 넣는다(누가 테이블을 지웠어도 켜기 전에 되살린다).
+    async fn sync(&self) -> Result<(), String> {
+        self.apply(true)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// 방화벽 에이전트 작업
+pub struct FirewallAgent {
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+    rules: Arc<FirewallRules>,
+}
+
+impl FirewallAgent {
+    pub fn spawn(rules: Arc<FirewallRules>) -> Self {
+        let (shutdown, rx) = oneshot::channel();
+        Self {
+            shutdown,
+            task: tokio::spawn(run_firewall(rules.clone(), FIREWALL_REFRESH, rx)),
+            rules,
+        }
+    }
+
+    /// 멈춘다. 규칙은 그대로 둔다(VM이 계속 돈다). 다만 클러스터에서 빠졌으면(`left`, 이 노드에 배정된
+    /// VM이 없다) 테이블을 지운다. 지우지 못하면 경고만 남긴다.
+    pub async fn shutdown(self, left: bool) {
+        let _ = self.shutdown.send(());
+        let _ = self.task.await;
+        if !left {
+            return;
+        }
+        if let Err(e) = self.rules.clear().await {
+            tracing::warn!(error = %e, "cannot remove the firewall rules after leaving the cluster");
+        }
+    }
+}
+
+async fn run_firewall(
+    rules: Arc<FirewallRules>,
+    refresh: Duration,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(refresh);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watch = None;
+    loop {
+        // 주기 차례(시작 포함)에는 바뀌지 않았어도 다시 넣는다.
+        let force = tokio::select! {
+            _ = &mut shutdown => return,
+            _ = interval.tick() => true,
+            () = firewall_changed(&mut watch) => {
+                // 잇따른 변경을 모은다. 구독이 끊긴 때도 같이 기다려 다시 구독하기를 몰아치지 않는다.
+                tokio::select! {
+                    _ = &mut shutdown => return,
+                    () = tokio::time::sleep(DEBOUNCE) => {}
+                }
+                watch = None;
+                false
+            }
+        };
+        // 이번에 읽을 목록 뒤의 변경을 놓치지 않게 먼저 구독한다.
+        if watch.is_none() {
+            watch = rules
+                .cluster
+                .list::<VmSpec>()
+                .ok()
+                .and_then(|(revision, _)| rules.cluster.watch(revision).ok());
+        }
+        // 하던 적용은 끊지 않는다. 종료는 차례 사이에서만 본다.
+        if let Err(e) = rules.apply(force).await {
+            tracing::warn!(error = %e.root_cause(), "{e}");
+        }
+    }
+}
+
+/// VM이나 SecurityGroup 리소스가 바뀔 때까지 기다린다. 구독이 끊기면(뒤처짐, 스냅샷 설치) 구독을
+/// 버리고 돌아가 넣은 뒤 다시 구독하게 한다. 구독이 없으면 기다리기만 한다.
+async fn firewall_changed(watch: &mut Option<Watch>) {
+    let Some(w) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        match w.next().await {
+            Ok(
+                WatchEvent::Put {
+                    kind: Kind::Vm | Kind::SecurityGroup,
+                    ..
+                }
+                | WatchEvent::Deleted {
+                    kind: Kind::Vm | Kind::SecurityGroup,
+                    ..
+                },
+            ) => return,
+            Ok(WatchEvent::Reset { .. }) | Err(_) => {
+                *watch = None;
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use super::*;
+    use orbivisor_cluster::types::NodeId;
+    use orbivisor_driver::DriverError;
+    use orbivisor_types::resource::Resource;
+    use orbivisor_types::security_group::Rule;
+    use orbivisor_types::vm::{CpuSpec, MacAddr, MachineType, NicModel, NicSpec, PowerState};
+    use uuid::Uuid;
+
+    use crate::bootstrap::tests::single_node;
+
+    /// 받은 글을 기록한다. `fail`이면 실패한다.
+    #[derive(Debug, Default)]
+    struct RecordingFirewall {
+        applied: StdMutex<Vec<String>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Firewall for RecordingFirewall {
+        async fn apply(&self, ruleset: &str) -> Result<(), DriverError> {
+            self.applied.lock().unwrap().push(ruleset.to_string());
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DriverError::ToolFailed {
+                    tool: "nft",
+                    stderr: "boom".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn rule(json: serde_json::Value) -> Rule {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn group(name: &str, rules: Vec<Rule>) -> SecurityGroup {
+        Resource::new(
+            name,
+            SecurityGroupSpec {
+                description: None,
+                rules,
+            },
+        )
+    }
+
+    fn mac(last: u8) -> MacAddr {
+        MacAddr([0x52, 0x54, 0, 0, 0, last])
+    }
+
+    fn nic(mac: Option<MacAddr>, groups: &[&str]) -> NicSpec {
+        NicSpec {
+            ips: Vec::new(),
+            qos: None,
+            network: "lan".into(),
+            model: NicModel::Virtio,
+            mac,
+            security_groups: groups.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    fn vm(name: &str, node: Option<Uuid>, nics: Vec<NicSpec>) -> Vm {
+        Resource::new(
+            name,
+            VmSpec {
+                hugepages: None,
+                numa: None,
+                cpu: CpuSpec {
+                    emulator: None,
+                    policy: Default::default(),
+                    thread_policy: None,
+                    flags: Vec::new(),
+                    sockets: 1,
+                    cores: 1,
+                    model: Default::default(),
+                    max_vcpus: None,
+                },
+                memory_mib: 256,
+                firmware: Default::default(),
+                machine: MachineType::Virt,
+                disks: vec![],
+                nics,
+                power: PowerState::Stopped,
+                restart: Default::default(),
+                node,
+                snapshot_schedule: None,
+                ha: None,
+                placement: None,
+                max_memory_mib: None,
+                replication: Vec::new(),
+                cdroms: vec![],
+                cloud_init: None,
+                template: false,
+                tpm: false,
+                secure_boot: false,
+                guest_agent: None,
+                folder: None,
+            },
+        )
+    }
+
+    #[test]
+    fn firewall_nics_expand_the_groups_of_each_nic() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let web = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "80" }),
+        );
+        let smtp = rule(
+            serde_json::json!({ "direction": "out", "action": "drop", "protocol": "tcp", "ports": "25" }),
+        );
+        let out_drop = rule(serde_json::json!({ "direction": "out", "action": "drop" }));
+        let groups = vec![
+            group("ssh", vec![ssh.clone()]),
+            group("web", vec![web.clone(), smtp.clone()]),
+            group("unused", vec![ssh.clone()]),
+        ];
+        // 노드와 상관없이 모든 VM을 본다.
+        let a = vm(
+            "a",
+            Some(Uuid::now_v7()),
+            vec![
+                // 그룹 없는 NIC는 방화벽이 없다.
+                nic(Some(mac(1)), &[]),
+                // NIC의 그룹 순서대로 펼친다.
+                nic(Some(mac(2)), &["web", "ssh"]),
+                // 없는 그룹은 규칙이 없는 것이고 나가기도 막는다.
+                nic(Some(mac(3)), &["gone"]),
+            ],
+        );
+        let b = vm(
+            "b",
+            None,
+            vec![
+                // MAC이 없는 NIC는 건너뛴다.
+                nic(None, &["ssh"]),
+                nic(Some(mac(5)), &["ssh", "gone", "web"]),
+            ],
+        );
+        let c = vm("c", None, vec![nic(Some(mac(6)), &[])]);
+        assert_eq!(
+            firewall_nics(&[a.clone(), b.clone(), c], &groups, &[]),
+            vec![
+                FirewallNic {
+                    tap: tap_name(a.id, 1),
+                    mac: mac(2),
+                    rules: vec![web.clone(), smtp.clone(), ssh.clone()],
+                },
+                FirewallNic {
+                    tap: tap_name(a.id, 2),
+                    mac: mac(3),
+                    rules: vec![out_drop.clone()],
+                },
+                FirewallNic {
+                    tap: tap_name(b.id, 1),
+                    mac: mac(5),
+                    rules: vec![ssh, web, smtp, out_drop],
+                },
+            ]
+        );
+        assert_eq!(firewall_nics(&[], &groups, &[]), vec![]);
+    }
+
+    /// 계획 66: 펼치기를 `nic_policy`로 옮겨도 nftables 규칙 글이 바이트까지 같다(옮기기 전 글을 그대로 적어 둠).
+    #[test]
+    fn the_ruleset_text_is_unchanged() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22", "remote": "10.0.0.0/8" }),
+        );
+        let web = rule(
+            serde_json::json!({ "direction": "in", "action": "drop", "protocol": "tcp", "ports": "8000-8080" }),
+        );
+        let smtp = rule(
+            serde_json::json!({ "direction": "out", "action": "drop", "protocol": "tcp", "ports": "25" }),
+        );
+        let groups = vec![group("ssh", vec![ssh]), group("web", vec![web, smtp])];
+        let mut a = vm(
+            "a",
+            None,
+            vec![
+                nic(Some(mac(1)), &["web", "ssh"]),
+                nic(Some(mac(2)), &["ssh", "gone"]),
+                nic(Some(mac(3)), &[]),
+            ],
+        );
+        a.id = Uuid::from_u128(0x0195_f7a0_0000_7000_8000_0000_0000_00a1);
+        let text = ruleset("0123456789ab", &firewall_nics(&[a], &groups, &[]));
+        assert_eq!(
+            text,
+            "table bridge opl_0123456789ab {}\ndelete table bridge opl_0123456789ab\ntable bridge opl_0123456789ab {\n\tchain o_op00000000a1n0 {\n\t\tether saddr != 52:54:00:00:00:01 drop\n\t\tmeta protocol arp return\n\t\tct state established,related return\n\t\tct state invalid drop\n\t\tmeta l4proto tcp th dport 25 drop\n\t}\n\tchain i_op00000000a1n0 {\n\t\tmeta protocol arp accept\n\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept\n\t\tudp sport 67 udp dport 68 accept\n\t\tudp sport 547 udp dport 546 accept\n\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tmeta l4proto tcp th dport 8000-8080 drop\n\t\tmeta protocol ip ip saddr 10.0.0.0/8 meta l4proto tcp th dport 22 accept\n\t\tdrop\n\t}\n\tchain o_op00000000a1n1 {\n\t\tether saddr != 52:54:00:00:00:02 drop\n\t\tmeta protocol arp return\n\t\tct state established,related return\n\t\tct state invalid drop\n\t\tdrop\n\t}\n\tchain i_op00000000a1n1 {\n\t\tmeta protocol arp accept\n\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept\n\t\tudp sport 67 udp dport 68 accept\n\t\tudp sport 547 udp dport 546 accept\n\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tmeta protocol ip ip saddr 10.0.0.0/8 meta l4proto tcp th dport 22 accept\n\t\tdrop\n\t}\n\tmap out_nics {\n\t\ttype ifname : verdict\n\t\telements = { \"op00000000a1n0\" : jump o_op00000000a1n0, \"op00000000a1n1\" : jump o_op00000000a1n1 }\n\t}\n\tmap in_nics {\n\t\ttype ifname : verdict\n\t\telements = { \"op00000000a1n0\" : jump i_op00000000a1n0, \"op00000000a1n1\" : jump i_op00000000a1n1 }\n\t}\n\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n\t\tiifname vmap @out_nics\n\t\toifname vmap @in_nics\n\t}\n\tchain input {\n\t\ttype filter hook input priority 0; policy accept;\n\t\tiifname vmap @out_nics\n\t}\n\tchain output {\n\t\ttype filter hook output priority 0; policy accept;\n\t\toifname vmap @in_nics\n\t}\n}\n"
+        );
+    }
+
+    /// SDN(OVN) 네트워크의 NIC는 방화벽 NIC가 아니다(그 tap은 OVS 포트다). 같은 VM의 단순 NIC는 그대로다.
+    #[test]
+    fn sdn_nics_are_skipped() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let groups = vec![group("ssh", vec![ssh.clone()])];
+        let mut sdn_nic = nic(Some(mac(2)), &["ssh"]);
+        sdn_nic.network = "tenant".into();
+        let a = [vm("a", None, vec![nic(Some(mac(1)), &["ssh"]), sdn_nic])];
+        let tenant: Network = Resource::new(
+            "tenant",
+            serde_json::from_value(serde_json::json!({ "sdn": {} })).unwrap(),
+        );
+        let lan: Network = Resource::new(
+            "lan",
+            serde_json::from_value(serde_json::json!({ "bridge": "vmbr0" })).unwrap(),
+        );
+        let plain = FirewallNic {
+            tap: tap_name(a[0].id, 0),
+            mac: mac(1),
+            rules: vec![ssh.clone()],
+        };
+        assert_eq!(
+            firewall_nics(&a, &groups, &[tenant, lan.clone()]),
+            vec![plain.clone()]
+        );
+        // 네트워크가 SDN이 아니면 둘 다다.
+        assert_eq!(firewall_nics(&a, &groups, &[lan]).len(), 2);
+    }
+
+    /// 스펙에서 뺐지만 도는 QEMU에 아직 붙은 NIC(게스트가 내려 주지 않음)는 기록된 보안 그룹으로 계속 막는다.
+    #[test]
+    fn nics_still_in_the_running_qemu_keep_their_rules() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let groups = vec![group("ssh", vec![ssh.clone()])];
+        let mut a = vm(
+            "a",
+            Some(Uuid::now_v7()),
+            vec![nic(Some(mac(1)), &[]), nic(Some(mac(2)), &["ssh"])],
+        );
+        a.status.hardware = Some(orbivisor_types::vm::RunningHardware::legacy(&a.spec));
+        a.spec.nics.pop();
+        assert_eq!(
+            firewall_nics(&[a.clone()], &groups, &[]),
+            vec![FirewallNic {
+                tap: tap_name(a.id, 1),
+                mac: mac(2),
+                rules: vec![ssh.clone()],
+            }]
+        );
+        // QEMU가 내려 주면(기록에서도 빠지면) 규칙이 없다.
+        a.status.hardware = Some(orbivisor_types::vm::RunningHardware::legacy(&a.spec));
+        assert_eq!(firewall_nics(&[a], &groups, &[]), vec![]);
+    }
+
+    /// 스펙의 NIC와 QEMU에 아직 붙은 다른 NIC가 같은 순번(같은 tap)이면 QEMU의 NIC 규칙이 이긴다.
+    #[test]
+    fn the_running_nic_owns_its_tap() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let web = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "80" }),
+        );
+        let groups = vec![group("ssh", vec![ssh.clone()]), group("web", vec![web])];
+        let mut a = vm(
+            "a",
+            Some(Uuid::now_v7()),
+            vec![nic(Some(mac(1)), &[]), nic(Some(mac(2)), &["ssh"])],
+        );
+        a.status.hardware = Some(orbivisor_types::vm::RunningHardware::legacy(&a.spec));
+        // NIC 1을 떼고 다른 NIC를 붙이는 중: 게스트가 아직 mac(2)를 내려 주지 않았다.
+        a.spec.nics[1] = nic(Some(mac(3)), &["web"]);
+        assert_eq!(
+            firewall_nics(&[a.clone()], &groups, &[]),
+            vec![FirewallNic {
+                tap: tap_name(a.id, 1),
+                mac: mac(2),
+                rules: vec![ssh],
+            }]
+        );
+    }
+
+    fn test_config(witness: bool) -> Config {
+        toml::from_str(&format!(
+            "name = \"n\"\naddress = \"h\"\nwitness = {witness}\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false"
+        ))
+        .unwrap()
+    }
+
+    fn test_host(firewall: Option<Arc<RecordingFirewall>>) -> Host {
+        let mut host = Host::from_config(&test_config(false), "t").unwrap();
+        host.net = None;
+        host.firewall = firewall.map(|f| f as Arc<dyn Firewall>);
+        host
+    }
+
+    #[tokio::test]
+    async fn runs_only_on_a_non_witness_node_with_a_firewall() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, _) = single_node(dir.path()).await;
+        let cluster = Arc::new(cluster);
+        let host = test_host(None);
+        assert!(
+            FirewallRules::new(cluster.clone(), &test_config(false), &host, "t".into()).is_none()
+        );
+        let host = test_host(Some(Arc::default()));
+        assert!(
+            FirewallRules::new(cluster.clone(), &test_config(true), &host, "t".into()).is_none()
+        );
+        assert!(
+            FirewallRules::new(cluster.clone(), &test_config(false), &host, "t".into()).is_some()
+        );
+        cluster.shutdown().await.unwrap();
+    }
+
+    fn rules_for(cluster: &Arc<Cluster>, firewall: &Arc<RecordingFirewall>) -> Arc<FirewallRules> {
+        FirewallRules::new(
+            cluster.clone(),
+            &test_config(false),
+            &test_host(Some(firewall.clone())),
+            "abc".into(),
+        )
+        .unwrap()
+    }
+
+    /// 같은 글이면 다시 넣지 않고, 넣기가 실패했거나 강제면(주기 차례, 시작 직전 확인) 다시 넣는다.
+    #[tokio::test]
+    async fn skips_the_same_ruleset_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, _) = single_node(dir.path()).await;
+        let cluster = Arc::new(cluster);
+        let firewall = Arc::new(RecordingFirewall::default());
+        let rules = rules_for(&cluster, &firewall);
+        let count = || firewall.applied.lock().unwrap().len();
+
+        assert!(rules.apply(false).await.unwrap());
+        assert_eq!(
+            *firewall.applied.lock().unwrap(),
+            ["table bridge opl_abc {}\ndelete table bridge opl_abc\n"]
+        );
+        assert!(!rules.apply(false).await.unwrap());
+        assert_eq!(count(), 1);
+        assert!(rules.apply(true).await.unwrap());
+        assert_eq!(count(), 2);
+        rules.sync().await.unwrap();
+        assert_eq!(count(), 3);
+
+        // 실패하면 같은 글이어도 다음 차례에 다시 넣는다.
+        firewall
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = rules.sync().await.unwrap_err();
+        assert!(
+            err.contains("cannot apply the firewall rules") && err.contains("boom"),
+            "{err}"
+        );
+        firewall
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(rules.apply(false).await.unwrap());
+        assert_eq!(count(), 5);
+        assert!(!rules.apply(false).await.unwrap());
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 조건이 맞을 때까지 기다린다.
+    async fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !ok() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// VM·그룹이 바뀌면 주기를 기다리지 않고 다시 넣는다. 규칙 글이 같으면(방화벽과 상관없는 변경)
+    /// 다시 넣지 않는다.
+    #[tokio::test]
+    async fn reapplies_on_vm_and_group_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, NodeId(me)) = single_node(dir.path()).await;
+        let cluster = Arc::new(cluster);
+        let firewall = Arc::new(RecordingFirewall::default());
+        let rules = rules_for(&cluster, &firewall);
+        let (stop, rx) = oneshot::channel();
+        // 주기는 길게 둔다. 시작할 때 한 번, 그 뒤로는 바뀔 때마다 넣는다.
+        let task = tokio::spawn(run_firewall(rules, Duration::from_secs(3600), rx));
+        let applied = || firewall.applied.lock().unwrap().clone();
+        let last = || applied().last().cloned().unwrap_or_default();
+
+        wait_for("first apply", || applied().len() == 1).await;
+        let web = group(
+            "web",
+            vec![rule(
+                serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "80" }),
+            )],
+        );
+        cluster.create(&web).await.unwrap();
+        let guarded = vm("guarded", Some(me), vec![nic(Some(mac(1)), &["web"])]);
+        cluster.create(&guarded).await.unwrap();
+        let tap = tap_name(guarded.id, 0);
+        wait_for("apply after the VM is created", || {
+            last().contains(&format!("chain i_{tap} {{")) && last().contains("th dport 80 accept")
+        })
+        .await;
+
+        // 그룹 규칙을 바꾸면 곧바로 다시 넣는다.
+        let mut spec = web.spec.clone();
+        spec.rules = vec![rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "443" }),
+        )];
+        cluster
+            .update_spec(web.id, None, web.labels.clone(), &spec)
+            .await
+            .unwrap();
+        wait_for("apply after the group changes", || {
+            last().contains("th dport 443 accept") && !last().contains("th dport 80 accept")
+        })
+        .await;
+
+        // 방화벽과 상관없는 VM은 글을 바꾸지 않으므로 다시 넣지 않는다.
+        let before = applied().len();
+        let plain = vm("plain", Some(me), vec![nic(Some(mac(2)), &[])]);
+        cluster.create(&plain).await.unwrap();
+        tokio::time::sleep(DEBOUNCE * 3).await;
+        assert_eq!(applied().len(), before);
+
+        // VM을 지우면 테이블을 지우기만 하는 글이 된다.
+        cluster.delete::<VmSpec>(guarded.id, None).await.unwrap();
+        wait_for("apply after the VM is deleted", || {
+            last() == "table bridge opl_abc {}\ndelete table bridge opl_abc\n"
+        })
+        .await;
+        stop.send(()).unwrap();
+        task.await.unwrap();
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 클러스터에서 빠질 때만 테이블을 지운다.
+    #[tokio::test]
+    async fn leaving_removes_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, NodeId(me)) = single_node(dir.path()).await;
+        let cluster = Arc::new(cluster);
+        cluster.create(&group("web", vec![])).await.unwrap();
+        cluster
+            .create(&vm("guarded", Some(me), vec![nic(Some(mac(1)), &["web"])]))
+            .await
+            .unwrap();
+        let firewall = Arc::new(RecordingFirewall::default());
+        let applied = || firewall.applied.lock().unwrap().clone();
+        let empty = "table bridge opl_abc {}\ndelete table bridge opl_abc\n";
+
+        let agent = FirewallAgent::spawn(rules_for(&cluster, &firewall));
+        wait_for("first apply", || applied().len() == 1).await;
+        agent.shutdown(false).await;
+        assert_eq!(applied().len(), 1);
+        assert!(applied()[0].contains("chain i_"));
+
+        let agent = FirewallAgent::spawn(rules_for(&cluster, &firewall));
+        wait_for("first apply", || applied().len() == 2).await;
+        agent.shutdown(true).await;
+        assert_eq!(applied().len(), 3);
+        assert_eq!(applied()[2], empty);
+        cluster.shutdown().await.unwrap();
+    }
+}

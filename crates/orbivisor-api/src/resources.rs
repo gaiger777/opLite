@@ -1,0 +1,1010 @@
+//! 종류에 상관없는 조회 핸들러와 공통 요청 형식, 풀·네트워크·노드 핸들러.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::header::IF_MATCH;
+use axum::http::{HeaderMap, StatusCode};
+use orbivisor_cluster::types::Rejection;
+use orbivisor_cluster::{Cluster, ClusterError, Typed};
+use orbivisor_types::alert::{AlertRuleSpec, AlertRuleStatus};
+use orbivisor_types::backup_job::{BackupJobSpec, BackupJobStatus};
+use orbivisor_types::ha_check::{HaCheckSpec, HaCheckStatus};
+use orbivisor_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
+use orbivisor_types::node::{Node, NodeRole, NodeSpec, NodeStatus};
+use orbivisor_types::placement::{
+    HaGroupSpec, HaGroupStatus, PlacementRuleSpec, PlacementRuleStatus,
+};
+use orbivisor_types::resource::{Resource, ResourceSpec, validate_name};
+use orbivisor_types::security_group::{SecurityGroupSpec, SecurityGroupStatus};
+use orbivisor_types::storage::{
+    PoolBackend, StoragePool, StoragePoolSpec, StoragePoolStatus, VolumeSpec, VolumeStatus,
+};
+use orbivisor_types::task::{TaskOp, TaskSpec, TaskStatus};
+use orbivisor_types::vm::{VmSpec, VmStatus};
+use orbivisor_types::vm_export::{VmExportSpec, VmExportStatus};
+use orbivisor_types::vm_import::{VmImportSpec, VmImportStatus};
+use orbivisor_types::vmware::{VmwareMigrationSpec, VmwareMigrationStatus};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::auth::{Action, Principal};
+use crate::authz::{AuthzObject, Owned, Owners};
+use crate::backups::check_no_backups;
+use crate::cluster::require_feature;
+use crate::error::{ApiError, Json};
+use crate::state::AppState;
+use orbivisor_types::authz::Privilege;
+use orbivisor_types::node::FOLDERS;
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRequest<S> {
+    pub name: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    pub spec: S,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRequest<S> {
+    /// 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+    /// `null`을 보낼 수 있다).
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub labels: BTreeMap<String, String>,
+    pub spec: S,
+}
+
+/// `null`을 빈 레이블로 받는다.
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    Ok(Option::<BTreeMap<String, String>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct List<T> {
+    pub revision: u64,
+    pub items: Vec<T>,
+}
+
+/// 경로의 `{key}`는 id(UUID)나 이름이다.
+pub fn lookup<S: ResourceSpec>(cluster: &Cluster, key: &str) -> Result<Typed<S>, ApiError> {
+    let found = match Uuid::try_parse(key) {
+        Ok(id) => cluster.get::<S>(id)?,
+        Err(_) => cluster.get_by_name::<S>(key)?,
+    };
+    found.ok_or_else(|| ApiError::not_found(format!("{} {key:?} not found", S::KIND.as_str())))
+}
+
+/// `If-Match: <revision>` (따옴표로 감싸도 된다). 없으면 revision을 확인하지 않는다.
+pub fn if_match(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
+    let Some(value) = headers.get(IF_MATCH) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|v| v.trim().trim_matches('"').parse().ok())
+        .map(Some)
+        .ok_or_else(|| ApiError::bad_request("If-Match must be a resource revision"))
+}
+
+/// 경로에서 id와 이름을 구분할 수 있도록 UUID 모양의 이름은 받지 않는다.
+pub fn check_name(name: &str) -> Result<(), ApiError> {
+    validate_name(name).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if Uuid::try_parse(name).is_ok() {
+        return Err(ApiError::bad_request(format!(
+            "invalid name {name:?}: names must not look like an id"
+        )));
+    }
+    Ok(())
+}
+
+/// 응답으로 내기 전에 리소스에서 가릴 것을 가린다(`public` — 묻는 주체와 그 리소스의 주인에 따라 다를 수 있다).
+type Public<S> = fn(&AppState, &Principal, &Owned, &mut Typed<S>);
+
+/// 목록과 조회가 권한을 보는 법(계획 62)
+pub(crate) trait Visible: ResourceSpec {
+    /// 폴더를 따르는 종류면 참: 목록은 항목마다 거르고, 조회는 경로표가 객체를 본다. 거짓이면 루트 종류다(종류 단위
+    /// 루트 확인).
+    const SCOPED: bool;
+    /// 주인 표(`Owners`)가 있어야 주인을 안다(볼륨·백업·Task).
+    const NEEDS_OWNERS: bool = false;
+
+    /// 항목의 주인. 루트 종류는 쓰지 않는다.
+    fn owned(_owners: &Owners, _item: &Typed<Self>) -> Owned {
+        Owned::cluster()
+    }
+
+    /// 항목 하나의 주인(조회). 주인 표를 다 뜨지 않아도 되면 바꾼다.
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Self::owned(&owners_for::<Self>(state)?, item))
+    }
+}
+
+macro_rules! root_kinds {
+    ($($spec:ty),*) => {$(
+        impl Visible for $spec {
+            const SCOPED: bool = false;
+        }
+    )*};
+}
+
+root_kinds!(
+    VmwareMigrationSpec,
+    NodeSpec,
+    SecurityGroupSpec,
+    BackupJobSpec,
+    HaGroupSpec,
+    HaCheckSpec,
+    AlertRuleSpec,
+    PlacementRuleSpec
+);
+
+macro_rules! in_folder {
+    ($($spec:ty),*) => {$(
+        impl Visible for $spec {
+            const SCOPED: bool = true;
+
+            fn owned(_owners: &Owners, item: &Typed<Self>) -> Owned {
+                Owned::object(AuthzObject::authz_target(item))
+            }
+        }
+    )*};
+}
+
+in_folder!(VmSpec, NetworkSpec, StoragePoolSpec);
+
+impl Visible for VolumeSpec {
+    const SCOPED: bool = true;
+    const NEEDS_OWNERS: bool = true;
+
+    fn owned(owners: &Owners, item: &Typed<Self>) -> Owned {
+        Owned::object(owners.volume(&item.name, &item.spec.pool))
+    }
+
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Owned::object(Owners::around_volume(
+            &state.cluster,
+            &item.name,
+            &item.spec.pool,
+        )?))
+    }
+}
+
+impl Visible for VmImportSpec {
+    const SCOPED: bool = true;
+
+    fn owned(_owners: &Owners, item: &Typed<Self>) -> Owned {
+        Owned::object(Owners::import(item.id))
+    }
+}
+
+/// 내보내기(계획 72)는 VM을 따른다(지운 VM이면 루트).
+impl Visible for VmExportSpec {
+    const SCOPED: bool = true;
+    const NEEDS_OWNERS: bool = true;
+
+    fn owned(owners: &Owners, item: &Typed<Self>) -> Owned {
+        Owned::object(owners.vm(item.spec.vm))
+    }
+
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Owned::object(Owners::around_export(
+            &state.cluster,
+            item.spec.vm,
+        )?))
+    }
+}
+
+impl Visible for TaskSpec {
+    const SCOPED: bool = true;
+    const NEEDS_OWNERS: bool = true;
+
+    fn owned(owners: &Owners, item: &Typed<Self>) -> Owned {
+        owners.task(&item.spec)
+    }
+
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Owners::around_task(&state.cluster, &item.spec)?.task(&item.spec))
+    }
+}
+
+/// 주인 표(필요한 종류만 뜬다)
+fn owners_for<S: Visible>(state: &AppState) -> Result<Owners, ApiError> {
+    if S::NEEDS_OWNERS {
+        Owners::load(&state.cluster)
+    } else {
+        Ok(Owners::default())
+    }
+}
+
+fn list<S: Visible>(
+    state: &AppState,
+    principal: &Principal,
+    public: Public<S>,
+) -> Result<Json<List<Typed<S>>>, ApiError> {
+    if !S::SCOPED {
+        state.authorize(principal, Action::Read, S::KIND)?;
+    }
+    let (revision, items) = state.cluster.list::<S>()?;
+    let owners = owners_for::<S>(state)?;
+    let mut items: Vec<(Owned, Typed<S>)> = items
+        .into_iter()
+        .map(|i| (S::owned(&owners, &i), i))
+        .collect();
+    if S::SCOPED {
+        items = state
+            .authz
+            .filter_by(principal, items, |(owned, _)| *owned)?;
+    }
+    let items = items
+        .into_iter()
+        .map(|(owned, mut item)| {
+            public(state, principal, &owned, &mut item);
+            item
+        })
+        .collect();
+    Ok(Json(List { revision, items }))
+}
+
+fn get<S: Visible>(
+    state: &AppState,
+    principal: &Principal,
+    key: &str,
+    public: Public<S>,
+) -> Result<Json<Typed<S>>, ApiError> {
+    if !S::SCOPED {
+        state.authorize(principal, Action::Read, S::KIND)?;
+    }
+    // 폴더를 따르는 종류는 경로표가 이 객체를 볼 수 있는지 봤다.
+    let mut item = lookup::<S>(&state.cluster, key)?;
+    let owned = S::owned_one(state, &item)?;
+    public(state, principal, &owned, &mut item);
+    Ok(Json(item))
+}
+
+/// 종류별 목록·조회 핸들러. OpenAPI 문서에 종류마다 경로가 따로 필요해 제네릭 핸들러 대신 쓴다. 마지막 인자는 응답에서
+/// 가릴 것을 가리는 함수다(상태·묻는 주체·주인·리소스, 없으면 그대로).
+macro_rules! list_and_get {
+    ($list:ident, $get:ident, $spec:ident, $status:ident, $path:literal, $item_path:literal, $tag:literal) => {
+        list_and_get!($list, $get, $spec, $status, $path, $item_path, $tag, |_, _, _, _| {});
+    };
+    ($list:ident, $get:ident, $spec:ident, $status:ident, $path:literal, $item_path:literal, $tag:literal, $public:expr) => {
+        #[utoipa::path(get, path = $path, tag = $tag, responses(
+                                    (status = 200, body = List<Resource<$spec, $status>>),
+                                    (status = "4XX", body = crate::error::ErrorBody),
+                                ))]
+        pub async fn $list(
+            State(state): State<Arc<AppState>>,
+            principal: Principal,
+        ) -> Result<Json<List<Resource<$spec, $status>>>, ApiError> {
+            list::<$spec>(&state, &principal, $public)
+        }
+
+        #[utoipa::path(get, path = $item_path, tag = $tag,
+                                    params(("key" = String, Path, description = "id or name")),
+                                    responses(
+                                        (status = 200, body = Resource<$spec, $status>),
+                                        (status = "4XX", body = crate::error::ErrorBody),
+                                    ))]
+        pub async fn $get(
+            State(state): State<Arc<AppState>>,
+            principal: Principal,
+            Path(key): Path<String>,
+        ) -> Result<Json<Resource<$spec, $status>>, ApiError> {
+            get::<$spec>(&state, &principal, &key, $public)
+        }
+    };
+}
+
+list_and_get!(
+    list_nodes,
+    get_node,
+    NodeSpec,
+    NodeStatus,
+    "/nodes",
+    "/nodes/{key}",
+    "nodes"
+);
+list_and_get!(
+    list_pools,
+    get_pool,
+    StoragePoolSpec,
+    StoragePoolStatus,
+    "/storage-pools",
+    "/storage-pools/{key}",
+    "storage"
+);
+list_and_get!(
+    list_volumes,
+    get_volume,
+    VolumeSpec,
+    VolumeStatus,
+    "/volumes",
+    "/volumes/{key}",
+    "storage"
+);
+list_and_get!(
+    list_vms,
+    get_vm,
+    VmSpec,
+    VmStatus,
+    "/vms",
+    "/vms/{key}",
+    "vms",
+    |state, principal, owned, vm| crate::vms::mask_spec(
+        state,
+        principal,
+        owned.target,
+        &mut vm.spec
+    )
+);
+list_and_get!(
+    list_networks,
+    get_network,
+    NetworkSpec,
+    NetworkStatus,
+    "/networks",
+    "/networks/{key}",
+    "networks"
+);
+list_and_get!(
+    list_security_groups,
+    get_security_group,
+    SecurityGroupSpec,
+    SecurityGroupStatus,
+    "/security-groups",
+    "/security-groups/{key}",
+    "security-groups",
+    |state, _, _, group| crate::security_groups::count_nics(state, group)
+);
+list_and_get!(
+    list_backup_jobs,
+    get_backup_job,
+    BackupJobSpec,
+    BackupJobStatus,
+    "/backup-jobs",
+    "/backup-jobs/{key}",
+    "backups"
+);
+list_and_get!(
+    list_vm_imports,
+    get_vm_import,
+    VmImportSpec,
+    VmImportStatus,
+    "/vm-imports",
+    "/vm-imports/{key}",
+    "vm-imports"
+);
+list_and_get!(
+    list_vm_exports,
+    get_vm_export,
+    VmExportSpec,
+    VmExportStatus,
+    "/vm-exports",
+    "/vm-exports/{key}",
+    "vm-exports"
+);
+// VMware 이전 계획(계획 72 — 루트 종류, `system.read`)
+list_and_get!(
+    list_vmware_migrations,
+    get_vmware_migration,
+    VmwareMigrationSpec,
+    VmwareMigrationStatus,
+    "/vmware-migrations",
+    "/vmware-migrations/{key}",
+    "vmware"
+);
+list_and_get!(
+    list_ha_groups,
+    get_ha_group,
+    HaGroupSpec,
+    HaGroupStatus,
+    "/ha-groups",
+    "/ha-groups/{key}",
+    "ha"
+);
+list_and_get!(
+    list_ha_checks,
+    get_ha_check,
+    HaCheckSpec,
+    HaCheckStatus,
+    "/ha-checks",
+    "/ha-checks/{key}",
+    "ha"
+);
+list_and_get!(
+    list_alert_rules,
+    get_alert_rule,
+    AlertRuleSpec,
+    AlertRuleStatus,
+    "/alert-rules",
+    "/alert-rules/{key}",
+    "alerts"
+);
+list_and_get!(
+    list_placement_rules,
+    get_placement_rule,
+    PlacementRuleSpec,
+    PlacementRuleStatus,
+    "/placement-rules",
+    "/placement-rules/{key}",
+    "ha"
+);
+list_and_get!(
+    list_tasks,
+    get_task,
+    TaskSpec,
+    TaskStatus,
+    "/tasks",
+    "/tasks/{key}",
+    "tasks",
+    |state, principal, owned, task| crate::volumes::public_task(
+        task,
+        crate::vms::writes_vm(state, principal, owned.target)
+    )
+);
+
+#[utoipa::path(post, path = "/storage-pools", tag = "storage",
+    request_body = CreateRequest<StoragePoolSpec>,
+    responses((status = 201, body = Resource<StoragePoolSpec, StoragePoolStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_pool(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Json(req): Json<CreateRequest<serde_json::Value>>,
+) -> Result<(StatusCode, Json<StoragePool>), ApiError> {
+    check_name(&req.name)?;
+    // `shared`를 적었는지 알아야 하므로 spec은 JSON 값으로 받아 읽는다.
+    let shared_given = req.spec.get("shared").is_some();
+    let mut spec: StoragePoolSpec = serde_json::from_value(req.spec)
+        .map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
+    // 폴더는 모든 노드가 알아야 쓴다(기능 검사가 권한 검사보다 먼저다).
+    if spec.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
+    state.authz.require_new(
+        &principal,
+        Privilege::StorageConfig,
+        StoragePoolSpec::KIND,
+        spec.folder,
+    )?;
+    // 풀의 백엔드는 노드의 경로·VG·데이터셋·Ceph·NFS를 가리킨다: 만들기는 루트 `cluster.admin`이다(폴더의
+    // `storage.config`는 있는 풀의 바꾸기·지우기만, 리뷰 1).
+    require_host_admin(&state, &principal, "creating a storage pool")?;
+    check_pool_spec(&state.cluster, &mut spec, shared_given)?;
+    let mut pool = Resource::new(req.name, spec);
+    pool.labels = req.labels;
+    pool.revision = state.cluster.create(&pool).await?;
+    Ok((StatusCode::CREATED, Json(pool)))
+}
+
+/// 노드의 자원(경로·장치·브리지)을 가리키는 쓰기: 루트 `cluster.admin`이 없으면 403.
+pub(crate) fn require_host_admin(
+    state: &AppState,
+    principal: &Principal,
+    what: &str,
+) -> Result<(), ApiError> {
+    if state.authz.allows(
+        principal,
+        Privilege::ClusterAdmin,
+        orbivisor_types::authz_eval::AuthzTarget::Root,
+    ) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        format!("{what} needs cluster.admin: it points at host paths, devices or bridges"),
+    ))
+}
+
+/// 풀 spec의 값을 검사하고 늘 공유인 백엔드(NFS·RBD·공유 LVM)의 `shared`를 채운다. `shared_given`은 요청이
+/// `shared`를 적었는지다. 풀 만들기 API와 Ceph 풀 등록 Task가 함께 쓴다.
+pub(crate) fn check_pool_spec(
+    cluster: &Cluster,
+    spec: &mut StoragePoolSpec,
+    shared_given: bool,
+) -> Result<(), ApiError> {
+    spec.validate()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // NFS·RBD·공유 LVM 풀은 늘 공유다. `shared`가 없으면 true로 두고 false면 거절한다.
+    let always_shared = match spec.backend {
+        PoolBackend::Nfs { .. } => Some("nfs"),
+        PoolBackend::Rbd { .. } => Some("rbd"),
+        PoolBackend::LvmShared { .. } => Some("lvm-shared"),
+        PoolBackend::Dir { .. } | PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } => None,
+    };
+    if let Some(kind) = always_shared {
+        if shared_given && !spec.shared {
+            return Err(ApiError::bad_request(format!(
+                "{kind} pools are always shared"
+            )));
+        }
+        spec.shared = true;
+    }
+    // LVM-thin·ZFS 풀은 노드 로컬이다.
+    if matches!(spec.backend, PoolBackend::LvmThin { .. }) && spec.shared {
+        return Err(ApiError::bad_request(
+            "lvm-thin pools are node-local; shared must be false",
+        ));
+    }
+    if matches!(spec.backend, PoolBackend::Zfs { .. }) && spec.shared {
+        return Err(ApiError::bad_request(
+            "zfs pools are node-local; shared must be false",
+        ));
+    }
+    for node in &spec.nodes {
+        if cluster.get::<NodeSpec>(*node)?.is_none() {
+            return Err(ApiError::bad_request(format!("node {node} not found")));
+        }
+    }
+    Ok(())
+}
+
+/// 볼륨이나 백업이 남아 있으면 409 `pool_in_use`
+#[utoipa::path(delete, path = "/storage-pools/{key}", tag = "storage",
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn delete_pool(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let pool = lookup::<StoragePoolSpec>(&state.cluster, &key)?;
+    let (_, volumes) = state.cluster.list::<VolumeSpec>()?;
+    if let Some(v) = volumes.iter().find(|v| v.spec.pool == pool.name) {
+        return Err(ApiError::conflict(
+            "pool_in_use",
+            format!("pool {:?} still has volume {:?}", pool.name, v.name),
+        ));
+    }
+    check_no_backups(&state, &pool)?;
+    crate::vm_exports::check_no_exports(&state, &pool)?;
+    state
+        .cluster
+        .delete::<StoragePoolSpec>(pool.id, if_match(&headers)?)
+        .await?;
+    crate::permissions::drop_orphans(&state.cluster).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 풀에서 바꿀 수 있는 값: 디렉터리 풀의 `shared`, dir·NFS 풀의 `backups`. 적지 않은 값은 그대로 둔다.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PoolPatch {
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub shared: Option<bool>,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub backups: Option<bool>,
+}
+
+/// 디렉터리 풀의 `shared`(다른 백엔드는 400, 루트 `cluster.admin`)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수
+/// 있다)를 바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
+/// 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
+/// 백업이 남은 풀의 `backups`를 끄거나 `shared`를 바꾸면 409 `pool_in_use`다. 같은 값이면 쓰지 않고
+/// 그대로 200이다.
+#[utoipa::path(patch, path = "/storage-pools/{key}", tag = "storage",
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
+    request_body = PoolPatch,
+    responses((status = 200, body = Resource<StoragePoolSpec, StoragePoolStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn patch_pool(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<PoolPatch>,
+) -> Result<Json<StoragePool>, ApiError> {
+    if req.shared.is_none() && req.backups.is_none() {
+        return Err(ApiError::bad_request("give shared or backups"));
+    }
+    let expected = if_match(&headers)?;
+    // VM 옮기기·마이그레이션 요청의 검사와 엇갈리지 않게 한다.
+    let _lock = state.vm_lock.lock().await;
+    for _ in 0..10 {
+        let pool = lookup::<StoragePoolSpec>(&state.cluster, &key)?;
+        if let Some(expected) = expected
+            && expected != pool.revision
+        {
+            return Err(ClusterError::Rejected(Rejection::RevisionMismatch {
+                expected,
+                actual: pool.revision,
+            })
+            .into());
+        }
+        let fixed = match pool.spec.backend {
+            PoolBackend::Dir { .. } => None,
+            PoolBackend::Nfs { .. } => Some("nfs pools are always shared"),
+            PoolBackend::Rbd { .. } => Some("rbd pools are always shared"),
+            PoolBackend::LvmShared { .. } => Some("lvm-shared pools are always shared"),
+            PoolBackend::LvmThin { .. } => Some("lvm-thin pools are always node-local"),
+            PoolBackend::Zfs { .. } => Some("zfs pools are always node-local"),
+        };
+        if let Some(why) = fixed.filter(|_| req.shared.is_some()) {
+            return Err(ApiError::bad_request(format!(
+                "only dir pools can change shared; {why}"
+            )));
+        }
+        let mut spec = pool.spec.clone();
+        spec.shared = req.shared.unwrap_or(spec.shared);
+        spec.backups = req.backups.unwrap_or(spec.backups);
+        // `shared`는 모든 노드가 같은 파일을 본다는 호스트 구성의 주장이라(마이그레이션·HA가 믿는다) 풀 만들기처럼
+        // 루트 `cluster.admin`이다(리뷰 2 N11). `backups`는 그 풀의 `storage.config`(경로표)로 충분하다.
+        if spec.shared != pool.spec.shared {
+            state
+                .authz
+                .require_root(&principal, Privilege::ClusterAdmin)?;
+        }
+        spec.validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if spec == pool.spec {
+            return Ok(Json(pool));
+        }
+        // 공유가 아닌 풀의 백업은 쓴 노드에만 있다(`status.node`). 공유 여부를 바꾸면 그 기록이 틀린다.
+        if (pool.spec.backups && !spec.backups) || pool.spec.shared != spec.shared {
+            check_no_backups(&state, &pool)?;
+        }
+        let to_local = pool.spec.shared && !spec.shared;
+        if to_local {
+            check_pool_local(&state, &pool)?;
+        }
+        match state
+            .cluster
+            .update_spec(pool.id, Some(pool.revision), pool.labels.clone(), &spec)
+            .await
+        {
+            Ok(_) => {}
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. }))
+                if expected.is_none() =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let written = lookup::<StoragePoolSpec>(&state.cluster, &pool.id.to_string())?;
+        // `vm_lock`은 이 노드의 요청만 막는다. 검사와 쓰기 사이에 다른 노드가 VM을 옮기거나
+        // 마이그레이션을 시작했을 수 있으니 다시 보고, 이제 안 되면 공유로 되돌린다(그 사이 누가 풀을
+        // 바꿨으면 그 값을 둔다).
+        if to_local && let Err(e) = check_pool_local(&state, &written) {
+            let mut spec = written.spec.clone();
+            spec.shared = true;
+            if let Err(revert) = state
+                .cluster
+                .update_spec(
+                    written.id,
+                    Some(written.revision),
+                    written.labels.clone(),
+                    &spec,
+                )
+                .await
+            {
+                tracing::warn!(pool = %written.name, error = %revert, "cannot make the pool shared again");
+            }
+            return Err(e);
+        }
+        return Ok(Json(written));
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the pool kept changing while being updated; try again",
+    ))
+}
+
+/// 공유 풀을 로컬로 바꿔도 되는지. 볼륨은 만든 노드에 있는 것으로 돌아가므로, 그 볼륨을 쓰는 VM이
+/// 다른 노드에 있거나 옮겨 가는 중이면 409 `pool_in_use`다.
+fn check_pool_local(state: &AppState, pool: &StoragePool) -> Result<(), ApiError> {
+    let (_, volumes) = state.cluster.list::<VolumeSpec>()?;
+    let volumes: Vec<_> = volumes
+        .iter()
+        .filter(|v| v.spec.pool == pool.name)
+        .collect();
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    for vm in &vms {
+        for disk in &vm.spec.disks {
+            let Some(volume) = volumes.iter().find(|v| v.name == disk.volume) else {
+                continue;
+            };
+            if let (Some(node), Some(home)) = (vm.spec.node, volume.status.node)
+                && node != home
+            {
+                return Err(ApiError::conflict(
+                    "pool_in_use",
+                    format!(
+                        "VM {:?} is on a different node from its volume {:?}; move it back before making pool {:?} local",
+                        vm.name, volume.name, pool.name
+                    ),
+                ));
+            }
+            let migrating = tasks.iter().any(|t| {
+                t.spec.target == vm.id
+                    && !t.status.state.is_finished()
+                    && matches!(t.spec.op, TaskOp::VmMigrate { .. })
+            });
+            if migrating {
+                return Err(ApiError::conflict(
+                    "pool_in_use",
+                    format!(
+                        "VM {:?} with a disk on pool {:?} is migrating; try again when the migration has finished",
+                        vm.name, pool.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크, 또는 OVN 논리 스위치인 SDN
+/// 네트워크(`sdn`, 서브넷 `subnets` — 계획 65). 이름 `user`와 브리지 `br-int`는 예약되어 있다. SDN 네트워크는 폴더의
+/// `network.config`로 만들고, SDN(OVN)이 세워지지 않았으면 409 `sdn_not_ready`, 서브넷 검증은 400 `invalid_subnet`.
+/// VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
+///
+/// 공급자(외부) 네트워크(`sdn.provider {physnet, vlan}` — 계획 66 §8)는 노드의 물리 망에 붙으므로 루트 `cluster.admin`이고,
+/// 같은 physnet·VLAN의 공급자 네트워크가 있으면 409 `physnet_conflict`다. 공급자 네트워크와 서브넷의 `floating_pools`·
+/// `ipv6_mode`는 모든 노드가 `sdn-routing`을 알아야 한다(409 `cluster_upgrading`, 검증보다 먼저). physnet이 준비된 노드가
+/// 없어도 만들고 `orbivisor-warning`으로 알린다.
+#[utoipa::path(post, path = "/networks", tag = "networks",
+    request_body = CreateRequest<NetworkSpec>,
+    responses((status = 201, body = Resource<NetworkSpec, NetworkStatus>,
+        headers(("orbivisor-warning" = String, description = "no node has the provider network's physnet ready (only then)"))),
+        (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_network(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Json(req): Json<CreateRequest<NetworkSpec>>,
+) -> Result<(StatusCode, HeaderMap, Json<Network>), ApiError> {
+    check_name(&req.name)?;
+    if req.spec.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
+    // SDN 네트워크와 서브넷(계획 65)은 옛 노드가 풀지 못한다(검증보다 먼저).
+    if req.spec.sdn.is_some() || !req.spec.subnets.is_empty() {
+        require_feature(&state.cluster, orbivisor_types::node::SDN)?;
+    }
+    // 공급자 네트워크와 서브넷의 유동 IP 풀·IPv6 모드(계획 66)도 옛 노드가 풀지 못한다.
+    if req.spec.is_provider() || req.spec.subnets.iter().any(crate::sdn::subnet_uses_routing) {
+        require_feature(&state.cluster, orbivisor_types::node::SDN_ROUTING)?;
+    }
+    state.authz.require_new(
+        &principal,
+        Privilege::NetworkConfig,
+        NetworkSpec::KIND,
+        req.spec.folder,
+    )?;
+    // 브리지 네트워크는 노드의 브리지·NIC·VLAN에 VM을 붙인다: 루트 `cluster.admin`이다. 폴더의 `network.config`로는
+    // orbivisord가 만드는 VXLAN 네트워크만 만든다(리뷰 1). 공급자 네트워크도 노드의 물리 망이다(계획 66 §8).
+    if req.spec.bridge.is_some() {
+        require_host_admin(&state, &principal, "creating a bridge network")?;
+    }
+    if req.spec.is_provider() {
+        require_host_admin(&state, &principal, "creating a provider network")?;
+    }
+    if req.name == USER_NETWORK {
+        return Err(ApiError::bad_request(format!(
+            "network name {USER_NETWORK:?} is reserved for user-mode NAT"
+        )));
+    }
+    req.spec.validate().map_err(|e| {
+        let e2 = ApiError::bad_request(e.to_string());
+        if matches!(e, orbivisor_types::network::NetworkError::Subnet(..)) {
+            e2.with_code("invalid_subnet")
+        } else {
+            e2
+        }
+    })?;
+    // SDN 네트워크는 OVN이 세워진 뒤에만(409 `sdn_not_ready` — 계획 65 §13)
+    if req.spec.is_sdn() {
+        crate::sdn::require_ready(&state.cluster)?;
+    }
+    if let Some(vni) = req.spec.vni() {
+        let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+        if let Some(other) = networks.iter().find(|n| n.spec.vni() == Some(vni)) {
+            return Err(ApiError::conflict(
+                "vni_in_use",
+                format!("VNI {vni} is used by network {:?}", other.name),
+            ));
+        }
+    }
+    crate::routing::check_name_unreferenced(&state, &principal, &req.name)?;
+    let mut warnings = Vec::new();
+    if let Some(provider) = req.spec.provider() {
+        let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+        if let Some(other) = networks
+            .iter()
+            .find(|n| n.spec.provider().is_some_and(|p| p.key() == provider.key()))
+        {
+            return Err(ApiError::conflict(
+                "physnet_conflict",
+                format!(
+                    "provider network {:?} already uses physnet {} ({})",
+                    other.name,
+                    provider.physnet,
+                    provider
+                        .vlan
+                        .map_or_else(|| "flat".to_string(), |v| format!("VLAN {v}"))
+                ),
+            ));
+        }
+        let (_, nodes) = state.cluster.list::<NodeSpec>()?;
+        if !nodes.iter().any(|n| {
+            n.status
+                .sdn
+                .as_ref()
+                .is_some_and(|s| s.physnet_ready(&provider.physnet))
+        }) {
+            warnings.push(format!(
+                "no node has physnet {} ready yet; VMs on this network cannot start until one has \
+                 (`orbivisorctl node sdn NODE --physnet {}=BRIDGE`)",
+                provider.physnet, provider.physnet
+            ));
+        }
+    }
+    let mut network = Resource::new(req.name, req.spec);
+    network.labels = req.labels;
+    network.revision = state.cluster.create(&network).await?;
+    let mut headers = HeaderMap::new();
+    if let Some(v) = warnings
+        .first()
+        .and_then(|w| axum::http::HeaderValue::from_str(w).ok())
+    {
+        headers.insert(crate::revision::WARNING, v);
+    }
+    Ok((StatusCode::CREATED, headers, Json(network)))
+}
+
+/// VM이 쓰거나, 라우터의 인터페이스·외부이거나, 유동 IP가 있으면 409 `network_in_use`. 공급자 네트워크는 루트
+/// `cluster.admin`이다.
+#[utoipa::path(delete, path = "/networks/{key}", tag = "networks",
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
+    responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn delete_network(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
+    if network.spec.is_provider() {
+        require_host_admin(&state, &principal, "deleting a provider network")?;
+    }
+    crate::routing::check_network_unused(&state, &principal, &network)?;
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    if let Some(vm) = vms
+        .iter()
+        .find(|vm| vm.spec.nics.iter().any(|n| n.network == network.name))
+    {
+        return Err(ApiError::conflict(
+            "network_in_use",
+            format!("network {:?} is used by VM {:?}", network.name, vm.name),
+        ));
+    }
+    state
+        .cluster
+        .delete::<NetworkSpec>(network.id, if_match(&headers)?)
+        .await?;
+    crate::permissions::drop_orphans(&state.cluster).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /nodes/{key}`의 쿼리
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateNodeQuery {
+    /// `host_resources`의 409 `host_cpus_in_use`·`hugepages_in_use`를 넘기고 쓴다(응답 헤더 `orbivisor-warning`).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// 노드의 주소, 유지보수 모드, 역할(`roles`), 호스트 자원 설정(`host_resources`)을 바꾼다. 노드 리소스는 orbivisord가
+/// 시작할 때 스스로 만든다. 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는
+/// API가 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
+///
+/// `sdn`(계획 66 §7: physnet → Linux 브리지, 게이트웨이 우선순위)도 칸이 없으면 저장된 값을 그대로 두고 `{}`면 지운다.
+/// 바꾸려면 모든 노드가 `sdn-routing`을 알고(409 `cluster_upgrading`) SDN이 세워졌어야 하며(409 `sdn_not_ready`, 지우기는
+/// 빼고) 위트니스·macOS 노드는 400, 검증은 400 `invalid_node_sdn`, 빠지는 physnet을 쓰는 VM이 이 노드에서 돌면 409
+/// `physnet_in_use`(`details.vms`)다.
+///
+/// `host_resources`(계획 64: 예약·전용 CPU, 실행 중 hugepages 예약)는 칸이 없으면 저장된 값을 그대로 두고(이 칸을
+/// 모르는 클라이언트의 PUT이 지우지 않게) `{}`면 지운다. 바꾸려면 모든 노드가 `numa`를 알아야 하고(409
+/// `cluster_upgrading`), 노드가 알린 토폴로지에 맞아야 한다(온라인 CPU, 예약·전용이 겹치지 않음, 공유 CPU가 남음, 있는
+/// 호스트 NUMA 노드 — 400 `invalid_host_resources`). 도는 VM이 고정된 pCPU가 새 전용 CPU 밖이면 409
+/// `host_cpus_in_use`(`details.vms`), Orbivisor VM이 쓰는 hugepages보다 적게 예약하면 409 `hugepages_in_use`이고
+/// `?force=true`면 쓰고 경고를 `orbivisor-warning`으로 준다.
+#[utoipa::path(put, path = "/nodes/{key}", tag = "nodes",
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header), UpdateNodeQuery),
+    request_body = UpdateRequest<NodeSpec>,
+    responses((status = 200, body = Resource<NodeSpec, NodeStatus>, headers(
+            ("orbivisor-warning" = String, description = "what `force` let through (only when there is something)"),
+        )), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn update_node(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: crate::audit::AuditNote,
+    Path(key): Path<String>,
+    crate::error::Query(query): crate::error::Query<UpdateNodeQuery>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateRequest<NodeSpec>>,
+) -> Result<(HeaderMap, Json<Node>), ApiError> {
+    state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
+    let node = lookup::<NodeSpec>(&state.cluster, &key)?;
+    let mut spec = NodeSpec {
+        witness: node.spec.witness,
+        ..req.spec
+    };
+    if let Some(roles) = &mut spec.roles {
+        roles.sort();
+        roles.dedup();
+        if spec.witness && roles.contains(&NodeRole::Api) {
+            return Err(ApiError::bad_request(
+                "a witness has no API; it cannot have the api role",
+            ));
+        }
+        // 옛 노드는 `roles`가 든 Node를 풀지 못한다.
+        require_feature(&state.cluster, "node-roles")?;
+    }
+    // 노드 SDN 설정(계획 66 physnet·게이트웨이): 칸이 없으면 저장된 값 그대로, `{}`면 지움, 바꾸면 검사
+    let sdn_note = match spec.sdn.take() {
+        None => {
+            spec.sdn = node.spec.sdn.clone();
+            None
+        }
+        Some(asked) => {
+            let asked = (asked != orbivisor_types::sdn::NodeSdnConfig::default()).then_some(asked);
+            if asked == node.spec.sdn {
+                spec.sdn = asked;
+                None
+            } else {
+                let note = crate::sdn::check_node_sdn(&state, &node, asked.as_ref())?;
+                spec.sdn = asked;
+                Some(note)
+            }
+        }
+    };
+    // 호스트 자원 설정(계획 64): 없으면 그대로, `{}`면 지움, 바꾸면 검증과 쓰기 전 확인
+    let change =
+        crate::numa::host_resources_change(&state, &node, spec.host_resources.take(), query.force)?;
+    spec.host_resources = change.value;
+    state
+        .cluster
+        .update_spec(node.id, if_match(&headers)?, req.labels, &spec)
+        .await?;
+    let notes: Vec<String> = change.audit.into_iter().chain(sdn_note).collect();
+    if !notes.is_empty() {
+        audit.detail(notes.join(", "));
+    }
+    let mut out = HeaderMap::new();
+    if !change.warnings.is_empty()
+        && let Ok(v) = axum::http::HeaderValue::from_str(&change.warnings.join("; "))
+    {
+        out.insert(crate::revision::WARNING, v);
+    }
+    Ok((out, Json(lookup::<NodeSpec>(&state.cluster, &key)?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 읽어 다시 쓰는 클라이언트가 보낸 `labels: null`은 레이블 없음이다(없는 칸과 같다).
+    #[test]
+    fn null_labels_mean_no_labels() {
+        let r: UpdateRequest<serde_json::Value> =
+            serde_json::from_str(r#"{"labels": null, "spec": {}}"#).unwrap();
+        assert!(r.labels.is_empty());
+        let r: UpdateRequest<serde_json::Value> =
+            serde_json::from_str(r#"{"labels": {"a": "b"}, "spec": {}}"#).unwrap();
+        assert_eq!(r.labels["a"], "b");
+        let r: UpdateRequest<serde_json::Value> = serde_json::from_str(r#"{"spec": {}}"#).unwrap();
+        assert!(r.labels.is_empty());
+    }
+}

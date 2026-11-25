@@ -13,11 +13,11 @@ import (
 // every spec field is an attribute (or listed in Excluded with a reason), with the same type class and
 // required-ness. A field the server adds and the provider does not know fails here, with the list.
 //
-// OPL_OPENAPI is the OpenAPI document: `cargo run -p opl-api --bin opl-api-openapi > openapi.json`.
+// OPL_OPENAPI is the OpenAPI document: `cargo run -p orbivisor-api --bin orbivisor-api-openapi > openapi.json`.
 func TestSchemasMatchTheServer(t *testing.T) {
 	file := os.Getenv("OPL_OPENAPI")
 	if file == "" {
-		t.Skip("OPL_OPENAPI is not set (cargo run -p opl-api --bin opl-api-openapi > openapi.json)")
+		t.Skip("OPL_OPENAPI is not set (cargo run -p orbivisor-api --bin orbivisor-api-openapi > openapi.json)")
 	}
 	raw, err := os.ReadFile(file)
 	if err != nil {

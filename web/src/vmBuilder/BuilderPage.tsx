@@ -43,7 +43,7 @@ import { defaultMachine, type VmFormValues } from "@/vms/form";
 import { postVolume } from "@/vms/form/submit";
 import { ViewSwitch } from "@/vmBuilder/ViewSwitch";
 
-/** 서버 미리 확인 기능(`opl_types::node::VM_CHECK`) */
+/** 서버 미리 확인 기능(`orbivisor_types::node::VM_CHECK`) */
 const VM_CHECK = "vm-check";
 
 // 빌더만의 모양: 첫 화면 CSS(Tailwind)에 넣지 않고 이 조각 안에 둔다(설계 §4).

@@ -9,82 +9,82 @@ Linux에서 빌드하려면 `libssl-dev`와 `pkg-config`가 필요하다(클라�
 ```bash
 cargo test --workspace                                              # 단위 테스트
 brew install qemu                                                   # macOS 통합 테스트용 (Linux: 위 apt 패키지)
-cargo test -p opl-driver --features storage-it --test dir_storage   # qemu-img 스토리지 테스트
-cargo test -p opl-qemu --features qemu-it --test qemu_boot          # 실제 QEMU 기동 (macOS hvf, Linux KVM/TCG)
-cargo test -p opl-driver --features qemu-it --test qemu_driver      # 드라이버: 기동, 재부착, 크래시 감지
-cargo test -p opl-reconciler --features qemu-it --test qemu_restart # reconciler: orbivisord 재시작 후 재연결
-cargo test -p opl-api --features storage-it --test volumes          # API: 볼륨 생성·가져오기 (qemu-img)
-cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI → VM → 콘솔 → kill -9 → 재연결
-cargo test -p opld --features qemu-it --test backup                 # E2E: 실행 중 백업 → VM 지우기 → 복원(qemu-img, qemu-io 필요)
-cargo test -p opld --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
-cargo test -p opld --test cluster                                   # E2E: orbivisord 프로세스 3개로 클러스터 구성
+cargo test -p orbivisor-driver --features storage-it --test dir_storage   # qemu-img 스토리지 테스트
+cargo test -p orbivisor-qemu --features qemu-it --test qemu_boot          # 실제 QEMU 기동 (macOS hvf, Linux KVM/TCG)
+cargo test -p orbivisor-driver --features qemu-it --test qemu_driver      # 드라이버: 기동, 재부착, 크래시 감지
+cargo test -p orbivisor-reconciler --features qemu-it --test qemu_restart # reconciler: orbivisord 재시작 후 재연결
+cargo test -p orbivisor-api --features storage-it --test volumes          # API: 볼륨 생성·가져오기 (qemu-img)
+cargo test -p orbivisord --features qemu-it --test e2e                    # E2E: CLI → VM → 콘솔 → kill -9 → 재연결
+cargo test -p orbivisord --features qemu-it --test backup                 # E2E: 실행 중 백업 → VM 지우기 → 복원(qemu-img, qemu-io 필요)
+cargo test -p orbivisord --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
+cargo test -p orbivisord --test cluster                                   # E2E: orbivisord 프로세스 3개로 클러스터 구성
 # 폴더·권한·할당량·2단계 인증(QEMU 없음, `cargo test --workspace`에도 든다): 폴더 사용자의 목록·404, 위임, 할당량 409,
 # 범위 토큰, TOTP 둘째 단계·복구 코드·관리자 초기화, 노드 둘에서 동시에 만들어도 할당량을 지킴
-cargo test -p opld --test permissions
-cargo test -p opl-api --test permissions --test quotas --test two_factor --test webauthn   # API: 경로 시행·watch 거르기, 할당량, 2FA, 소프트웨어 인증기로 WebAuthn
-cargo test -p opl-api --lib authz                                   # 권한 색인: 옛 역할과의 동치, insta 행렬, proptest(색인 = 참조 구현)
-cargo test -p opl-cluster --test three_nodes concurrent_creates_on_two_nodes_keep_the_folder_quota  # memnet 세 노드 할당량 경쟁
-cargo test --release -p opl-cluster --features scale-it --lib quota_apply_cost -- --nocapture       # VM 1만 개에서 할당량 apply 시간
-cargo test -p opld --features starve-it --test starve              # E2E: 리더의 API 실행기를 막아도 리스·Raft 리더 그대로
+cargo test -p orbivisord --test permissions
+cargo test -p orbivisor-api --test permissions --test quotas --test two_factor --test webauthn   # API: 경로 시행·watch 거르기, 할당량, 2FA, 소프트웨어 인증기로 WebAuthn
+cargo test -p orbivisor-api --lib authz                                   # 권한 색인: 옛 역할과의 동치, insta 행렬, proptest(색인 = 참조 구현)
+cargo test -p orbivisor-cluster --test three_nodes concurrent_creates_on_two_nodes_keep_the_folder_quota  # memnet 세 노드 할당량 경쟁
+cargo test --release -p orbivisor-cluster --features scale-it --lib quota_apply_cost -- --nocapture       # VM 1만 개에서 할당량 apply 시간
+cargo test -p orbivisord --features starve-it --test starve              # E2E: 리더의 API 실행기를 막아도 리스·Raft 리더 그대로
 # 지표 기록·경보(QEMU 없음, [test] 고리가 있는 metrics-it 빌드): SIGKILL 뒤 기록, Prometheus 긁기(엄격한 텍스트 형식 파서),
 # 127.0.0.1 webhook으로 시험 보내기·경보 발생·해제·보낸 기록
-cargo test -p opld --features metrics-it --test metrics_history --test alerts
-OPL_TEST_PROMTOOL=promtool cargo test -p opld --features metrics-it --test metrics_history   # promtool check metrics로도 본다(CI linux-kvm)
-cargo test -p opld --features qemu-it --test metrics_history --test alerts   # 위에 더해 VM 줄과 멈춘 채 옮긴 VM의 기록(QEMU 필요)
-cargo test -p opld --features migration-it,qemu-it --test migration metrics_history_follows_a_live_migration  # 라이브 마이그레이션 뒤 VM 기록
-cargo test -p opld --features qemu-it --test templates              # E2E: 템플릿 → 연결 배포(qcow2 겹층) → 평탄화, 카탈로그 받기 → 템플릿(qemu-img·qemu-io 필요)
+cargo test -p orbivisord --features metrics-it --test metrics_history --test alerts
+OPL_TEST_PROMTOOL=promtool cargo test -p orbivisord --features metrics-it --test metrics_history   # promtool check metrics로도 본다(CI linux-kvm)
+cargo test -p orbivisord --features qemu-it --test metrics_history --test alerts   # 위에 더해 VM 줄과 멈춘 채 옮긴 VM의 기록(QEMU 필요)
+cargo test -p orbivisord --features migration-it,qemu-it --test migration metrics_history_follows_a_live_migration  # 라이브 마이그레이션 뒤 VM 기록
+cargo test -p orbivisord --features qemu-it --test templates              # E2E: 템플릿 → 연결 배포(qcow2 겹층) → 평탄화, 카탈로그 받기 → 템플릿(qemu-img·qemu-io 필요)
 # x86_64 Linux, KVM: 실제 게스트 — Ubuntu 24.04 클라우드 이미지 템플릿 → 연결 복제 2대 켜기·보고 → 평탄화(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img OPL_TEST_CLOUD_SUMS=/tmp/SHA256SUMS \
-  cargo test -p opld --features templates-it,qemu-it --test templates -- --nocapture
-cargo test -p oplctl --features catalog-it --test catalog -- --nocapture  # 내장 이미지 카탈로그 링크·체크섬 파일 확인(인터넷 필요)
-cargo test -p opld --features qemu-it --test vtpm                   # E2E: TPM·Secure Boot·게스트 에이전트 CLI 흐름(swtpm 없어도 됨 — 노드 능력대로)
+  cargo test -p orbivisord --features templates-it,qemu-it --test templates -- --nocapture
+cargo test -p orbivisorctl --features catalog-it --test catalog -- --nocapture  # 내장 이미지 카탈로그 링크·체크섬 파일 확인(인터넷 필요)
+cargo test -p orbivisord --features qemu-it --test vtpm                   # E2E: TPM·Secure Boot·게스트 에이전트 CLI 흐름(swtpm 없어도 됨 — 노드 능력대로)
 # Linux, swtpm·swtpm-tools: 실제 swtpm으로 TPM VM의 상태 만들기·해시·초기화, 드라이버의 swtpm 수명과 TPM VM 옮기기
-cargo test -p opld --features vtpm-it --test vtpm
-cargo test -p opl-driver --features vtpm-it --test qemu_driver --test qemu_migration
+cargo test -p orbivisord --features vtpm-it --test vtpm
+cargo test -p orbivisor-driver --features vtpm-it --test qemu_driver --test qemu_migration
 # x86_64 Linux, KVM, swtpm·ovmf: 실제 게스트 — Ubuntu 24.04 클라우드 이미지를 Secure Boot·TPM·게스트 에이전트로 켜 /dev/tpm0·
 # SecureBoot 변수·EK 해시 보고, 게스트 정보·얼린 스냅샷·에이전트 끄기, 다시 켜기·복제의 EK(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
-  cargo test -p opld --features vtpm-it,install-media-it,qemu-it --test vtpm -- --nocapture
+  cargo test -p orbivisord --features vtpm-it,install-media-it,qemu-it --test vtpm -- --nocapture
 # 게스트 CPU 모델·플래그(계획 63)
-cargo test -p opl-types cpu                                         # 순수: 모델·플래그 serde 하위 호환, resolve·can_run·baseline 표, 보류 cpu
-cargo test -p opl-api --test cpu_models                             # API(Mock 노드 셋·카탈로그 둘): 별칭 고정·모호, 기준 auto·고정 409, 약한 노드 합류, 마이그레이션 409, host 경고
-cargo test -p opl-qemu --features qemu-it --test cpu_probe -- --nocapture   # 노드 CPU 탐침: 실제 QEMU에 QMP로 묻기(이 Mac은 HVF·TCG, KVM이면 응답을 로그에)
-OPL_RECORD_CPU_FIXTURES=$PWD/crates/opl-qemu/tests/fixtures/cpu \
-  cargo test -p opl-qemu --features qemu-it --test cpu_probe -- --nocapture  # 탐침 고정물(tests/fixtures/cpu/{arch}-{accel}.json) 다시 기록
+cargo test -p orbivisor-types cpu                                         # 순수: 모델·플래그 serde 하위 호환, resolve·can_run·baseline 표, 보류 cpu
+cargo test -p orbivisor-api --test cpu_models                             # API(Mock 노드 셋·카탈로그 둘): 별칭 고정·모호, 기준 auto·고정 409, 약한 노드 합류, 마이그레이션 409, host 경고
+cargo test -p orbivisor-qemu --features qemu-it --test cpu_probe -- --nocapture   # 노드 CPU 탐침: 실제 QEMU에 QMP로 묻기(이 Mac은 HVF·TCG, KVM이면 응답을 로그에)
+OPL_RECORD_CPU_FIXTURES=$PWD/crates/orbivisor-qemu/tests/fixtures/cpu \
+  cargo test -p orbivisor-qemu --features qemu-it --test cpu_probe -- --nocapture  # 탐침 고정물(tests/fixtures/cpu/{arch}-{accel}.json) 다시 기록
 # 실제 QEMU(게스트 OS 없음): 숨긴 플래그가 모든 vCPU에서 꺼짐(QMP qom-get), 숨김 목록 → 검사 루프 보류 → 전원 껐다 켜기, 명명 모델,
 # 받는 쪽은 기록된 CPU 그대로(노드 둘). x86_64만: vCPU 핫플러그 뒤 새 vCPU도 꺼짐, 못 주는 기능이 있는 모델은 enforce로 거절.
-# 이 Mac은 TCG로 aarch64(neoverse-n1)를 돌리고, x86 시험은 CI linux-kvm(FEATURES에 opld/cpu-it)
-cargo test -p opld --features cpu-it --test cpu
+# 이 Mac은 TCG로 aarch64(neoverse-n1)를 돌리고, x86 시험은 CI linux-kvm(FEATURES에 orbivisord/cpu-it)
+cargo test -p orbivisord --features cpu-it --test cpu
 # x86_64 Linux, KVM: 실제 게스트 — 러너 CPU에 있는 플래그(avx512vbmi → avx2 → pcid → sse4_2)를 --cpu-flags=-FLAG로 숨긴 Ubuntu 24.04
 # 클라우드 이미지의 /proc/cpuinfo에 없음, 실행 중 --no-cpu-flags는 보류로 남고 vm reboot 뒤 다시 보임(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
-  cargo test -p opld --features install-media-it,qemu-it --test install_media a_hidden_cpu_flag_is_absent_in_a_real_guest -- --nocapture
+  cargo test -p orbivisord --features install-media-it,qemu-it --test install_media a_hidden_cpu_flag_is_absent_in_a_real_guest -- --nocapture
 # NUMA·전용 CPU·hugepages(계획 64)
-cargo test -p opl-types numa                                        # 순수: serde 하위 호환(옛 JSON 바이트 그대로), CpuSet, layout·fit·fit_fixed·demand·pinning 표, 장부 exceeded, 보류 numa
-cargo test -p opl-qemu cmdline                                      # 명령줄: 안 쓰는 VM은 바이트 그대로, 공유 vNUMA, 전용 1G 묶기·거리, 노드마다 virtio-mem, aarch64
-cargo test -p opld --lib topology                                   # 노드 탐침 고정물(crates/opld/tests/fixtures/topology/{x86-2s,aarch64-1n,x86-no-numa,x86-offline}), 경고, 크기 4 KB 안
-cargo test -p opl-cluster hosts                                     # Raft 받아들이기 검사: 노드마다 셈, 늘지 않는 쓰기, 마이그레이션 확정, any
-cargo test -p opl-cluster --test three_nodes concurrent_creates_and_starts_on_two_nodes_keep_the_dedicated_cpus   # 두 팔로워가 동시에 만들고 켜도 전용 CPU 4개에 4번만
-cargo test -p opl-reconciler --test numa                            # 노드 할당기(Mock): 전용 배치·기록·고정, /sys 빈 hugepages, 켜는 중 예약의 기다림, 다시 고정
-cargo test -p opl-api --test numa --test incoming                   # API(Mock 노드 셋): 검증·기능 게이트, vm.dedicated·dedicated_vcpus, host_resources 409·force, 켜기 배치, 받는 쪽 다시 고르기
+cargo test -p orbivisor-types numa                                        # 순수: serde 하위 호환(옛 JSON 바이트 그대로), CpuSet, layout·fit·fit_fixed·demand·pinning 표, 장부 exceeded, 보류 numa
+cargo test -p orbivisor-qemu cmdline                                      # 명령줄: 안 쓰는 VM은 바이트 그대로, 공유 vNUMA, 전용 1G 묶기·거리, 노드마다 virtio-mem, aarch64
+cargo test -p orbivisord --lib topology                                   # 노드 탐침 고정물(crates/orbivisord/tests/fixtures/topology/{x86-2s,aarch64-1n,x86-no-numa,x86-offline}), 경고, 크기 4 KB 안
+cargo test -p orbivisor-cluster hosts                                     # Raft 받아들이기 검사: 노드마다 셈, 늘지 않는 쓰기, 마이그레이션 확정, any
+cargo test -p orbivisor-cluster --test three_nodes concurrent_creates_and_starts_on_two_nodes_keep_the_dedicated_cpus   # 두 팔로워가 동시에 만들고 켜도 전용 CPU 4개에 4번만
+cargo test -p orbivisor-reconciler --test numa                            # 노드 할당기(Mock): 전용 배치·기록·고정, /sys 빈 hugepages, 켜는 중 예약의 기다림, 다시 고정
+cargo test -p orbivisor-api --test numa --test incoming                   # API(Mock 노드 셋): 검증·기능 게이트, vm.dedicated·dedicated_vcpus, host_resources 409·force, 켜기 배치, 받는 쪽 다시 고르기
 # 실제 Linux(QEMU 필요): 이 호스트 탐침(JSON을 찍음), 2M hugepages 실행 중 예약·되돌리기, 스레드 친화, 실제 VM의 vCPU·에뮬레이터 고정과
 # 스코프 cpuset, 2M hugepages 백엔드, 공유 VM, 동시에 켠 전용 VM 둘의 409, 실행 중 붙인 vCPU, 한 호스트의 orbivisord 둘 사이 마이그레이션 뒤
 # 다시 고정. /sys에 쓰는 시험(hugepages 예약)은 root와 OPL_TEST_NUMA_SYS=1일 때만 돈다 — 배포 서버에서 기능만 켜고 돌려도 호스트 설정을
-# 바꾸지 않게. 시험이 예약한 hugepages는 끝에 원래 수로 되돌린다. CI linux-kvm은 아래처럼 root로(FEATURES에 opld/numa-it, env에
+# 바꾸지 않게. 시험이 예약한 hugepages는 끝에 원래 수로 되돌린다. CI linux-kvm은 아래처럼 root로(FEATURES에 orbivisord/numa-it, env에
 # OPL_TEST_NUMA_SYS=1, OPL_TEST_SYSTEMD=1) 돈다. 러너는 4 vCPU·NUMA 노드 하나라 호스트 노드 둘 이상의 맞춤·1G·SMT는 고정물·Mock만 본다.
-cargo test -p opld --features numa-it --lib topology::real -- --nocapture
+cargo test -p orbivisord --features numa-it --lib topology::real -- --nocapture
 sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 OPL_TEST_NUMA_SYS=1 CARGO_TARGET_DIR=/tmp/opl-root-target \
-  cargo test -p opld --features qemu-it,numa-it --lib --test numa -- --nocapture
+  cargo test -p orbivisord --features qemu-it,numa-it --lib --test numa -- --nocapture
 # x86_64 Linux, KVM: 실제 게스트 — Ubuntu 24.04 클라우드 이미지를 --sockets 2 --numa 2로 켜 게스트의 /sys/devices/system/node/node*/
 # cpulist·MemTotal을 보고(노드 둘, 소켓마다 CPU 하나, 메모리 반씩), 기록 numa의 모양(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
-  cargo test -p opld --features install-media-it,qemu-it --test install_media a_guest_sees_its_numa_nodes -- --nocapture
+  cargo test -p orbivisord --features install-media-it,qemu-it --test install_media a_guest_sees_its_numa_nodes -- --nocapture
 # SDN(OVN, 계획 65)
-cargo test -p opl-types -- sdn ipam network                         # 순수: serde 하위 호환(옛 NetworkSpec·NicSpec·NodeStatus·RuntimeNic 바이트 그대로), 서브넷 검증 표, IPAM allocate(/16에 1만 개)
-cargo test -p opl-driver ovn                                        # OvnHost 단계(가짜 CommandRunner, 실제 출력 고정물 src/ovn/fixtures/), 단위 파일 기대 글, OVSDB 클라이언트(가짜 서버·실제 RPC 고정물)
-cargo test -p opl-cluster --test single_node an_sdn_address_belongs_to_one_nic_per_network   # Raft 주소 겹침 검사
-cargo test -p opl-api --test ovn_sync --test ipam --test sdn --test sdn_tasks   # OvnSync(가짜 NB: 다른 것만·펜싱·나누기·5천 포트), IPAM 경합·복제·복원, /sdn·PATCH·ips·권한, Task
-cargo test -p oplctl sdn                                            # sdn·network subnet·network ips·--ip 명령
+cargo test -p orbivisor-types -- sdn ipam network                         # 순수: serde 하위 호환(옛 NetworkSpec·NicSpec·NodeStatus·RuntimeNic 바이트 그대로), 서브넷 검증 표, IPAM allocate(/16에 1만 개)
+cargo test -p orbivisor-driver ovn                                        # OvnHost 단계(가짜 CommandRunner, 실제 출력 고정물 src/ovn/fixtures/), 단위 파일 기대 글, OVSDB 클라이언트(가짜 서버·실제 RPC 고정물)
+cargo test -p orbivisor-cluster --test single_node an_sdn_address_belongs_to_one_nic_per_network   # Raft 주소 겹침 검사
+cargo test -p orbivisor-api --test ovn_sync --test ipam --test sdn --test sdn_tasks   # OvnSync(가짜 NB: 다른 것만·펜싱·나누기·5천 포트), IPAM 경합·복제·복원, /sdn·PATCH·ips·권한, Task
+cargo test -p orbivisorctl sdn                                            # sdn·network subnet·network ips·--ip 명령
 pnpm -C web test src/sdn src/networks                               # 마법사·상태·서브넷 편집·IP 서랍·NIC 주소(msw)
 # Linux(Ubuntu 24.04), root, OVN이 없는 버려도 되는 기계: orbivisord가 apt로 OVN을 설치하고 노드 하나에 NB·SB·northd와 chassis,
 # mTLS(다른 CA·인증서 없음·평문 거절), 127.0.0.2의 두 번째 ovsdb 합류·떠나기, OvnSync·펜싱, 이름공간 포트의 busybox udhcpc와 ping·위조
@@ -92,148 +92,148 @@ pnpm -C web test src/sdn src/networks                               # 마법사�
 # (CI `ovn` 작업). busybox와 QEMU가 필요하다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target \
   OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
-  cargo test -p opld --features sdn-it --test sdn -- --nocapture
+  cargo test -p orbivisord --features sdn-it --test sdn -- --nocapture
 # SDN 라우팅(계획 66)
-cargo test -p opl-types -- router floating_ip sdn security_group     # 순수: 공급자·유동 IP 풀·ipv6_mode·라우터·노드 sdn 검증, eui64, gateway_ranking(HRW), nic_policy
-cargo test -p opld firewall::tests::the_ruleset_text_is_unchanged    # nic_policy로 옮긴 뒤에도 nftables 규칙 글이 바이트 그대로
-cargo test -p opl-driver physnet                                    # physnet 명령·매핑 합치기(남의 항목 보존·충돌)·빼는 차례
-cargo test -p opl-api ovn_sync                                      # 라우터·NAT·HA 그룹·RA·DHCPv6 행, 그룹 목록 Port_Group·ACL 띠, 실패하면 닫힘, 5천 포트 × ACL 2650
-cargo test -p opl-api --test sdn_routing                            # 라우터·유동 IP·공급자·노드 sdn API, 권한, 할당량, IPAM(EUI-64·풀), 409들
-cargo test -p oplctl routing                                        # router·fip·node sdn 명령
+cargo test -p orbivisor-types -- router floating_ip sdn security_group     # 순수: 공급자·유동 IP 풀·ipv6_mode·라우터·노드 sdn 검증, eui64, gateway_ranking(HRW), nic_policy
+cargo test -p orbivisord firewall::tests::the_ruleset_text_is_unchanged    # nic_policy로 옮긴 뒤에도 nftables 규칙 글이 바이트 그대로
+cargo test -p orbivisor-driver physnet                                    # physnet 명령·매핑 합치기(남의 항목 보존·충돌)·빼는 차례
+cargo test -p orbivisor-api ovn_sync                                      # 라우터·NAT·HA 그룹·RA·DHCPv6 행, 그룹 목록 Port_Group·ACL 띠, 실패하면 닫힘, 5천 포트 × ACL 2650
+cargo test -p orbivisor-api --test sdn_routing                            # 라우터·유동 IP·공급자·노드 sdn API, 권한, 할당량, IPAM(EUI-64·풀), 409들
+cargo test -p orbivisorctl routing                                        # router·fip·node sdn 명령
 pnpm -C web test src/routing src/nodes src/security-groups          # 라우터 서랍·유동 IP 붙이기·노드 physnet 카드·NIC 수(msw)
 # SDN 서비스(계획 67)
-cargo test -p opl-types -- load_balancer qos network_migration alert::sdn sdn   # 순수: LB·QoS·옮기기 검증 표, lb vips·ip_port_mappings, qos nic_rows·tc_commands(남의 필터 보존), migration plan(방식·주소 출처·막힘), allow_sets, SDN 경보 평가 표
-cargo test -p opl-cluster                                           # ip 겹침(LB 셋)·lb-listener·migration-source·migration-vm·migration-target, 할당량 networks·load_balancers와 바깥 VIP의 floating_ips
-cargo test -p opl-api ovn_sync                                      # LB·건강 검사·QoS·l2gateway 행(가짜 NB), 같은 차례 붙이기, 계획 66 고정물에 연산 0개
-cargo test -p opl-api --test sdn_services --test network_migrate    # 기능 게이트, 권한, LB·QoS·할당량·유동 IP 떼기·잠금 미리 확인·토폴로지 감추기, 옮기기 상태 머신(라이브 실패·재시작·이어 하기·다리 노드 지움)
-cargo test -p opl-driver -- relink tc ovn::lockdown units           # tap 옮기기 명령, tc 명령, nftables 잠금 글·ss 파싱, sb.json·northd 단위(끔은 계획 66 글 그대로)
-cargo test -p oplctl -- lb migration sdn alerts                     # lb·vm nic-qos·network migrate·sdn lockdown·alert rule add-sdn-defaults 명령
+cargo test -p orbivisor-types -- load_balancer qos network_migration alert::sdn sdn   # 순수: LB·QoS·옮기기 검증 표, lb vips·ip_port_mappings, qos nic_rows·tc_commands(남의 필터 보존), migration plan(방식·주소 출처·막힘), allow_sets, SDN 경보 평가 표
+cargo test -p orbivisor-cluster                                           # ip 겹침(LB 셋)·lb-listener·migration-source·migration-vm·migration-target, 할당량 networks·load_balancers와 바깥 VIP의 floating_ips
+cargo test -p orbivisor-api ovn_sync                                      # LB·건강 검사·QoS·l2gateway 행(가짜 NB), 같은 차례 붙이기, 계획 66 고정물에 연산 0개
+cargo test -p orbivisor-api --test sdn_services --test network_migrate    # 기능 게이트, 권한, LB·QoS·할당량·유동 IP 떼기·잠금 미리 확인·토폴로지 감추기, 옮기기 상태 머신(라이브 실패·재시작·이어 하기·다리 노드 지움)
+cargo test -p orbivisor-driver -- relink tc ovn::lockdown units           # tap 옮기기 명령, tc 명령, nftables 잠금 글·ss 파싱, sb.json·northd 단위(끔은 계획 66 글 그대로)
+cargo test -p orbivisorctl -- lb migration sdn alerts                     # lb·vm nic-qos·network migrate·sdn lockdown·alert rule add-sdn-defaults 명령
 pnpm -C web test src/components/iso src/topology src/lb src/migration src/sdn src/alerts   # 투영·배치(200/50/2000 기록)·키보드·axe, LB 서랍, 마법사, 잠금 카드·SDN 경보(msw)
-# 백업 저장소(계획 68) — 가짜 S3(opl-store `fake-s3`)와 MockHypervisor로 S3·QEMU 없이
-cargo test -p opl-store                                             # 형식(청크·인덱스·매니페스트 v3 고정물), 키 계층·복구 키·escrow, 로컬·메모리·가짜 S3 백엔드 공통 시험, SigV4 공개 벡터, GC 안전 모형 proptest, Bloom 오탐률, 검증, NBD 클라이언트·서버
-cargo test -p opl-types backup_store                                # 스펙 검증 표, chunk_ranges·merge_index, verify::due, serde 하위 호환
-cargo test -p opl-api --test backup_stores --test backup_store_types   # 저장소 API·권한·비밀 가리기·읽기 전용 붙이기·scan·넘겨받기, 복사, 두 Env 원격 복제(없는 청크만), 기능 게이트
-cargo test -p opl-api --features storage-it --test backup_store_tasks --test live_restore_tasks   # 백업·증분·GC·검증·옮기기 Task, 라이브 복원 상태 머신(qemu-img·qemu-nbd)
-cargo test -p opl-store --features storage-it --test nbd_qemu       # 우리 NBD ↔ qemu-nbd·qemu-img·qemu-io, 재연결
-cargo test -p opl-driver --features qemu-it --test qemu_fleece --test qemu_live_restore   # 실제 QEMU 플리싱·비트맵 문맥·ENOSPC, 라이브 복원 배선·갈아타기·재연결
-cargo test -p opld --features backup-it --test backup_store         # E2E(orbivisorctl): 로컬 저장소 실행 중 VM 전체 → 증분 → GC·검증 → 복원·라이브 복원이 원본과 같음
-cargo test -p oplctl -- backup_store backup                         # backup-store·backup verify/convert/copy·vm live-restore 인자와 표
+# 백업 저장소(계획 68) — 가짜 S3(orbivisor-store `fake-s3`)와 MockHypervisor로 S3·QEMU 없이
+cargo test -p orbivisor-store                                             # 형식(청크·인덱스·매니페스트 v3 고정물), 키 계층·복구 키·escrow, 로컬·메모리·가짜 S3 백엔드 공통 시험, SigV4 공개 벡터, GC 안전 모형 proptest, Bloom 오탐률, 검증, NBD 클라이언트·서버
+cargo test -p orbivisor-types backup_store                                # 스펙 검증 표, chunk_ranges·merge_index, verify::due, serde 하위 호환
+cargo test -p orbivisor-api --test backup_stores --test backup_store_types   # 저장소 API·권한·비밀 가리기·읽기 전용 붙이기·scan·넘겨받기, 복사, 두 Env 원격 복제(없는 청크만), 기능 게이트
+cargo test -p orbivisor-api --features storage-it --test backup_store_tasks --test live_restore_tasks   # 백업·증분·GC·검증·옮기기 Task, 라이브 복원 상태 머신(qemu-img·qemu-nbd)
+cargo test -p orbivisor-store --features storage-it --test nbd_qemu       # 우리 NBD ↔ qemu-nbd·qemu-img·qemu-io, 재연결
+cargo test -p orbivisor-driver --features qemu-it --test qemu_fleece --test qemu_live_restore   # 실제 QEMU 플리싱·비트맵 문맥·ENOSPC, 라이브 복원 배선·갈아타기·재연결
+cargo test -p orbivisord --features backup-it --test backup_store         # E2E(orbivisorctl): 로컬 저장소 실행 중 VM 전체 → 증분 → GC·검증 → 복원·라이브 복원이 원본과 같음
+cargo test -p orbivisorctl -- backup_store backup                         # backup-store·backup verify/convert/copy·vm live-restore 인자와 표
 pnpm -C web test src/backupStores src/backups                       # 저장소 목록·마법사(복구 키 확인)·서랍·키 카드, 백업 표 대상·검증 배지, 라이브 복원 띠(msw, axe)
 # 실제 S3 호환 저장소(아래 "백업 저장소 S3 시험"): QEMU + qemu-nbd, S3 끝점 둘(HTTP·사설 CA HTTPS)과 docker 컨테이너 이름
 OPL_S3_ENDPOINT=http://127.0.0.1:9000 OPL_S3_TLS_ENDPOINT=https://127.0.0.1:9443 OPL_S3_CA=/tmp/opl-s3-certs/ca.pem \
   OPL_S3_ACCESS_KEY=… OPL_S3_SECRET_KEY=… OPL_S3_BUCKET=orbi OPL_S3_CONTAINER=opl-s3 \
-  cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1
+  cargo test -p orbivisord --features s3-it --test backup_s3 -- --nocapture --test-threads=1
 # 파일 단위 복원(계획 69) — 가짜 도우미(MockHypervisor: 에이전트 몸통 + 메모리 나무)와 가짜 게스트 에이전트로 QEMU 없이
-cargo test -p opl-restore                                           # 통신 규약(프레임·이름·흐름 검사, 해석기 proptest), 에이전트 몸통(소켓 쌍 + 임시 디렉터리: 쪽 나눔·링크 탈출·하드 링크·취소·동시 흐름), 탐지 고정물·마운트 표, zip·tar.gz 작성기(무작위 나무 왕복)
-cargo test -p opl-restore --features storage-it --test archive_tools   # 만든 zip·tar.gz를 unzip -t·bsdtar·GNU tar·Python zipfile로 읽음(Debian: unzip libarchive-tools), 7만 항목 zip64
-cargo test -p opl-types file_restore                                # EntryPath·볼륨 id·guest_path_ok·guest_target_name·content_disposition·노드 고르기, serde 하위 호환
-cargo test -p opl-api --test file_restore --test file_restore_types --test two_nodes   # 세션 API·권한·토큰·감사·backup_in_use·보존·되돌려 쓰기(가짜 QGA), 기능 게이트, 다른 노드의 세션
-cargo test -p oplctl -- file_restore                                # backup files 경로 나누기·volumes 표·ls 쪽 넘김·ls -l
+cargo test -p orbivisor-restore                                           # 통신 규약(프레임·이름·흐름 검사, 해석기 proptest), 에이전트 몸통(소켓 쌍 + 임시 디렉터리: 쪽 나눔·링크 탈출·하드 링크·취소·동시 흐름), 탐지 고정물·마운트 표, zip·tar.gz 작성기(무작위 나무 왕복)
+cargo test -p orbivisor-restore --features storage-it --test archive_tools   # 만든 zip·tar.gz를 unzip -t·bsdtar·GNU tar·Python zipfile로 읽음(Debian: unzip libarchive-tools), 7만 항목 zip64
+cargo test -p orbivisor-types file_restore                                # EntryPath·볼륨 id·guest_path_ok·guest_target_name·content_disposition·노드 고르기, serde 하위 호환
+cargo test -p orbivisor-api --test file_restore --test file_restore_types --test two_nodes   # 세션 API·권한·토큰·감사·backup_in_use·보존·되돌려 쓰기(가짜 QGA), 기능 게이트, 다른 노드의 세션
+cargo test -p orbivisorctl -- file_restore                                # backup files 경로 나누기·volumes 표·ls 쪽 넘김·ls -l
 pnpm -C web test src/fileRestore src/backups                        # 볼륨 나무·파일 표·키보드·내려받기 링크·VM으로 복원 대화상자, 백업 표 동작(msw, axe)
 bash packaging/tests/restore-image-test.sh                          # 이미지 빌더(가짜 deb·ELF·.ko — 네트워크·cargo 없이), 시험 게스트 갈래, 두 번 빌드 같음
 # 실제 도우미 VM(아래 "파일 단위 복원 시험"): 이미지(rustup의 <arch>-unknown-linux-musl 타깃, bsdtar·zstd·python3)와 고정물 디스크
 packaging/restore-image/build.sh --arch aarch64 --out /tmp/fr/img/aarch64       # x86_64 호스트면 --arch x86_64 --out /tmp/fr/img/x86_64
-crates/opl-restore/tests/fixtures/make-disks.sh /tmp/fr/fx                       # 있는 도구만(macOS: Homebrew e2fsprogs·dosfstools·mtools), lvm.img는 root
+crates/orbivisor-restore/tests/fixtures/make-disks.sh /tmp/fr/fx                       # 있는 도구만(macOS: Homebrew e2fsprogs·dosfstools·mtools), lvm.img는 root
 OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
-  cargo test -p opl-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1   # 탐지·SHA-256·저널 재생·덮개 한도·kill -9·치우기, PROBE 줄
+  cargo test -p orbivisor-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1   # 탐지·SHA-256·저널 재생·덮개 한도·kill -9·치우기, PROBE 줄
 OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
-  cargo test -p opld --features restore-it --test file_restore -- --nocapture   # E2E (1)~(5)(orbivisorctl backup files — (5)는 OPL_RESTORE_TEST_GUEST가 있을 때)
+  cargo test -p orbivisord --features restore-it --test file_restore -- --nocapture   # E2E (1)~(5)(orbivisorctl backup files — (5)는 OPL_RESTORE_TEST_GUEST가 있을 때)
 pnpm -C web build && OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
-  cargo test -p opld --features web-it --test web browser_browses_backup_files   # 브라우저로 찾아보기·내려받기
+  cargo test -p orbivisord --features web-it --test web browser_browses_backup_files   # 브라우저로 찾아보기·내려받기
 # VM 빌더·만들기 미리 확인(계획 71)
-cargo test -p opl-api --test vm_checks                              # POST /vm-checks: 통과(고를 노드·아무것도 안 씀)·문제 모음과 자리·이름·머신·만들 볼륨·영역 규칙·403/404·folder_required·409·감사 없음·OpenAPI
-cargo test -p opl-api vm_checks                                     # area_of 코드 → 자리 표, slot_of
-cargo test -p oplctl -- vm_create_dry_run web_cross                 # vm create --dry-run(표·-o json·끝 코드), 웹 CLI 미리 보기 교차 시험(아래)
+cargo test -p orbivisor-api --test vm_checks                              # POST /vm-checks: 통과(고를 노드·아무것도 안 씀)·문제 모음과 자리·이름·머신·만들 볼륨·영역 규칙·403/404·folder_required·409·감사 없음·OpenAPI
+cargo test -p orbivisor-api vm_checks                                     # area_of 코드 → 자리 표, slot_of
+cargo test -p orbivisorctl -- vm_create_dry_run web_cross                 # vm create --dry-run(표·-o json·끝 코드), 웹 CLI 미리 보기 교차 시험(아래)
 pnpm -C web test src/dnd src/vmBuilder src/placement/hard.test.ts   # 끌기 틀(상태 기계 사건열 성질 시험·자동 스크롤·제공자), 빌더 모델(부품·놓기 규칙 표·놓기·문제·요청·JSON·CLI·무작위 놓기)과 화면(msw, axe), hard 배치 규칙 예상
 pnpm -C web test src/clusterMap/drop.test.ts src/clusterMap/ClusterMapDrag.test.tsx   # 지도 끌어 옮기기: 놓을 자리 판정 표, 마우스·터치·m 키·권한·가장자리 보기 옮기기
-pnpm -C web build && cargo test -p opld --features web-it --test web browser_builds_vms_with_the_builder   # 브라우저로 빌더 만들기 셋(QEMU를 켜지 않음)
-# VMware 이전 2·OVA 내보내기(계획 72) — 가짜 vSphere(opl-api 기능 `fake-vsphere`: 스냅샷 사슬·CBT·게스트 쓰기·호스트 티켓·결함 주입)
-cargo test -p opl-types -- vmware vm_export                         # 순수: serde 하위 호환(빈 값 안 씀), 비밀번호 가림, 검증 표, 항목·스냅샷 이름
-cargo test -p opl-api --lib -- vmware vm_imports::ovf_write vm_exports   # SOAP 봉투·결함, 인벤토리·CBT 구역, 매핑·VMware 쪽 표, 스케줄러 순수 plan, OVF 쓰개 ↔ 계획 29 읽개, ustar
+pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_builds_vms_with_the_builder   # 브라우저로 빌더 만들기 셋(QEMU를 켜지 않음)
+# VMware 이전 2·OVA 내보내기(계획 72) — 가짜 vSphere(orbivisor-api 기능 `fake-vsphere`: 스냅샷 사슬·CBT·게스트 쓰기·호스트 티켓·결함 주입)
+cargo test -p orbivisor-types -- vmware vm_export                         # 순수: serde 하위 호환(빈 값 안 씀), 비밀번호 가림, 검증 표, 항목·스냅샷 이름
+cargo test -p orbivisor-api --lib -- vmware vm_imports::ovf_write vm_exports   # SOAP 봉투·결함, 인벤토리·CBT 구역, 매핑·VMware 쪽 표, 스케줄러 순수 plan, OVF 쓰개 ↔ 계획 29 읽개, ustar
 # API 시험(가짜 스토리지 — qemu 없이). PATH에 qemu-img·qemu-nbd가 없어야 가짜 길을 탄다(CI check에도 qemu-img가 없다).
-PATH=/usr/bin:/bin cargo test -p opl-api --features fake-vsphere \
+PATH=/usr/bin:/bin cargo test -p orbivisor-api --features fake-vsphere \
   --test vsphere --test vmware_api --test vmware_sync --test vmware_cutover   # 클라이언트·원본/계획 API·회차/스케줄러·전환·되돌림·예약 전환, 끝에 원본 안전 단언
-cargo test -p opl-api --features fake-vsphere,storage-it --test vmware_sync qemu_nbd_writes_the_target_volumes   # 실제 qemu-nbd 쓰기 대상
-cargo test -p opl-api --features storage-it --test vm_import_tasks an_exported_ova_imports_back_with_the_same_disk   # 내보내기 → OVA 가져오기 왕복(qemu-img compare)
-cargo test -p opl-api --test vm_exports                             # 내보내기 API·링크·권한(가짜 스토리지)
-cargo run -p opl-api --features fake-vsphere --bin fake-vsphere -- --port 8989   # 손으로 띄우는 가짜 vCenter(연결 정보 JSON 한 줄 — svc01 시연·웹 개발)
+cargo test -p orbivisor-api --features fake-vsphere,storage-it --test vmware_sync qemu_nbd_writes_the_target_volumes   # 실제 qemu-nbd 쓰기 대상
+cargo test -p orbivisor-api --features storage-it --test vm_import_tasks an_exported_ova_imports_back_with_the_same_disk   # 내보내기 → OVA 가져오기 왕복(qemu-img compare)
+cargo test -p orbivisor-api --test vm_exports                             # 내보내기 API·링크·권한(가짜 스토리지)
+cargo run -p orbivisor-api --features fake-vsphere --bin fake-vsphere -- --port 8989   # 손으로 띄우는 가짜 vCenter(연결 정보 JSON 한 줄 — svc01 시연·웹 개발)
 # govmomi vcsim(SOAP 꼴, GitHub `vmware-sim` 작업 — vcsim·govc v0.56.2 실행 파일, nbdkit). vcsim은 QueryChangedDiskAreas가 없어 CBT는 가짜만 본다.
 vcsim -l 127.0.0.1:8989 -username user -password pass &
 OPL_TEST_VCSIM=127.0.0.1:8989 OPL_TEST_VCSIM_USER=user OPL_TEST_VCSIM_PASSWORD=pass OPL_TEST_NBDKIT=$(command -v nbdkit) \
-  cargo test -p opl-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
+  cargo test -p orbivisor-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
 # 실제 opld(QEMU·qemu-img·qemu-nbd): 따뜻한 이전(회차 사이 쓰기·델타 둘·전환·볼륨 바이트 같음·원본 꺼짐·NIC 끊김·revert), 차가운 한 대·
 # 마무리, 내보내기 → 내려받은 OVA(ustar) → OVA 가져오기 왕복. `[test] vmware_tick_ms`·`vmware_sync_secs`로 스케줄러·델타 주기를 줄인다.
-cargo test -p opld --features qemu-it,fake-vsphere --test vmware_migration
+cargo test -p orbivisord --features qemu-it,fake-vsphere --test vmware_migration
 pnpm -C web test src/vmware src/exports                             # 원본 지문 흐름·비밀번호가 저장소에 없음, 나무·찾기, 마법사, 상세·서랍·전환·되돌리기, 내보내기(msw, axe)
-pnpm -C web build && cargo test -p opld --features web-it --test web browser_migrates_a_vmware_vm_and_exports_it   # 브라우저: 원본 → 마법사 → 전환 → VM 링크 → OVA 내려받기
+pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_migrates_a_vmware_vm_and_exports_it   # 브라우저: 원본 → 마법사 → 전환 → VM 링크 → OVA 내려받기
 # 선언형 운영(계획 73) — 적용·설정 기록·되돌리기·드리프트·ACME. API 시험은 FakeStorage(PATH에 qemu-img가 없어야 가짜 길)
-cargo test -p opl-types -- manifest apply_set history acme                # 순수: 매니페스트·비밀 값, 이력 가림(history_mask)·사유·출처, ACME 스펙 검증·가림
-cargo test -p opl-cluster --test history                                  # 출처를 단 명령(Attributed)·이력 표·보존·스냅샷 칸
-cargo test --release -p opl-cluster --test history -- --ignored --nocapture   # 쓰기 길 비용(노드 하나, update_spec 300번 — 기록 +1.3%)
-cargo test --release -p opl-cluster --lib -- --ignored history_overhead --nocapture   # 상태 머신 1000번 바꾸기(파일 +1.0%)
-PATH=/usr/bin:/bin cargo test -p opl-api --test declarative --test declarative_kinds_a --test declarative_kinds_b \
+cargo test -p orbivisor-types -- manifest apply_set history acme                # 순수: 매니페스트·비밀 값, 이력 가림(history_mask)·사유·출처, ACME 스펙 검증·가림
+cargo test -p orbivisor-cluster --test history                                  # 출처를 단 명령(Attributed)·이력 표·보존·스냅샷 칸
+cargo test --release -p orbivisor-cluster --test history -- --ignored --nocapture   # 쓰기 길 비용(노드 하나, update_spec 300번 — 기록 +1.3%)
+cargo test --release -p orbivisor-cluster --lib -- --ignored history_overhead --nocapture   # 상태 머신 1000번 바꾸기(파일 +1.0%)
+PATH=/usr/bin:/bin cargo test -p orbivisor-api --test declarative --test declarative_kinds_a --test declarative_kinds_b \
   --test history_api --test config_history --test acme_api               # 계획·막힘·저장한 계획·가지치기·충돌, 종류 스물다섯 왕복, 이력·되돌리기·드리프트, ACME API·HTTP-01·SNI
-cargo test -p opl-api --lib -- declarative history drift acme            # diff·overlay proptest, 시점 판단, JWS·EAB·ARI id·DNS 메시지·TSIG·훅 검사·due·plan
-cargo test -p oplctl -- declarative history cert web_cross               # apply·plan·diff 끝 코드·export 파일·크기·secretFrom, history·restore·drift, cert, 웹 YAML 쓰개 ↔ CLI 읽개
+cargo test -p orbivisor-api --lib -- declarative history drift acme            # diff·overlay proptest, 시점 판단, JWS·EAB·ARI id·DNS 메시지·TSIG·훅 검사·due·plan
+cargo test -p orbivisorctl -- declarative history cert web_cross               # apply·plan·diff 끝 코드·export 파일·크기·secretFrom, history·restore·drift, cert, 웹 YAML 쓰개 ↔ CLI 읽개
 # 실제 QEMU, 노드 둘: examples/declarative/web/ apply → diff 0 → plan(restart 표시) → apply --reason → 다른 노드에서 웹처럼 바꿈 →
 # drift(누가) → restore --revision → export 왕복 diff 0 → --minimal을 다른 묶음으로 → restore --at(폴더) → apply --prune --prune-data
-cargo test -p opld --features qemu-it --test declarative
+cargo test -p orbivisord --features qemu-it --test declarative
 pnpm -C web test src/history src/declarative src/certs                    # 설정 기록·서랍·되돌리기·시점, 선언 묶음·adopt, ⋯ 메뉴·YAML·Terraform 칩, 인증서(msw, axe)
-pnpm -C web build && cargo test -p opld --features web-it --test web browser_restores_a_vm_from_its_config_history   # 브라우저: 메모리 바꿈 → ⋯ 설정 기록 → 되돌리기
+pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_restores_a_vm_from_its_config_history   # 브라우저: 메모리 바꿈 → ⋯ 설정 기록 → 되돌리기
 # ACME 실제(아래 "ACME 시험"): Pebble·challtestsrv(v2.10.1), 있으면 BIND(RFC 2136)
-OPL_TEST_PEBBLE_DIR=/tmp/pebble-bin cargo test -p opl-api --features acme-it --test acme -- --nocapture
+OPL_TEST_PEBBLE_DIR=/tmp/pebble-bin cargo test -p orbivisor-api --features acme-it --test acme -- --nocapture
 eval "$(.github/scripts/acme-bind.sh "$(command -v named)" /tmp/opl-bind 15353)"   # OPL_TEST_BIND·OPL_TEST_BIND_KEY를 내보낸다
 OPL_TEST_PEBBLE_DIR=/tmp/pebble-bin OPL_TEST_BIND=$OPL_TEST_BIND OPL_TEST_BIND_KEY=$OPL_TEST_BIND_KEY \
-  cargo test -p opl-api --features acme-it --test acme -- --nocapture
+  cargo test -p orbivisor-api --features acme-it --test acme -- --nocapture
 # 개발 서버(Terraform 수용 시험·웹 데모): 노드 하나, 가짜 하이퍼바이저·메모리 스토리지, 연결 정보 JSON 한 줄
-cargo run -p opld --features devserver --bin opl-devserver -- --port 8006   # --dir DIR(없으면 임시, 끝날 때 지움), --exit-on-stdin-eof
-cargo test -p opld --features devserver --test devserver
+cargo run -p orbivisord --features devserver --bin orbivisor-devserver -- --port 8006   # --dir DIR(없으면 임시, 끝날 때 지움), --exit-on-stdin-eof
+cargo test -p orbivisord --features devserver --test devserver
 # Terraform/OpenTofu 공급자(Go, 아래 "Terraform 공급자 시험")
-cargo run -q -p opl-api --bin opl-api-openapi > /tmp/openapi.json && cargo build -p opld --features devserver --bin opl-devserver
+cargo run -q -p orbivisor-api --bin orbivisor-api-openapi > /tmp/openapi.json && cargo build -p orbivisord --features devserver --bin orbivisor-devserver
 cd terraform && go vet ./... && OPL_OPENAPI=/tmp/openapi.json go test ./...    # 단위와 스키마 맞춤(OpenAPI의 Manifest{Kind})
-TF_ACC=1 TF_ACC_TERRAFORM_PATH=$(command -v terraform) OPL_DEVSERVER=$PWD/../target/debug/opl-devserver \
+TF_ACC=1 TF_ACC_TERRAFORM_PATH=$(command -v terraform) OPL_DEVSERVER=$PWD/../target/debug/orbivisor-devserver \
   go test ./internal/provider/ -count=1 -v -timeout 30m                 # 수용 시험 여덟(terraform)
-TF_ACC=1 TF_ACC_TERRAFORM_PATH=$(command -v tofu) TF_ACC_PROVIDER_HOST=registry.opentofu.org OPL_DEVSERVER=$PWD/../target/debug/opl-devserver \
+TF_ACC=1 TF_ACC_TERRAFORM_PATH=$(command -v tofu) TF_ACC_PROVIDER_HOST=registry.opentofu.org OPL_DEVSERVER=$PWD/../target/debug/orbivisor-devserver \
   go test ./internal/provider/ -count=1 -v -timeout 30m                 # 같은 시험을 OpenTofu로
 # 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
 sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
-  cargo test -p opld --features sdn-multinode-it --test sdn_multinode -- --nocapture
+  cargo test -p orbivisord --features sdn-multinode-it --test sdn_multinode -- --nocapture
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opld --features qemu-it,net-it --test bridge  # E2E: 브리지 네트워크
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opld --features qemu-it,net-it --test vxlan   # E2E: VXLAN 네트워크
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opld --features qemu-it,net-it --test firewall  # E2E: VM 방화벽(nftables 필요)
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p orbivisor-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p orbivisord --features qemu-it,net-it --test bridge  # E2E: 브리지 네트워크
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p orbivisord --features qemu-it,net-it --test vxlan   # E2E: VXLAN 네트워크
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p orbivisord --features qemu-it,net-it --test firewall  # E2E: VM 방화벽(nftables 필요)
 # Linux, root: 실제 NFS 풀. nfs-kernel-server로 127.0.0.1에 rw,no_root_squash로 내보낸 디렉터리가 필요하다.
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_NFS_EXPORT=/srv/opl-nfs cargo test -p opld --features nfs-it --test nfs
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_NFS_EXPORT=/srv/opl-nfs cargo test -p orbivisord --features nfs-it --test nfs
 # Linux, root: 실제 LVM-thin 풀. 테스트가 LV를 만들고 지워도 되는 VG/thin pool과 lvm2, qemu-io가 필요하다.
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM=opltest/tp cargo test -p opl-driver --features lvm-it --test lvm_storage
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM=opltest/tp cargo test -p opld --features lvm-it --test lvm
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM=opltest/tp cargo test -p orbivisor-driver --features lvm-it --test lvm_storage
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM=opltest/tp cargo test -p orbivisord --features lvm-it --test lvm
 # Linux, root: 실제 ZFS 풀. 테스트가 zvol을 만들고 지워도 되는 데이터셋과 zfsutils-linux, qemu-io가 필요하다.
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_ZFS=opltestz/opl cargo test -p opl-driver --features zfs-it --test zfs_storage
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_ZFS=opltestz/opl cargo test -p opld --features zfs-it --test zfs
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_ZFS=opltestz/opl cargo test -p orbivisor-driver --features zfs-it --test zfs_storage
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_ZFS=opltestz/opl cargo test -p orbivisord --features zfs-it --test zfs
 # Linux, root: 실제 Ceph RBD 풀. 테스트가 이미지를 만들고 지워도 되는 Ceph 풀과 ceph-common, qemu-block-extra, qemu-io,
 # client.admin으로 접속할 수 있는 /etc/ceph/ceph.conf·키링이 필요하다. 제한된 사용자 시험은 아래 세 변수가 있을 때만 돈다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_RBD=rbd \
   OPL_TEST_RBD_USER=opltest OPL_TEST_RBD_NAMESPACE=opl OPL_TEST_RBD_CONF=/etc/opl-ceph/ceph.conf \
-  cargo test -p opl-driver --features rbd-it --test rbd_storage
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_RBD=rbd cargo test -p opld --features rbd-it --test rbd
+  cargo test -p orbivisor-driver --features rbd-it --test rbd_storage
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_RBD=rbd cargo test -p orbivisord --features rbd-it --test rbd
 # Linux(Ubuntu 24.04), root, Ceph가 없는 버려도 되는 기계: orbivisord가 apt로 Ceph를 설치하고 노드 하나에 mon·mgr, 시험이 만든
 # 루프 장치에 OSD, 풀 등록, 그 풀의 디스크로 VM 켜기(Ceph 꾸러미와 데몬이 남는다 — CI `ceph` 작업)
-sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opld --features ceph-it,qemu-it --test ceph -- --nocapture
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p orbivisord --features ceph-it,qemu-it --test ceph -- --nocapture
 # Linux, root: 실제 공유 LVM 풀. 테스트가 LV를 만들고 지워도 되는, 잠금을 시작한 공유(lvmlockd) VG와 lvm2-lockd, sanlock,
 # qemu-io가 필요하다. OPL_TEST_ISCSI(포털,타깃)가 있으면 opld 시험은 VG가 그 타깃의 LUN 위에 있다고 본다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHARED=oplshared \
-  cargo test -p opl-driver --features lvm-shared-it --test lvm_shared_storage
+  cargo test -p orbivisor-driver --features lvm-shared-it --test lvm_shared_storage
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_TEST_LVM_SHARED=oplshared \
-  OPL_TEST_ISCSI=127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared cargo test -p opld --features lvm-shared-it --test lvm_shared
+  OPL_TEST_ISCSI=127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared cargo test -p orbivisord --features lvm-shared-it --test lvm_shared
 # 실제 라이브 마이그레이션: 한 호스트의 orbivisord 둘, 공유 디렉터리 풀과 노드마다 다른 경로의 로컬 디렉터리 풀(디스크 복사,
 # macOS는 TCG로 돈다). nfs-it·rbd-it·lvm-shared-it와 그 환경 변수를 함께 주면(Linux, root) 그 풀로도 옮기고, lvm-it·zfs-it와
 # 함께 주면 로컬 디스크를 디렉터리 풀 → LVM-thin·ZFS 풀 → 디렉터리 풀로 옮긴다.
-cargo test -p opld --features migration-it --test migration
+cargo test -p orbivisord --features migration-it --test migration
 # 실제 HA 복구: 한 호스트의 orbivisord 둘(process 펜싱)과 위트니스, 공유 디렉터리 풀(macOS는 TCG로 돈다).
-cargo test -p opld --features ha-it --test ha
+cargo test -p orbivisord --features ha-it --test ha
 # Linux(Ubuntu·Debian), root: 실제 OpenLDAP. ldap-setup.sh가 이 기계의 slapd 설정과 디렉터리를 지우고 늘 새 데이터베이스로
 # 다시 설정한다(다시 돌려도 된다 — 옛 데이터베이스는 /var/backups로 옮겨짐). 버려도 되는 기계에서만: CI(`CI=true`)가 아니면
 # OPL_LDAP_SETUP_WIPE=1을 주어야 돌고, 없으면 설명을 찍고 끝난다(CI `ldap` 작업).
@@ -244,7 +244,7 @@ export OPL_TEST_LDAP_URL=ldaps://127.0.0.1:636 OPL_TEST_LDAP_STARTTLS_URL=ldap:/
   OPL_TEST_LDAP_USER=alice OPL_TEST_LDAP_USER_PASSWORD=alice-pw OPL_TEST_LDAP_OTHER_USER=bob \
   OPL_TEST_LDAP_OTHER_PASSWORD=bob-pw OPL_TEST_LDAP_GROUP=cn=admins,ou=groups,dc=example,dc=com
 sudo -E OPL_LDAP_SETUP_WIPE=1 sh .github/scripts/ldap-setup.sh
-cargo test -p opl-api --features ldap-it --test ldap_it
+cargo test -p orbivisor-api --features ldap-it --test ldap_it
 ```
 
 `nfs-it` 시험은 orbivisord가 내보내기를 마운트하고, 그 풀에 볼륨을 만들고 qcow2 스냅샷을 찍고 지운 뒤, 풀을 지우면
@@ -332,7 +332,7 @@ sudo vgcreate --shared oplshared "/dev/disk/by-path/ip-127.0.0.1:3260-iscsi-$IQN
 #         (lvm.conf의 use_lvmlockd를 0으로 되돌린다)
 ```
 
-`sdn-it` 시험(`crates/opld/tests/sdn.rs`, 계획 65)은 **OVN이 깔린 적 없는 기계**에서 root로 돈다. orbivisord가 `sdn init`·
+`sdn-it` 시험(`crates/orbivisord/tests/sdn.rs`, 계획 65)은 **OVN이 깔린 적 없는 기계**에서 root로 돈다. orbivisord가 `sdn init`·
 `sdn chassis install`(API와 orbivisorctl)로 `ovn-central`·`ovn-host`·`openvswitch-switch`를 apt로 깔고, 배포판 중앙 단위를 끄고
 가린 뒤 Orbivisor 단위(`opl-ovn-nb`·`-sb`·`-northd`)를 띄운다. 시험은 NB·SB가 노드 주소의 `pssl`에만 듣는지(`ss -ltn`),
 클러스터 CA 인증서로만 붙는지, SB `Chassis`가 노드 UUID·Geneve·underlay인지, 127.0.0.2의 `ovsdb-server` 한 쌍의 합류·떠나기,
@@ -341,7 +341,7 @@ busybox `udhcpc`, 서로 ping, 위조 주소는 막힘), SDN NIC VM의 `br-int` 
 opld 다시 띄우기를 본다. 시험은 **호스트에 OVN 꾸러미·데몬·`/var/lib/opl/ovn`을 남긴다** — 그래서 GitHub의 깨끗한 Ubuntu
 24.04 러너에서만 돌린다. CI `ovn` 작업은 QEMU·OVMF·busybox만 미리 깔고 `/etc/ovn`·`/etc/openvswitch`와 OVN 꾸러미가 없는지
 확인한 뒤(OVN은 orbivisord가 설치), Ubuntu 24.04 클라우드 이미지를 받아 `OPL_TEST_CLOUD_IMAGE`로 넘기고
-`cargo test --features opld/sdn-it -p opld --test sdn`을 root로 돌린다(빌드 2분쯤, 시험 2~3분). 러너 하나는 OVS 하나라 chassis
+`cargo test --features orbivisord/sdn-it -p orbivisord --test sdn`을 root로 돌린다(빌드 2분쯤, 시험 2~3분). 러너 하나는 OVS 하나라 chassis
 둘 사이의 Geneve와 라이브 마이그레이션의 두 chassis 바인딩은 여기서 보지 않는다(아래 `sdn-multinode`가 본다).
 계획 66부터 같은 시험이 러너 호스트에 Linux 브리지 `oplext0`와 "물리 라우터" 이름공간 `ext`(203.0.113.1)를 만들고 노드 physnet
 `ext=oplext0`·공급자 네트워크(localnet ping), 라우터의 DHCP 기본 경로·동서 ping·SNAT(`tcpdump`의 보낸 주소)·중앙 유동 IP,
@@ -358,7 +358,7 @@ Orbivisor 중앙이 아니라 허용 목록에 막히므로), 새 절 넷을 CLI
 자기 행·6645는 됨, `--wait=hv`, 127.0.0.3 출발은 6641·6642·6645 시간 초과, 끄면 단위 글이 계획 66 그대로). 작업이 `iperf3`도 깐다.
 `linux-kvm`의 `net-it`는 실제 tc로 `tap_rate_limits_use_tc_police`를 본다.
 
-**여러 노드 SDN 시험**(`crates/opld/tests/sdn_multinode.rs`, 기능 `sdn-multinode-it`, 계획 66)은 한 Linux 호스트에 **privileged
+**여러 노드 SDN 시험**(`crates/orbivisord/tests/sdn_multinode.rs`, 기능 `sdn-multinode-it`, 계획 66)은 한 Linux 호스트에 **privileged
 systemd 컨테이너 셋**(`opl-c1`~`c3`)을 Orbivisor 노드로 띄운다. 이미지 `ci/sdn-node/Dockerfile`은 `ubuntu:24.04`에 systemd·
 iproute2·nftables·qemu-system-x86·ovmf·qemu-utils·tcpdump·busybox·python3만 넣고 **OVN·OVS는 넣지 않는다** — orbivisord가
 `sdn init`·`sdn central add`·`sdn chassis install`로 apt에서 깐다(시험만을 위한 코드 길이 없다). 컨테이너마다 자기 netns·systemd·
@@ -385,7 +385,7 @@ remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 
 `modprobe -a openvswitch geneve`, `docker build -t opl-sdn-node ci/sdn-node`, 위 `cargo test`를 root로(캐시 없이 `$RUNNER_TEMP/target`)
 돌린다. 시험은 계획 66 때 약 170초였고 계획 67의 절로 늘었다(설계 어림 약 6분 더 — `timeout-minutes: 60` 그대로, OVN 24.03).
 
-**백업 저장소 S3 시험**(`crates/opld/tests/backup_s3.rs`, 기능 `s3-it`, 계획 68)은 실제 QEMU VM을 실제 S3 호환 저장소에 orbivisorctl로
+**백업 저장소 S3 시험**(`crates/orbivisord/tests/backup_s3.rs`, 기능 `s3-it`, 계획 68)은 실제 QEMU VM을 실제 S3 호환 저장소에 orbivisorctl로
 백업한다: (1) 암호화 S3 저장소에 실행 중 VM 백업 다섯 번과 GC 세 번을 함께 → 모든 백업 검증 통과, 저장소의 모든 객체에 디스크의
 평문 표식이 없음, 복원이 같음, 처리량 `PROBE`, (2) 사설 CA HTTPS — CA 없이는 초기화 실패, `--ca-file`이면 백업·복원, (3) 512 MiB
 디스크: 백업 도중 저장소 `docker pause` 20초 → 백업 성공, 라이브 복원 도중 멈춤 → 헬퍼 `kill -9` → orbivisord 다시 시작 → 풀면
@@ -398,13 +398,13 @@ remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 
 
 **파일 단위 복원 시험**(계획 69)은 실제 도우미 이미지와 고정물 디스크가 있어야 돈다 — `OPL_RESTORE_IMAGE_DIR`(그 아래
 `<arch>/manifest.json`, `packaging/restore-image/build.sh`가 만듦)와 `OPL_RESTORE_FIXTURES`(`make-disks.sh`가 만든 이미지·`expected.sha256`)가
-없으면 건너뛴다. 이미지 판은 시험 빌드의 opld 판과 같아야 하므로 같은 소스 트리에서 만든다. `crates/opl-driver/tests/restore_helper.rs`
-(`restore-it` = `qemu-it`)는 도우미를 직접 띄워 고정물 11개(ext4는 opl-store NBD 서버 원본, 나머지 qcow2 원본)의 탐지 표·파일마다 SHA-256·
+없으면 건너뛴다. 이미지 판은 시험 빌드의 opld 판과 같아야 하므로 같은 소스 트리에서 만든다. `crates/orbivisor-driver/tests/restore_helper.rs`
+(`restore-it` = `qemu-it`)는 도우미를 직접 띄워 고정물 11개(ext4는 orbivisor-store NBD 서버 원본, 나머지 qcow2 원본)의 탐지 표·파일마다 SHA-256·
 더러운 ext4·XFS 저널 재생·같은 UUID XFS 둘·MBR·GPT·LUKS "not supported"·LVM 선형·씬, 덮개 한도, `kill -9`, 버려 둔 도우미의 치우기를 보고,
 부팅 시간·흘리기 MB/s를 `PROBE` 줄로 찍는다. 고르는 것: `OPL_RESTORE_QEMU`·`OPL_RESTORE_QEMU_IMG`(바이너리), `OPL_RESTORE_ACCEL=tcg`(가속
 강제), `OPL_RESTORE_BIG_MIB`(흘리기 크기, 기본 256), `OPL_RESTORE_SCOPE=1`(systemd scope). Linux에서 root로 돌리면 `-run-with user=nobody`
 뒤 QEMU uid와 seccomp도 본다. XFS 더러운 로그 고정물(`xfs-dirty.img`)은 root가 만든다(CI `file-restore` 작업의 "Fixture disks" 걸음 —
-루프 마운트, 파일 쓰기·fsync, `xfs_io -x -c shutdown`). `crates/opld/tests/file_restore.rs`(`restore-it` = `backup-it`, unzip·tar 필요)는
+루프 마운트, 파일 쓰기·fsync, `xfs_io -x -c shutdown`). `crates/orbivisord/tests/file_restore.rs`(`restore-it` = `backup-it`, unzip·tar 필요)는
 orbivisorctl `backup files`로 (1) 고정물 ext4 VM의 암호화 로컬 저장소 백업 — 나열·raw·zip·tar.gz를 고정물과 견주고 닫은 뒤 도우미·세션
 디렉터리가 남지 않음, (2) 옛 풀 전체 → 더러운 저널 증분 체인, (3) 도우미 `kill -9`, (4) 세션이 열린 채 opld `SIGKILL` 뒤 치우기, (5) 실제
 게스트 에이전트로 되돌려 쓰기를 본다. (5)는 `build.sh --test-guest --out <dir>`(같은 커널에 Debian `qemu-guest-agent`·정적 busybox,
@@ -416,10 +416,10 @@ macOS 유닉스 소켓 경로는 104바이트 안이어야 하므로 이미지·
 CI **`file-restore`** 작업(Ubuntu 24.04 러너, KVM, root, `timeout-minutes: 60`)은 도구를 깔고 x86_64 이미지를 **두 번** 빌드해 세 파일의
 해시가 같은지 보고(재현), aarch64 이미지는 빌드만(부팅은 svc01), x86_64 시험 게스트를 만든 뒤, 고정물 전체(btrfs·ntfs·LVM·XFS 더러운 로그)를
 root로 만들고, root로 `restore_helper`(`OPL_RESTORE_SCOPE=1`)와 opld E2E (1)~(5)를, 마지막에 `OPL_RESTORE_ACCEL=tcg`로 도우미 시험을 한 번
-더 돌린다. `check (ubuntu)`는 musl 두 타깃의 `cargo tree -p opl-restore`에 C 빌드 스크립트(`cc`·`ring`·`openssl-sys`)가 없는지와
+더 돌린다. `check (ubuntu)`는 musl 두 타깃의 `cargo tree -p orbivisor-restore`에 C 빌드 스크립트(`cc`·`ring`·`openssl-sys`)가 없는지와
 `archive_tools`를, `shell`은 `restore-image-test.sh`를, `package`는 `orbivisor-restore-image` deb 빌드·설치를 본다.
 
-**ACME 시험**(`crates/opl-api/tests/acme.rs`, 기능 `acme-it`, 계획 73)은 Let's Encrypt의 시험 서버 Pebble과 `pebble-challtestsrv`
+**ACME 시험**(`crates/orbivisor-api/tests/acme.rs`, 기능 `acme-it`, 계획 73)은 Let's Encrypt의 시험 서버 Pebble과 `pebble-challtestsrv`
 실행 파일이 든 디렉터리 `OPL_TEST_PEBBLE_DIR`이 있어야 돈다(없으면 건너뜀 — GitHub 릴리스 v2.10.1, 체크섬 파일이 없어 CI가 SHA-256을
 핀한다). Pebble(`-strict`, 무작위 badNonce 5% 그대로)로 HTTP-01 노드마다 받기·키 파일 0600·끼우기·`replaces` 갱신 뒤 새 일련번호(열린
 연결 그대로)·ARI 창, DNS-01 훅 공유 와일드카드·짧은 프로필, EAB, 실패 물러서기를 본다. RFC 2136은 `OPL_TEST_BIND`(`ip:port`)·
@@ -431,13 +431,13 @@ CI **`acme`** 작업(Ubuntu 24.04)은 Pebble·challtestsrv 리눅스 판(SHA-256
 **Terraform 공급자 시험**(`terraform/`, Go 1.26 — `go.mod`의 `toolchain go1.26.11`)은 `go vet`·`gofmt`·`go mod verify`·staticcheck·
 govulncheck, 단위 시험과 스키마 맞춤(`TestSchemasMatchTheServer` — `OPL_OPENAPI`의 매니페스트 스키마와 리소스 맨 위 칸의 이름·타입·필수),
 그리고 `TF_ACC=1`의 수용 시험 여덟이다(VM 묶음·할당량을 넘는 VM이 plan에서 오류·네트워크·권한·백업·인증서·데이터 소스·템플릿).
-수용 시험의 `TestMain`이 `OPL_DEVSERVER`의 `opl-devserver`를 `--exit-on-stdin-eof`로 띄우고, terraform 실행 파일은
-`TF_ACC_TERRAFORM_PATH`(OpenTofu면 `TF_ACC_PROVIDER_HOST=registry.opentofu.org`도)로 준다. `opl-devserver`는 메모리 스토리지 노드 하나
+수용 시험의 `TestMain`이 `OPL_DEVSERVER`의 `orbivisor-devserver`를 `--exit-on-stdin-eof`로 띄우고, terraform 실행 파일은
+`TF_ACC_TERRAFORM_PATH`(OpenTofu면 `TF_ACC_PROVIDER_HOST=registry.opentofu.org`도)로 준다. `orbivisor-devserver`는 메모리 스토리지 노드 하나
 (풀 `local`·`backup`, SDN을 세운 것처럼 적음 — OVN 없음, ACME 계정 `dev` — CA에 등록하지 않음, 노드 기능 모두와 `http01`)를 클러스터 CA가
 서명한 HTTPS(127.0.0.1)로 띄우고 `{"url","token","ca_pem","ca_fingerprint","admin_password","node","dir"}` 한 줄을 찍는다(admin 비밀번호는
 실행마다 무작위, `--address`는 루프백만 — 다른 주소는 `--insecure-expose`가 있어야 한다). 스키마를 바꾸면
 `terraform/docs/`를 `tfplugindocs`로 다시 만든다(명령은 `terraform/main.go` 머리). CI **`terraform`** 작업(행렬 terraform 1.17.2·tofu 1.13.9,
-SHA-256 핀, setup-go 1.26.11, staticcheck v0.8.2, govulncheck v1.9.0)이 `opl-devserver`·OpenAPI를 cargo로 만들고 위 검사 전부와 수용 시험을
+SHA-256 핀, setup-go 1.26.11, staticcheck v0.8.2, govulncheck v1.9.0)이 `orbivisor-devserver`·OpenAPI를 cargo로 만들고 위 검사 전부와 수용 시험을
 돌린다.
 
 웹 UI (`web/`):
@@ -453,8 +453,8 @@ pnpm -C web test src/clusterMap src/components/iso   # 클러스터 지도(계�
 pnpm -C web typecheck && pnpm -C web lint
 pnpm -C web gen:api          # API를 바꾼 뒤 src/api/schema.d.ts를 다시 만든다(CI가 확인한다)
 pnpm -C web exec playwright install chromium
-pnpm -C web build && cargo test -p opld --features web-it --test web   # E2E: 브라우저 → 업로드 → VM → 콘솔 → 정리, 폴더 사용자·2FA
-pnpm -C web build && cargo test -p opld --features web-it --test web browser_shows_a_folder_user_only_their_folder   # 폴더 사용자만(QEMU 없이 돈다)
+pnpm -C web build && cargo test -p orbivisord --features web-it --test web   # E2E: 브라우저 → 업로드 → VM → 콘솔 → 정리, 폴더 사용자·2FA
+pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_shows_a_folder_user_only_their_folder   # 폴더 사용자만(QEMU 없이 돈다)
 ```
 
 브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 영역 탭으로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
@@ -486,11 +486,11 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 390px 폭 가로 넘침 없음은 `builder.spec.ts`가 본다.
 
 **웹 CLI 미리 보기 교차 시험.** 빌더 모델 시험(`web/src/vmBuilder/model/cli.test.ts`)이 대표 상태 열둘의 CLI 명령(셸을 거치지 않는 인자 배열)·
-user-data 파일·웹 요청 본문을 `web/src/vmBuilder/model/__fixtures__/cli.json`과 견주고(다르면 실패), `crates/oplctl/src/web_cross.rs`가 같은
+user-data 파일·웹 요청 본문을 `web/src/vmBuilder/model/__fixtures__/cli.json`과 견주고(다르면 실패), `crates/orbivisorctl/src/web_cross.rs`가 같은
 파일의 명령을 진짜 CLI(`run`)로 가짜 API에 보내 받은 `POST /vms`(템플릿은 `POST /vms/{key}/clone`) 본문이 웹 본문과 같은지 본다(CLI가 보내지
 않는 서버 기본값은 고르게 한 뒤). 사례마다 `before`(그 앞의 `POST /volumes`·`POST /placement-rules`, 차례대로)도 CLI가 보낸 요청과
 차례·본문을 맞춰 보고, 웹 `power: running`은 CLI 명령의 `--start`와 그 켜기 요청(`POST /vms/<이름>/actions/start`)이 있을 때만이다. CLI 플래그나 웹 본문을 바꾸면 한쪽이 깨진다 — 의도한 바뀜이면 `UPDATE_FIXTURES=1 pnpm -C web test
-src/vmBuilder`로 고정 파일을 다시 쓰고 `cargo test -p oplctl web_cross`를 돌린다. 고정 파일은 prettier가 건드리지 않는다(`.prettierignore`).
+src/vmBuilder`로 고정 파일을 다시 쓰고 `cargo test -p orbivisorctl web_cross`를 돌린다. 고정 파일은 prettier가 건드리지 않는다(`.prettierignore`).
 
 접근성 검사는 `src/test/axe.ts`의 `expectNoAxeViolations(container)`가 `axe-core`를 직접 부른다(jsdom에서 안 되는
 `color-contrast` 규칙은 끄고 `src/tokens.test.ts`가 대신한다). 머리줄·팔레트·서랍·목록·상세·설정·홈 시험에서 돈다. 새 색

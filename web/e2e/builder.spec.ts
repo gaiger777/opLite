@@ -4,7 +4,7 @@ import { expect, type Locator, type Page, test } from "@playwright/test";
 // 놓기·폴더·작게 포함), 키보드만(b2), 휴대폰 폭 서랍의 누르기 들기와 "여기에 놓기"(b3). 모두 꺼진 채 만든다(QEMU를 켜지
 // 않음). b1은 문제가 칸에 붙는지 본다: 이미 있는 볼륨 `b1-disk0`과 이름이 겹침(브라우저 오류 — 서버에 묻지 않음), 풀 여유보다
 // 큰 디스크(서버 경고 — 디스크 줄), vCPU 할당량 1인 폴더 `/q`(서버 오류 — VM 틀, 만들기 막힘). 클러스터·풀·그 볼륨·폴더는
-// Rust 테스트(`crates/opld/tests/web.rs`)가 준비하고 만든 VM을 확인한다.
+// Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비하고 만든 VM을 확인한다.
 const user = process.env.OPL_USER ?? "admin";
 const password = process.env.OPL_PASSWORD ?? "";
 /** 새 디스크를 만들 dir 풀 이름 */

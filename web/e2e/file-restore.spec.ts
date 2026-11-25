@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { expect, type Page, test } from "@playwright/test";
 
 // 계획 69: 백업 안 파일 찾아보기. 실제 도우미 이미지·QEMU로 연 세션에서 디렉터리에 들어가고, 파일 하나와 폴더(zip)를
-// 내려받고, 닫는다. 고정물 ext4 디스크 VM과 그 저장소 백업은 Rust 테스트(`crates/opld/tests/web.rs`)가 준비한다.
+// 내려받고, 닫는다. 고정물 ext4 디스크 VM과 그 저장소 백업은 Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비한다.
 const user = process.env.OPL_USER ?? "admin";
 const password = process.env.OPL_PASSWORD ?? "";
 /** 찾아볼 백업 이름 */

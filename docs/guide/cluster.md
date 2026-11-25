@@ -75,7 +75,7 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
   다른 노드가 선거로 리더가 된 뒤에 회복한다.
 - **끄기.** 장애를 조사하느라 systemd watchdog을 잠시 끄려면 `systemctl edit opld`로 `[Service]`에 `WatchdogSec=0`을
   둔다.
-- **시험.** `cargo test -p opld --features starve-it --test starve`가 opld 셋의 리더의 `api` 실행기를 15초 동안 막고
+- **시험.** `cargo test -p orbivisord --features starve-it --test starve`가 opld 셋의 리더의 `api` 실행기를 15초 동안 막고
   그동안 리더·임기가 그대로이고 모든 노드의 리스 나이가 3초 미만이며 `WATCHDOG=1`이 멈추는지 본다. `starve-it`
   기능은 시험 빌드에만 있는 고리(`[test] block_api_ms`, 제어 소켓의 `/v1/test/…`)를 넣으므로 배포 빌드에 켜지 않는다.
 
@@ -648,7 +648,7 @@ zone = "rack-a"   # 장애 영역(랙·전원·방). 노드 레이블 zone으로
 - **남은 것.** 리더 장애 뒤 새 리더까지는 노드 수와 관계없이 3~4초다(openraft가 마지막 하트비트 뒤 리더 리스 2초와 선거
   제한 시간 1~2초를 기다린다). 리스 갱신을 투표 멤버가 묶어 리더에 전달하는 것과 처음부터 관찰 노드로 합류하는 것은
   나중이다.
-- **규모 시험.** `cargo test -p opl-cluster --features scale-it --test scale -- --nocapture`가 한 프로세스에 노드
+- **규모 시험.** `cargo test -p orbivisor-cluster --features scale-it --test scale -- --nocapture`가 한 프로세스에 노드
   300개(투표 5, 대기 learner 2, 나머지 관찰 노드, `OPL_SCALE_NODES`로 바꿈(20 이상), CI는 100)를 띄우고 모든 노드가 리스를
   갱신하며 `VoterKeeper`·`RoleKeeper`를 띄운 채로 잰다. 관찰 노드는 learner로 따라잡지 않고 빈 저장소로 바로 관찰 노드로
   연다(시작 시간을 줄임). 저장소는 메모리에 둔다(한 디스크에 수백 노드의 fsync가 몰리지 않게). 기준과 잰 값(Apple
@@ -735,11 +735,11 @@ cluster_addresses = ["10.0.0.11", "10.1.0.11"]  # 앞이 우선 링크. 호스�
   시작한 노드)는 첫 링크도 그 노드의 설정 값으로 바뀐다. 업그레이드 전에 노드마다 `address`(또는 `cluster_addresses`)가
   다른 노드가 닿는 주소인지 본다. `address`도 이제 합류 API와 같은 호스트 규칙으로 검사하므로(끝의 점·멀티캐스트 등은
   거절되어 노드가 시작하지 않는다) 올리기 전에 확인한다.
-- **시험.** `cargo test -p opld --test cluster`가 우선 링크를 아무도 듣지 않는 127.0.0.2로 둔 세 노드(`cluster_listen`은
+- **시험.** `cargo test -p orbivisord --test cluster`가 우선 링크를 아무도 듣지 않는 127.0.0.2로 둔 세 노드(`cluster_listen`은
   127.0.0.1)로 합류·쓰기 전달·리더 kill -9 뒤 새 리더를 확인하고(macOS는 연결이 응답 없이 시간 초과, Linux는 거절이라
   두 가지 모두 "죽은 우선 링크"다), 링크 하나로 만든 노드에 `cluster_addresses`를 더해 다시 시작하면 인증서와 멤버십이
-  바뀌는지 본다. 링크를 도중에 끊고 되살리기는 memnet(`cargo test -p opl-cluster --test links`)과 gRPC
-  (`cargo test -p opl-peer --test grpc`) 시험이 본다.
+  바뀌는지 본다. 링크를 도중에 끊고 되살리기는 memnet(`cargo test -p orbivisor-cluster --test links`)과 gRPC
+  (`cargo test -p orbivisor-peer --test grpc`) 시험이 본다.
 
 ## 노드 유지보수와 비우기
 
