@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { ApplySetPage } from "@/declarative/ApplySetPage";
 import { ApplySetsPage } from "@/declarative/ApplySetsPage";
 import { expectNoAxeViolations } from "@/test/axe";
-import { applySet, DRIFTED, SET_ID, WEB_ID } from "@/test/declarative";
+import { applySet, AT, DRIFTED, SET_ID, WEB_ID } from "@/test/declarative";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -73,10 +73,60 @@ it("shows each object's state, who changed it, and adopts the chosen ones", asyn
   await expectNoAxeViolations(container);
   await user.click(within(web).getByRole("checkbox", { name: "Choose web" }));
   await user.click(screen.getByRole("button", { name: "Accept 1 actual value as declared" }));
+  const confirm = await screen.findByRole("alertdialog", {
+    name: "Accept the actual values in web-prod?",
+  });
+  expect(confirm).toHaveTextContent("vm web: its actual values become the declaration");
+  await user.click(within(confirm).getByRole("button", { name: "Accept" }));
   await waitFor(() => expect(adopted).toEqual({ objects: [WEB_ID] }));
   expect(
     await screen.findByText("Apply set web-prod now declares the actual values."),
   ).toBeInTheDocument();
+});
+
+it("adopts all only after confirming, naming the visible drift rows instead of sending an empty list", async () => {
+  const user = userEvent.setup();
+  const LAN_ID = "019a0f3c-0000-7000-8073-000000000002";
+  const set = applySet("web-prod", {
+    drift: {
+      checked_at: AT,
+      revision: 90,
+      items: [
+        { kind: "vm", id: WEB_ID, name: "web", state: "modified", paths: ["vcpus"] },
+        { kind: "network", id: LAN_ID, name: "lan", state: "missing" },
+        // 묶음 레이블만 단 것은 받아들일 것이 없다
+        {
+          kind: "vm",
+          id: "019a0f3c-0000-7000-8073-000000000009",
+          name: "stray",
+          state: "unmanaged",
+        },
+      ],
+    },
+  });
+  mockLists({});
+  let adopted: unknown;
+  server.use(
+    http.get(apiUrl("/apply-sets/:key"), () => HttpResponse.json(set)),
+    http.post(apiUrl("/apply-sets/:key/adopt"), async ({ request }) => {
+      adopted = await request.json();
+      return HttpResponse.json(applySet("web-prod"));
+    }),
+  );
+  renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
+  await user.click(
+    await screen.findByRole("button", { name: "Accept all actual values as declared" }),
+  );
+  const confirm = await screen.findByRole("alertdialog", {
+    name: "Accept the actual values in web-prod?",
+  });
+  expect(confirm).toHaveTextContent(
+    "network lan: gone from the cluster, so it leaves the apply set",
+  );
+  expect(confirm).not.toHaveTextContent("stray");
+  expect(adopted).toBeUndefined();
+  await user.click(within(confirm).getByRole("button", { name: "Accept" }));
+  await waitFor(() => expect(adopted).toEqual({ objects: [LAN_ID, WEB_ID] }));
 });
 
 it("hides adopting from viewers", async () => {

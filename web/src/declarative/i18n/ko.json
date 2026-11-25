@@ -58,7 +58,12 @@
       "difference": "차이",
       "paths_one": "칸 {{count}}개 다름",
       "paths_other": "칸 {{count}}개 다름",
-      "by": "{{time}}에 {{user}}이(가) 바꿈({{source}}, revision {{revision}})"
+      "by": "{{time}}에 {{user}}이(가) 바꿈({{source}}, revision {{revision}})",
+      "adoptTitle": "{{name}}의 실제 값을 선언으로 받아들일까요?",
+      "adoptHint": "그러면 적용 묶음이 클러스터의 지금 값을 선언합니다. 클러스터는 바뀌지 않습니다. 그 뒤 orbivisorctl export --set으로 파일을 고치세요.",
+      "adopt": "받아들이기",
+      "adoptItem": "{{kind}} {{name}}: 실제 값이 선언이 됩니다",
+      "adoptMissing": "{{kind}} {{name}}: 클러스터에 없어 적용 묶음에서 빠집니다"
     }
   }
 }

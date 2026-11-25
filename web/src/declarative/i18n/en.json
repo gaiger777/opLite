@@ -58,7 +58,12 @@
       "difference": "Difference",
       "paths_one": "{{count}} field differs",
       "paths_other": "{{count}} fields differ",
-      "by": "Changed by {{user}} at {{time}} ({{source}}, revision {{revision}})"
+      "by": "Changed by {{user}} at {{time}} ({{source}}, revision {{revision}})",
+      "adoptTitle": "Accept the actual values in {{name}}?",
+      "adoptHint": "The apply set then declares what the cluster has now. Nothing in the cluster changes; update your files afterwards with orbivisorctl export --set.",
+      "adopt": "Accept",
+      "adoptItem": "{{kind}} {{name}}: its actual values become the declaration",
+      "adoptMissing": "{{kind}} {{name}}: gone from the cluster, so it leaves the apply set"
     }
   }
 }

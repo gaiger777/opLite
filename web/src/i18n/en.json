@@ -179,7 +179,15 @@
     "vm_restoring": "The VM is being live-restored. Wait for the restore or cancel it.",
     "vm_not_restoring": "The VM is not being live-restored.",
     "backup_exists": "That store already has a copy of this backup.",
-    "vm_exporting": "The VM is being exported. Wait until the export is done."
+    "vm_exporting": "The VM is being exported. Wait until the export is done.",
+    "plan_stale": "Something changed after the plan was made. Plan again and review it: {{message}}",
+    "plan_not_found": "The plan is gone (plans last 30 minutes and are kept by the node that made them). Plan again.",
+    "plan_blocked": "The plan has blocked steps and was not applied: {{message}}",
+    "plan_not_started": "The server did not start the plan.",
+    "history_unavailable": "The configuration history cannot be read right now: {{message}}",
+    "manifest_unsupported": "This kind cannot be declared or exported: {{message}}",
+    "http01_unavailable": "The HTTP-01 challenge cannot be served: {{message}}",
+    "apply_set_too_large": "The apply set is too large to store: {{message}}"
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",

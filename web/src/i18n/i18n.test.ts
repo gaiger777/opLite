@@ -239,3 +239,26 @@ it("translates the plan-67 error codes (review 2 m2)", () => {
     "부하 분산기 설정이 올바르지 않습니다: listener tcp/80 twice",
   );
 });
+
+it("translates the declarative and history error codes in both languages", async () => {
+  const stale = new ApiError(412, "plan_stale", 'vm "web" changed after the plan was made');
+  const gone = new ApiError(404, "plan_not_found", "plan 019a not found");
+  const t = i18n.getFixedT("ko");
+  expect(errorMessage(t, stale)).toBe(
+    '계획을 세운 뒤 바뀐 것이 있습니다. 다시 계획해 확인하세요: vm "web" changed after the plan was made',
+  );
+  expect(errorMessage(t, gone)).toMatch(/^계획이 없습니다/);
+  for (const code of [
+    "plan_stale",
+    "plan_not_found",
+    "plan_blocked",
+    "plan_not_started",
+    "history_unavailable",
+    "manifest_unsupported",
+    "http01_unavailable",
+    "apply_set_too_large",
+  ]) {
+    expect(i18n.getFixedT("en")(`errors.${code}`)).not.toBe(`errors.${code}`);
+    expect(i18n.getFixedT("ko")(`errors.${code}`)).not.toBe(`errors.${code}`);
+  }
+});

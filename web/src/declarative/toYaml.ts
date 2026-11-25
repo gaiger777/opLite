@@ -7,9 +7,22 @@ const PLAIN = /^[A-Za-z_/][A-Za-z0-9_./@+-]*(?: [A-Za-z0-9_./@+()-]+)*$/;
 /** YAML 1.1·1.2가 문자열이 아닌 값으로 읽을 수 있는 낱말 */
 const RESERVED = /^(?:true|false|yes|no|on|off|y|n|null|nan|inf)$/i;
 
+/**
+ * JSON이 탈출하지 않지만 YAML 큰따옴표 안에 그대로 두면 안 되는 글자: DEL·C1 제어 문자(c-printable 밖)·BOM·U+FFFE·U+FFFF,
+ * 그리고 YAML 1.1이 줄바꿈으로 읽는 NEL(U+0085)·U+2028·U+2029(접혀 값이 바뀐다). 짝 없는 대리 글자는 API(UTF-8) 값에 나올
+ * 수 없어 다루지 않는다.
+ */
+const UNPRINTABLE = /[\u007f-\u009f\u2028\u2029\ufeff\ufffe\uffff]/g;
+
 function text(s: string): string {
-  // JSON 문자열은 YAML 큰따옴표 문자열이기도 하다(같은 탈출 문자).
-  return PLAIN.test(s) && !RESERVED.test(s) ? s : JSON.stringify(s);
+  if (PLAIN.test(s) && !RESERVED.test(s)) {
+    return s;
+  }
+  // JSON 문자열은 YAML 큰따옴표 문자열이기도 하다(같은 탈출 문자) — JSON이 그대로 두는 위 글자만 더 탈출한다.
+  return JSON.stringify(s).replace(
+    UNPRINTABLE,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

@@ -134,3 +134,18 @@ it("does not filter the backup store conditions by node or VM", () => {
   expect(spec.condition).toEqual({ kind: "backup_verify_failed" });
   expect(spec).not.toHaveProperty("nodes");
 });
+
+it("keeps a certificate rule's threshold when another field is edited", () => {
+  const expiring = rule({ condition: { kind: "certificate_expiring", days: 30 } });
+  const form = { ...ruleFormOf(expiring), severity: "warning" as const };
+  expect(ruleSpecOf(form).condition).toEqual({ kind: "certificate_expiring", days: 30 });
+  const failing = rule({ condition: { kind: "certificate_renew_failed", failures: 5 } });
+  expect(ruleSpecOf(ruleFormOf(failing)).condition).toEqual({
+    kind: "certificate_renew_failed",
+    failures: 5,
+  });
+  // 다른 조건으로 바꾸면 받은 조건을 쓰지 않는다
+  expect(ruleSpecOf({ ...ruleFormOf(expiring), kind: "node_offline" }).condition).toEqual({
+    kind: "node_offline",
+  });
+});

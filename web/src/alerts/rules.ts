@@ -138,6 +138,8 @@ export interface RuleForm {
   /** 노드·VM 이름(쉼표로 나눔, 비면 모두) */
   nodes: string;
   vms: string;
+  /** 폼이 고치지 않는 조건(인증서 조건 — `CONDITION_KINDS` 밖)의 받은 값. 고치면 그대로 돌려보낸다(문턱값을 지키려고). */
+  rawCondition?: AlertCondition;
 }
 
 export function emptyRuleForm(): RuleForm {
@@ -173,6 +175,7 @@ export function ruleFormOf(rule: AlertRule): RuleForm {
     ...(c.kind === "vm_metric" && { vmMetric: c.metric, op: c.op, value: String(c.value) }),
     ...(c.kind === "pool_usage" && { percent: String(c.percent) }),
     ...(c.kind === "task_failed" && { ops: (c.ops ?? []).join(", ") }),
+    ...(!CONDITION_KINDS.includes(c.kind) && { rawCondition: c }),
     forSecs: String(spec.for_secs),
     severity: spec.severity,
     targets: [...spec.targets],
@@ -253,11 +256,15 @@ function conditionOf(form: RuleForm): AlertCondition {
       const ops = splitNames(form.ops);
       return ops.length > 0 ? { kind: "task_failed", ops } : { kind: "task_failed" };
     }
-    // 인증서 조건(계획 73)은 아직 폼에 없다(CONDITION_KINDS 밖). 서버 기본값으로 보낸다.
+    // 인증서 조건(계획 73)은 아직 폼에 없다(CONDITION_KINDS 밖). 받은 조건을 그대로, 없으면 서버 기본값으로 보낸다.
     case "certificate_expiring":
-      return { kind: "certificate_expiring", days: 14 };
+      return form.rawCondition?.kind === form.kind
+        ? form.rawCondition
+        : { kind: "certificate_expiring", days: 14 };
     case "certificate_renew_failed":
-      return { kind: "certificate_renew_failed", failures: 3 };
+      return form.rawCondition?.kind === form.kind
+        ? form.rawCondition
+        : { kind: "certificate_renew_failed", failures: 3 };
     default:
       return { kind: form.kind };
   }

@@ -179,7 +179,15 @@
     "vm_restoring": "VM을 라이브 복원하는 중입니다. 복원을 기다리거나 취소하세요.",
     "vm_not_restoring": "VM을 라이브 복원하는 중이 아닙니다.",
     "backup_exists": "그 저장소에 이미 이 백업의 사본이 있습니다.",
-    "vm_exporting": "VM을 내보내는 중입니다. 내보내기가 끝날 때까지 기다리세요."
+    "vm_exporting": "VM을 내보내는 중입니다. 내보내기가 끝날 때까지 기다리세요.",
+    "plan_stale": "계획을 세운 뒤 바뀐 것이 있습니다. 다시 계획해 확인하세요: {{message}}",
+    "plan_not_found": "계획이 없습니다(계획은 30분 동안, 그 계획을 세운 노드에만 있습니다). 다시 계획하세요.",
+    "plan_blocked": "계획에 막힌 단계가 있어 적용하지 않았습니다: {{message}}",
+    "plan_not_started": "서버가 계획을 시작하지 않았습니다.",
+    "history_unavailable": "지금은 설정 기록을 읽을 수 없습니다: {{message}}",
+    "manifest_unsupported": "이 종류는 선언하거나 내보낼 수 없습니다: {{message}}",
+    "http01_unavailable": "HTTP-01 확인을 받을 수 없습니다: {{message}}",
+    "apply_set_too_large": "적용 묶음이 너무 커서 저장할 수 없습니다: {{message}}"
   },
   "nav": {
     "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",

@@ -7,6 +7,7 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import { usePermissions } from "@/auth/usePermissions";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { ResourceHeader } from "@/components/ResourceHeader";
 import { StatusChip, type StatusTone } from "@/components/StatusChip";
@@ -30,7 +31,6 @@ import {
 import { DriftChip } from "@/declarative/ApplySetsPage";
 import { ExportYamlDialog } from "@/declarative/ExportYamlDialog";
 import { actorName, canRestoreAnything, refreshHistory } from "@/history/api";
-import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
 
 type RowState = DriftItem["state"] | "same";
@@ -88,7 +88,7 @@ export function ApplySetPage() {
   const set = useApplySet(name);
   const [chosen, setChosen] = useState<ReadonlySet<string>>(new Set());
   const [exporting, setExporting] = useState(false);
-  const [adopting, setAdopting] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   if (set.data === undefined) {
     return <ListPending error={set.error} />;
   }
@@ -103,7 +103,13 @@ export function ApplySetPage() {
     ...objects.map((o) => ({ id: o.id, kind: o.kind, name: o.name, item: drift.get(o.id) })),
     ...extra.map((d) => ({ id: d.id, kind: d.kind, name: d.name, item: d })),
   ];
-  const adoptable = canRestoreAnything(perms) && drift.size > 0;
+  // 받아들일 수 있는 줄: 묶음이 기억하는 객체 가운데 보이는 드리프트(관리 밖은 묶음에 없어 받아들일 것이 없다). 서버는
+  // 빈 목록을 묶음의 모든 드리프트로 넓히므로(볼 수 없는 것까지) 늘 보이는 id를 적어 보낸다.
+  const candidates = rows.filter(
+    (r) => r.item && r.item.state !== "unmanaged" && objects.some((o) => o.id === r.id),
+  );
+  const adoptable = canRestoreAnything(perms) && candidates.length > 0;
+  const targets = chosen.size > 0 ? candidates.filter((r) => chosen.has(r.id)) : candidates;
   const pick = (id: string, on: boolean) =>
     setChosen((prev) => {
       const next = new Set(prev);
@@ -116,22 +122,15 @@ export function ApplySetPage() {
     });
 
   async function adopt() {
-    setAdopting(true);
-    try {
-      await call(
-        api.POST("/apply-sets/{key}/adopt", {
-          params: { path: { key: s.id } },
-          body: chosen.size > 0 ? { objects: [...chosen] } : {},
-        }),
-      );
-      toast.success(t("declarative.set.adopted", { name: s.name }));
-      setChosen(new Set());
-      await Promise.all([refreshApplySets(queryClient), refreshHistory(queryClient)]);
-    } catch (err) {
-      toast.error(errorMessage(t, err));
-    } finally {
-      setAdopting(false);
-    }
+    await call(
+      api.POST("/apply-sets/{key}/adopt", {
+        params: { path: { key: s.id } },
+        body: { objects: targets.map((r) => r.id) },
+      }),
+    );
+    toast.success(t("declarative.set.adopted", { name: s.name }));
+    setChosen(new Set());
+    await Promise.all([refreshApplySets(queryClient), refreshHistory(queryClient)]);
   }
 
   return (
@@ -181,7 +180,7 @@ export function ApplySetPage() {
           <p>{t("declarative.set.driftHint", { count: drift.size })}</p>
           {adoptable && (
             <div>
-              <Button size="sm" variant="outline" disabled={adopting} onClick={() => void adopt()}>
+              <Button size="sm" variant="outline" onClick={() => setConfirming(true)}>
                 {chosen.size > 0
                   ? t("declarative.set.adoptChosen", { count: chosen.size })
                   : t("declarative.set.adoptAll")}
@@ -212,7 +211,7 @@ export function ApplySetPage() {
                 <TableRow key={row.id}>
                   {adoptable && (
                     <TableCell>
-                      {row.item && row.item.state !== "unmanaged" && (
+                      {candidates.includes(row) && (
                         <Checkbox
                           aria-label={t("declarative.set.chooseNamed", { name: row.name })}
                           checked={chosen.has(row.id)}
@@ -235,6 +234,25 @@ export function ApplySetPage() {
           </TableBody>
         </Table>
       </div>
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        title={t("declarative.set.adoptTitle", { name: s.name })}
+        description={t("declarative.set.adoptHint")}
+        confirmLabel={t("declarative.set.adopt")}
+        impact={targets.map((r) =>
+          t(
+            r.item?.state === "missing"
+              ? "declarative.set.adoptMissing"
+              : "declarative.set.adoptItem",
+            {
+              kind: r.kind,
+              name: r.name,
+            },
+          ),
+        )}
+        onConfirm={adopt}
+      />
       {exporting && (
         <ExportYamlDialog
           title={t("declarative.export.title", { name: s.name })}

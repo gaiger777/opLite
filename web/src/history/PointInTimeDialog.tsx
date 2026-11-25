@@ -89,7 +89,9 @@ export function PointInTimeDialog({
   const [deleteCreated, setDeleteCreated] = useState(false);
   const [dataLoss, setDataLoss] = useState(false);
   const [reason, setReason] = useState("");
-  const [plan, setPlan] = useState<PlanView | null>(null);
+  // 본 계획과 그 계획을 세운 입력(`body()`의 JSON). 입력이 그 뒤 바뀌었으면 보이지도 적용하지도 않는다 — 계획 요청 중에
+  // 입력을 바꾸면 늦게 온 응답이 지금 입력과 다른 계획이다.
+  const [planned, setPlanned] = useState<{ view: PlanView; key: string } | null>(null);
   const [planning, setPlanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -98,7 +100,7 @@ export function PointInTimeDialog({
     <T,>(set: (v: T) => void) =>
     (v: T) => {
       set(v);
-      setPlan(null);
+      setPlanned(null);
     };
   const at: PointRestoreRequest["at"] | null =
     mode === "time"
@@ -126,11 +128,16 @@ export function PointInTimeDialog({
     };
   }
 
+  const current = at && scoped ? JSON.stringify(body()) : null;
+  const plan = planned && planned.key === current ? planned.view : null;
+
   async function preview() {
     setPlanning(true);
     setError(null);
+    const asked = body();
     try {
-      setPlan(await planRestorePoint(body()));
+      const view = await planRestorePoint(asked);
+      setPlanned({ view, key: JSON.stringify(asked) });
     } catch (err) {
       setError(errorMessage(t, err));
     } finally {

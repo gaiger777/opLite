@@ -84,7 +84,10 @@
       "nameTaken": "The name {{name}} is used by another resource now. Give a new name to recreate it under (it gets a new id).",
       "newName": "New name",
       "preview": "Plan again",
-      "changed": "The plan changed while you were reading it. Review it again and restore."
+      "changed": "The plan changed while you were reading it. Review it again and restore.",
+      "stale": "The resource changed or the plan expired. Review the new plan and restore again.",
+      "force": "Take over from Terraform and restore anyway",
+      "forceHint": "Terraform manages this resource. Restoring it here makes it differ from your Terraform configuration, so the next terraform apply changes it back unless you update the configuration too."
     },
     "point": {
       "open": "Restore to a point in time…",

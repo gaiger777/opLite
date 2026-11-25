@@ -71,6 +71,11 @@ it("quotes strings YAML would read as something else", () => {
   expect(yaml).toContain('"true": bool key');
 });
 
+it("escapes characters YAML does not allow in a double-quoted string", () => {
+  const yaml = toYaml([{ s: "del\u007f c1\u0080\u009f nel\u0085 ls\u2028 bom\ufeff ok é" }]);
+  expect(yaml).toBe('---\ns: "del\\u007f c1\\u0080\\u009f nel\\u0085 ls\\u2028 bom\\ufeff ok é"\n');
+});
+
 it("writes nested lists and odd numbers", () => {
   expect(toYaml([{ m: [[1, 2], [], [{ a: -3.25 }]], n: [Number.NaN] }])).toBe(
     '---\nm:\n  -\n    - 1\n    - 2\n  - []\n  -\n    - a: -3.25\n"n":\n  - null\n',
@@ -108,6 +113,7 @@ it("matches the YAML fixture the CLI reads back", () => {
           nested: [[1, 2], [], [{ a: false }]],
           empty: {},
           nothing: null,
+          controls: "del\u007f c1\u0080\u009f nel\u0085 ls\u2028\u2029 bom\ufeff",
         },
       ],
     },

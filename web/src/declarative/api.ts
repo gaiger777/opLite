@@ -6,6 +6,7 @@ import { type QueryClient, useQuery } from "@tanstack/react-query";
 import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import type { Task } from "@/api/types";
+import i18n from "@/i18n";
 
 type Schemas = components["schemas"];
 export type PlanView = Schemas["PlanView"];
@@ -64,7 +65,7 @@ export function planOf(reply: PlanView | ApplyStarted): PlanView {
 export async function applyPlan(plan: PlanView): Promise<Task> {
   const started = await call(api.POST("/apply", { body: { plan: plan.plan } }));
   if (!("task" in started)) {
-    throw new Error("the server did not start the plan");
+    throw new Error(i18n.t("errors.plan_not_started"));
   }
   return started.task;
 }

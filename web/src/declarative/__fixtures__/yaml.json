@@ -131,10 +131,11 @@
             ]
           ],
           "empty": {},
-          "nothing": null
+          "nothing": null,
+          "controls": "del c1 nel ls   bom﻿"
         }
       ],
-      "yaml": "---\n\"123\": number key\nstrings:\n  - \"true\"\n  - \"No\"\n  - \"null\"\n  - \"~\"\n  - \"123\"\n  - \"1.5\"\n  - \"0x1f\"\n  - \".inf\"\n  - \"a: b\"\n  - \"#x\"\n  - \"- x\"\nspaces:\n  - \"x \"\n  - \" x\"\n  - \"a  b\"\n  - \"\"\nmulti: \"line 1\\nline 2\\ttab \\\"quoted\\\" \\\\\"\nko: \"웹 서버 — 설명\"\n\"key with: colon\": 1\nnumbers:\n  - 0\n  - -1\n  - 1.5\n  - 4294967296\nnested:\n  -\n    - 1\n    - 2\n  - []\n  -\n    - a: false\nempty: {}\nnothing: null\n"
+      "yaml": "---\n\"123\": number key\nstrings:\n  - \"true\"\n  - \"No\"\n  - \"null\"\n  - \"~\"\n  - \"123\"\n  - \"1.5\"\n  - \"0x1f\"\n  - \".inf\"\n  - \"a: b\"\n  - \"#x\"\n  - \"- x\"\nspaces:\n  - \"x \"\n  - \" x\"\n  - \"a  b\"\n  - \"\"\nmulti: \"line 1\\nline 2\\ttab \\\"quoted\\\" \\\\\"\nko: \"웹 서버 — 설명\"\n\"key with: colon\": 1\nnumbers:\n  - 0\n  - -1\n  - 1.5\n  - 4294967296\nnested:\n  -\n    - 1\n    - 2\n  - []\n  -\n    - a: false\nempty: {}\nnothing: null\ncontrols: \"del\\u007f c1\\u0080\\u009f nel\\u0085 ls\\u2028\\u2029 bom\\ufeff\"\n"
     }
   ]
 }

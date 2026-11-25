@@ -523,3 +523,11 @@ opld 수용 시험·Terraform·웹 데모가 함께 쓰는 실행 파일(`crates
 - **ACME·Terraform: 훅 출력.** 표준 출력·오류는 이 노드 debug 로그에만, 오류(`status.error`·경보)에는 끝 상태와 표준 오류 첫 줄 200자까지만.
 - **ACME·Terraform: opl-devserver.** admin 비밀번호는 실행마다 무작위(연결 정보 줄의 `admin_password`), 루프백이 아닌 `--address`는 `--insecure-expose`가 있어야 한다.
 - **ACME·Terraform: OpenAPI.** `RenewStarted.tasks`를 `Resource_TaskSpec_TaskStatus[]`로 적었다(예전엔 `Resource[]`).
+- 웹: 시점 되돌리기는 본 계획을 그 계획을 세운 입력(`body()`의 JSON)과 함께 둔다. 지금 입력과 다르면 계획을 보이지도 적용하지도 않는다 — 계획 요청 중에 입력을 바꾸면 늦게 온 응답이 버려진다(입력을 막는 것보다 덜 거슬린다).
+- 웹: 경보 규칙 폼은 폼이 고치지 않는 조건(인증서 둘, `CONDITION_KINDS` 밖)의 받은 조건을 `rawCondition`으로 들고 다니며 그대로 돌려보낸다 — 심각도만 바꿔도 `days`·`failures`가 기본값(14·3)으로 덮이던 것. `days`·`failures` 입력은 아직 넣지 않았다(가이드의 한계 그대로).
+- 웹: 리소스 하나 되돌리기에서 `POST /apply {plan}`이 412 `plan_stale`·404 `plan_not_found`면 계획을 다시 세워 보이고 "바뀌었거나 만료됨 — 새 계획을 보고 다시" 오류를 보인다(같은 id를 다시 보내지 않는다).
+- 웹: `errors.*`에 `plan_stale`·`plan_not_found`·`plan_blocked`·`history_unavailable`·`manifest_unsupported`·`http01_unavailable`·`apply_set_too_large`와 `applyPlan`의 `plan_not_started`(영·한).
+- 웹: 묶음 "받아들이기"는 확인 대화상자(받아들일 객체 목록 — 없음은 "묶음에서 빠짐")를 거치고, 고른 것이 없어도 늘 보이는 받아들일 줄(묶음 객체 가운데 관리 밖이 아닌 드리프트)의 id를 적어 보낸다. 빈 목록(서버가 모든 드리프트로 넓힘)은 보내지 않는다. 묶음 밖 드리프트 줄은 고를 수 없다(서버 404).
+- 웹: Terraform 객체 되돌리기는 숨기지 않고, 막힘이 모두 `managed_elsewhere`이면 "Terraform에서 넘겨받아 그래도 되돌리기" 체크(경고: 다음 `terraform apply`가 되돌림)를 보이고 켜면 `force_conflicts: true`로 다시 계획한다. 숨기면 지원 이력에서 웹 편집을 되돌릴 길이 CLI뿐이고, 계획(막힘 이유)을 보인 뒤 고르게 하는 편이 낫다고 보았다. 다른 막힘이 섞이면 보이지 않는다.
+- 웹: `toYaml`은 JSON이 탈출하지 않는 DEL·C1·NEL·U+2028/2029·BOM·U+FFFE/FFFF를 `\uXXXX`로 쓴다(교차 고정 파일에 한 경우 — `web_cross.rs` 통과). 짝 없는 대리 글자는 API 값에 나올 수 없어 다루지 않았다.
+- 웹: 갱신 응답 `tasks`의 형 변환(`as unknown as Task`)은 그대로 둔다 — 서버가 `RenewStarted.tasks`를 `Task`로 고쳐 `schema.d.ts`를 다시 만들어도 그대로 컴파일된다(그때 지우면 된다).

@@ -306,3 +306,163 @@ it("plans a point-in-time restore and allows data loss only on its own", async (
   await user.click(within(dialog).getByRole("button", { name: "Restore" }));
   await waitFor(() => expect(applied).toEqual({ plan: plan().plan }));
 });
+
+it("drops a point-in-time plan that comes back after the inputs changed", async () => {
+  const user = userEvent.setup();
+  mockLists({});
+  mockTimeline();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  server.use(
+    http.post(apiUrl("/history/restore"), async () => {
+      await held;
+      return HttpResponse.json(
+        plan({ summary: { create: 0, update: 0, delete: 2, unchanged: 0, blocked: 0 } }),
+      );
+    }),
+  );
+  renderPage(<HistoryPage />, { path: "/history" });
+  await user.click(await screen.findByRole("button", { name: "Restore to a point in time…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore to a point in time" });
+  await user.type(within(dialog).getByLabelText("Folder"), "/prod/web");
+  const deleteCreated = within(dialog).getByRole("checkbox", { name: /Delete resources created/ });
+  await user.click(deleteCreated);
+  await user.click(within(dialog).getByRole("button", { name: "Show the plan" }));
+  // 계획을 세우는 동안 지우기를 끈다 — 늦게 온 (지우기 둘) 계획은 보이지 않고 적용할 수 없다.
+  await user.click(deleteCreated);
+  release();
+  await waitFor(() =>
+    expect(within(dialog).getByRole("button", { name: "Show the plan" })).toBeEnabled(),
+  );
+  expect(within(dialog).queryByText(/2 to delete/)).not.toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Restore" })).toBeDisabled();
+});
+
+it("plans again when the restore plan went stale or is gone, and applies the new plan", async () => {
+  const user = userEvent.setup();
+  mockLists({});
+  mockTimeline();
+  const fresh = "019a0f3c-0000-7000-8073-0000000000f2";
+  let planned = 0;
+  const applied: unknown[] = [];
+  server.use(
+    http.post(apiUrl("/history/vm/:key/restore"), () => {
+      planned++;
+      return HttpResponse.json(plan(planned > 1 ? { plan: fresh } : {}));
+    }),
+    http.post(apiUrl("/apply"), async ({ request }) => {
+      const body = (await request.json()) as { plan: string };
+      applied.push(body);
+      return body.plan === fresh
+        ? HttpResponse.json({ plan: plan(), task: task("t1", "apply", WEB_ID) }, { status: 202 })
+        : HttpResponse.json(
+            { code: "plan_stale", message: 'vm "web" changed after the plan was made; plan again' },
+            { status: 412 },
+          );
+    }),
+  );
+  renderPage(<HistoryPage />, { path: "/history" });
+  const [first] = await screen.findAllByRole("button", { name: /more memory/ });
+  await user.click(first!);
+  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  await within(dialog).findByText(/1 to change/);
+  await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+  expect(
+    await within(dialog).findByText(
+      "The resource changed or the plan expired. Review the new plan and restore again.",
+    ),
+  ).toBeInTheDocument();
+  expect(planned).toBe(2);
+  await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+  await waitFor(() => expect(applied.at(-1)).toEqual({ plan: fresh }));
+  await waitFor(() => expect(dialog).not.toBeInTheDocument());
+});
+
+it("offers to take over a Terraform-managed resource and plans with force_conflicts", async () => {
+  const user = userEvent.setup();
+  mockLists({});
+  mockTimeline();
+  const bodies: Record<string, unknown>[] = [];
+  server.use(
+    http.post(apiUrl("/history/vm/:key/restore"), async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      bodies.push(body);
+      return HttpResponse.json(
+        body.force_conflicts
+          ? plan()
+          : plan({
+              summary: { create: 0, update: 0, delete: 0, unchanged: 0, blocked: 1 },
+              steps: [
+                {
+                  n: 1,
+                  kind: "Vm",
+                  name: "web",
+                  action: "blocked",
+                  problems: [
+                    {
+                      code: "managed_elsewhere",
+                      level: "error",
+                      message: "Vm web is managed by Terraform",
+                    },
+                  ],
+                },
+              ],
+            }),
+      );
+    }),
+  );
+  renderPage(<HistoryPage />, { path: "/history" });
+  const [first] = await screen.findAllByRole("button", { name: /more memory/ });
+  await user.click(first!);
+  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  const force = await within(dialog).findByRole("checkbox", {
+    name: "Take over from Terraform and restore anyway",
+  });
+  expect(dialog).toHaveTextContent(/next terraform apply changes it back/);
+  expect(within(dialog).getByRole("button", { name: "Restore" })).toBeDisabled();
+  await user.click(force);
+  await within(dialog).findByText(/1 to change/);
+  expect(bodies.at(-1)).toEqual({ revision: 81, dry_run: true, force_conflicts: true });
+  expect(within(dialog).getByRole("button", { name: "Restore" })).toBeEnabled();
+});
+
+it("does not offer the Terraform takeover for other blocks", async () => {
+  const user = userEvent.setup();
+  mockLists({});
+  mockTimeline();
+  server.use(
+    http.post(apiUrl("/history/vm/:key/restore"), () =>
+      HttpResponse.json(
+        plan({
+          summary: { create: 0, update: 0, delete: 0, unchanged: 0, blocked: 1 },
+          steps: [
+            {
+              n: 1,
+              kind: "Vm",
+              name: "web",
+              action: "blocked",
+              problems: [
+                { code: "managed_elsewhere", level: "error", message: "managed by Terraform" },
+                { code: "forbidden", level: "error", message: "no vm.config" },
+              ],
+            },
+          ],
+        }),
+      ),
+    ),
+  );
+  renderPage(<HistoryPage />, { path: "/history" });
+  const [first] = await screen.findAllByRole("button", { name: /more memory/ });
+  await user.click(first!);
+  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  await within(dialog).findByText(/no vm.config/);
+  expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+});
