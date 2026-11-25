@@ -756,7 +756,6 @@ jobs:
       OPL_TEST_VCSIM: "127.0.0.1:8989"
       OPL_TEST_VCSIM_USER: user
       OPL_TEST_VCSIM_PASSWORD: pass
-      OPL_TEST_NBDKIT: /usr/sbin/nbdkit
       GOVC_URL: "https://user:pass@127.0.0.1:8989/sdk"
       GOVC_INSECURE: "1"
     steps:
@@ -768,6 +767,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config nbdkit qemu-utils
           nbdkit --version
+          echo "OPL_TEST_NBDKIT=$(command -v nbdkit)" >> "$GITHUB_ENV"
       - name: govmomi vcsim and govc (pinned release, SHA-256 checked)
         run: |
           mkdir -p "$RUNNER_TEMP/govmomi" && cd "$RUNNER_TEMP/govmomi"
