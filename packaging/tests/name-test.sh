@@ -3,6 +3,8 @@
 # 옛 제품 이름(opLite, oplite)이 허용 목록 밖에 남지 않았는지 본다(설계 2026-11-10-rename-orbivisor §3.10·§3.12).
 # git grep -nI -i oplite의 줄마다 그 파일에 허용한 낱말을 지우고도 oplite(대소문자 무관)가 남으면 실패다.
 # 이름에 oplite가 있는 파일도 전환 패키지 control과 V0 픽스처 밖에 있으면 실패다.
+# 노드 위의 옛 이름(계획 74 설계 2026-11-26-naming-orbivisor §3.7 — /etc/opl·/var/lib/opl·/run/opl·/var/log/opl,
+# opld.service, opl-ovn-*, OPL_* 환경 변수, 옛 크레이트 이름)도 호환 코드·그 시험·안내의 이름 바꾸기 절 밖에 있으면 실패다.
 # bash(3.2도 됨)와 git만 있으면 된다. CI shell 작업에서 shellcheck 옆에 돈다.
 # 쓰는 법: bash packaging/tests/name-test.sh
 set -eu
@@ -42,6 +44,9 @@ RULES=(
 	'crates/orbivisor-types/src/realm.rs|"oplite"'
 	'crates/orbivisorctl/src/cli.rs|"oplite"|client id: oplite'
 	'web/src/realms/RealmsPage.test.tsx|"oplite"'
+	# 옛 경로 짝(/etc/opl)이 이름이 비슷한 /etc/oplite를 옛 경로로 보지 않는지 보는 시험 자료(계획 74)
+	'crates/orbivisor-types/src/layout.rs|"/etc/oplite/a"'
+	'crates/orbivisord/src/layout.rs|# /etc/oplite'
 	# 전환 패키지를 만들고 시험하는 파일에만 있는 모양(전환 패키지의 문서 디렉터리, 옛 V0 트리 등)
 	'packaging/deb/build-deb.sh|usr/share/doc/oplite'
 	'packaging/tests/build-deb-test.sh|usr/share/(doc/)?oplite|tree-oplite|Replaces oplite\)'
@@ -213,6 +218,149 @@ while IFS= read -r path; do
 	fi
 done <<<"$names"
 if [ "$left" -eq 0 ]; then ok "이름에 oplite가 있는 파일은 전환 control과 V0 픽스처뿐"; else fail "이름에 oplite가 있는 파일 ${left}개(위)"; fi
+
+# 노드 위의 옛 이름(계획 74). 단어 경계(\b)는 macOS bash의 정규식에 없으므로 [^A-Za-z0-9_]로 쓴다.
+W='([^A-Za-z0-9_]|$)'
+OLD_RE="/etc/opl$W|/var/lib/opl$W|/run/opl$W|/var/log/opl$W|opld\.service|opl-ovn-|(^|[^A-Za-z0-9_])OPL_[A-Z]"
+OLD_RE+="|opl[-_](types|api|cluster|driver|peer|qemu|reconciler|restore|store)$W|crates/opl(d|ctl)?$W"
+
+# 통째로 허용하는 파일: 옛 이름을 다루는 것이 일인 호환 코드와 유지 스크립트, 그것을 시험하는 패키징 시험
+OLD_EXCLUDE=(
+	':!packaging/tests/name-test.sh'
+	':!docs/superpowers/plans'
+	':!docs/superpowers/specs'
+	# 옛 배치·옛 환경 변수 받기(옛↔새 짝 표와 그 시험)
+	':!crates/orbivisor-types/src/layout.rs'
+	':!crates/orbivisor-types/src/legacy.rs'
+	':!crates/orbivisord/src/layout.rs'
+	# OVN 유닛 옛 이름을 별칭 링크로 바꾸기
+	':!crates/orbivisor-driver/src/ovn/units.rs'
+	# enable 링크·덮어쓰기 옮기기, 지울 때 옛 이름 링크
+	':!packaging/deb/postinst'
+	':!packaging/deb/postrm'
+	# 옛 판에서 올리기를 시험하는 패키징 시험과 옛 판(V0) 픽스처
+	':!packaging/tests/build-deb-test.sh'
+	':!packaging/tests/deb-test.sh'
+	':!packaging/tests/maint-test.sh'
+	':!packaging/tests/repo-test.sh'
+	':!packaging/tests/fixtures/oplite-v0'
+)
+
+# 허용 규칙 "<파일 glob>|<ERE>"(위 RULES와 같은 모양): 옛 이름을 일부러 받는 줄의 모양
+OLD_RULES=(
+	# 이름 바꾸기 앞에 저장된 ACME 훅 경로(spec에 들어 있다)
+	'crates/orbivisor-types/src/acme.rs|"/etc/opl/[^"]*"'
+	'crates/orbivisor-api/src/acme/dns/hook.rs|/etc/opl/acme-hooks/'
+	'crates/orbivisor-api/src/acme/api.rs|옛 판은 `/etc/opl/acme-hooks/`만'
+	'web/src/certs/dialogs.tsx|/etc/opl/acme-hooks/'
+	# 섞인 클러스터에서 옛 이름으로 적는 경로, 옛 Task가 든 경로
+	'crates/orbivisor-api/src/ceph.rs|옛 이름\(`/etc/opl/…`\)'
+	'crates/orbivisor-api/src/tasks.rs|옛 경로\(`/var/lib/opl/uploads/…`\)'
+	'web/src/ceph/ceph.ts|"/(etc|var/lib|run|var/log)/opl"|옛 이름\(`/etc/opl` 등\)'
+	'web/src/ceph/ceph.test.ts|"/etc/opl[^"]*"|옛 /etc/opl\)'
+	# OVN 유닛 옛 이름 옮기기와 그 시험
+	'crates/orbivisor-driver/src/ovn/host.rs|앞의 단위\(`opl-ovn-\*\.service`\)'
+	'crates/orbivisor-driver/src/ovn/host/tests.rs|opl-ovn-'
+	# 옛 빌드 변수 이름으로 빌드한 값 받기
+	'crates/orbivisor-types/src/version.rs|OPL_(VERSION|APT_URL|TELEMETRY_URL)'
+	'crates/orbivisor-types/src/subscription.rs|OPL_LICENSE_KEYS'
+	'crates/orbivisord/tests/version.rs|OPL_VERSION'
+	'crates/orbivisorctl/tests/version.rs|OPL_VERSION'
+	'packaging/deb/build-deb.sh|OPL_LICENSE_KEYS'
+	# 옛 실행 변수 받기와 그 시험
+	'crates/orbivisorctl/src/main.rs|옛 이름 OPL_X'
+	'crates/orbivisorctl/tests/legacy_env.rs|OPL_(SERVER|CONFIG)'
+	'crates/orbivisord/src/bin/orbivisor-devserver.rs|옛 이름 OPL_LOG'
+	'terraform/internal/provider/provider_test.go|OPL_LEGACY_T[0-9]+'
+	# 옛 제어 소켓·옛 설정 경로로 물러서기
+	'crates/orbivisorctl/src/cli.rs|옛 /run/opl/opld\.sock|"/run/opl/opld\.sock"'
+	'crates/orbivisord/src/main.rs|옛 `/etc/opl/opld\.toml`'
+	# 유닛: 옛 설정 경로 조건과 정적 별칭(옛 VM 스코프의 Before=opld.service)
+	'packaging/deb/orbivisord.service|ConditionPathExists=[|]/etc/opl/opld\.toml|별칭 Before=opld\.service'
+	'packaging/deb/build-deb.sh|유닛 opld\.service|Before=opld\.service|/usr/lib/systemd/system/opld\.service"'
+	# 이름 바꾸기 앞에 뜬 swtpm이 옛 경로로 연 TPM 파일
+	'packaging/deb/apparmor/orbivisor-swtpm|/(var/lib|run)/opl/vm/|\(/var/lib/opl, /run/opl\)'
+	# 구조 문서가 적는 옛 이름 링크·별칭("옛 `…`", "별칭 링크 `opld.service`")
+	'docs/architecture.md|옛 (이름 )?(링크 )?(디렉터리\()?`[^`]*`(·`[^`]*`)*|별칭 링크 `opld\.service`|`[|]/etc/opl/opld\.toml`|덮어쓰기\(`opld\.service\.d`\)'
+	# 시작하기의 설치 안내: 패키지가 까는 별칭
+	'docs/guide/getting-started.md|별칭 `opld\.service`'
+)
+
+# 시작하기의 두 "이름 바꾸기" 절(계획 43·74)은 옛 이름을 설명한다: 첫 절 머리부터 둘째 절 다음 머리 앞까지
+GUIDE=docs/guide/getting-started.md
+rename_range() {
+	awk '/^## 이름 바꾸기 \(opLite/ { from = NR }
+		/^## 이름 바꾸기 2 / { two = 1; next }
+		two && /^## / && !to { to = NR - 1 }
+		END { if (!to) to = NR; if (from && two) print from, to }' "$ROOT/$GUIDE"
+}
+
+# old_left <파일> <줄>: 허용 모양을 지운 뒤 노드 위의 옛 이름이 남으면 참
+old_left() {
+	local path=$1 text=$2 rule glob re
+	for rule in "${OLD_RULES[@]}"; do
+		glob=${rule%%|*} re=${rule#*|}
+		# shellcheck disable=SC2053 # glob으로 비교한다.
+		[[ $path == $glob ]] || continue
+		while [[ $text =~ $re ]]; do
+			text=${text/"${BASH_REMATCH[0]}"/}
+		done
+	done
+	[[ $text =~ $OLD_RE ]]
+}
+
+# expect_old <기대 left|clean> <파일> <줄>
+expect_old() {
+	local got=clean
+	if old_left "$2" "$3"; then got=left; fi
+	if [ "$got" = "$1" ]; then ok "옛 이름 규칙 $1: $2: $3"; else fail "옛 이름 규칙 $2: $3 → $got (기대 $1)"; fi
+}
+expect_old left docs/guide/cluster.md '# /etc/opl/opld.toml (노드마다)'
+expect_old left docs/guide/storage.md '`rm -rf /var/lib/opl`을 하면'
+expect_old left docs/guide/network.md 'journalctl -u opl-ovn-nb'
+expect_old left docs/guide/cluster.md 'systemctl edit opld로 opld.service.d'
+expect_old left docs/guide/backup.md 'export OPL_ESXI_PASSWORD=…'
+expect_old left README.md 'cargo test -p opl-api'
+expect_old left docs/architecture.md '`crates/opld/src/main.rs`'
+expect_old left docs/architecture.md 'opl_types::acme'
+expect_old left web/src/certs/i18n/en.json '"hook": "The hook must be a file under /etc/opl/acme-hooks/."'
+expect_old left docs/guide/development.md 'sudo mkdir -p /etc/opl-ceph'
+expect_old clean docs/guide/network.md 'oplv100, opl-r-<id>, opl_<태그>, opl-vm-1.scope'
+expect_old clean docs/guide/cluster.md '/etc/oplite-x, /var/lib/oplx, ORBIVISOR_SERVER, XOPL_A, opl-apix'
+expect_old clean docs/architecture.md '(기본 `/etc/orbivisor/orbivisord.toml`, 없고 옛 `/etc/opl/opld.toml`이 있으면 그것)'
+expect_old clean docs/architecture.md '| 유닛(+ 정적 별칭 링크 `opld.service`) |'
+expect_old left docs/architecture.md '옛 `/etc/opl/opld.toml`이 있으면 그것. 설정은 /etc/opl/opld.toml'
+expect_old clean crates/orbivisorctl/src/cli.rs '                Path::new("/run/opl/opld.sock"),'
+expect_old left crates/orbivisorctl/src/cli.rs '    /// 소켓 (기본: /run/opl/opld.sock)'
+expect_old clean packaging/deb/orbivisord.service 'ConditionPathExists=|/etc/opl/opld.toml'
+expect_old left packaging/deb/orbivisord.service 'ExecStart=/usr/bin/opld --config /etc/opl/opld.toml'
+expect_old clean crates/orbivisor-types/src/version.rs '    _ => match option_env!("OPL_VERSION") {'
+expect_old left crates/orbivisor-types/src/version.rs 'option_env!("OPL_SOCKET")'
+
+range=$(rename_range)
+if [ -n "$range" ]; then ok "시작하기의 이름 바꾸기 절: 줄 $range"; else fail "시작하기에서 두 이름 바꾸기 절을 찾지 못함"; fi
+from=${range% *} to=${range#* }
+code=0
+lines=$(git grep -nIE "$OLD_RE" -- . "${OLD_EXCLUDE[@]}" </dev/null) || code=$?
+if [ "$code" -gt 1 ]; then
+	echo "name-test: git grep 실패(종료 코드 $code)"
+	exit 1
+fi
+left=0
+while IFS= read -r line; do
+	[ -n "$line" ] || continue
+	path=${line%%:*}
+	rest=${line#*:}
+	num=${rest%%:*}
+	if [ "$path" = "$GUIDE" ] && [ -n "$range" ] && [ "$num" -ge "$from" ] && [ "$num" -le "$to" ]; then
+		continue
+	fi
+	if old_left "$path" "${rest#*:}"; then
+		echo "  $line"
+		left=$((left + 1))
+	fi
+done <<<"$lines"
+if [ "$left" -eq 0 ]; then ok "허용 목록 밖의 노드 옛 이름 없음"; else fail "허용 목록 밖의 노드 옛 이름 ${left}줄(위)"; fi
 
 if [ "$FAILED" -ne 0 ]; then
 	echo "name-test: 실패"
