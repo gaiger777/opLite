@@ -8,6 +8,8 @@
 //! 계획 70: VM을 켠 뒤 인프라 › 노드의 보기 "지도"에서 노드 블록·VM 타일을 보고 키보드·누르기로 서랍을 열고 목록 보기·휴대폰 폭을 본다.
 //! 계획 71: 지도에서 `m`(한 노드라 옮길 곳 없음 알림과 Esc), 보기 "빌더"로 마우스·키보드·휴대폰 폭에서 VM을 만든다
 //! (`builder.spec.ts`, QEMU를 켜지 않음).
+//! 계획 72: 시험 안에 띄운 가짜 vSphere로 원본 더하기(지문) → 마법사 → 따뜻한 동기화 → 전환 → VM 링크, 그 VM을 OVA로
+//! 내보내 내려받기(`vmware.spec.ts`, QEMU를 켜지 않음).
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -429,5 +431,85 @@ async fn browser_browses_backup_files() {
                 .is_ok_and(|mut e| e.next().is_some())
     })
     .await;
+    d.stop();
+}
+
+/// 계획 72: 가짜 vSphere(기본 세계 — 켜진 `web01`, 4 MiB 디스크 둘)를 띄우고 브라우저가 원본을 더해 마법사로 따뜻한 이전을
+/// 만들고 전환한 뒤 만든 VM을 OVA로 내보내 내려받는다. 끝나면 원본은 꺼지고 NIC가 "켤 때 연결"에서 빠졌으며, 대상 VM은 꺼진
+/// 채 있고 볼륨 바이트가 원본과 같고, 내보내기는 준비됐다. 스케줄러 틱 0.5초, 델타 주기 3초.
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_migrates_a_vmware_vm_and_exports_it() {
+    use opl_api::vmware::fake::{FakeConfig, FakeVsphere};
+    use opl_types::vmware::VmwarePower;
+
+    let _one = BROWSER.lock().await;
+    web_dir();
+    let mut d = Daemon::new(
+        "node1",
+        "[test]\nvmware_tick_ms = 500\nvmware_sync_secs = 3\n",
+    );
+    d.start().await;
+    d.init("web-vmware").await;
+    d.login().await;
+    let dir = d.path("local");
+    std::fs::create_dir(&dir).unwrap();
+    d.ctl(&["pool", "create", "local", "--path", dir.to_str().unwrap()])
+        .await
+        .unwrap();
+    d.wait_pool_ready("local").await;
+    d.ctl(&["network", "create", "lan", "--bridge", "br0"])
+        .await
+        .unwrap();
+    let fake = FakeVsphere::start(FakeConfig::default()).await;
+    let spec = fake.source_spec();
+
+    let out = playwright(
+        "e2e/vmware.spec.ts",
+        vec![
+            ("OPL_URL", d.server()),
+            ("OPL_USER", "admin".into()),
+            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
+            ("OPL_POOL", "local".into()),
+            ("OPL_NETWORK", "lan".into()),
+            ("OPL_VSPHERE_HOST", spec.host.clone()),
+            ("OPL_VSPHERE_PORT", spec.port.to_string()),
+            ("OPL_VSPHERE_USER", spec.user.clone()),
+            ("OPL_VSPHERE_PASSWORD", spec.password.expose().to_string()),
+            ("OPL_VSPHERE_FINGERPRINT", spec.fingerprint.clone()),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "playwright failed:\n{}\n{}\nopld log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        d.log()
+    );
+    assert_eq!(fake.power("web01"), VmwarePower::PoweredOff);
+    assert_eq!(fake.nics_start_connected("web01"), vec![false, false]);
+    let vm = d.ctl_json(&["vm", "get", "web01"]).await;
+    assert_eq!(vm["spec"]["power"], "stopped", "{vm}");
+    for (i, disk) in vm["spec"]["disks"].as_array().unwrap().iter().enumerate() {
+        let volume = d
+            .ctl_json(&["volume", "get", disk["volume"].as_str().unwrap()])
+            .await;
+        let format = volume["spec"]["format"].as_str().unwrap();
+        let file = dir.join(format!("{}.{format}", volume["id"].as_str().unwrap()));
+        let raw = d.path("disk.raw");
+        let out = Command::new("qemu-img")
+            .args(["convert", "-O", "raw"])
+            .arg(&file)
+            .arg(&raw)
+            .output()
+            .expect("run qemu-img");
+        assert!(out.status.success(), "qemu-img convert: {out:?}");
+        assert!(
+            std::fs::read(&raw).unwrap() == fake.disk_bytes("web01", i),
+            "disk {i} differs from the source"
+        );
+    }
+    let export = d.ctl_json(&["export", "get", "web01-ova"]).await;
+    assert_eq!(export["status"]["phase"], "ready", "{export}");
     d.stop();
 }

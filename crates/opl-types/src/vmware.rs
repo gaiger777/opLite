@@ -375,9 +375,11 @@ pub enum VmwareMigrationMode {
 pub struct VmwareRules {
     /// 원본 네트워크(이름 또는 `moref:dvportgroup-12`) → 우리 네트워크
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub networks: Vec<VmwareMapping>,
     /// 원본 데이터스토어 이름 → 우리 풀(디스크마다)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub datastores: Vec<VmwareMapping>,
     /// 규칙에 없는 데이터스토어의 디스크를 둘 풀
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -663,6 +665,7 @@ pub struct VmwareMigrationStatus {
     pub phase: VmwareMigrationPhase,
     /// 항목 상태(`VmwareVmState::as_str`)별 VM 수
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub counts: BTreeMap<String, u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
@@ -743,9 +746,11 @@ impl VmwareVmSpec {
 pub struct VmwareOverrides {
     /// 디스크 순번별 풀(비면 데이터스토어 규칙)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub pools: Vec<String>,
     /// 원본 네트워크 → 우리 네트워크
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub networks: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
@@ -767,7 +772,7 @@ pub struct VmwareOverrides {
     pub memory_mib: Option<u32>,
     /// 원본 NIC 순번별 SDN 주소
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Vec<String>>))]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Vec<String>>, default))]
     pub ips: Vec<Vec<IpAddr>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
@@ -796,6 +801,7 @@ pub struct VmwareVmStatus {
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub source: Option<VmwareSourceVm>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub disks: Vec<VmwareSyncDisk>,
     /// 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -807,9 +813,11 @@ pub struct VmwareVmStatus {
     pub pending_snapshot: Option<VmwareSnapshotRef>,
     /// 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
     #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub cbt_enabled_by_us: bool,
     /// 끝낸 회차 수
     #[serde(skip_serializing_if = "is_zero32")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub rounds: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
@@ -827,14 +835,17 @@ pub struct VmwareVmStatus {
     pub target_vm: Option<Uuid>,
     /// 바꾼 원본 설정(되돌림·취소가 되돌린다)
     #[serde(skip_serializing_if = "VmwareSourceChanges::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub source_changes: VmwareSourceChanges,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub error: Option<String>,
     /// 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub history: Vec<VmwareHistory>,
     /// 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -842,6 +853,7 @@ pub struct VmwareVmStatus {
     pub started_at: Option<u64>,
     /// 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
     #[serde(skip_serializing_if = "is_zero32")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub sync_failures: u32,
     /// 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1045,12 +1057,15 @@ pub struct VmwareSnapshotRef {
 pub struct VmwareSourceChanges {
     /// 전환이 원본을 껐다(되돌림이 켠다).
     #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub powered_off_by_us: bool,
     /// `startConnected=false`로 바꾼 NIC 장치 키
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub nics_disconnected: Vec<i32>,
     /// 설명(annotation)을 바꿨다.
     #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub annotation_added: bool,
     /// 바꾸기 전 설명(되돌림이 되살린다)
     #[serde(skip_serializing_if = "Option::is_none")]

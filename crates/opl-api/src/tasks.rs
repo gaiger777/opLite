@@ -207,6 +207,8 @@ pub struct TaskRunnerConfig {
     pub vmware_start_timeout: Duration,
     /// VMware 전환: 게스트 종료 기다림의 상한(시험이 줄인다 — 없으면 계획의 `shutdown_timeout_s`)
     pub vmware_shutdown_limit: Option<Duration>,
+    /// VMware 따뜻한 이전의 델타 주기(시험이 줄인다 — 없으면 계획의 `sync.interval_min`, 5분 이상)
+    pub vmware_sync_every: Option<Duration>,
 }
 
 impl TaskRunnerConfig {
@@ -254,6 +256,7 @@ impl TaskRunnerConfig {
             vmware_checkpoint_bytes: vmware::CHECKPOINT_BYTES,
             vmware_start_timeout: vmware::START_TIMEOUT,
             vmware_shutdown_limit: None,
+            vmware_sync_every: None,
         }
     }
 }

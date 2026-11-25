@@ -1,6 +1,6 @@
 # 가상 머신
 
-설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, NUMA·전용 CPU·hugepages, 라이브 마이그레이션, 만들기 전 미리 확인. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, NUMA·전용 CPU·hugepages, 라이브 마이그레이션, 만들기 전 미리 확인, OVA로 내보내기. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [설치 매체와 cloud-init](#설치-매체와-cloud-init)
 - [템플릿과 링크드 클론](#템플릿과-링크드-클론)
@@ -14,6 +14,7 @@
 - [NUMA·전용 CPU·hugepages](#numa전용-cpuhugepages)
 - [라이브 마이그레이션](#라이브-마이그레이션)
 - [만들기 전 미리 확인](#만들기-전-미리-확인)
+- [OVA로 내보내기](#ova로-내보내기)
 
 ## 설치 매체와 cloud-init
 
@@ -1275,3 +1276,39 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
   `POST /vms?dry_run=true`가 아니라 따로 된 경로인 까닭은 옛 노드가 질의를 모르고 진짜 VM을 만들기 때문이다.
 - **한계.** 그 순간의 답이다(잡아 두지 않음 — 확인과 만들기 사이 바뀌면 만들기가 알린다). 템플릿 배포(`POST /vms/{key}/clone`)의 미리 확인은
   없다. 준비 단계 문제는 첫 하나다.
+
+## OVA로 내보내기
+
+계획 72. **꺼진** VM(템플릿도)을 VMware·Workstation·VirtualBox가 받는 OVF 묶음으로 dir·NFS 풀에 쓰고, 하나의 OVA로 내려받는다.
+디스크마다 `qemu-img convert -O vmdk -o subformat=streamOptimized`(SHA-256), OVF 1.0 + `vmw:` 서술자, `.mf` 매니페스트를
+`{풀}/orbivisor-exports/{내보내기 id}/`에 둔다. 내려받기는 그 파일들을 그 자리에서 ustar로 이어 흘린다(정확한 `Content-Length`,
+풀에 OVA를 따로 만들지 않는다).
+
+```bash
+orbivisorctl vm export web --pool nfs1 --guest-os ubuntu64Guest --hw-version 14 --wait   # 이름 없으면 web-20261125-093000
+orbivisorctl vm export web --pool nfs1 --download web.ova     # 다 쓴 뒤 내려받기까지(--wait를 품는다)
+orbivisorctl export list                                       # NAME VM POOL PHASE OVA FILES ERROR
+orbivisorctl export download web-20261125-093000 -O web.ova    # --file web.ovf 하나만도
+orbivisorctl export delete web-20261125-093000
+govc import.ova -name web web.ova                              # vSphere 쪽(또는 ovftool, vSphere Client의 "Deploy OVF Template")
+```
+
+- **조건.** VM이 꺼져 있어야 한다(409 `vm_running`). 쓰는 동안 그 VM 켜기·스펙 바꾸기·지우기·옮기기는 409 `vm_exporting`. 풀은
+  dir·NFS만(400 `pool_not_file`), 디스크 할당 크기 합 + 1 GiB가 남아 있어야 한다(507). 내보내기가 남은 풀은 지울 수 없다.
+- **guestId.** `--guest-os`(VMware guestId) > 그 VM을 만든 VMware 가져오기의 원본 값 > `otherGuest64` + 경고. `--hw-version`은
+  7~21(기본 14 — ESXi 6.7 이상). `--keep-macs`면 MAC을 `vmw:Config addressType=manual`로 적는다(vSphere가 이것으로 MAC을
+  지키는지는 실제 vSphere에서 확인하지 못했다).
+- **경고로 빠지는 것.** vTPM·CD-ROM·cloud-init·NUMA·전용 CPU·hugepages·핫플러그 한도·HA·배치·복제·보안 그룹·SDN 주소·NIC 속도 제한,
+  aarch64 VM(x86 VMware에서 켤 수 없음). 디스크는 pvscsi(15개까지) 또는 AHCI(30개까지)로 적는다.
+- **내려받기 링크.** `POST /api/v1/vm-exports/{name}/download-link`가 10분짜리 서명 링크(그 사용자만 — 남이면 403, 지나면 410
+  `link_expired`)를 주고, 어느 노드에서든 받을 수 있다(파일이 그 노드에 없으면 쓴 노드에서 노드 사이 흐름으로 받는다).
+  덜 쓴·실패한 내보내기는 409 `export_not_ready`.
+- **Task.** `vm-export`(VM 줄, 시간 제한 없음, 이어 가지 않음 — orbivisord가 다시 뜨면 실패하고 디렉터리를 지운다),
+  `vm-export-delete`.
+- **웹.** VM 상세 ⋯의 "OVA로 내보내기…"(꺼진 VM, `vm.export`)는 가상 머신 › 가져오기의 **내보내기** 보기(`/vm-exports?export=<VM>`)로
+  가서 대화상자(풀·이름·guestId·하드웨어 판·MAC 유지)를 연다. 진행·경고·내려받기·지우기는 그 보기에 있다.
+- **권한.** 그 VM의 `vm.export`(내장 `operator`에 없다, 지운 VM의 내보내기는 루트) — 만들기·내려받기·지우기 모두, 만들기는 풀의
+  `storage.allocate`도(403). 기능
+  `vm-export`가 없는 노드가 있으면 409 `cluster_upgrading`.
+- **확인한 것.** 내보낸 OVA를 계획 29 OVA 가져오기로 다시 들이면 디스크 바이트가 같다(시험), GitHub `vmware-sim`에서 govmomi vcsim이
+  `govc import.ova`로 받는다. 실제 vSphere·ovftool·VirtualBox에서의 받기와 게스트 부팅은 손 확인이다.

@@ -102,6 +102,7 @@ orbivisorctl network create lan-a --bridge br0 --folder /teamA     # 네트워�
 | `vm.dedicated` | 전용 CPU(`cpu.policy=dedicated`)나 hugepages가 있는 VM 만들기, 그 칸(정책·스레드·에뮬레이터·hugepages) 바꾸기, 그런 VM으로 복제·배포·가져오기·복원 — 새 VM의 폴더(바꾸기는 그 VM)에서 본다. `vm.create`·`vm.config`와 함께 필요하다([NUMA·전용 CPU·hugepages](vms.md#numa전용-cpuhugepages)) |
 | `backup.create` · `backup.restore` · `backup.delete` · `backup.job` | 지금 백업·원격 사본 · 복원 · 지우기 · 백업 작업(루트) |
 | `backup.file_restore` | 백업 안 파일 찾아보기·내려받기·VM으로 되돌려 쓰기(계획 69, 내장 `operator`에 없음 — [파일 단위 복원](backup.md#파일-단위-복원)) |
+| `vm.export` | VM을 OVA/OVF로 내보내기·내려받기·지우기(계획 72, 내장 `operator`에 없음 — [OVA로 내보내기](vms.md#ova로-내보내기)) |
 | `storage.allocate` · `storage.config` | 풀에 볼륨 만들기·늘리기·지우기, 이미지 받기 · 풀 만들기·바꾸기 |
 | `network.assign` · `network.config` | NIC를 그 네트워크에 붙이기 · 네트워크·보안 그룹 쓰기 |
 | `inventory.folder` · `inventory.move` · `inventory.quota` | 하위 폴더 만들기·이름 바꾸기·지우기 · 옮기기(원본·대상 둘 다) · 자식 폴더의 할당량 |
@@ -117,7 +118,7 @@ orbivisorctl network create lan-a --bridge br0 --folder /teamA     # 네트워�
 | 내장 역할 | 권한 |
 |---|---|
 | `admin` | 전부 |
-| `operator` | `system.read`·`cluster.read`·`alert.read`, `vm.*` 8개(`vm.dedicated` 빼고), `backup.*` 4개(`backup.file_restore` 빼고), `storage.allocate`, `network.assign` |
+| `operator` | `system.read`·`cluster.read`·`alert.read`, `vm.*` 8개(`vm.dedicated` 빼고), `backup.*` 4개(`backup.file_restore` 빼고), `storage.allocate`, `network.assign`(`vm.export` 없음) |
 | `viewer` | `system.read`·`cluster.read`·`alert.read` |
 
 내장 역할은 예전 역할과 뜻이 같다. 사용자의 전역 역할(`user create --role`)은 "루트에 그 내장 역할 grant"로 읽으므로 grant가

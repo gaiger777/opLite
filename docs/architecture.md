@@ -66,7 +66,7 @@ Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에
 
 | 크레이트 | 줄 수(대략) | 하는 일 |
 |---|---|---|
-| `opl-types` | 30k | 리소스 모델(39종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
+| `opl-types` | 30k | 리소스 모델(43종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
 | `opl-qemu` | 7k | QEMU 명령줄 만들기, QMP·QGA 클라이언트, 펌웨어 찾기, cloud-init ISO 만들기 |
 | `opl-store` | 9k | 백업 저장소(계획 68): 청크·고정 인덱스·매니페스트 v3 형식, 암호화 키 계층·복구 키·escrow, 로컬·S3 백엔드(직접 짠 SigV4), GC 표시·쓸기·Bloom 필터, 검증, NBD 클라이언트·서버(`backup-serve` 헬퍼), 가짜 S3(`fake-s3` 기능) |
 | `opl-restore` | 5k | 파일 단위 복원(계획 69): 도우미 VM과의 통신 규약(프레임·메시지·한도·`StreamCheck`), 에이전트 몸통(`Fs` trait·탐지 해석·마운트 옵션·나열·읽기·걷기)과 PID 1 바이너리 `orbivisor-restore-agent`(정적 musl — C 의존성 없음, 그래서 opl-types도 쓰지 않음), zip·tar.gz 흘려 쓰기 작성기 |
@@ -304,10 +304,11 @@ sequenceDiagram
 | `names` | (kind, name) → id (이름 유일성 색인) |
 | `meta` | `vote`, `committed`, `last_applied`, `last_purged`, `last_membership`, `snapshot_meta`, `snapshot_data`, `node_mode`, `schema_version` … |
 
-- **리소스 39종** (`crates/opl-types/src/resource.rs`의 `Kind`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
+- **리소스 43종** (`crates/opl-types/src/resource.rs`의 `Kind`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
   Cluster, JoinToken, Network, Snapshot, SecurityGroup, Backup, BackupJob, VmImport, Settings, Realm, Remote, Session,
   VipHolder, HaGroup, PlacementRule, NodeFence, HaCheck, Ceph, AlertRule, NotificationTarget, Folder, Grant,
-  AccessRole, Group, TwoFactor, CpuCatalog, Sdn, Router, FloatingIp, LoadBalancer, NetworkMigration, BackupStore(계획 68).
+  AccessRole, Group, TwoFactor, CpuCatalog, Sdn, Router, FloatingIp, LoadBalancer, NetworkMigration, BackupStore(계획 68),
+  VmwareSource, VmwareMigration, VmwareVm, VmExport(계획 72).
 - 모든 리소스는 같은 봉투 `Resource<S,T> { id, name, revision, labels, spec, status }`다(`resource.rs:7-18`).
 - **revision은 클러스터 전체에 하나인 순서다.** 리소스의 `revision`은 마지막으로 바꾼 Raft 로그 index이고
   (`crates/opl-cluster/src/state_machine.rs:381,419,427,443`), 목록의 revision은 `last_applied`다
@@ -507,6 +508,7 @@ sequenceDiagram
 | `TelemetryReporter` | 텔레메트리 보고 | 틱 60초, 24시간마다 | `telemetry.rs:221-229,292` |
 | `RemotePoller` | 원격 클러스터 상태 모으기 | 30초 | `remotes.rs:558-559,608` |
 | `OvnSync` | Raft의 SDN 네트워크·서브넷·VM NIC·라우터·유동 IP·보안 그룹·부하 분산기·QoS·옮기기 다리를 OVN NB에 맞추기(다른 것만, 펜싱 토큰), 지운 노드의 SB chassis 지우기(모든 노드가 `sdn-services`면 중앙 에이전트가 대신), 10초마다 게이트웨이 주인·LB 멤버 건강 관찰(SDN 경보 입력), `SdnStatus.sync`(§11.4~§11.6). `Sdn`이 `ready`가 아니면 쉼 | 바뀌면 0.5초 모아, 60초마다, 리더 확인 1초 | `ovn_sync/mod.rs:44-48,82-83,136,486` |
+| `VmwareScheduler` | VMware 이전 계획(`running`)의 항목마다 `vmware-sync`(전체·델타)·`vmware-cutover`(예약 전환 `cutover.at`, 항목에 요청 시각을 먼저 적어 한 번만)·`vmware-cleanup`(취소) Task 만들기. 계획의 동시 수·같은 ESXi 호스트·같은 노드 한도(모든 계획의 Task를 셈), 델타·전환이 새 전체 복사보다 먼저. 모든 항목이 끝난 계획을 `finished`로. 진행은 항목(Raft)에 있어 새 리더가 다음 틱에 잇는다(계획 72). 기능 `vmware-migrate`가 모든 노드에 있을 때만 | 15초 | `vmware_scheduler.rs:40-51,383` |
 | 리스 표 | 노드의 `RenewLease`를 받아 메모리에 기록(§5.1) | 요청마다 | `crates/opl-cluster/src/lease.rs` |
 
 리더 일이 **아닌** 것(오해하기 쉬운 것):
@@ -913,8 +915,12 @@ graph TD
   (`by_target`)로 맞춘다: 같은 VM·볼륨·백업·노드·Ceph의 앞 Task가 끝나야 다음이 돈다(`tasks.rs:600-664`).
 - **다시 시작해도 대개 이어지지 않는다.** 데몬이 다시 뜰 때 Running인 Task는 "interrupted: orbivisord restarted"로 실패
   처리한다. 노드 업그레이드(`NodeUpgrade`), 단순 → SDN 옮기기(`NetworkMigrate`, 계획 67), 라이브 복원(`BackupLiveRestore`,
-  계획 68)만 이어간다(`tasks.rs`의 이어 가는 Task 목록) — 셋 다 진행을 Raft·노드 파일에 두고 다시 읽어 걸음을 정한다.
-- 제한 시간 기본 600초. 마이그레이션·백업·복원·복제·가져오기·업그레이드·비우기·내려받기·flatten·Ceph·파일 복원 세션·게스트로 되돌려 쓰기는 없음.
+  계획 68), VMware 이전의 `VmwareSync`·`VmwareCutover`·`VmwareRevert`·`VmwareCleanup`(계획 72 — 대상은 `vmware-vm` 항목, 항목 줄)만
+  이어간다(`tasks.rs:792-803`) — 모두 진행을 Raft·노드 파일에 두고 다시 읽어 걸음을 정한다. VMware 동기화는 디스크별 체크포인트
+  (`copied_bytes`·`rounds`·`change_id`, 조각을 쓰고 FLUSH한 뒤에만), 전환은 걸음(`cutover_step` — 먼저 적고 한다, 모든 걸음은 다시 해도
+  같다)으로 잇는다.
+- 제한 시간 기본 600초. 마이그레이션·백업·복원·복제·가져오기·업그레이드·비우기·내려받기·flatten·Ceph·파일 복원 세션·게스트로 되돌려 쓰기·
+  VMware 동기화·전환·되돌리기·정리·VM 내보내기는 없음(VMware Task는 걸음마다 한도 — 조각 멈춤 10분, 게스트 종료 `shutdown_timeout_s`, 켜기 5분).
 - **잠금.** 클러스터 전체의 VM 잠금은 없다. 노드 로컬 `vm_lock`이 그 노드에서의 VM spec 검증·쓰기를 줄 세우고
   (`crates/opl-api/src/state.rs:46-48`), 노드 사이 경쟁은 revision 비교(412)로 막는다. 라이브 마이그레이션 동안은
   reconciler의 "hold"(`begin_migration`/`end_migration`)가 그 VM을 건드리지 않게 한다(`reconciler.rs:73-90`).
@@ -1205,6 +1211,26 @@ flowchart LR
   - 자세한 것은 [파일 단위 복원 안내](guide/backup.md#파일-단위-복원)와 [설계](superpowers/specs/2026-11-24-file-restore-design.md).
 - **로컬 디스크 복제(HA)**는 §5.7.
 - VMware 가져오기(OVA, ESXi)는 `VmImport` 리소스와 Task다([백업·복제·가져오기 안내](guide/backup.md)).
+- **VMware 이전 2(계획 72)**는 리소스 넷이다: `VmwareSource`(연결 — 비밀번호는 Raft에, 보기·watch·감사·`Debug`에서 뺌, 인증서 SHA-256
+  지문 고정), `VmwareMigration`(계획 — 규칙·한도·동기화 주기·전환 정책, 요약 상태), `VmwareVm`(VM 하나 — 디스크마다 changeId·복사량·볼륨,
+  우리 스냅샷 moref, 바꾼 원본 설정의 옛 값, 전환 걸음, 내린 시간; Raft 독점 키 `vmware-vm` = instanceUuid로 한 원본 VM은 끝나지 않은
+  항목 하나에만), `VmExport`.
+  - **vSphere 클라이언트**(`crates/opl-api/src/vmware/`): 손으로 쓴 SOAP vim25 XML + `roxmltree`(WSDL 코드 생성·새 의존성 없음), 계획 30의
+    지문 고정 TLS를 꺼낸 `http.rs`(keep-alive·POST·Range·쿠키). 세션(`Session`, 노드 캐시 5분)·`PropertyCollector` 인벤토리(노드 캐시
+    60초)·`ReconfigVM`(CBT·설명·NIC `startConnected`)·스냅샷·`QueryChangedDiskAreas`·전원·`AcquireGenericServiceTicket`·`SearchDatastore`.
+  - **복사**: 회차마다 "새 스냅샷 S(n+1) 만들기 → S(n) 지우기(합치기)"로 기반 flat 파일을 지난 회차의 모습으로 얼려 두고, CBT가 준 바뀐
+    구역(사이 256 KiB 이하는 이음)을 그 파일에서 HTTPS 범위 읽기로 읽는다(vCenter면 호스트 티켓으로 ESXi에 바로 — 호스트 인증서는
+    vCenter의 PEM으로 고정, 안 되면 vCenter `/folder`; vSAN·vVols는 운영자가 깐 nbdkit-vddk → 우리 NBD 클라이언트). 쓰기는 `Pending`
+    대상 볼륨을 쓰기 가능한 `qemu-nbd`(writeback, 체크포인트마다 FLUSH)로 열어 opl-store NBD 클라이언트의 WRITE·WRITE_ZEROES로 한다.
+    노드 시작 sweep은 살아 있는 항목의 `pending` 볼륨(레이블 `orbivisor.io/vmware-vm`)을 지우지 않는다.
+  - **전환**: 걸음 `preparing`(켜진 채 델타, 원본 보호) → `stopping-source` → `final-sync` → `creating-vm`(VM id를 먼저 적음, 볼륨은
+    바로 전에 `ready`) → `starting-vm`. `final-sync` 뒤 실패는 자동 되돌림(대상 VM 지움·NIC·설명 되돌림·원본 켬 → `rolled-back`), 되돌림
+    실패는 손으로 할 일과 함께 `failed`. 원본 VM·디스크·사용자 스냅샷을 지우는 호출은 없다.
+  - **내보내기**: 꺼진 VM의 디스크마다 `qemu-img convert -O vmdk subformat=streamOptimized` + OVF 1.0(`vm_imports/ovf_write.rs`, 계획 29
+    읽개와 왕복 시험) + SHA-256 `.mf`를 dir·NFS 풀 `orbivisor-exports/{id}/`에, 내려받기는 서명 링크(클러스터 CA 키에서 HKDF, 10분·사용자에
+    묶임)로 ustar를 그 자리에서 흘린다(다른 노드면 노드 사이 흐름 `ExportDownload`).
+  - 자세한 것은 [VMware 이전 안내](guide/backup.md#vcenter-일괄-이전과-따뜻한-이전), [OVA로 내보내기](guide/vms.md#ova로-내보내기),
+    [설계](superpowers/specs/2026-11-25-vmware2-design.md).
 
 ### 10.4 이미지 라이브러리
 
@@ -1581,6 +1607,7 @@ graph LR
 | OVN(계획 65~67) | NB·SB·Raft는 `pssl`만, 클러스터 CA mTLS(노드 인증서 사본), OvnSync는 서버 이름도 확인. 잠금(계획 67, 새 클러스터 기본): SB 역할 포트 `role=ovn-controller`(chassis는 자기 행만), northd 전용 특권 포트 6645, Raft 멤버십을 따르는 nftables 주소 허용 목록(지운 노드는 인증서가 살아 있어도 끊김). `Port_Binding`·`MAC_Binding`·`FDB`는 OVN RBAC가 id를 보지 않음, NB에는 RBAC 없음. SDN NIC의 보안 그룹은 OVN ACL(포트 보안이 IP 위조도 막음), 포트는 Port_Group이 있어야 생김(실패하면 닫힘) | §11.4~§11.6 |
 | swtpm | AppArmor 추가 규칙 | §9.2 |
 | 파일 단위 복원(계획 69) | 백업 안 파일시스템은 믿지 않는 입력 — 호스트 커널·opld가 해석하지 않고 세션마다 네트워크 없는 도우미 VM(에이전트 PID 1, 셸 없음, `ro,nodev,nosuid,noexec`)이 해석. 원본은 QEMU `read-only=on` + 버리는 덮개, scope·`-run-with user=nobody`·seccomp sandbox, 통신 규약 한도(위반이면 세션 닫음), 아카이브 경로 거르기·zip에 링크 없음, 내려받기 링크는 60초·한 번·같은 사용자, 요청마다 권한 다시 확인, 새 권한 `backup.file_restore`(operator 없음), 암호화 저장소 키는 opld 안에만. macOS는 권한 내림·sandbox 없음 | §10.3 |
+| VMware 이전·내보내기(계획 72) | 원본 비밀번호는 Raft에만(API·watch·감사·로그·`Debug`·Task에서 뺌, `Secret` 타입), vCenter·ESXi 인증서 SHA-256 지문 고정(틀리면 비밀번호를 보내기 전에 끊음 — 가짜 vSphere 요청 기록으로 시험), 호스트 티켓 길의 ESXi 인증서는 vCenter가 알려 준 PEM으로 고정, VDDK 비밀번호는 nbdkit 표준 입력, 원본 쓰기는 우리 스냅샷·CBT·보호 설정·전원뿐, 원본 바꾸기 `cluster.admin`·전환은 대상 폴더 `vm.create`+`vm.power`, 새 권한 `vm.export`(operator 없음), 내려받기 서명 링크(HKDF 키, 10분·사용자, 감사에 토큰 없음) | §10.3 |
 | 백업 저장소(계획 68) | 노드에서 AES-256-GCM(HKDF로 나눈 키, HMAC 청크 id, 결정적 nonce, 매니페스트 HMAC 인증), 주 키는 Raft에(API·watch·감사·`Debug`에서 뺌), 복구 키·저장소 안 argon2id escrow, S3는 rustls + SigV4(인증서 검증 실패는 다시 하지 않음), `backup-serve` 소켓 0600·설정은 표준 입력 | §10.3 |
 
 **저장된 비밀은 암호화하지 않는다.** LDAP `bind_password`, OIDC `client_secret`, IPMI/Redfish 비밀번호, SMTP 비밀번호,
@@ -1852,6 +1879,13 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
   실제 Windows는 손 확인이다. RHEL·Rocky 에이전트의 기본 막힘은 가짜 에이전트의 `supported_commands`로만 보았다(가이드의 설정 줄은 실제
   RHEL 게스트로 확인하지 않음). 실제 BitLocker·같은 VG UUID의 LVM 디스크 둘은 시험하지 않았다. btrfs·ntfs 고정물과 x86_64 KVM·강제 TCG
   측정은 GitHub `file-restore`에서만 돈다. 악의적으로 만든 파일시스템 이미지로 도우미 커널을 퍼징하지는 않았다(격리 벽에 기댐).
+- **계획 72(VMware 이전 2)에서 확인하지 못한 것.** 실험실에 vCenter·ESXi·VDDK가 없다. 의미는 가짜 vSphere(스냅샷 사슬·CBT·
+  게스트 쓰기)로, SOAP 꼴은 GitHub `vmware-sim`의 govmomi vcsim(v0.56.2)으로만 보았다 — **vcsim은 `QueryChangedDiskAreas`가 없어**
+  (`MethodNotFound`) CBT 바뀐 구역은 가짜 vSphere로만 시험했다. 켜진 VM 기반 flat의 `/folder` 범위 읽기, 호스트 티켓 한 번 쓰기,
+  합치기 시간, 무료 ESXi 거절 문구, vSAN·vVols의 VDDK 길(CI는 nbdkit `file` 플러그인 배선만)은 가정이다. 이전한 게스트의 부팅은 확인하지
+  못했다(aarch64 TCG, VMware 게스트 없음 — 바이트 같음만). OVA 내보내기는 govc `import.ova`(vcsim)로만 받아 보았고 실제 vSphere·ovftool·
+  VirtualBox와 `vmw:Config addressType=manual`의 MAC 지킴은 손 확인이다. 속도는 가짜 vSphere 루프백 수치뿐이다. 손 확인 절차는
+  [안내](guide/backup.md#vcenter-일괄-이전과-따뜻한-이전).
 - **OVN 24.03 RBAC가 막지 않는 것.** 잠금은 SB `Chassis`·`Encap`·`Chassis_Private`의 주인만 보고, `Port_Binding`·`MAC_Binding`·`FDB` 쓰기는 id 검사
   없이 받는다(OVN이 그렇게 정의). 망가진 chassis의 포트 가로채기는 막지 못하고 탐지 경보도 아직 없다.
 - **OVN 판에 기대는 것.** 바깥 → 안의 큰 DF 패킷에 ICMP가 없는 것(`gateway_mtu`가 게이트웨이로 나가는 방향만 잼), ACL 우선순위

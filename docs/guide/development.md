@@ -147,6 +147,25 @@ cargo test -p oplctl -- vm_create_dry_run web_cross                 # vm create 
 pnpm -C web test src/dnd src/vmBuilder src/placement/hard.test.ts   # 끌기 틀(상태 기계 사건열 성질 시험·자동 스크롤·제공자), 빌더 모델(부품·놓기 규칙 표·놓기·문제·요청·JSON·CLI·무작위 놓기)과 화면(msw, axe), hard 배치 규칙 예상
 pnpm -C web test src/clusterMap/drop.test.ts src/clusterMap/ClusterMapDrag.test.tsx   # 지도 끌어 옮기기: 놓을 자리 판정 표, 마우스·터치·m 키·권한·가장자리 보기 옮기기
 pnpm -C web build && cargo test -p opld --features web-it --test web browser_builds_vms_with_the_builder   # 브라우저로 빌더 만들기 셋(QEMU를 켜지 않음)
+# VMware 이전 2·OVA 내보내기(계획 72) — 가짜 vSphere(opl-api 기능 `fake-vsphere`: 스냅샷 사슬·CBT·게스트 쓰기·호스트 티켓·결함 주입)
+cargo test -p opl-types -- vmware vm_export                         # 순수: serde 하위 호환(빈 값 안 씀), 비밀번호 가림, 검증 표, 항목·스냅샷 이름
+cargo test -p opl-api --lib -- vmware vm_imports::ovf_write vm_exports   # SOAP 봉투·결함, 인벤토리·CBT 구역, 매핑·VMware 쪽 표, 스케줄러 순수 plan, OVF 쓰개 ↔ 계획 29 읽개, ustar
+# API 시험(가짜 스토리지 — qemu 없이). PATH에 qemu-img·qemu-nbd가 없어야 가짜 길을 탄다(CI check에도 qemu-img가 없다).
+PATH=/usr/bin:/bin cargo test -p opl-api --features fake-vsphere \
+  --test vsphere --test vmware_api --test vmware_sync --test vmware_cutover   # 클라이언트·원본/계획 API·회차/스케줄러·전환·되돌림·예약 전환, 끝에 원본 안전 단언
+cargo test -p opl-api --features fake-vsphere,storage-it --test vmware_sync qemu_nbd_writes_the_target_volumes   # 실제 qemu-nbd 쓰기 대상
+cargo test -p opl-api --features storage-it --test vm_import_tasks an_exported_ova_imports_back_with_the_same_disk   # 내보내기 → OVA 가져오기 왕복(qemu-img compare)
+cargo test -p opl-api --test vm_exports                             # 내보내기 API·링크·권한(가짜 스토리지)
+cargo run -p opl-api --features fake-vsphere --bin fake-vsphere -- --port 8989   # 손으로 띄우는 가짜 vCenter(연결 정보 JSON 한 줄 — svc01 시연·웹 개발)
+# govmomi vcsim(SOAP 꼴, GitHub `vmware-sim` 작업 — vcsim·govc v0.56.2 실행 파일, nbdkit). vcsim은 QueryChangedDiskAreas가 없어 CBT는 가짜만 본다.
+vcsim -l 127.0.0.1:8989 -username user -password pass &
+OPL_TEST_VCSIM=127.0.0.1:8989 OPL_TEST_VCSIM_USER=user OPL_TEST_VCSIM_PASSWORD=pass OPL_TEST_NBDKIT=$(command -v nbdkit) \
+  cargo test -p opl-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
+# 실제 opld(QEMU·qemu-img·qemu-nbd): 따뜻한 이전(회차 사이 쓰기·델타 둘·전환·볼륨 바이트 같음·원본 꺼짐·NIC 끊김·revert), 차가운 한 대·
+# 마무리, 내보내기 → 내려받은 OVA(ustar) → OVA 가져오기 왕복. `[test] vmware_tick_ms`·`vmware_sync_secs`로 스케줄러·델타 주기를 줄인다.
+cargo test -p opld --features qemu-it,fake-vsphere --test vmware_migration
+pnpm -C web test src/vmware src/exports                             # 원본 지문 흐름·비밀번호가 저장소에 없음, 나무·찾기, 마법사, 상세·서랍·전환·되돌리기, 내보내기(msw, axe)
+pnpm -C web build && cargo test -p opld --features web-it --test web browser_migrates_a_vmware_vm_and_exports_it   # 브라우저: 원본 → 마법사 → 전환 → VM 링크 → OVA 내려받기
 # 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
 sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \

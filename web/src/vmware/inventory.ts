@@ -409,13 +409,14 @@ export function levelTone(level: PreflightLevel): "success" | "warning" | "dange
 
 /** 지금 회차의 복사 진행(0~1). 디스크 표가 없으면(아직 시작 전) 없다. */
 export function copyProgress(item: MigrationItem): number | undefined {
-  const disks = item.status.disks;
+  // 빈 칸은 서버가 보내지 않는다(디스크 표·회차).
+  const disks = item.status.disks ?? [];
   if (disks.length === 0) {
     return undefined;
   }
   const total = disks.reduce((sum, d) => sum + d.capacity_bytes, 0);
   if (item.status.state !== "copying") {
-    return item.status.rounds > 0 ? 1 : undefined;
+    return (item.status.rounds ?? 0) > 0 ? 1 : undefined;
   }
   const copied = disks.reduce((sum, d) => sum + Math.min(d.copied_bytes ?? 0, d.capacity_bytes), 0);
   return total > 0 ? copied / total : undefined;
@@ -423,7 +424,7 @@ export function copyProgress(item: MigrationItem): number | undefined {
 
 /** 마지막 델타 크기 합(바이트) */
 export function lastDelta(item: MigrationItem): number | undefined {
-  const deltas = item.status.disks.map((d) => d.last_delta_bytes);
+  const deltas = (item.status.disks ?? []).map((d) => d.last_delta_bytes);
   return deltas.some((d) => d !== undefined)
     ? deltas.reduce<number>((sum, d) => sum + (d ?? 0), 0)
     : undefined;

@@ -43,7 +43,10 @@ rbd-it = []
 lvm-shared-it = []
 # 브라우저(Playwright)로 웹 UI를 확인하는 E2E. qemu-it의 준비물에 더해 pnpm과
 # `pnpm -C web exec playwright install chromium`, 빌드한 web/dist가 필요하다.
-web-it = ["qemu-it", "web-ui"]
+web-it = ["qemu-it", "web-ui", "fake-vsphere"]
+# 시험 안에 가짜 vSphere(opl-api `fake-vsphere`)를 띄워 실제 opld로 VMware 이전을 보는 E2E(계획 72 `tests/vmware_migration.rs`,
+# qemu-it와 함께 — qemu-img가 필요하다)와 브라우저 E2E(`web-it`가 켠다). 배포 빌드에는 없다.
+fake-vsphere = ["opl-api/fake-vsphere"]
 # Orbivisor가 Ceph를 설치·구성하는 E2E(계획 56): Ceph가 없는 깨끗한 호스트에서 orbivisord가 apt로 Ceph 꾸러미를
 # 받아 mon·mgr을 세우고, 시험이 만든 루프 장치에 OSD를 만들고(시험 끝에 뗀다), RBD 풀을 등록해 VM을 켠다.
 # qemu-it와 함께 켜고, Linux(Ubuntu 24.04)에서 root, apt가 닿는 네트워크와 qemu-block-extra가 필요하다. 호스트에

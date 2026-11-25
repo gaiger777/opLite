@@ -132,7 +132,7 @@ export function ExportsPage() {
                     </TableCell>
                     <TableCell>{exp.spec.pool}</TableCell>
                     <TableCell>
-                      {phase === "ready" ? formatBytes(exp.status.ova_bytes) : "—"}
+                      {phase === "ready" ? formatBytes(exp.status.ova_bytes ?? 0) : "—"}
                     </TableCell>
                     <TableCell>
                       <StatusChip tone={TONE[phase]} busy={phase === "writing"}>
@@ -143,13 +143,13 @@ export function ExportsPage() {
                           {exp.status.error}
                         </div>
                       )}
-                      {exp.status.warnings.length > 0 && (
+                      {(exp.status.warnings?.length ?? 0) > 0 && (
                         <details className="text-xs">
                           <summary className="cursor-pointer text-muted-foreground">
-                            {t("vmExports.warnings", { count: exp.status.warnings.length })}
+                            {t("vmExports.warnings", { count: exp.status.warnings!.length })}
                           </summary>
                           <ul className="list-disc pl-5">
-                            {exp.status.warnings.map((w) => (
+                            {exp.status.warnings!.map((w) => (
                               <li key={w} className="break-words whitespace-normal">
                                 {w}
                               </li>

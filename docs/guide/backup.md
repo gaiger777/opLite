@@ -1338,6 +1338,8 @@ VMware VM을 OVA 파일로 내보내거나 ESXi·vCenter 데이터스토어에�
 세 단계다: OVA를 올리거나 ESXi의 VM을 고르면 orbivisord가 OVF(또는 `.vmx`와 디스크 디스크립터)를 읽어 원본 VM(CPU, 메모리,
 펌웨어, 디스크, NIC)과 Orbivisor VM 제안을 보이고, 사용자가 이름·풀·네트워크 매핑과 고칠 값을 정해 실행하면 디스크를
 볼륨으로 옮겨 **꺼진** 새 VM을 만든다. 실행이 실패하면 원본이 남으므로 값을 바꿔 다시 실행한다.
+VM 여러 대를 한 번에, 켜진 VM을 짧은 중단으로 옮기려면 아래 [vCenter 일괄 이전과 따뜻한 이전](#vcenter-일괄-이전과-따뜻한-이전)을
+쓴다(계획 72). Orbivisor VM을 VMware로 가져가는 OVA 내보내기는 [VM 안내](vms.md#ova로-내보내기)에 있다.
 
 **OVA 만들기.** VMware에서 VM을 먼저 끈다(스냅샷이 있으면 통합하거나 지운다).
 
@@ -1472,3 +1474,127 @@ orbivisorctl import run web01 --name web --pool local --net lan  # 디스크를 
   이어 받기·취소·전체 시간 제한은 없다. ESXi에서는 디스크립터가 따로 없는 VMDK·여러 extent·RDM을 받지 않는다.
 - **남을 수 있는 것.** 실행이 볼륨을 다 만든 뒤 VM을 만들기 전에 orbivisord가 죽으면 `{VM 이름}-disk{i}` 볼륨이 남는다(복제·복원과
   같다) — `orbivisorctl volume delete`로 지운다.
+
+### vCenter 일괄 이전과 따뜻한 이전
+
+계획 72. 저장한 vCenter·ESXi **원본 연결**(`vmware-source`)의 인벤토리에서 VM을 여러 대(한 계획에 200대까지) 고르고, 매핑 규칙
+한 번(네트워크·데이터스토어 → 풀·폴더·노드·장치 종류·MAC)으로 **이전 계획**(`vmware-migration`)을 만든다. 계획의 VM마다
+항목(`vmware-vm`)이 생기고, 리더의 스케줄러가 한도를 지키며 VM마다 이어 가는 Task로 옮긴다. 원본 VM은 **어떤 경우에도 지우지
+않는다** — 원본에 하는 일은 우리 스냅샷 만들기·지우기, CBT 켜기·끄기, 전환 때 끄기와 보호 설정뿐이다.
+
+- **차가운 이전(`--cold`)**: 꺼진 VM의 디스크를 한 번 통째로 복사한다(켜진 VM은 미리 확인이 막는다). 전환은 VM 만들기·켜기만이다.
+- **따뜻한 이전(`--warm`)**: 원본이 **켜진 채** 우리 스냅샷 위에서 전체 복사하고, 그 뒤 주기(`--sync-every`, 기본 60분)마다
+  CBT(`QueryChangedDiskAreas`)가 알려 준 바뀐 블록만 다시 옮긴다. 회차마다 "새 스냅샷 만들기 → 앞 스냅샷 지우기(합치기)"를 해서
+  기반 flat 파일이 늘 지난 회차의 모습이 되고, 바뀐 구역을 그 파일에서 범위 읽기로 읽는다(VDDK가 필요 없다). **전환** 때만 원본을
+  끄고(게스트 종료 또는 전원 끄기) 마지막 델타를 옮긴 뒤 VM을 만들어 켠다 — 내리는 시간은 마지막 델타 크기 ÷ 잰 속도다.
+
+```bash
+# 1. 원본 연결(admin). 지문 없이 주면 서버 인증서 지문을 알려 준다(비밀번호는 보내지 않는다).
+export OPL_VMWARE_PASSWORD='…'                          # 또는 --password-file, 둘 다 없으면 터미널에서 묻는다
+orbivisorctl vmware source add vc1 --host vcenter.example.com --user migr@vsphere.local
+# error: … fingerprint AB:CD:…; check it and rerun with --fingerprint AB:CD:…
+orbivisorctl vmware source add vc1 --host vcenter.example.com --user migr@vsphere.local --fingerprint AB:CD:…
+# vmware-source vc1 added (vcenter 8.0.2)
+orbivisorctl vmware source browse vc1 --path DC1/vm/Prod  # PATH NAME POWER OS CPU MEMORY DISKS SNAPSHOTS CBT
+
+# 2. 계획(초안) → VM마다 미리 확인 → 시작
+orbivisorctl vmware migration create wave1 --source vc1 --warm \
+  --vm DC1/vm/Prod/web01 --vm DC1/vm/Prod/db01 \
+  --net "VM Network=lan" --net dvpg-web=web --datastore ds1=fast --pool slow \
+  --folders mirror --folder /prod --sync-every 30m
+orbivisorctl vmware migration preflight wave1            # VM LEVEL PROBLEMS — 막힌 VM이 있으면 끝 코드 1
+orbivisorctl vmware migration start wave1                # 막힌 VM은 failed로 남고 나머지가 시작한다
+orbivisorctl vmware migration get wave1                  # VM STATE ROUND COPIED LAST-DELTA ESTIMATE NEXT-SYNC
+
+# 3. 전환(점검 창에) → 확인 → 마무리 또는 되돌리기
+orbivisorctl vmware vm cutover wave1-web01 --wait        # vmware-vm wave1-web01 is done (downtime 252s)
+orbivisorctl vmware vm finalize wave1-web01 --wait       # 우리 스냅샷·CBT를 치운다(되돌릴 수 없게 됨)
+orbivisorctl vmware vm revert wave1-db01 --confirm db01 --wait   # 대상 VM을 끄고 원본을 다시 켠다
+```
+
+- **상태.** 항목은 `draft`(시작 전) → `pending` → `copying`(전체 복사) → `syncing`(따뜻한 — 델타 회차를 돈다) 또는 `ready`(차가운 —
+  복사 끝) → `cutting-over`(걸음 `preparing`·`stopping-source`·`final-sync`·`creating-vm`·`starting-vm`) → `done` → `finalized`나
+  `reverted`. 실패는 `failed`(이유는 `error`, `vmware vm retry`가 체크포인트부터 다시 한다), 전환 중 실패해 원본을 되살렸으면
+  `rolled-back`(다시 전환할 수 있다), 취소는 `cancelled`(우리 스냅샷·CBT·대상 볼륨을 치운다). 회차·전체 복사·전환은 끊기거나
+  orbivisord가 다시 떠도 Raft에 적힌 체크포인트·걸음부터 잇는다. 리더가 바뀌어도 새 리더의 스케줄러가 다음 틱(15초)에 잇는다.
+- **한도.** 계획의 `--parallel`(동시 동기화·전환, 기본 4), `--per-host`(ESXi 호스트마다 2), `--per-node`(대상 노드마다 2)와
+  대역(`limits.bandwidth_mib_s`, API·웹)을 지킨다. 델타·전환이 새 전체 복사보다 먼저 돈다. 사용자 스냅샷이 있는 VM은 따뜻한
+  이전에서 그 회차를 건너뛰고 경고한다(스냅샷을 지우면 다음 주기에 잇는다). 14일(`stop_after_days`) 동안 전환하지 않으면 원본에
+  스냅샷이 오래 남지 않게 동기화를 멈춘다(`retry`가 다시 시작).
+- **미리 확인.** VM마다 계획 71의 만들기 검사(대상 폴더 권한 먼저, 할당량·풀 공간·네트워크·노드 — 숨은 풀·네트워크는 새지
+  않는다)와 VMware 쪽 표(`vmware_snapshots`·`vmware_ft`·`vmware_template`·`vmware_rdm`·`vmware_independent_disk`·`vmware_multi_writer`·
+  `vmware_needs_vddk`(vSAN·vVols)·`vmware_powered_on`(차가운)·`vmware_no_tools`(따뜻한 + 게스트 종료, 경고)·`vmware_restricted`(무료
+  ESXi) …)를 칸(`source`·`disks.N`·`nics.N`·`guest` …)과 함께 준다. 매핑되지 않은 네트워크는 막힘이다(`network_unmapped`).
+
+**전환 점검표.**
+
+1. 계획 상세의 "예상 내릴 시간"(마지막 델타 ÷ 잰 속도)을 본다. `cutover.max_final_delta_gib`를 주면 끄기 직전 델타가 그보다 클 때
+   원본을 끄지 않고 멈춘다(`final_delta_too_large`).
+2. 게스트 맞추기를 **원본에서 미리** 한다(아래) — 다음 델타가 그 바뀐 파일을 옮긴다.
+3. 전환: 원본 보호(`protect_source`, 기본 켬)면 원본 NIC의 "켤 때 연결"을 끄고 설명에 "Migrated to Orbivisor VM …"을 붙인 뒤, 켜진
+   채 델타 한 번 → 게스트 종료(VMware Tools, `shutdown_timeout_s` 기본 600초 — 넘기면 원본은 켜진 채 멈춤) 또는 전원 끄기 → 마지막
+   델타 → VM 만들기(원본 MAC 그대로, `--new-macs`면 새 MAC) → 켜기(`--no-start`면 꺼진 채). 걸음마다 Raft에 먼저 적는다.
+4. **자동 되돌림**: `final-sync` 뒤 어느 걸음에서든 실패하면 대상 VM을 지우고(볼륨은 남김) NIC·설명을 되돌린 뒤 원본을 다시 켠다 →
+   `rolled-back`(이유는 `error`). 되돌림까지 실패하면 `failed`와 손으로 할 일("stop and delete Orbivisor VM …, then turn "Connect At
+   Power On" back on …, then power on … in vCenter")을 남기고, `retry`가 되돌림을 다시 한다. 할당량·용량을 넘으면 VM 만들기에서
+   막혀 같은 되돌림을 한다.
+5. 새 VM이 잘 돌면 `finalize`(우리 스냅샷·우리가 켠 CBT를 지움, 원본 보호는 남김). 안 되면 `revert --confirm <Orbivisor VM 이름>`:
+   대상 VM을 끄고(지우지 않음) NIC·설명을 되돌리고 원본을 켠다 → `reverted`. **전환 뒤 대상 VM에서 쓴 데이터는 원본으로 가지
+   않는다.** 내린 시간은 항목 `downtime_s`·기록 "cut over; downtime 4m12s"·감사 로그에 남는다.
+6. **예약 전환**: `--cutover-at 2026-12-01T02:00:00Z`면 그 시각이 지난 뒤 스케줄러가 `ready`·`syncing`(회차 ≥ 1) 항목을 같은 한도
+   안에서 한 번씩 전환한다(실패해 되돌린 항목을 다시 끄지 않는다).
+
+**게스트 맞추기.** Orbivisor는 게스트 안에서 명령을 돌리지 않는다(virt-v2v도 없다).
+
+- **RHEL·Rocky·CentOS**: initramfs에 virtio 드라이버가 없을 수 있다(미리 확인 `guest_initramfs`). 원본에서
+  `dracut -f --add-drivers 'virtio_blk virtio_net virtio_pci'`(또는 `--no-hostonly`)를 돌린 뒤 다음 회차를 기다린다.
+- **Windows**: 제안은 SATA·e1000e다(드라이버가 있음). `--driver-iso virtio-win`을 주면 그 ISO 볼륨을 CD로 붙여 만든다 — 켠 뒤
+  드라이버를 넣고 virtio로 바꾼다([위](#vmware에서-가져오기)의 Windows 항목). pvscsi·vmxnet3 흉내 장치는 없다.
+- **네트워크**: NIC 이름이 바뀔 수 있다(`ens192` → `enp1s0`, 미리 확인 `guest_nic_renamed`). MAC은 그대로라 DHCP 예약은 산다.
+  `reserve_ips`(웹 "Reserve guest IPs")면 SDN 네트워크의 NIC마다 VMware Tools가 알린 IP를 IPAM에 예약한다(그새 쓰였으면 다른
+  주소와 경고).
+- VMware Tools는 켠 뒤 게스트에서 지운다.
+
+**원본 안전.** 원본 VM·디스크·사용자 스냅샷을 지우거나 바꾸는 호출은 없다. 우리 스냅샷 이름은 `orbivisor-migration-…`이고 Raft에
+적힌 moref만 지운다. 전환 뒤 원본은 꺼진 채 "켤 때 연결"이 꺼져 있어 누가 켜도 같은 MAC·IP가 둘이 되지 않는다. 회차마다 원본
+데이터스토어에 델타 크기만큼 합치기 I/O가 생긴다(VMware 백업 작업과 겹치면 그 회차를 건너뛴다).
+
+**디스크 읽는 길.** 기본은 데이터스토어 `/folder` 범위 읽기다. vCenter면 VM이 있는 ESXi 호스트에 호스트 티켓
+(`AcquireGenericServiceTicket`)으로 바로 붙고(호스트 인증서는 vCenter가 알려 준 것으로 고정), 안 되면 vCenter `/folder`로 내려간다.
+vSAN·vVols 데이터스토어는 `/folder`로 읽을 수 없어 **VDDK** 길이 필요하다(`vmware source add … --vddk [--vddk-libdir DIR]`).
+VDDK는 VMware 독점 라이브러리라 Orbivisor가 넣지 않는다: 운영자가 노드마다 `nbdkit`과 `nbdkit-vddk-plugin`(배포판 꾸러미)을 깔고
+Broadcom 사이트에서 받은 VDDK를 `/opt/vmware-vix-disklib-distrib`에 풀어 노드 설정에 적는다.
+
+```toml
+# /etc/opl/opld.toml
+[vmware]
+nbdkit = "/usr/sbin/nbdkit"
+vddk_libdir = "/opt/vmware-vix-disklib-distrib"   # 원본의 --vddk-libdir가 먼저
+```
+
+**실제 vCenter에서 손으로 확인하기.** 실험실에 vCenter·ESXi가 없어 아래는 가짜 vSphere(의미)와 govmomi vcsim(SOAP 꼴)으로만
+시험했다. 처음 쓰는 vSphere에서는 버려도 되는 작은 Linux VM(디스크 둘, Tools 켜짐)으로 먼저 본다:
+
+1. `vmware source add`·`check`·`browse` — 종류·판, 폴더·클러스터·호스트·분산 포트 그룹 이름이 vSphere Client와 같은지.
+2. 따뜻한 계획(`--sync-every 5m`)을 시작하고 vSphere Client의 그 VM "Snapshots"에 `orbivisor-migration-…` 하나만 보이는지, 회차마다
+   바뀌고 합치기가 끝나는지(Tasks 창), 게스트에서 파일을 쓴 뒤 다음 회차의 `LAST-DELTA`가 작게 늘어나는지.
+3. 전환 → 원본이 꺼지고 NIC "Connect At Power On"이 꺼지고 설명이 붙었는지, 새 VM이 켜지는지(게스트 부팅), 쓴 파일이 있는지.
+4. `revert` → 원본이 연결된 채 다시 켜지는지. 다시 전환 → `finalize` → 원본에 우리 스냅샷이 없고 CBT가 꺼졌는지(우리가 켰을 때).
+5. 무료 ESXi는 API가 읽기 전용이라 차가운 이전만 된다(`vmware_restricted`) — 그 거절 문구를 확인한다.
+
+호스트 티켓 한 번 쓰기, 켜진 VM 기반 flat의 `/folder` 범위 읽기, 합치기 시간, vSAN·VDDK 처리량은 이 손 확인이 처음 보는 것이다.
+
+**웹.** 가상 머신 › 가져오기 탭의 보기 넷: 가져오기(계획 29·30) | **VMware 이전**(계획 목록·상세 — VM별 상태 칩·회차·복사
+막대·마지막 델타·예상/실제 내릴 시간·다음 동기화, 고른 VM 일괄 전환·취소, 서랍의 디스크별 진행·기록·되돌리기·마무리·다시 하기)
+| **VMware 원본**(연결·지문 확인·다시 확인) | **내보내기**. 새 계획은 마법사다: 원본·이름·방식 → 인벤토리 나무("VM과 폴더" |
+"호스트와 클러스터", 찾기·전원 거르기, 이미 다른 계획에 든 VM은 고를 수 없음) → 매핑(고른 VM이 쓰는 네트워크·데이터스토어만) →
+한도·전환 정책 → 미리 확인(VM마다 칩, "막힌 VM은 빼고 시작").
+
+**권한.** 원본 보기 `cluster.read`, 원본 만들기·바꾸기·지우기 `cluster.admin`(비밀번호는 Raft에만 — API·watch·감사·로그·`Debug`에
+없다). 계획·항목 보기 루트 `system.read`, 만들기·시작·멈춤·취소·다시 하기 루트 `vm.create`, 전환·되돌리기·마무리는 **대상 폴더의**
+`vm.create` + `vm.power`. 기능 `vmware-migrate`가 없는 노드가 있으면 409 `cluster_upgrading`.
+
+**한계.** 실제 vCenter·ESXi·VDDK에서 시험하지 않았다(위 손 확인). 사용자 스냅샷·독립 디스크·RDM·FT·멀티라이터 디스크 VM은
+따뜻한 이전을 받지 않는다(차가운 이전은 꺼진 VM의 일부만). 게스트를 고치지 않고, 실제 게스트 부팅은 실험실에서 확인하지 못했다
+(aarch64 TCG, VMware 게스트 없음 — 시험은 바이트 같음만). 시험 부팅, 앱 그룹 전환·전환 훅, 원본 포트 그룹 바꾸기, 태그·리소스 풀·
+DRS 규칙 옮기기는 없다. 속도는 가짜 vSphere 루프백 수치(디버그 빌드 전체 복사 107 MiB/s)뿐이다.

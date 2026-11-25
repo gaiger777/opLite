@@ -716,3 +716,28 @@ For stage 8: docs (vms.md export section, access.md vm.export, development.md te
 - 새 칸: 서랍에 전환 요청·원본 끈 시각·내린 시간(`cutover_requested_at`·`source_stopped_at`·`downtime_s`), 표의 예상 내릴 시간
   칸은 끝난 항목이면 실제 내린 시간("4m 12s(실제)"). history의 "cut over; downtime …"는 서버 글 그대로.
 - 첫 화면 묶음 480,433 → 480,434 B.
+
+### 스테이지 8
+
+- **실제 시험은 노드 하나**: `crates/opld/tests/vmware_migration.rs`(기능 `qemu-it` + 새 opld 기능 `fake-vsphere` = opl-api
+  `fake-vsphere`, `web-it`가 켬)는 §14·계획 Task 8의 "두 노드" 대신 opld 하나다 — 이전의 노드 사이 일(다른 노드 세션·내보내기 중계)은
+  API 시험(`two_nodes`)이 보고, 여기서는 실제 qemu-img·qemu-nbd 쓰기 대상과 스케줄러·이어 가는 Task를 진짜 프로세스로 본다. 가짜
+  vSphere는 시험 프로세스 안에 띄워 게스트 쓰기·전원·NIC·설명을 직접 보고 바꾼다. 따뜻한 이전(회차 사이 쓰기 → 델타 회차 → 전환 직전
+  쓰기 → 전환 → 볼륨 바이트 = 원본 마지막 바이트, 원본 꺼짐·NIC 끊김·설명, 내린 시간 → revert → 원본 켜짐·되돌림·우리 스냅샷·CBT
+  없음)과 차가운 한 대(→ 마무리 → OVA 내보내기 → 내려받기 ustar → OVA 가져오기 → 바이트 같음)가 이 Mac에서 10초 안에 돈다. 만든 VM은
+  켜지 않는다(`--no-start` — 게스트 없음, aarch64).
+- **시험 고리**: 델타 주기 하한이 5분이라 `[test] vmware_tick_ms`(스케줄러 틱)·`vmware_sync_secs`(→ `TaskRunnerConfig.vmware_sync_every`,
+  델타 주기 덮어쓰기)를 `qemu-it` 빌드에만 더했다(배포 빌드에는 칸이 없어 설정에 쓰면 거절).
+- **E2E가 잡은 제품 버그(고침)**: 서버는 `VmwareVmStatus`의 빈 목록·0·false·빈 원본 변경을 보내지 않는데(serde skip), OpenAPI가 그 칸을
+  **꼭 있는** 칸으로 적어 웹이 `status.disks.length`에서 깨졌다(시작한 직후 이전 상세가 "Something went wrong"). vitest 고정물은 늘 칸을
+  채워 못 잡았다. `opl-types/src/{vmware,vm_export}.rs`의 skip 칸(Option 말고) 모두에 `schema(default)`를 달아 선택 칸으로 바꾸고
+  (`schema.d.ts` 다시 만듦 — JSON은 그대로), 웹은 `?? []`·`?? 0`으로 읽는다(서버 꼴 그대로의 항목 시험을 더함). 계획 29의
+  `VmImportStatus.warnings`도 같은 꼴이지만 이 계획 밖이라 두었다.
+- **e2e의 네트워크**: 마법사의 네트워크 고르기는 네트워크 리소스만 보이고 사용자 모드 `user`는 없다(미리 확인은 매핑 없는 네트워크를
+  막음) — E2E는 브리지 네트워크 `lan`을 만들어 고른다(VM은 켜지 않음).
+- **내려받은 파일 이름**은 VM 이름(`web01.ova`)이다(내보내기 이름이 아님 — 스테이지 6 그대로).
+- **CI**: `vmware-sim`에 `qemu-utils`와 `govc import.ova` 단계(storage-it 왕복 시험이 `OPL_EXPORT_OVA_OUT`로 남긴 OVA; 확인은
+  `.vmdk`로 끝나는 문자열이 있는지 — govc 판의 JSON 칸 대소문자에 기대지 않게), `linux-kvm` FEATURES에 `opld/fake-vsphere`
+  (`vmware_migration`이 돈다).
+- **아직 보지 않은 것**: 내보내기의 guestId는 VMware 이전으로 만든 VM이면 그 항목의 원본 `guest_os`를 쓰지 않는다(계획 29 가져오기만 —
+  E2E의 `otherGuest64` 경고). 다음 계획에서 `VmwareVm.status.source`를 보게 하면 된다.

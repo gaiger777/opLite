@@ -582,6 +582,26 @@ impl Config {
         Duration::from_secs(HOTPLUG_TIMEOUT_SECS)
     }
 
+    /// VMware 이전 스케줄러 설정(15초 틱). 시험 빌드(`qemu-it`)는 `[test] vmware_tick_ms`로 줄인다.
+    pub fn vmware_scheduler_config(&self) -> opl_api::VmwareSchedulerConfig {
+        #[cfg(feature = "qemu-it")]
+        if let Some(ms) = self.test.vmware_tick_ms {
+            return opl_api::VmwareSchedulerConfig {
+                tick: Duration::from_millis(ms.max(1)),
+            };
+        }
+        opl_api::VmwareSchedulerConfig::default()
+    }
+
+    /// 따뜻한 이전의 델타 주기 덮어쓰기(없으면 계획의 주기). 시험 빌드(`qemu-it`)만 `[test] vmware_sync_secs`로 준다.
+    pub fn vmware_sync_every(&self) -> Option<Duration> {
+        #[cfg(feature = "qemu-it")]
+        if let Some(secs) = self.test.vmware_sync_secs {
+            return Some(Duration::from_secs(secs.max(1)));
+        }
+        None
+    }
+
     /// TPM 상태 해시·사본 주기(60초). 시험 빌드(`qemu-it`)는 `[test] firmware_sync_secs`로 바꾼다.
     pub fn firmware_sync_interval(&self) -> Duration {
         #[cfg(feature = "qemu-it")]
@@ -1335,6 +1355,14 @@ pub struct TestSection {
     #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
     #[serde(default)]
     pub alert_tick_ms: Option<u64>,
+    /// VMware 이전 스케줄러의 틱(밀리초, 기본 15000, 계획 72). 실제 시험이 복사·회차를 빨리 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub vmware_tick_ms: Option<u64>,
+    /// 따뜻한 이전의 델타 주기(초, 계획의 `sync.interval_min`은 5분 이상, 계획 72). 실제 시험이 회차 둘을 빨리 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub vmware_sync_secs: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -2849,6 +2877,28 @@ mod tests {
         let parsed = toml::from_str::<Config>(&format!("{text}[test]\nhotplug_timeout_secs = 5"));
         #[cfg(feature = "qemu-it")]
         assert_eq!(parsed.unwrap().hotplug_timeout(), Duration::from_secs(5));
+        #[cfg(not(feature = "qemu-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] vmware_tick_ms`·`vmware_sync_secs`는 `qemu-it` 빌드에만 있고 VMware 이전 스케줄러 틱과 델타 주기를 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_vmware_timers_only_in_qemu_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(
+            parse(text).vmware_scheduler_config().tick,
+            Duration::from_secs(15)
+        );
+        assert_eq!(parse(text).vmware_sync_every(), None);
+        let parsed = toml::from_str::<Config>(&format!(
+            "{text}[test]\nvmware_tick_ms = 500\nvmware_sync_secs = 3"
+        ));
+        #[cfg(feature = "qemu-it")]
+        {
+            let c = parsed.unwrap();
+            assert_eq!(c.vmware_scheduler_config().tick, Duration::from_millis(500));
+            assert_eq!(c.vmware_sync_every(), Some(Duration::from_secs(3)));
+        }
         #[cfg(not(feature = "qemu-it"))]
         assert!(parsed.is_err());
     }

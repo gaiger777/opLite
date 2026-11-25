@@ -317,6 +317,18 @@ it("shows history, disks and the round in the drawer and retries a failed VM", a
   await waitFor(() => expect(posted).toEqual([{ path: `${failed.id}/retry`, body: null }]));
 });
 
+it("reads items as the server sends them, without the empty lists and zero counts", async () => {
+  const user = userEvent.setup();
+  // 서버는 빈 목록·0·false·빈 원본 변경을 보내지 않는다(serde skip — 브라우저 E2E가 잡은 깨짐).
+  const bare = { ...migrationItem("new01", 5), status: { state: "pending" } } as MigrationItem;
+  setup([bare]);
+  open();
+  const table = await screen.findByRole("table", { name: "wave1" });
+  expect(await within(table).findByRole("row", { name: /new01/ })).toHaveTextContent("Waiting");
+  await user.click(screen.getByRole("button", { name: "Open new01" }));
+  expect(screen.getByRole("dialog", { name: "new01" })).toHaveTextContent("Rounds0");
+});
+
 it("shows no actions to users who may not create VMs", async () => {
   setup();
   open({ ...ADMIN, role: "viewer" });

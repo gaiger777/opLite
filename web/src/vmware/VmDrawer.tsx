@@ -51,6 +51,10 @@ export function VmDrawer({
   const { t, i18n } = useTranslation();
   const vms = useList("vm");
   const status = item.status;
+  // 빈 목록은 서버가 보내지 않는다.
+  const disks = status.disks ?? [];
+  const warnings = status.warnings ?? [];
+  const history = status.history ?? [];
   const source = status.source;
   const target = status.target_vm ? vms.data?.find((v) => v.id === status.target_vm) : undefined;
   const time = (s: number) => formatTime(new Date(s * 1000), i18n.language);
@@ -94,7 +98,7 @@ export function VmDrawer({
             <Row label={t("common.state")}>
               <ItemStateChip item={item} />
             </Row>
-            <Row label={t("vmware.drawer.rounds")}>{status.rounds}</Row>
+            <Row label={t("vmware.drawer.rounds")}>{status.rounds ?? 0}</Row>
             {status.estimate_s !== undefined && (
               <Row label={t("vmware.drawer.estimate")}>{formatDuration(status.estimate_s)}</Row>
             )}
@@ -141,7 +145,7 @@ export function VmDrawer({
                 )}
               </Row>
             )}
-            {status.source_changes.nics_disconnected.length > 0 && (
+            {(status.source_changes?.nics_disconnected?.length ?? 0) > 0 && (
               <Row label={t("vmware.drawer.sourceNics")}>{t("vmware.drawer.nicsDisconnected")}</Row>
             )}
           </dl>
@@ -153,11 +157,11 @@ export function VmDrawer({
               <p className="break-words whitespace-pre-wrap">{status.error}</p>
             </div>
           )}
-          {status.warnings.length > 0 && (
+          {warnings.length > 0 && (
             <div className="flex flex-col gap-1">
               <h3 className="text-sm font-medium">{t("vmware.drawer.warnings")}</h3>
               <ul className="list-disc pl-5 text-sm">
-                {status.warnings.map((w) => (
+                {warnings.map((w) => (
                   <li key={w} className="break-words">
                     {w}
                   </li>
@@ -165,7 +169,7 @@ export function VmDrawer({
               </ul>
             </div>
           )}
-          {status.disks.length > 0 && (
+          {disks.length > 0 && (
             <div className="flex flex-col gap-1">
               <h3 className="text-sm font-medium">{t("vmware.drawer.disks")}</h3>
               <div className="overflow-x-auto">
@@ -179,7 +183,7 @@ export function VmDrawer({
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {status.disks.map((d) => (
+                    {disks.map((d) => (
                       <TableRow key={d.key}>
                         <TableCell className="font-mono text-xs break-all whitespace-normal">
                           {d.file}
@@ -207,11 +211,11 @@ export function VmDrawer({
               </div>
             </div>
           )}
-          {status.history.length > 0 && (
+          {history.length > 0 && (
             <div className="flex flex-col gap-1">
               <h3 className="text-sm font-medium">{t("vmware.drawer.history")}</h3>
               <ol className="flex flex-col gap-1 text-sm">
-                {[...status.history].reverse().map((h, i) => (
+                {[...history].reverse().map((h, i) => (
                   <li key={i} className="flex flex-wrap gap-x-3">
                     <span className="text-xs text-muted-foreground tabular-nums">{time(h.at)}</span>
                     <span className="break-words">{h.event}</span>

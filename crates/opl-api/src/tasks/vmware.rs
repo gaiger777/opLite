@@ -208,6 +208,15 @@ async fn recount(ctx: &Ctx, migration: Uuid) {
     }
 }
 
+/// 따뜻한 이전의 델타 주기(초): 계획의 `sync.interval_min`, 시험은 실행기 설정이 덮어쓴다.
+pub(super) fn sync_every(ctx: &Ctx, m: &VmwareMigration) -> u64 {
+    ctx.config
+        .vmware_sync_every
+        .map_or(u64::from(m.spec.sync.interval_min) * 60, |d| {
+            d.as_secs().max(1)
+        })
+}
+
 fn get_migration(ctx: &Ctx, id: Uuid) -> Result<VmwareMigration, SyncError> {
     ctx.cluster
         .get::<VmwareMigrationSpec>(id)?
@@ -449,7 +458,7 @@ async fn run_sync(ctx: &Ctx, task: &Task, full: bool) -> Result<Option<String>, 
         }
         // 따뜻한 이전: 이번 회차를 건너뛰고 다음 주기에 다시 본다(설계 §9.2).
         let at = now();
-        let every = u64::from(run.migration.spec.sync.interval_min) * 60;
+        let every = sync_every(run.ctx, &run.migration);
         let warning =
             format!("{message}; skipping this round until only Orbivisor snapshots remain");
         let item = update_item(ctx, id, |s| {
@@ -561,7 +570,7 @@ async fn finish_round(
 ) -> Result<Option<String>, SyncError> {
     let at = now();
     let warm = run.warm();
-    let every = u64::from(run.migration.spec.sync.interval_min) * 60;
+    let every = sync_every(run.ctx, &run.migration);
     let warnings = run.warnings();
     let secs = took.as_secs_f64().max(0.001);
     let item = update_item(run.ctx, run.item, |s| {

@@ -849,7 +849,7 @@ async fn stop_before_source(ctx: &Ctx, id: Uuid, warm: bool, message: &str) -> R
     }
     let at_time = now();
     let every = get_migration(ctx, item.spec.migration)
-        .map(|m| u64::from(m.spec.sync.interval_min) * 60)
+        .map(|m| super::sync_every(ctx, &m))
         .unwrap_or(3600);
     let item = update_item(ctx, id, |s| {
         s.state = if warm {

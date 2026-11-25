@@ -18,7 +18,7 @@ use opl_api::{
     OvnTransport, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller, ReplicaConfig,
     ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
     TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager,
-    VipManagerConfig, VmwareScheduler, VmwareSchedulerConfig,
+    VipManagerConfig, VmwareScheduler,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -946,6 +946,7 @@ impl Member {
         // 핫플러그 Task가 보안 그룹을 건 NIC를 붙이기 전에 규칙을 넣는다(reconciler와 같은 문).
         runner_config.firewall = gate;
         runner_config.hotplug_timeout = config.hotplug_timeout();
+        runner_config.vmware_sync_every = config.vmware_sync_every();
         // 복제 Task: 받는 쪽(ReplicaConfig)·reconciler와 같은 기록 디렉터리
         runner_config.replica_dir = Some(config.data_dir.join(REPLICAS_DIR));
         runner_config.replication_bandwidth = config.replication.bandwidth();
@@ -1077,7 +1078,7 @@ impl Member {
                 )
             });
         let vmware = on(&rt.work, || {
-            VmwareScheduler::spawn(state.clone(), VmwareSchedulerConfig::default())
+            VmwareScheduler::spawn(state.clone(), config.vmware_scheduler_config())
         });
         // 리더가 Raft의 SDN 네트워크를 OVN NB에 맞춘다(계획 65 — `Sdn`이 준비되기 전에는 쉰다).
         let ovn_sync = on(&rt.work, || {

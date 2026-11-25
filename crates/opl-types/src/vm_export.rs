@@ -90,12 +90,15 @@ pub struct VmExportStatus {
     pub phase: VmExportPhase,
     /// 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub files: Vec<VmExportFile>,
     /// 내려받을 OVA(ustar)의 정확한 크기
     #[serde(skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub ova_bytes: u64,
     /// OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]

@@ -9497,24 +9497,17 @@ export interface components {
                 };
                 status: {
                     error?: string;
-                    /**
-                     * @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
-                     * @default []
-                     */
-                    files: components["schemas"]["VmExportFile"][];
+                    /** @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크) */
+                    files?: components["schemas"]["VmExportFile"][];
                     /**
                      * Format: int64
                      * @description 내려받을 OVA(ustar)의 정확한 크기
-                     * @default 0
                      */
-                    ova_bytes: number;
+                    ova_bytes?: number;
                     /** @default pending */
                     phase: components["schemas"]["VmExportPhase"];
-                    /**
-                     * @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
-                     * @default []
-                     */
-                    warnings: string[];
+                    /** @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등) */
+                    warnings?: string[];
                 };
             }[];
             /** Format: int64 */
@@ -9770,11 +9763,8 @@ export interface components {
                     sync?: components["schemas"]["VmwareSyncPolicy"];
                 };
                 status: {
-                    /**
-                     * @description 항목 상태(`VmwareVmState::as_str`)별 VM 수
-                     * @default {}
-                     */
-                    counts: {
+                    /** @description 항목 상태(`VmwareVmState::as_str`)별 VM 수 */
+                    counts?: {
                         [key: string]: number;
                     };
                     error?: string;
@@ -9873,11 +9863,8 @@ export interface components {
                 };
                 /** @description VM 하나의 이전 상태(설계 §6). 진행 걸음마다 Raft에 먼저 적고 한다(이어 가기·되돌리기). */
                 status: {
-                    /**
-                     * @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
-                     * @default false
-                     */
-                    cbt_enabled_by_us: boolean;
+                    /** @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다). */
+                    cbt_enabled_by_us?: boolean;
                     /**
                      * Format: int64
                      * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
@@ -9885,8 +9872,7 @@ export interface components {
                     cutover_requested_at?: number;
                     /** @description `state`가 `cutting-over`일 때 지금 걸음 */
                     cutover_step?: components["schemas"]["VmwareCutoverStep"];
-                    /** @default [] */
-                    disks: components["schemas"]["VmwareSyncDisk"][];
+                    disks?: components["schemas"]["VmwareSyncDisk"][];
                     /**
                      * Format: int64
                      * @description 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
@@ -9898,11 +9884,8 @@ export interface components {
                      * @description 예상 마지막 델타 시간(초 — 마지막 델타 바이트 ÷ 잰 속도)
                      */
                     estimate_s?: number;
-                    /**
-                     * @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
-                     * @default []
-                     */
-                    history: components["schemas"]["VmwareHistory"][];
+                    /** @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터) */
+                    history?: components["schemas"]["VmwareHistory"][];
                     /** Format: int64 */
                     last_sync_at?: number;
                     /** Format: int64 */
@@ -9912,18 +9895,14 @@ export interface components {
                     /**
                      * Format: int32
                      * @description 끝낸 회차 수
-                     * @default 0
                      */
-                    rounds: number;
+                    rounds?: number;
                     /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
                     snapshot?: components["schemas"]["VmwareSnapshotRef"];
                     /** @description 원본 VM(인벤토리에서 읽은 것) */
                     source?: components["schemas"]["VmwareSourceVm"];
-                    /**
-                     * @description 바꾼 원본 설정(되돌림·취소가 되돌린다)
-                     * @default {}
-                     */
-                    source_changes: components["schemas"]["VmwareSourceChanges"];
+                    /** @description 바꾼 원본 설정(되돌림·취소가 되돌린다) */
+                    source_changes?: components["schemas"]["VmwareSourceChanges"];
                     /**
                      * Format: int64
                      * @description 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
@@ -9939,16 +9918,14 @@ export interface components {
                     /**
                      * Format: int32
                      * @description 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
-                     * @default 0
                      */
-                    sync_failures: number;
+                    sync_failures?: number;
                     /**
                      * Format: uuid
                      * @description 만든 VM
                      */
                     target_vm?: string;
-                    /** @default [] */
-                    warnings: string[];
+                    warnings?: string[];
                 };
             }[];
             /** Format: int64 */
@@ -13475,24 +13452,17 @@ export interface components {
             };
             status: {
                 error?: string;
-                /**
-                 * @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
-                 * @default []
-                 */
-                files: components["schemas"]["VmExportFile"][];
+                /** @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크) */
+                files?: components["schemas"]["VmExportFile"][];
                 /**
                  * Format: int64
                  * @description 내려받을 OVA(ustar)의 정확한 크기
-                 * @default 0
                  */
-                ova_bytes: number;
+                ova_bytes?: number;
                 /** @default pending */
                 phase: components["schemas"]["VmExportPhase"];
-                /**
-                 * @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
-                 * @default []
-                 */
-                warnings: string[];
+                /** @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등) */
+                warnings?: string[];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -13736,11 +13706,8 @@ export interface components {
                 sync?: components["schemas"]["VmwareSyncPolicy"];
             };
             status: {
-                /**
-                 * @description 항목 상태(`VmwareVmState::as_str`)별 VM 수
-                 * @default {}
-                 */
-                counts: {
+                /** @description 항목 상태(`VmwareVmState::as_str`)별 VM 수 */
+                counts?: {
                     [key: string]: number;
                 };
                 error?: string;
@@ -13831,11 +13798,8 @@ export interface components {
             };
             /** @description VM 하나의 이전 상태(설계 §6). 진행 걸음마다 Raft에 먼저 적고 한다(이어 가기·되돌리기). */
             status: {
-                /**
-                 * @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
-                 * @default false
-                 */
-                cbt_enabled_by_us: boolean;
+                /** @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다). */
+                cbt_enabled_by_us?: boolean;
                 /**
                  * Format: int64
                  * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
@@ -13843,8 +13807,7 @@ export interface components {
                 cutover_requested_at?: number;
                 /** @description `state`가 `cutting-over`일 때 지금 걸음 */
                 cutover_step?: components["schemas"]["VmwareCutoverStep"];
-                /** @default [] */
-                disks: components["schemas"]["VmwareSyncDisk"][];
+                disks?: components["schemas"]["VmwareSyncDisk"][];
                 /**
                  * Format: int64
                  * @description 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
@@ -13856,11 +13819,8 @@ export interface components {
                  * @description 예상 마지막 델타 시간(초 — 마지막 델타 바이트 ÷ 잰 속도)
                  */
                 estimate_s?: number;
-                /**
-                 * @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
-                 * @default []
-                 */
-                history: components["schemas"]["VmwareHistory"][];
+                /** @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터) */
+                history?: components["schemas"]["VmwareHistory"][];
                 /** Format: int64 */
                 last_sync_at?: number;
                 /** Format: int64 */
@@ -13870,18 +13830,14 @@ export interface components {
                 /**
                  * Format: int32
                  * @description 끝낸 회차 수
-                 * @default 0
                  */
-                rounds: number;
+                rounds?: number;
                 /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
                 snapshot?: components["schemas"]["VmwareSnapshotRef"];
                 /** @description 원본 VM(인벤토리에서 읽은 것) */
                 source?: components["schemas"]["VmwareSourceVm"];
-                /**
-                 * @description 바꾼 원본 설정(되돌림·취소가 되돌린다)
-                 * @default {}
-                 */
-                source_changes: components["schemas"]["VmwareSourceChanges"];
+                /** @description 바꾼 원본 설정(되돌림·취소가 되돌린다) */
+                source_changes?: components["schemas"]["VmwareSourceChanges"];
                 /**
                  * Format: int64
                  * @description 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
@@ -13897,16 +13853,14 @@ export interface components {
                 /**
                  * Format: int32
                  * @description 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
-                 * @default 0
                  */
-                sync_failures: number;
+                sync_failures?: number;
                 /**
                  * Format: uuid
                  * @description 만든 VM
                  */
                 target_vm?: string;
-                /** @default [] */
-                warnings: string[];
+                warnings?: string[];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -16234,24 +16188,17 @@ export interface components {
         };
         VmExportStatus: {
             error?: string;
-            /**
-             * @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
-             * @default []
-             */
-            files: components["schemas"]["VmExportFile"][];
+            /** @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크) */
+            files?: components["schemas"]["VmExportFile"][];
             /**
              * Format: int64
              * @description 내려받을 OVA(ustar)의 정확한 크기
-             * @default 0
              */
-            ova_bytes: number;
+            ova_bytes?: number;
             /** @default pending */
             phase: components["schemas"]["VmExportPhase"];
-            /**
-             * @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
-             * @default []
-             */
-            warnings: string[];
+            /** @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등) */
+            warnings?: string[];
         };
         /** @description VM의 HA 정책. */
         VmHa: {
@@ -16738,11 +16685,8 @@ export interface components {
             sync?: components["schemas"]["VmwareSyncPolicy"];
         };
         VmwareMigrationStatus: {
-            /**
-             * @description 항목 상태(`VmwareVmState::as_str`)별 VM 수
-             * @default {}
-             */
-            counts: {
+            /** @description 항목 상태(`VmwareVmState::as_str`)별 VM 수 */
+            counts?: {
                 [key: string]: number;
             };
             error?: string;
@@ -16768,11 +16712,8 @@ export interface components {
              * @default null
              */
             folder: string;
-            /**
-             * @description 원본 NIC 순번별 SDN 주소
-             * @default []
-             */
-            ips: string[][];
+            /** @description 원본 NIC 순번별 SDN 주소 */
+            ips?: string[][];
             /** @default null */
             keep_macs: boolean;
             /**
@@ -16780,20 +16721,14 @@ export interface components {
              * @default null
              */
             memory_mib: number;
-            /**
-             * @description 원본 네트워크 → 우리 네트워크
-             * @default {}
-             */
-            networks: {
+            /** @description 원본 네트워크 → 우리 네트워크 */
+            networks?: {
                 [key: string]: string;
             };
             /** @default null */
             nic_model: components["schemas"]["NicModel"];
-            /**
-             * @description 디스크 순번별 풀(비면 데이터스토어 규칙)
-             * @default []
-             */
-            pools: string[];
+            /** @description 디스크 순번별 풀(비면 데이터스토어 규칙) */
+            pools?: string[];
             /**
              * Format: int32
              * @default null
@@ -16809,11 +16744,8 @@ export interface components {
              * @default null
              */
             cpu_model: components["schemas"]["CpuModel"];
-            /**
-             * @description 원본 데이터스토어 이름 → 우리 풀(디스크마다)
-             * @default []
-             */
-            datastores: components["schemas"]["VmwareMapping"][];
+            /** @description 원본 데이터스토어 이름 → 우리 풀(디스크마다) */
+            datastores?: components["schemas"]["VmwareMapping"][];
             /**
              * @description 규칙에 없는 데이터스토어의 디스크를 둘 풀
              * @default null
@@ -16840,11 +16772,8 @@ export interface components {
              * @default true
              */
             keep_macs: boolean;
-            /**
-             * @description 원본 네트워크(이름 또는 `moref:dvportgroup-12`) → 우리 네트워크
-             * @default []
-             */
-            networks: components["schemas"]["VmwareMapping"][];
+            /** @description 원본 네트워크(이름 또는 `moref:dvportgroup-12`) → 우리 네트워크 */
+            networks?: components["schemas"]["VmwareMapping"][];
             /**
              * Format: uuid
              * @description 대상 노드. 없으면 시작할 때 고른다(풀이 보이고 메모리 여유).
@@ -16878,26 +16807,17 @@ export interface components {
         };
         /** @description 우리가 바꾼 원본 설정. 바꾸기 전에 옛 값을 먼저 적는다. */
         VmwareSourceChanges: {
-            /**
-             * @description 설명(annotation)을 바꿨다.
-             * @default false
-             */
-            annotation_added: boolean;
-            /**
-             * @description `startConnected=false`로 바꾼 NIC 장치 키
-             * @default []
-             */
-            nics_disconnected: number[];
+            /** @description 설명(annotation)을 바꿨다. */
+            annotation_added?: boolean;
+            /** @description `startConnected=false`로 바꾼 NIC 장치 키 */
+            nics_disconnected?: number[];
             /**
              * @description 바꾸기 전 설명(되돌림이 되살린다)
              * @default null
              */
             old_annotation: string;
-            /**
-             * @description 전환이 원본을 껐다(되돌림이 켠다).
-             * @default false
-             */
-            powered_off_by_us: boolean;
+            /** @description 전환이 원본을 껐다(되돌림이 켠다). */
+            powered_off_by_us?: boolean;
         };
         /** @description 비밀번호를 뺀 원본 스펙 */
         VmwareSourceSpecView: {
@@ -17023,11 +16943,8 @@ export interface components {
         VmwareVmState: "draft" | "pending" | "copying" | "syncing" | "ready" | "cutting-over" | "done" | "finalized" | "failed" | "rolled-back" | "reverted" | "cancelled";
         /** @description VM 하나의 이전 상태(설계 §6). 진행 걸음마다 Raft에 먼저 적고 한다(이어 가기·되돌리기). */
         VmwareVmStatus: {
-            /**
-             * @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
-             * @default false
-             */
-            cbt_enabled_by_us: boolean;
+            /** @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다). */
+            cbt_enabled_by_us?: boolean;
             /**
              * Format: int64
              * @description 마지막 전환 요청 시각(유닉스 초 — 예약 전환은 그 시각 뒤 한 번만 한다)
@@ -17035,8 +16952,7 @@ export interface components {
             cutover_requested_at?: number;
             /** @description `state`가 `cutting-over`일 때 지금 걸음 */
             cutover_step?: components["schemas"]["VmwareCutoverStep"];
-            /** @default [] */
-            disks: components["schemas"]["VmwareSyncDisk"][];
+            disks?: components["schemas"]["VmwareSyncDisk"][];
             /**
              * Format: int64
              * @description 마지막 전환의 내린 시간(초 — 원본 끄기 시작 → 대상 VM 켜짐)
@@ -17048,11 +16964,8 @@ export interface components {
              * @description 예상 마지막 델타 시간(초 — 마지막 델타 바이트 ÷ 잰 속도)
              */
             estimate_s?: number;
-            /**
-             * @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
-             * @default []
-             */
-            history: components["schemas"]["VmwareHistory"][];
+            /** @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터) */
+            history?: components["schemas"]["VmwareHistory"][];
             /** Format: int64 */
             last_sync_at?: number;
             /** Format: int64 */
@@ -17062,18 +16975,14 @@ export interface components {
             /**
              * Format: int32
              * @description 끝낸 회차 수
-             * @default 0
              */
-            rounds: number;
+            rounds?: number;
             /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
             snapshot?: components["schemas"]["VmwareSnapshotRef"];
             /** @description 원본 VM(인벤토리에서 읽은 것) */
             source?: components["schemas"]["VmwareSourceVm"];
-            /**
-             * @description 바꾼 원본 설정(되돌림·취소가 되돌린다)
-             * @default {}
-             */
-            source_changes: components["schemas"]["VmwareSourceChanges"];
+            /** @description 바꾼 원본 설정(되돌림·취소가 되돌린다) */
+            source_changes?: components["schemas"]["VmwareSourceChanges"];
             /**
              * Format: int64
              * @description 전환이 원본을 끄기 시작한 시각(유닉스 초 — 내린 시간을 센다, 설계 §10.1)
@@ -17089,16 +16998,14 @@ export interface components {
             /**
              * Format: int32
              * @description 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
-             * @default 0
              */
-            sync_failures: number;
+            sync_failures?: number;
             /**
              * Format: uuid
              * @description 만든 VM
              */
             target_vm?: string;
-            /** @default [] */
-            warnings: string[];
+            warnings?: string[];
         };
         /**
          * @description 볼륨의 내용 종류

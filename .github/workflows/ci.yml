@@ -402,7 +402,7 @@ jobs:
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it,opld/numa-it,opld/backup-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it,opld/numa-it,opld/backup-it,opld/fake-vsphere
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl
@@ -766,7 +766,7 @@ jobs:
       - name: OpenSSL headers (native-tls) and nbdkit
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config nbdkit
+          sudo apt-get install -y libssl-dev pkg-config nbdkit qemu-utils
           nbdkit --version
       - name: govmomi vcsim and govc (pinned release, SHA-256 checked)
         run: |
@@ -785,6 +785,13 @@ jobs:
           govc about
           govc find / -type m
       - run: cargo test -p opl-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
+      # 계획 72 스테이지 6: 우리가 내보낸 OVA(storage-it 왕복 시험이 남김)를 vcsim이 govc import.ova로 받는다.
+      - name: VM export OVA into vcsim (govc import.ova)
+        run: |
+          OPL_EXPORT_OVA_OUT="$RUNNER_TEMP/web.ova" cargo test -p opl-api --features storage-it --test vm_import_tasks \
+            an_exported_ova_imports_back_with_the_same_disk -- --nocapture
+          govc import.ova -name=orbivisor-export "$RUNNER_TEMP/web.ova"
+          govc vm.info -json orbivisor-export | jq -e '[.. | strings | select(endswith(".vmdk"))] | length >= 1'
       - name: vcsim log
         if: failure()
         run: tail -n 200 "$RUNNER_TEMP/vcsim.log"

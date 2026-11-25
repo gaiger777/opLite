@@ -41,7 +41,7 @@ export function MigrationPhaseChip({ phase }: { phase: MigrationPhase }) {
 /** 항목 상태별 수를 짧게(`3 syncing · 1 done`) */
 export function CountsText({ migration }: { migration: Migration }) {
   const { t } = useTranslation();
-  const counts = Object.entries(migration.status.counts).filter(([, n]) => n > 0);
+  const counts = Object.entries(migration.status.counts ?? {}).filter(([, n]) => n > 0);
   if (counts.length === 0) {
     return <>—</>;
   }
@@ -110,7 +110,7 @@ export function MigrationsPage() {
             </TableHeader>
             <TableBody>
               {items.map((m) => {
-                const total = Object.values(m.status.counts).reduce((a, b) => a + b, 0);
+                const total = Object.values(m.status.counts ?? {}).reduce((a, b) => a + b, 0);
                 return (
                   <TableRow key={m.id}>
                     <TableCell className="font-medium">

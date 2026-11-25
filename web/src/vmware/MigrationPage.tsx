@@ -330,7 +330,7 @@ export function MigrationPage() {
                         </div>
                       )}
                     </TableCell>
-                    <TableCell>{item.status.rounds}</TableCell>
+                    <TableCell>{item.status.rounds ?? 0}</TableCell>
                     <TableCell>
                       {progress !== undefined ? (
                         <Progress
