@@ -210,7 +210,7 @@ impl Provider {
         match (self, handle) {
             (Self::Cloudflare(p), Handle::Cloudflare { zone, ids }) => p.remove(zone, ids).await,
             (Self::Route53(p), Handle::Route53 { zone }) => p.remove(zone, fqdn, values).await,
-            (Self::PowerDns(p), Handle::PowerDns { zone }) => p.remove(zone, fqdn).await,
+            (Self::PowerDns(p), Handle::PowerDns { zone }) => p.remove(zone, fqdn, values).await,
             (Self::Rfc2136(p), _) => {
                 for v in values {
                     p.send(fqdn, v, false).await?;

@@ -1,6 +1,8 @@
 //! 훅 공급자: `{path} add|remove {fqdn} {value}`를 이 노드에서 부른다(acme.sh·lego의 공급자를 잇는 길). 파일은 훅
 //! 디렉터리 아래(`/etc/opl/acme-hooks/` — 스펙 검증), root(또는 opld를 돌리는 사용자) 소유, 그룹·다른 사용자가 쓸 수
-//! 없어야 한다. 환경은 비우고(`PATH`만) 60초 한도, 표준 출력·오류는 4 KiB까지만 남긴다.
+//! 없어야 한다. 환경은 비우고(`PATH`만) 60초 한도, 표준 출력·오류는 4 KiB까지만 읽어 이 노드 로그(debug)에만 남긴다.
+//! 실패하면 오류(인증서 status `error` — `cluster.read`가 보고 경보 알림에도 실린다)에는 끝 상태와 표준 오류 첫 줄
+//! 200자까지만 싣는다(lego·acme.sh를 감싼 훅은 실패할 때 API 자격 증명이나 요청 덤프를 찍곤 한다).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,6 +12,18 @@ use tokio::io::AsyncReadExt;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const OUTPUT_LIMIT: usize = 4096;
+/// 오류에 싣는 표준 오류 첫 줄의 한도(글자)
+const ERROR_LINE_LIMIT: usize = 200;
+
+/// 오류에 실을 표준 오류 요약: 첫 줄, 200자까지
+fn first_line(err: &str) -> String {
+    let line = err.lines().next().unwrap_or("").trim();
+    let mut out: String = line.chars().take(ERROR_LINE_LIMIT).collect();
+    if line.chars().count() > ERROR_LINE_LIMIT {
+        out.push('…');
+    }
+    out
+}
 
 pub struct Hook {
     /// 실제 파일(노드 설정의 훅 뿌리 아래로 옮긴 경로)
@@ -86,17 +100,18 @@ impl Hook {
             .await
             .map_err(|_| format!("hook {} {action} timed out after 60s", self.path.display()))?;
         let status = status.map_err(|e| format!("hook {}: {e}", self.path.display()))?;
-        if !out.is_empty() {
-            tracing::info!(hook = %self.path.display(), action, output = %out, "ACME DNS hook");
+        if !out.is_empty() || !err.is_empty() {
+            tracing::debug!(hook = %self.path.display(), action, stdout = %out, stderr = %err, "ACME DNS hook output");
         }
         if !status.success() {
+            let line = first_line(&err);
             return Err(format!(
                 "hook {} {action} failed ({status}){}",
                 self.path.display(),
-                if err.is_empty() {
+                if line.is_empty() {
                     String::new()
                 } else {
-                    format!(": {err}")
+                    format!(": {line}")
                 }
             ));
         }
@@ -122,7 +137,7 @@ mod tests {
         let log = dir.path().join("log");
         std::fs::write(
             &path,
-            format!("#!/bin/sh\necho \"$1 $2 $3 ${{HOME:-nohome}}\" >> {}\n[ \"$1\" = add ] || {{ echo bad >&2; exit 3; }}\n", log.display()),
+            format!("#!/bin/sh\necho \"$1 $2 $3 ${{HOME:-nohome}}\" >> {}\n[ \"$1\" = add ] || {{ echo bad >&2; echo AWS_SECRET=hunter2 >&2; exit 3; }}\n", log.display()),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -134,7 +149,10 @@ mod tests {
             .run("remove", "_acme-challenge.a.test", "v1")
             .await
             .unwrap_err();
+        // 표준 오류는 첫 줄만(뒤 줄의 비밀은 status·경보에 가지 않는다 — 리뷰 1)
         assert!(err.contains("failed") && err.ends_with(": bad"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        assert_eq!(first_line(&"x".repeat(300)).chars().count(), 201);
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "add _acme-challenge.a.test v1 nohome\nremove _acme-challenge.a.test v1 nohome\n"

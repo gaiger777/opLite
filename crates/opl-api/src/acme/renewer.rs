@@ -22,6 +22,10 @@ use crate::tasks::create_task;
 
 /// ARI 창을 다시 묻는 간격
 const ARI_EVERY: i64 = 86_400;
+/// ARI를 묻지 못했을 때 다시 묻기까지
+const ARI_RETRY: i64 = 3600;
+/// ARI 묻기(디렉터리·창) 하나의 한도
+const ARI_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct AcmeRenewerConfig {
@@ -72,13 +76,12 @@ fn need(
     None
 }
 
-/// 인증서 하나의 할 일. 물러서는 중(`next_attempt_at`)이면 없다. 노드마다면 온라인이고 `acme`를 아는 덮는 노드마다
-/// (오프라인 노드는 건너뛰고 돌아오면 잇는다).
+/// 인증서 하나의 할 일. 물러서는 중이면 없다(공유는 `next_attempt_at`, 노드마다는 그 노드의 `node_failures` — 한 노드의
+/// 물러서기가 다른 노드를 막지 않는다). 노드마다면 온라인이고 `acme`를 아는 덮는 노드마다(오프라인 노드는 건너뛰고 돌아오면
+/// 잇는다).
 pub fn due(cert: &Certificate, nodes: &[Node], now: i64) -> Vec<Due> {
-    if cert.status.next_attempt_at.is_some_and(|t| t > now) {
-        return Vec::new();
-    }
     match cert.spec.scope {
+        CertificateScope::Shared if cert.status.backing_off(None, now) => Vec::new(),
         CertificateScope::Shared => need(
             cert.status.shared.as_ref(),
             &cert.spec.names,
@@ -91,6 +94,7 @@ pub fn due(cert: &Certificate, nodes: &[Node], now: i64) -> Vec<Due> {
         CertificateScope::PerNode { .. } => covered_nodes(&cert.spec, nodes)
             .into_iter()
             .filter(|n| n.status.online && n.status.features.iter().any(|f| f == ACME))
+            .filter(|n| !cert.status.backing_off(Some(n.id), now))
             .filter_map(|n| {
                 let names = cert.spec.names_for(&n.name, &node_address(n));
                 need(cert.status.nodes.get(&n.id), &names, &cert.spec, now).map(|reason| Due {
@@ -229,7 +233,23 @@ pub async fn tick(state: &AppState, config: &AcmeRenewerConfig) {
         {
             tracing::debug!(error = %e, "cannot drop expired HTTP-01 answers");
         }
-        Box::pin(refresh_ari(state, cert, now)).await;
+        // 뺀 노드·더는 덮지 않는 노드의 실패를 지운다(요약·경보에 남지 않게).
+        let covered: Vec<Uuid> = covered_nodes(&cert.spec, &nodes)
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        if cert
+            .status
+            .node_failures
+            .keys()
+            .any(|n| !covered.contains(n))
+            && let Err(e) = order::modify_status(cluster, cert.id, |s| {
+                s.retain_nodes(|n| covered.contains(n))
+            })
+            .await
+        {
+            tracing::debug!(error = %e, "cannot drop failures of uncovered nodes");
+        }
     }
     for (certificate, node, run_on) in plan(
         &certs,
@@ -250,24 +270,31 @@ pub async fn tick(state: &AppState, config: &AcmeRenewerConfig) {
             tracing::warn!(error = %e.message, "cannot create the ACME order task");
         }
     }
+    // ARI 창 다시 묻기는 주문을 만든 뒤에(CA가 늦거나 멈춰도 주문이 밀리지 않게)
+    for cert in &certs {
+        Box::pin(refresh_ari(state, cert, now)).await;
+    }
 }
 
-/// ARI 창을 하루 한 번 다시 묻는다. 창이 바뀌면 `renew_at`도 다시 정한다.
+/// ARI 창을 하루 한 번 다시 묻는다. 창이 바뀌면 `renew_at`도 다시 정한다. AKI가 없는(인증서 id가 없는) 인증서는 묻지 않고,
+/// CA가 창을 주지 않으면(`renewalInfo`가 없는 CA) `ari_checked_at`에 적어 하루 뒤에 다시 묻는다. CA가 닿지 않으면 한 시간 뒤.
+/// 묻기마다 [`ARI_TIMEOUT`] 한도다.
 async fn refresh_ari(state: &AppState, cert: &Certificate, now: i64) {
     if cert.spec.renew != RenewPolicy::Ari {
         return;
     }
-    let stale = |i: &IssuedCert| i.ari.is_none_or(|w| w.checked_at + ARI_EVERY <= now);
-    let mut slots: Vec<(Option<Uuid>, IssuedCert)> = cert
+    let mut slots: Vec<(Option<Uuid>, IssuedCert, String)> = cert
         .status
         .nodes
         .iter()
-        .filter(|(_, i)| stale(i))
-        .map(|(n, i)| (Some(*n), i.clone()))
+        .map(|(n, i)| (Some(*n), i))
+        .chain(cert.status.shared.iter().map(|s| (None, s)))
+        .filter(|(_, i)| ari_stale(i, now))
+        .filter_map(|(n, i)| {
+            let id = ari::leaf(&i.chain_pem).ok()?.cert_id?;
+            Some((n, i.clone(), id))
+        })
         .collect();
-    if let Some(s) = cert.status.shared.as_ref().filter(|s| stale(s)) {
-        slots.push((None, s.clone()));
-    }
     if slots.is_empty() {
         return;
     }
@@ -283,20 +310,35 @@ async fn refresh_ari(state: &AppState, cert: &Certificate, now: i64) {
     ) else {
         return;
     };
-    let Ok(client) =
-        super::client::AcmeClient::connect(url, account.spec.ca_bundle.as_deref(), key).await
-    else {
+    // 창 없이 물은 것: (슬롯, 일련번호, 다시 물을 수 있게 적을 때)
+    let mut asked: Vec<(Option<Uuid>, String, i64)> = Vec::new();
+    let connected = tokio::time::timeout(
+        ARI_TIMEOUT,
+        super::client::AcmeClient::connect(url, account.spec.ca_bundle.as_deref(), key),
+    )
+    .await;
+    let Ok(Ok(client)) = connected else {
+        for (node, issued, _) in slots.drain(..) {
+            asked.push((node, issued.serial, now - ARI_EVERY + ARI_RETRY));
+        }
+        mark_asked(state, cert, asked).await;
         return;
     };
-    for (node, issued) in slots {
-        let Some(id) = ari::leaf(&issued.chain_pem).ok().and_then(|l| l.cert_id) else {
-            continue;
-        };
-        let info = match client.renewal_info(&id).await {
-            Ok(Some(info)) => info,
-            Ok(None) => continue,
-            Err(e) => {
+    for (node, issued, id) in slots {
+        let info = match tokio::time::timeout(ARI_TIMEOUT, client.renewal_info(&id)).await {
+            Ok(Ok(Some(info))) => info,
+            Ok(Ok(None)) => {
+                asked.push((node, issued.serial, now));
+                continue;
+            }
+            Ok(Err(e)) => {
                 tracing::debug!(error = %e, "cannot read the ARI renewal window");
+                asked.push((node, issued.serial, now - ARI_EVERY + ARI_RETRY));
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!("the ARI renewal window request timed out");
+                asked.push((node, issued.serial, now - ARI_EVERY + ARI_RETRY));
                 continue;
             }
         };
@@ -343,6 +385,35 @@ async fn refresh_ari(state: &AppState, cert: &Certificate, now: i64) {
         if let Err(e) = result {
             tracing::debug!(error = %e, "cannot store the ARI renewal window");
         }
+    }
+    mark_asked(state, cert, asked).await;
+}
+
+/// 다시 물어야 하나: 창이 있으면 그 `checked_at`, 없으면 `ari_checked_at`에서 하루가 지났나
+fn ari_stale(i: &IssuedCert, now: i64) -> bool {
+    let checked = i.ari.map(|w| w.checked_at).or(i.ari_checked_at);
+    checked.is_none_or(|t| t + ARI_EVERY <= now)
+}
+
+/// 창 없이 물은 슬롯에 `ari_checked_at`을 적는다(같은 인증서일 때만 — 그 사이 새로 받았으면 그대로).
+async fn mark_asked(state: &AppState, cert: &Certificate, asked: Vec<(Option<Uuid>, String, i64)>) {
+    if asked.is_empty() {
+        return;
+    }
+    let result = order::modify_status(&state.cluster, cert.id, |s| {
+        for (node, serial, at) in &asked {
+            let slot = match node {
+                Some(n) => s.nodes.get_mut(n),
+                None => s.shared.as_mut(),
+            };
+            if let Some(i) = slot.filter(|i| &i.serial == serial) {
+                i.ari_checked_at = Some(*at);
+            }
+        }
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "cannot note the ARI check");
     }
 }
 
@@ -406,6 +477,7 @@ mod tests {
             renew_at,
             key: CertificateKey::EcdsaP256,
             error: None,
+            ari_checked_at: None,
         }
     }
 
@@ -445,12 +517,15 @@ mod tests {
         assert_eq!(due(&c, &nodes, 600).len(), 2);
         c.spec.key = CertificateKey::EcdsaP384;
         assert_eq!(due(&c, &nodes, 10)[0].reason, "key type changed");
-        // 물러서는 중이면 없다.
-        c.status.next_attempt_at = Some(20);
+        // 물러서는 중이면 없다(노드마다).
+        for n in [1, 2] {
+            c.status
+                .record_failure(Some(Uuid::from_u128(n)), "x".into(), 0, |_| 20);
+        }
         assert!(due(&c, &nodes, 10).is_empty());
         assert_eq!(due(&c, &nodes, 20).len(), 2);
         // 고른 노드만
-        c.status.next_attempt_at = None;
+        c.status.node_failures.clear();
         c.spec.scope = CertificateScope::PerNode {
             nodes: vec![Uuid::from_u128(2)],
         };
@@ -530,5 +605,37 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn ari_is_asked_once_a_day_even_without_a_window() {
+        let mut i = issued(&["a"], 500);
+        assert!(ari_stale(&i, 0));
+        i.ari_checked_at = Some(100);
+        assert!(!ari_stale(&i, 100 + ARI_EVERY - 1));
+        assert!(ari_stale(&i, 100 + ARI_EVERY));
+        i.ari = Some(opl_types::acme::AriWindow {
+            start: 1,
+            end: 2,
+            checked_at: 1000,
+        });
+        assert!(!ari_stale(&i, 1000 + ARI_EVERY - 1));
+    }
+
+    /// 리뷰 1: 한 노드의 물러서기는 다른 노드(새 노드·갱신할 노드)를 막지 않는다.
+    #[test]
+    fn one_node_backing_off_does_not_block_others() {
+        let nodes = [node(1, true), node(2, true)];
+        let mut c = cert(CertificateScope::PerNode { nodes: vec![] });
+        c.status
+            .record_failure(Some(Uuid::from_u128(1)), "n1: x".into(), 0, |_| 3600);
+        assert_eq!(
+            due(&c, &nodes, 10),
+            [Due {
+                node: Some(Uuid::from_u128(2)),
+                reason: "not issued yet"
+            }]
+        );
+        assert_eq!(due(&c, &nodes, 3600).len(), 2);
     }
 }

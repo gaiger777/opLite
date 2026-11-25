@@ -775,6 +775,7 @@ pub async fn delete_certificate(
 /// 만든 주문 Task들
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RenewStarted {
+    #[schema(value_type = Vec<Resource<opl_types::task::TaskSpec, opl_types::task::TaskStatus>>)]
     pub tasks: Vec<Task>,
 }
 
@@ -833,7 +834,7 @@ pub async fn renew_certificate(
             "no online node can order this certificate",
         ));
     }
-    super::order::modify_status(&state.cluster, cert.id, |s| s.next_attempt_at = None)
+    super::order::modify_status(&state.cluster, cert.id, |s| s.clear_backoff())
         .await
         .map_err(ApiError::internal)?;
     let mut created = Vec::new();

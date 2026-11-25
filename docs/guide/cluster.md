@@ -417,7 +417,8 @@ orbivisorctl cert delete vip
   `--http01`(기본)·`--dns01 DNS`, `--key p256|p384`(기본 ECDSA P-256), `--profile`, `--days-before N`, `--preferred-chain CN`(고를
   사슬의 루트 CN), `--no-install`(받기만 — 리스너에 끼우지 않음), `--no-precheck`. 리더가 다음 틱(60초)에 주문한다.
 - **노드마다와 공유.** 노드마다 인증서는 그 노드에서 주문 Task가 돌고 키가 **그 노드 디스크에만** 있다(`{data_dir}/pki/acme/{인증서
-  id}.key`, 0600 — Raft에 없다). 이름 자리 `{node}`(노드 이름)·`{node_address}`(노드 주소)는 노드마다 인증서에서만 쓴다. 꺼진 노드는
+  id}.{일련번호}.key`, 0600 — Raft에 없다. 새 키는 새 사슬을 status에 적은 뒤에야 옛 키를 지우므로, 적기가 실패해도 끼운 인증서는
+  그대로다). 이름 자리 `{node}`(노드 이름)·`{node_address}`(노드 주소)는 노드마다 인증서에서만 쓴다. 꺼진 노드는
   건너뛰고 돌아오면 잇는다. **공유** 인증서는 리더(위트니스면 id가 가장 작은 온라인 노드)가 한 번 받고, 키는 Raft status의 비밀이라
   (보기·watch·감사·기록에서 뺀다) 모든 노드가 읽어 끼운다. 같은 이름 묶음을 노드 수만큼 주문하지 않으므로 CA 속도 한도(Let's Encrypt는
   같은 이름 묶음 주에 5장)에 걸리지 않는다 — VIP·로드밸런서 이름은 공유로 받는다.
@@ -425,10 +426,14 @@ orbivisorctl cert delete vip
 - **와일드카드**(`*.`)는 DNS-01만이다.
 - **프로필**(`--profile`)은 디렉터리의 `meta.profiles`에 있을 때만 보낸다(Let's Encrypt `classic`·`tlsserver`·`shortlived`).
 - **갱신.** 기본은 CA가 알려 주는 갱신 창(ARI, RFC 9773) 안의 무작위 시각이고(설정 `acme.renew_jitter`, 기본 켬), 리더가 하루 한 번 창을
-  다시 묻는다. 창이 없으면 유효 기간의 1/3이 남았을 때, `--days-before N`이면 만료 N일 전이다. 갱신 주문은 옛 인증서를 `replaces`로
+  다시 묻는다. 창이 없으면 유효 기간의 1/3이 남았을 때, `--days-before N`이면 만료 N일 전이다(N일이 받은 인증서의 수명 이상이면 — 예: 6일짜리
+  `shortlived`에 7 — 받자마자 다시 주문하지 않게 1/3 규칙으로 하고 그 인증서의 `error`에 알린다). 갱신 주문은 옛 인증서를 `replaces`로
   알린다. 리더 `AcmeRenewer`가 60초마다 할 일(받은 것 없음·이름 바뀜·키 종류 바뀜·갱신 시각 지남)을 보고 Task `acme-order`를 만든다
   (클러스터 전체에 동시 2개). 실패하면 5분 × 2^(n−1)(6시간까지, 속도 한도면 `Retry-After`) 물러서고, 받은 인증서가 살아 있으면 계속 쓴다.
-- 지운 인증서의 노드 키 파일은 지우지 않는다. 키와 사슬이 맞지 않는 인증서는 경고하고 끼우지 않는다.
+  노드마다 인증서는 실패·물러서기를 **노드마다** 센다(status `node_failures` — 한 노드가 실패해도 다른 노드의 주문은 막히지 않고, 다른
+  노드가 성공해도 그 실패는 남는다). `failures`·`error`는 가장 많이 실패한 노드의 요약(`노드 이름: …`)이다. CA가 ARI를 주지 않으면
+  하루 한 번만 다시 묻는다.
+- 지운 인증서의 노드 키 파일은 각 노드가 한 시간 뒤에 지운다. 키와 사슬이 맞지 않는 인증서는 경고하고 끼우지 않는다.
 
 ### HTTP-01
 
@@ -440,11 +445,13 @@ http_listen = "0.0.0.0:80"     # listen·cluster_listen과 다른 포트
 
 - 이 리스너는 `GET /.well-known/acme-challenge/{token}`에만 Raft에 적힌 도전 값으로 답한다 — 그래서 이름이 VIP나 DNS 라운드 로빈으로
   **어느 노드를 가리켜도** 답한다. 그 밖의 요청은 설정 `acme.http_redirect`(기본 켬)면 `308 https://{Host}:{listen 포트}{경로}`, 끄면
-  404다. 본문을 읽지 않고, 머리 8 KiB·연결당 요청 하나·10초·초당 100·동시 256이다. 밖에서 포트 80이 닿아야 한다(방화벽).
+  404다. 본문을 읽지 않고, 머리 8 KiB·연결당 요청 하나·10초·동시 256이다. 초당 100 한도는 도전 경로가 아닌 요청에만 건다(누가
+  포트 80을 두드려도 CA의 검증 요청은 503을 받지 않는다). 경로에 보이는 ASCII가 아닌 글자가 있으면 400이다. 밖에서 포트 80이 닿아야 한다(방화벽).
 - `http_listen`을 켠 노드는 노드 기능에 `http01`을 알린다. HTTP-01 인증서를 만들거나 바꿀 때 대상 노드(공유면 모든 노드)가
   `http01`을 알리지 않으면 400 `http01_unavailable`(노드 이름)이다.
 - **스스로 확인.** 주문 전에 노드가 `http://{이름}/.well-known/acme-challenge/{token}`을 스스로 불러 보고, 안 되면 CA에 묻지 않고 실패한다
-  (CA의 실패 검증 속도 한도를 아낌). 밖에서만 닿는 이름이면 `--no-precheck`.
+  (CA의 실패 검증 속도 한도를 아낌 — 이름이 아직 답을 적용하지 않은 다른 노드를 가리킬 수 있어 5초쯤 다시 해 본다). 밖에서만 닿는
+  이름이면 `--no-precheck`.
 - `acme.http_redirect`·`acme.renew_jitter`는 `orbivisorctl settings set`에 아직 키가 없어 `PATCH /api/v1/settings {"acme":
   {"http_redirect": false}}`나 `Settings` 매니페스트([선언형 운영](declarative.md))로 바꾼다.
 
@@ -478,11 +485,17 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
   ```
 
 - **위임.** `_acme-challenge.web.example.com CNAME web.acme.example.net`이 있으면 CNAME을 따라가 그 이름에 쓴다(쓰기 권한을 좁힌
-  영역에 맡김). 와일드카드와 기본 이름처럼 같은 TXT 이름의 값 둘은 한 번에 넣는다.
+  영역에 맡김). `--zones`가 있으면 따라간 이름도 그 영역 안이어야 한다(아니면 주문 실패 — 다른 영역의 TXT를 건드리지 않게).
+  와일드카드와 기본 이름처럼 같은 TXT 이름의 값 둘은 한 번에 넣는다. Route 53·PowerDNS는 지금 TXT rrset을 읽어 **우리 값만** 더하고
+  빼므로(다 비면 rrset을 지움) 같은 이름의 다른 TXT(다른 주문·다른 ACME 클라이언트·SPF)는 남는다. Route 53은 읽은 rrset을 그대로
+  DELETE하고 고친 것을 CREATE하는 한 묶음이라 그 사이 바뀌면 거절되어 다시 읽는다. PowerDNS API에는 조건부 쓰기가 없어 읽기와 쓰기
+  사이에 다른 쪽이 쓴 값은 잃을 수 있다.
 - **훅.** `{path} add|remove {fqdn} {value}`(예: `add _acme-challenge.example.com Abc…`)를 **주문을 도는 노드에서** 부른다(노드마다
   인증서는 각 노드, 공유는 고른 노드 — 그러니 모든 노드에 같은 파일을 둔다). 경로는 `/etc/opl/acme-hooks/` 아래 파일만(`..` 없음 —
   만들 때 검사), 주인은 root(또는 orbivisord를 돌리는 사용자), 그룹·다른 사용자가 쓸 수 없고 실행할 수 있어야 한다(부를 때마다 검사).
-  환경은 비우고 `PATH`만 주며 60초 한도, 표준 출력·오류는 4 KiB까지만 로그에 남는다. 그래서 자격 증명은 파일에서 읽는다. acme.sh·
+  환경은 비우고 `PATH`만 주며 60초 한도, 표준 출력·오류는 4 KiB까지만 이 노드 로그(debug)에 남는다. 실패하면 끝 상태와 표준 오류
+  **첫 줄**(200자까지)이 인증서 status `error`에 실린다 — `cluster.read` 사용자와 경보 알림이 보므로 첫 줄에 비밀을 찍지 않는다. 그래서
+  자격 증명은 파일에서 읽는다. acme.sh·
   lego의 많은 공급자를 이 길로 잇는다. 예(BIND `nsupdate`):
 
   ```sh
@@ -509,7 +522,7 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
 | 조건 | 무엇 | 누가 평가 | 대상 |
 |---|---|---|---|
 | `certificate_expiring {days: 14}` | 이 노드 리스너가 낼 수 있는 인증서(기본 + SNI — 출처가 무엇이든)와 **내부 노드 인증서**(824일, 자동 갱신 없음) 가운데 가장 이른 만료가 `days`일 안(값은 남은 날) | 그 노드 | 노드 |
-| `certificate_renew_failed {failures: 3}` | ACME 인증서의 연속 실패가 `failures`번 이상 | **리더** | 인증서 |
+| `certificate_renew_failed {failures: 3}` | ACME 인증서의 연속 실패가 `failures`번 이상(노드마다 인증서는 노드마다 세고 알림에 그 노드들을 적는다) | **리더** | 인증서 |
 
 `orbivisorctl alert rule create`와 웹 규칙 폼에는 아직 없다. API나 `AlertRule` 매니페스트로 만든다:
 
@@ -544,8 +557,8 @@ CI는 Pebble·pebble-challtestsrv·BIND로만 시험한다(아래 한계). 실�
    /etc/opl/acme-hooks/nsupdate.sh` → `orbivisorctl cert add stg-dns --account stg --name '*.example.com' --shared --dns01 hook` →
    `cert renew stg-dns --wait` → `openssl s_client -servername x.example.com …`가 와일드카드 인증서를 받는다.
 5. `orbivisorctl cert renew stg-http --wait`를 한 번 더 해 새 일련번호가 끼워지는지(열린 연결은 그대로) 본다.
-6. 치우기: `cert delete stg-http`·`cert delete stg-dns`·`cert dns delete hook`·`cert account delete stg`, `{data_dir}/pki/acme/`의 키
-   파일과 `http_listen` 줄을 지운다(CA 쪽 스테이징 계정은 남는다).
+6. 치우기: `cert delete stg-http`·`cert delete stg-dns`·`cert dns delete hook`·`cert account delete stg`, `http_listen` 줄을 지운다
+   (`{data_dir}/pki/acme/`의 키 파일은 한 시간 뒤 노드가 지운다. CA 쪽 스테이징 계정은 남는다).
 
 ### 한계
 

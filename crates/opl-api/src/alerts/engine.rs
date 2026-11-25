@@ -972,13 +972,36 @@ impl Engine {
                         name: c.name.clone(),
                         node: None,
                     };
+                    // 노드마다 인증서는 노드마다 센다(요약 `failures`는 가장 많이 실패한 노드) — 그 노드들을 적는다.
                     let detail = failing.then(|| {
-                        format!(
-                            "Certificate {} failed {} ACME orders in a row: {}",
-                            c.name,
-                            c.status.failures,
-                            c.status.error.as_deref().unwrap_or("unknown error")
-                        )
+                        let nodes: Vec<String> = c
+                            .status
+                            .node_failures
+                            .values()
+                            .filter(|f| f.failures >= failures)
+                            .map(|f| {
+                                format!(
+                                    "- {} in a row: {}",
+                                    f.failures,
+                                    f.error.as_deref().unwrap_or("unknown error")
+                                )
+                            })
+                            .collect();
+                        if nodes.is_empty() {
+                            format!(
+                                "Certificate {} failed {} ACME orders in a row: {}",
+                                c.name,
+                                c.status.failures,
+                                c.status.error.as_deref().unwrap_or("unknown error")
+                            )
+                        } else {
+                            format!(
+                                "Certificate {} failed ACME orders on {} node(s):\n{}",
+                                c.name,
+                                nodes.len(),
+                                nodes.join("\n")
+                            )
+                        }
                     });
                     (subject, failing, detail)
                 })

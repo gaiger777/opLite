@@ -54,6 +54,7 @@ impl Issuer {
     fn sync(&mut self) -> Result<(), ApiCertError> {
         if let Some(dir) = &self.acme_keys {
             let (_, certs) = self.cluster.list::<CertificateSpec>()?;
+            crate::acme::install::remove_deleted_keys(dir, &certs);
             let found = crate::acme::install::installable(
                 &certs,
                 self.cluster.id().0,

@@ -48,7 +48,8 @@ pub fn installable(
                 if issued.not_after <= now {
                     continue;
                 }
-                let Ok(key_pem) = std::fs::read_to_string(super::order::key_path(dir, c.id)) else {
+                let path = super::order::key_path(dir, c.id, &issued.serial);
+                let Ok(key_pem) = std::fs::read_to_string(path) else {
                     continue;
                 };
                 out.push(Installable {
@@ -80,6 +81,43 @@ pub fn installable(
     }
     out.sort_by_key(|i| (!i.per_node, -i.not_after));
     out
+}
+
+/// 이만큼 지난 키 파일만 치운다(막 만든 인증서의 주문이 키를 쓴 뒤 status를 적기 전일 수 있다)
+const STALE_KEY_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 지운 인증서의 노드 키 파일(`{id}.{serial}.key`)을 치운다. 한 시간 넘게 지난 것만.
+pub fn remove_deleted_keys(dir: &Path, certs: &[Certificate]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(id) = name
+            .to_str()
+            .filter(|n| n.ends_with(".key"))
+            .and_then(|n| n.split('.').next())
+            .and_then(|id| id.parse::<Uuid>().ok())
+        else {
+            continue;
+        };
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= STALE_KEY_AGE);
+        if old && !certs.iter().any(|c| c.id == id) {
+            match std::fs::remove_file(e.path()) {
+                Ok(()) => {
+                    tracing::info!(file = %e.path().display(), "removed the key of a deleted ACME certificate")
+                }
+                Err(err) => {
+                    tracing::debug!(file = %e.path().display(), error = %err, "cannot remove an ACME key")
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +159,7 @@ mod tests {
             renew_at: 0,
             key: CertificateKey::EcdsaP256,
             error: None,
+            ari_checked_at: None,
         }
     }
 
@@ -147,8 +186,15 @@ mod tests {
             got.iter().map(|i| i.certificate).collect::<Vec<_>>(),
             [shared.id]
         );
+        // 다른 일련번호의 키(막 받은 새 키 — status는 아직 옛 사슬)는 고르지 않는다.
         std::fs::write(
-            super::super::order::key_path(dir.path(), per.id),
+            super::super::order::key_path(dir.path(), per.id, "2"),
+            "next-key",
+        )
+        .unwrap();
+        assert_eq!(installable(&certs, me, Some(dir.path()), 50).len(), 1);
+        std::fs::write(
+            super::super::order::key_path(dir.path(), per.id, "1"),
             "node-key",
         )
         .unwrap();
@@ -163,5 +209,36 @@ mod tests {
         // 만료된 것은 끼우지 않는다.
         assert_eq!(installable(&certs, me, Some(dir.path()), 150).len(), 1);
         assert!(installable(&certs, me, Some(dir.path()), 250).is_empty());
+    }
+
+    #[test]
+    fn removes_only_old_keys_of_deleted_certificates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = cert(1, CertificateScope::PerNode { nodes: vec![] });
+        let gone = Uuid::from_u128(2);
+        let keep = super::super::order::key_path(dir.path(), live.id, "1");
+        let old = super::super::order::key_path(dir.path(), gone, "1");
+        let fresh = super::super::order::key_path(dir.path(), Uuid::from_u128(3), "1");
+        for p in [&keep, &old, &fresh] {
+            std::fs::write(p, "k").unwrap();
+        }
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for p in [&keep, &old] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        remove_deleted_keys(dir.path(), std::slice::from_ref(&live));
+        assert!(keep.exists(), "a live certificate's key stays");
+        assert!(!old.exists(), "a deleted certificate's old key goes");
+        assert!(
+            fresh.exists(),
+            "a fresh key may belong to an order in flight"
+        );
+        assert!(dir.path().join("notes.txt").exists());
     }
 }

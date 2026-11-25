@@ -322,7 +322,7 @@ async fn http01_per_node_issue_install_and_renew() {
     );
     assert!(c.status.error.is_none() && c.status.failures == 0);
     // 키는 노드 디스크(0600)에만 — Raft 객체에는 없다.
-    let key = opl_api::acme::order::key_path(rig.keys.path(), c.id);
+    let key = opl_api::acme::order::key_path(rig.keys.path(), c.id, &issued.serial);
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(

@@ -1,7 +1,9 @@
 //! Task `acme-order`(계획 73 §11.2): 인증서 하나의 주문 하나. 노드마다 인증서는 그 노드에서(키는 그 노드 디스크
 //! `{key_dir}/{인증서 id}.key`, 0600 — Raft에 없음), 공유 인증서는 리더가 고른 노드에서(키는 Raft status의 비밀). 계정이
 //! 아직 등록되지 않았으면 등록한다. 진행 중 주문 URL을 status `orders`에 적어 Task가 다시 떠도 그 주문을 이어 본다.
-//! 실패는 status `failures`·`next_attempt_at`(물러서기)·`error`에 적고 Task도 실패한다.
+//! 실패는 공유면 status `failures`·`next_attempt_at`(물러서기)·`error`에, 노드마다면 그 노드의 `node_failures`에 적고 Task도
+//! 실패한다. 노드마다 키 파일은 일련번호를 이름에 넣어(`{id}.{serial}.key`) 새 사슬을 status에 적은 뒤에야 옛 키를 지운다 —
+//! 적기가 실패해도 지금 끼운 사슬과 키의 짝이 깨지지 않는다.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +26,8 @@ use crate::state::AppState;
 
 /// HTTP-01 답이 사는 시간
 const ANSWER_TTL: i64 = 600;
+/// HTTP-01 자기 확인을 다시 해 보는 동안
+const PRECHECK_RETRY: Duration = Duration::from_secs(5);
 /// 물러서기의 첫 간격과 한도
 const BACKOFF_FIRST: i64 = 300;
 const BACKOFF_MAX: i64 = 6 * 3600;
@@ -116,9 +120,37 @@ fn key_alg(kind: CertificateKey) -> Result<&'static rcgen::SignatureAlgorithm, A
     }
 }
 
-/// 노드마다 인증서의 키 파일
-pub fn key_path(dir: &Path, cert: Uuid) -> PathBuf {
-    dir.join(format!("{cert}.key"))
+/// 노드마다 인증서의 키 파일(받은 인증서의 일련번호마다 하나)
+pub fn key_path(dir: &Path, cert: Uuid, serial: &str) -> PathBuf {
+    dir.join(format!("{cert}.{serial}.key"))
+}
+
+/// `cert`의 키 파일 가운데 `keep`(일련번호)가 아닌 것을 지운다(`keep`이 None이면 모두).
+pub fn remove_keys(dir: &Path, cert: Uuid, keep: Option<&str>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{cert}.");
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // 일련번호가 이름에 없던 옛 꼴(`{id}.key`)
+        if name == format!("{cert}.key") {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        let Some(serial) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".key"))
+        else {
+            continue;
+        };
+        if Some(serial) != keep
+            && let Err(err) = std::fs::remove_file(e.path())
+        {
+            tracing::debug!(file = %e.path().display(), error = %err, "cannot remove an old ACME key");
+        }
+    }
 }
 
 fn write_key(path: &Path, pem: &str) -> Result<(), AcmeError> {
@@ -285,9 +317,22 @@ async fn prepare(
             .map_err(AcmeError::Invalid)?;
             out.http_tokens = answers.iter().map(|(_, t, _, _)| t.clone()).collect();
             if cert.spec.precheck {
-                // 답이 이 노드에 적용될 때까지 잠깐 기다린 뒤(쓰기는 리더 커밋 뒤 돌아온다) 부른다.
+                // 이 노드에는 답이 이미 적용됐지만(쓰기는 이 노드에 적용될 때까지 기다린다) 이름이 가리키는 다른 노드는
+                // 아직일 수 있으므로 5초쯤 다시 해 본다. 끝내 안 되면 넣은 답을 치우고 실패한다.
                 for (name, token, ka, _) in &answers {
-                    precheck(name, token, ka).await?;
+                    let deadline = tokio::time::Instant::now() + PRECHECK_RETRY;
+                    loop {
+                        match precheck(name, token, ka).await {
+                            Ok(()) => break,
+                            Err(_) if tokio::time::Instant::now() < deadline => {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            Err(e) => {
+                                cleanup(state, cert.id, out).await;
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
             }
             out.challenges = answers.into_iter().map(|(_, _, _, url)| url).collect();
@@ -314,9 +359,15 @@ async fn prepare(
                             a.identifier.value
                         ))
                     })?;
-                let fqdn =
-                    dns::query::follow_cname(resolver, &dns::challenge_name(&a.identifier.value))
-                        .await;
+                let name = dns::challenge_name(&a.identifier.value);
+                let fqdn = dns::query::follow_cname(resolver, &name).await;
+                // CNAME으로 따라간 이름도 스펙 `zones`(있으면) 안이어야 한다 — 다른 영역의 TXT를 건드리지 않게.
+                let zones = &provider_spec.spec.zones;
+                if fqdn != name && !zones.is_empty() && dns::longest_zone(&fqdn, zones).is_none() {
+                    return Err(AcmeError::Invalid(format!(
+                        "{name} is a CNAME to {fqdn}, which is outside the zones of acme-dns {dns_name}"
+                    )));
+                }
                 let value = super::jws::dns01_value(&client.key().key_authorization(&c.token));
                 by_name.entry(fqdn).or_default().push(value);
                 out.challenges.push(c.url.clone());
@@ -490,6 +541,17 @@ async fn issue(
     } else {
         0.0
     };
+    let warning = match cert.spec.renew {
+        opl_types::acme::RenewPolicy::DaysBefore { days }
+            if !ari::days_before_fits(days, leaf.not_before, leaf.not_after) =>
+        {
+            Some(format!(
+                "renew.days ({days}) is not shorter than this certificate's lifetime ({} days); renewing when a third of it is left",
+                (leaf.not_after - leaf.not_before) / 86_400
+            ))
+        }
+        _ => None,
+    };
     let issued = IssuedCert {
         serial: leaf.serial,
         not_before: leaf.not_before,
@@ -505,7 +567,9 @@ async fn issue(
             jitter,
         ),
         key: cert.spec.key,
-        error: None,
+        error: warning,
+        // 창을 받지 못했으면(CA에 ARI가 없음·AKI 없음) 하루 동안 다시 묻지 않는다.
+        ari_checked_at: ari.is_none().then(now),
     };
     Ok((issued, Some(key.serialize_pem())))
 }
@@ -540,9 +604,12 @@ pub async fn run(
     match result {
         Ok((issued, key_pem)) => {
             let key_pem = key_pem.unwrap_or_default();
-            // 노드마다: 키를 먼저 디스크에(끼우는 쪽은 status가 바뀌면 키 파일과 사슬을 함께 읽는다).
-            if let (Some(_), Some(dir)) = (target.node, &state.acme.key_dir) {
-                write_key(&key_path(dir, certificate), &key_pem).map_err(|e| e.to_string())?;
+            // 노드마다: 키를 먼저 디스크에 — 새 일련번호의 파일이라 지금 끼운 사슬(옛 일련번호)의 키는 그대로다. 끼우는 쪽은
+            // status 사슬의 일련번호로 키 파일을 고른다.
+            let key_dir = target.node.and(state.acme.key_dir.as_deref());
+            if let Some(dir) = key_dir {
+                write_key(&key_path(dir, certificate, &issued.serial), &key_pem)
+                    .map_err(|e| e.to_string())?;
             }
             let summary = format!(
                 "issued serial {} for {} (valid until {})",
@@ -551,7 +618,7 @@ pub async fn run(
                 super::fmt_time(issued.not_after)
             );
             let shared = target.node.is_none();
-            modify_status(cluster, certificate, |s| {
+            let committed = modify_status(cluster, certificate, |s| {
                 match target.node {
                     Some(n) => {
                         s.nodes.insert(n, issued.clone());
@@ -562,11 +629,20 @@ pub async fn run(
                     }
                 }
                 s.orders.remove(&key_slot);
-                s.failures = 0;
-                s.next_attempt_at = None;
-                s.error = None;
+                s.record_success(target.node);
             })
-            .await?;
+            .await;
+            match (committed, key_dir) {
+                (Ok(()), Some(dir)) => remove_keys(dir, certificate, Some(&issued.serial)),
+                (Err(e), dir) => {
+                    // 적지 못했다: 새 키는 쓸 데가 없다(다음 주문이 새로 받는다).
+                    if let Some(dir) = dir {
+                        let _ = std::fs::remove_file(key_path(dir, certificate, &issued.serial));
+                    }
+                    return Err(e);
+                }
+                _ => {}
+            }
             state.audit.record(crate::audit::system_entry(
                 "acme.order",
                 opl_types::audit::AuditTarget {
@@ -584,13 +660,24 @@ pub async fn run(
             Ok(Some(summary))
         }
         Err(e) => {
-            let message = e.to_string();
+            // 노드마다면 어느 노드의 실패인지 붙인다(요약 `error`·경보 알림에 보인다).
+            let message = match target.node {
+                Some(n) => {
+                    let name = cluster
+                        .get::<NodeSpec>(n)
+                        .ok()
+                        .flatten()
+                        .map_or_else(|| n.to_string(), |n| n.name);
+                    format!("{name}: {e}")
+                }
+                None => e.to_string(),
+            };
             let wait = e.retry_after().map(|s| s as i64);
             let keep_order = matches!(e, AcmeError::Http(_));
             let failed = modify_status(cluster, certificate, |s| {
-                s.failures = s.failures.saturating_add(1);
-                s.next_attempt_at = Some(now() + wait.unwrap_or_else(|| backoff(s.failures)));
-                s.error = Some(message.clone());
+                s.record_failure(target.node, message.clone(), now(), |n| {
+                    wait.unwrap_or_else(|| backoff(n))
+                });
                 if !keep_order {
                     s.orders.remove(&key_slot);
                 }
@@ -616,5 +703,26 @@ mod tests {
         assert_eq!(backoff(8), 6 * 3600);
         assert_eq!(backoff(100), 6 * 3600);
         assert_eq!(backoff(0), 300);
+    }
+
+    /// 리뷰 1: 새 키는 새 일련번호의 파일이고, 적은 뒤에야 옛 키를 지운다.
+    #[test]
+    fn key_files_per_serial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (c, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        write_key(&key_path(dir.path(), c, "aa"), "old").unwrap();
+        write_key(&key_path(dir.path(), c, "bb"), "new").unwrap();
+        write_key(&key_path(dir.path(), other, "aa"), "x").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(key_path(dir.path(), c, "aa")).unwrap(),
+            "old",
+            "writing the new key keeps the installed one"
+        );
+        remove_keys(dir.path(), c, Some("bb"));
+        assert!(!key_path(dir.path(), c, "aa").exists());
+        assert!(key_path(dir.path(), c, "bb").exists());
+        assert!(key_path(dir.path(), other, "aa").exists());
+        remove_keys(dir.path(), other, None);
+        assert!(!key_path(dir.path(), other, "aa").exists());
     }
 }

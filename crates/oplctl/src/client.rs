@@ -322,13 +322,19 @@ pub async fn fetch_ca(server: &str) -> anyhow::Result<String> {
     String::from_utf8(body).context("the cluster CA is not valid UTF-8")
 }
 
-/// 인증서(PEM)의 SHA-256 지문(`sha256:<16진수>`)
+/// 인증서(PEM)의 SHA-256 지문(`sha256:<16진수>`). 인증서가 꼭 하나여야 한다: TLS는 PEM의 인증서를
+/// 모두 믿으므로, 첫 것만 지문을 보면 중간자가 공개된 클러스터 CA 뒤에 제 CA를 붙일 수 있다.
 pub fn fingerprint(pem: &str) -> anyhow::Result<String> {
     use rustls_pki_types::CertificateDer;
     use rustls_pki_types::pem::PemObject;
     use sha2::{Digest, Sha256};
-    let der = CertificateDer::from_pem_slice(pem.as_bytes())
+    let mut certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("invalid certificate: {e}"))?;
+    if certs.len() != 1 {
+        bail!("the cluster CA must be exactly one certificate");
+    }
+    let der = certs.remove(0);
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(&der))))
 }
 
@@ -420,6 +426,9 @@ mod tests {
     #[test]
     fn fingerprint_rejects_garbage() {
         assert!(fingerprint("not a pem").is_err());
+        // 인증서 묶음은 받지 않는다(리뷰 1: 첫 것만 고정하면 나머지도 믿게 된다).
+        let bundle = cert_pem("a.example") + &cert_pem("evil.example");
+        assert!(fingerprint(&bundle).is_err());
     }
 
     /// 어떤 요청에도 `body`(JSON)로 답하는 HTTP 서버의 주소

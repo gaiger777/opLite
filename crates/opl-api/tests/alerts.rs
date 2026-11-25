@@ -1543,6 +1543,21 @@ async fn certificate_alerts_follow_expiry_and_renew_failures() {
     cert.status.failures = 3;
     cert.status.error = Some("the CA could not connect: refused".into());
     rig.env.cluster.create(&cert).await.unwrap();
+    // 노드마다 인증서: 노드마다 센 실패 — 알림이 그 노드를 적는다(리뷰 1).
+    let spec: CertificateSpec =
+        serde_json::from_value(json!({ "account": "le", "names": ["{node}.example.com"],
+        "challenge": { "kind": "http01" } }))
+        .unwrap();
+    let mut per: Certificate = Resource::new("per", spec);
+    for _ in 0..2 {
+        per.status.record_failure(
+            Some(rig.env.node),
+            "node1: no answer at port 80".into(),
+            0,
+            |_| 300,
+        );
+    }
+    rig.env.cluster.create(&per).await.unwrap();
     // 30일 남은 내부 노드 인증서
     let (node_pem, _) = common::acme::TestCa::new("node CA").issue(&["node1"]);
     let hv: Arc<dyn Hypervisor> = rig.env.hv.clone();
@@ -1563,12 +1578,19 @@ async fn certificate_alerts_follow_expiry_and_renew_failures() {
             sender: fast_sender(),
         },
     );
-    let hits = rig.hook.wait(2).await;
+    let hits = rig.hook.wait(3).await;
     let texts: Vec<String> = hits.iter().map(|h| h.json().to_string()).collect();
     assert!(
         texts
             .iter()
             .any(|t| t.contains("\"rule\":\"renewal\"") && t.contains("failed 3 ACME orders")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("on 1 node(s)")
+                && t.contains("2 in a row: node1: no answer at port 80")),
         "{texts:?}"
     );
     assert!(

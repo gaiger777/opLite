@@ -60,7 +60,7 @@ func (p *orbivisor) Schema(_ context.Context, _ provider.SchemaRequest, resp *pr
 			},
 			"ca_fingerprint": schema.StringAttribute{
 				Optional:            true,
-				MarkdownDescription: "Pin the cluster CA by its fingerprint `sha256:<hex>` (or `OPL_CA_FINGERPRINT`): without `ca_pem` the CA is read from the server and accepted only with this fingerprint.",
+				MarkdownDescription: "Pin the cluster CA by its fingerprint `sha256:<hex>` (or `OPL_CA_FINGERPRINT`): without `ca_pem` the CA is read from the server and accepted only with this fingerprint. The CA (read or `ca_pem`) must then be exactly one certificate.",
 			},
 			"timeout": schema.StringAttribute{
 				Optional:            true,

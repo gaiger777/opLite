@@ -313,7 +313,7 @@ provider "orbivisor" {
 ```
 
 - **공급자 칸.** `endpoint`(`OPL_SERVER`), `api_token`(`OPL_TOKEN`), `ca_pem`(`OPL_CA_PEM` — 클러스터 CA, 비우면 시스템 루트: ACME
-  인증서일 때), `ca_fingerprint`(`OPL_CA_FINGERPRINT` — `ca_pem` 없이 서버의 CA를 받아 이 지문일 때만 믿는다), `timeout`(적용·지우기
+  인증서일 때), `ca_fingerprint`(`OPL_CA_FINGERPRINT` — `ca_pem` 없이 서버의 CA를 받아 이 지문일 때만 믿는다 — 그때 CA는 인증서 하나여야 한다), `timeout`(적용·지우기
   하나의 Task를 기다리는 한도, Go 기간, 기본 `20m`), `force_conflicts`(적용 묶음이 관리하는 객체를 넘겨받음 — 아니면
   `managed_elsewhere` 오류). 머리 `Orbivisor-Client: terraform/{판}`이라 설정 기록의 출처가 `terraform`이다.
 - **리소스 열다섯.** `orbivisor_folder`, `orbivisor_network`, `orbivisor_router`, `orbivisor_floating_ip`, `orbivisor_security_group`,

@@ -35,8 +35,6 @@ use opl_types::vm::Arch;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-/// 만드는 admin 사용자의 비밀번호(웹 데모에서 로그인)
-const ADMIN_PASSWORD: &str = "devserver-admin";
 /// 기다리는 한도(리더 뽑기)
 const WAIT: Duration = Duration::from_secs(30);
 /// NFS 풀을 마운트할 자리(쓰지 않는다)
@@ -50,9 +48,12 @@ struct Args {
     /// 받을 포트(0이면 빈 포트)
     #[arg(long, default_value_t = 0)]
     port: u16,
-    /// 받을 주소
+    /// 받을 주소(루프백만 — 다른 주소는 `--insecure-expose`가 있어야 한다)
     #[arg(long, default_value = "127.0.0.1")]
     address: std::net::IpAddr,
+    /// 루프백이 아닌 주소에서도 받는다(같은 네트워크의 누구나 admin 로그인 화면에 닿는다)
+    #[arg(long)]
+    insecure_expose: bool,
     /// 상태 디렉터리(없으면 임시 디렉터리를 만들고 끝날 때 지운다)
     #[arg(long)]
     dir: Option<PathBuf>,
@@ -323,11 +324,23 @@ fn node_resource(id: Uuid) -> Resource<NodeSpec, NodeStatus> {
     me
 }
 
+/// 루프백이 아닌 주소는 `--insecure-expose`가 있을 때만
+fn check_address(address: std::net::IpAddr, insecure_expose: bool) -> anyhow::Result<()> {
+    if !address.is_loopback() && !insecure_expose {
+        anyhow::bail!(
+            "--address {address} is not a loopback address; this development server gives admin access to anyone who \
+             can reach it — pass --insecure-expose to listen there anyway"
+        );
+    }
+    Ok(())
+}
+
 /// 클러스터 정보·admin·풀 `local`·`backup`(준비됨)·세운 것처럼 적은 SDN·ACME 계정 `dev`(CA에 등록하지 않은 채 — 인증서 리소스를 만들 수 있게)를 심는다.
 async fn seed(
     cluster: &Cluster,
     node: Uuid,
     dir: &Path,
+    password: &str,
 ) -> anyhow::Result<opl_peer::pki::ClusterCa> {
     cluster.create(&node_resource(node)).await?;
     let ca = opl_peer::pki::ClusterCa::generate("devserver")?;
@@ -344,7 +357,7 @@ async fn seed(
         .create(&Resource::new(
             "admin",
             UserSpec {
-                password_hash: hash_password(ADMIN_PASSWORD.into())
+                password_hash: hash_password(password.into())
                     .await
                     .map_err(|e| anyhow::anyhow!("cannot hash the password: {}", e.message))?,
                 role: Role::Admin,
@@ -404,13 +417,13 @@ async fn seed(
 }
 
 /// 로그인해 admin API 토큰을 만든다.
-async fn admin_token(url: &str, ca_pem: &str) -> anyhow::Result<String> {
+async fn admin_token(url: &str, ca_pem: &str, password: &str) -> anyhow::Result<String> {
     let http = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes())?)
         .build()?;
     let resp = http
         .post(format!("{url}/api/v1/auth/login"))
-        .json(&json!({ "username": "admin", "password": ADMIN_PASSWORD }))
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await?
         .error_for_status()?;
@@ -455,6 +468,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    check_address(args.address, args.insecure_expose)?;
+    // admin 비밀번호는 실행마다 무작위(연결 정보 줄에 찍는다 — 웹 데모에서 로그인)
+    let password = Uuid::new_v4().simple().to_string();
     let (dir, _cleanup) = match args.dir {
         Some(d) => {
             std::fs::create_dir_all(&d)?;
@@ -488,7 +504,7 @@ async fn main() -> anyhow::Result<()> {
         .metrics(|m| m.state == ServerState::Leader, "leader")
         .await?;
     let node = id.0;
-    let ca = seed(&cluster, node, &dir).await?;
+    let ca = seed(&cluster, node, &dir, &password).await?;
 
     let hv: Arc<dyn Hypervisor> = Arc::new(MockHypervisor::default());
     let reconciler = Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config(node));
@@ -537,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     });
-    let token = admin_token(&url, &ca.cert_pem).await?;
+    let token = admin_token(&url, &ca.cert_pem, &password).await?;
     println!(
         "{}",
         json!({
@@ -545,7 +561,7 @@ async fn main() -> anyhow::Result<()> {
             "token": token,
             "ca_pem": ca.cert_pem,
             "ca_fingerprint": opl_peer::pki::fingerprint(&ca.cert_pem)?,
-            "admin_password": ADMIN_PASSWORD,
+            "admin_password": password,
             "node": node,
             "dir": dir,
         })
@@ -571,4 +587,18 @@ async fn main() -> anyhow::Result<()> {
     runner.shutdown().await;
     drop(reconciler);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_loopback_without_the_flag() {
+        assert!(check_address("127.0.0.1".parse().unwrap(), false).is_ok());
+        assert!(check_address("::1".parse().unwrap(), false).is_ok());
+        assert!(check_address("0.0.0.0".parse().unwrap(), false).is_err());
+        assert!(check_address("192.168.0.5".parse().unwrap(), false).is_err());
+        assert!(check_address("0.0.0.0".parse().unwrap(), true).is_ok());
+    }
 }

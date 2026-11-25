@@ -1,5 +1,6 @@
-//! PowerDNS 권한 서버 HTTP API: 영역 목록에서 가장 긴 접미사를 고르고 `PATCH /api/v1/servers/{id}/zones/{zone}`로 rrset을
-//! 바꾼다(`REPLACE`·`DELETE`).
+//! PowerDNS 권한 서버 HTTP API: 영역 목록에서 가장 긴 접미사를 고르고, 지금 TXT rrset을 읽어(`GET …/zones/{zone}`)
+//! 우리 값만 더하거나 뺀 것을 `PATCH /api/v1/servers/{id}/zones/{zone}`로 쓴다(`REPLACE` — 다 비면 `DELETE`). 다른 TXT
+//! 값(다른 주문·SPF 등)은 그대로 둔다. 읽기와 쓰기 사이는 원자적이지 않다(PowerDNS API에 조건부 쓰기가 없다).
 
 use serde_json::{Value, json};
 
@@ -62,6 +63,19 @@ impl PowerDns {
         Ok(())
     }
 
+    /// 지금 `fqdn`의 TXT rrset(ttl, 레코드들 — PowerDNS 그대로)
+    async fn current(&self, zone: &str, fqdn: &str) -> Result<Option<(u64, Vec<Value>)>, String> {
+        let name = format!("{}.", fqdn.trim_end_matches('.'));
+        let v = read_json(
+            http()?
+                .get(format!("{}/zones/{zone}", self.base()))
+                .query(&[("rrset_name", name.as_str()), ("rrset_type", "TXT")])
+                .header("X-API-Key", &self.api_key),
+        )
+        .await?;
+        Ok(find_rrset(&v, &name))
+    }
+
     pub async fn add(
         &self,
         fqdn: &str,
@@ -69,24 +83,79 @@ impl PowerDns {
         zones: &[String],
     ) -> Result<String, String> {
         let zone = self.zone(fqdn, zones).await?;
-        let records: Vec<Value> = values
-            .iter()
-            .map(|v| json!({ "content": format!("\"{v}\""), "disabled": false }))
-            .collect();
+        let name = format!("{}.", fqdn.trim_end_matches('.'));
+        let (ttl, mut records) = self.current(&zone, fqdn).await?.unwrap_or((60, Vec::new()));
+        for c in quoted(values) {
+            if !records.iter().any(|r| r["content"] == c.as_str()) {
+                records.push(json!({ "content": c, "disabled": false }));
+            }
+        }
         self.patch(
             &zone,
-            json!({ "name": format!("{}.", fqdn.trim_end_matches('.')), "type": "TXT", "ttl": 60,
-                    "changetype": "REPLACE", "records": records }),
+            json!({ "name": name, "type": "TXT", "ttl": ttl, "changetype": "REPLACE", "records": records }),
         )
         .await?;
         Ok(zone)
     }
 
-    pub async fn remove(&self, zone: &str, fqdn: &str) -> Result<(), String> {
-        self.patch(
-            zone,
-            json!({ "name": format!("{}.", fqdn.trim_end_matches('.')), "type": "TXT", "changetype": "DELETE" }),
-        )
-        .await
+    pub async fn remove(&self, zone: &str, fqdn: &str, values: &[String]) -> Result<(), String> {
+        let name = format!("{}.", fqdn.trim_end_matches('.'));
+        let Some((ttl, records)) = self.current(zone, fqdn).await? else {
+            return Ok(());
+        };
+        let ours = quoted(values);
+        let kept: Vec<Value> = records
+            .iter()
+            .filter(|r| !ours.iter().any(|c| r["content"] == c.as_str()))
+            .cloned()
+            .collect();
+        if kept.len() == records.len() {
+            return Ok(());
+        }
+        let rrset = if kept.is_empty() {
+            json!({ "name": name, "type": "TXT", "changetype": "DELETE" })
+        } else {
+            json!({ "name": name, "type": "TXT", "ttl": ttl, "changetype": "REPLACE", "records": kept })
+        };
+        self.patch(zone, rrset).await
+    }
+}
+
+fn quoted(values: &[String]) -> Vec<String> {
+    values.iter().map(|v| format!("\"{v}\"")).collect()
+}
+
+/// 영역 JSON에서 `name`(끝 점 포함)의 TXT rrset
+pub fn find_rrset(zone: &Value, name: &str) -> Option<(u64, Vec<Value>)> {
+    zone["rrsets"].as_array()?.iter().find_map(|r| {
+        (r["type"] == "TXT"
+            && r["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .then(|| {
+            (
+                r["ttl"].as_u64().unwrap_or(60),
+                r["records"].as_array().cloned().unwrap_or_default(),
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_txt_rrset() {
+        let zone = json!({ "rrsets": [
+            { "name": "_acme-challenge.a.example.com.", "type": "A", "ttl": 1, "records": [] },
+            { "name": "_ACME-challenge.a.example.com.", "type": "TXT", "ttl": 300,
+              "records": [{ "content": "\"keep\"", "disabled": false }] }
+        ]});
+        let (ttl, records) = find_rrset(&zone, "_acme-challenge.a.example.com.").unwrap();
+        assert_eq!(ttl, 300);
+        assert_eq!(records[0]["content"], "\"keep\"");
+        assert!(find_rrset(&zone, "_acme-challenge.b.example.com.").is_none());
+        assert!(find_rrset(&json!({}), "x.").is_none());
     }
 }

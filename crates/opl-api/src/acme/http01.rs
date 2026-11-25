@@ -1,7 +1,9 @@
 //! HTTP-01 리스너(계획 73 §11.3 — opld `[api] http_listen`, 기본 꺼짐). 하는 일은 둘뿐이다:
 //! `GET /.well-known/acme-challenge/{token}` → 인증서 status `challenges`의 `key_authorization`(Raft — 이름이 어느 노드를
 //! 가리켜도 답한다, 없으면 404), 그 밖은 설정 `acme.http_redirect`면 `308 https://{Host}:{API 포트}{경로}`, 아니면 404.
-//! 손으로 짠 HTTP/1.1이다 — 본문을 읽지 않고, 요청 머리 8 KiB·연결당 한 요청(`Connection: close`)·10초·초당 100 요청.
+//! 손으로 짠 HTTP/1.1이다 — 본문을 읽지 않고, 요청 머리 8 KiB·연결당 한 요청(`Connection: close`)·10초. 초당 100 요청
+//! 한도는 도전 경로가 아닌 요청(리다이렉트·404)에만 건다 — 도전 답은 메모리 조회뿐이고, 한도로 막으면 아무나 CA 검증을
+//! 503으로 떨어뜨릴 수 있다.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -20,7 +22,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 256;
 const RATE_PER_SEC: u32 = 100;
 
-/// 초당 요청 수 한도(노드 전체)
+/// 도전 경로가 아닌 요청의 초당 한도(노드 전체)
 struct Rate {
     window: Instant,
     used: u32,
@@ -65,7 +67,11 @@ fn parse_head(head: &str) -> Option<(&str, &str, Option<&str>)> {
     let method = first.next()?;
     let target = first.next()?;
     let version = first.next()?;
-    if !version.starts_with("HTTP/1.") || !target.starts_with('/') {
+    // 경로는 보이는 ASCII만(리다이렉트 `Location`에 그대로 싣는다 — 맨 LF·제어 글자로 머리를 끼워 넣지 못하게)
+    if !version.starts_with("HTTP/1.")
+        || !target.starts_with('/')
+        || !target.bytes().all(|c| (0x21..=0x7e).contains(&c))
+    {
         return None;
     }
     let host = lines.find_map(|l| {
@@ -141,24 +147,17 @@ pub fn respond(cluster: &Cluster, https_port: u16, head: &str) -> Vec<u8> {
     }
 }
 
+/// 도전 경로 요청인가(한도에서 뺀다)
+fn is_challenge(head: &str) -> bool {
+    parse_head(head).is_some_and(|(_, target, _)| target.starts_with(CHALLENGE_PREFIX))
+}
+
 async fn serve_one(
     mut stream: TcpStream,
     cluster: Arc<Cluster>,
     https_port: u16,
     rate: Arc<Mutex<Rate>>,
 ) {
-    let allowed = rate.lock().unwrap_or_else(|e| e.into_inner()).allow();
-    if !allowed {
-        let _ = stream
-            .write_all(&response(
-                "503 Service Unavailable",
-                &[("Retry-After", "1")],
-                "",
-                false,
-            ))
-            .await;
-        return;
-    }
     let read = async {
         let mut buf = Vec::with_capacity(1024);
         let mut chunk = [0u8; 1024];
@@ -183,6 +182,13 @@ async fn serve_one(
     };
     let reply = if head.is_empty() {
         response("431 Request Header Fields Too Large", &[], "", false)
+    } else if !is_challenge(&head) && !rate.lock().unwrap_or_else(|e| e.into_inner()).allow() {
+        response(
+            "503 Service Unavailable",
+            &[("Retry-After", "1")],
+            "",
+            false,
+        )
     } else {
         respond(&cluster, https_port, &head)
     };
@@ -266,6 +272,15 @@ mod tests {
         );
         assert_eq!(parse_head("GET abc HTTP/1.1"), None);
         assert_eq!(parse_head("garbage"), None);
+        // 리뷰 1: 맨 LF·제어 글자·공백 아닌 보이지 않는 글자가 든 경로는 400(Location에 실리지 않게)
+        assert_eq!(parse_head("GET /a\nSet-Cookie:x HTTP/1.1"), None);
+        assert_eq!(parse_head("GET /a\tb HTTP/1.1"), None);
+        assert_eq!(parse_head("GET /a\u{7f} HTTP/1.1"), None);
+        assert!(parse_head("GET /a?b=%0d%0a HTTP/1.1").is_some());
+        assert!(is_challenge(
+            "GET /.well-known/acme-challenge/x HTTP/1.1\r\nHost: a"
+        ));
+        assert!(!is_challenge("GET /other HTTP/1.1\r\nHost: a"));
         assert_eq!(host_name("a.example.com:80"), Some("a.example.com"));
         assert_eq!(host_name("[fd00::1]:80"), Some("[fd00::1]"));
         assert_eq!(host_name("evil.com/x"), None);

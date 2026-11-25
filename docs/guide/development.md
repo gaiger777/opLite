@@ -434,7 +434,8 @@ govulncheck, 단위 시험과 스키마 맞춤(`TestSchemasMatchTheServer` — `
 수용 시험의 `TestMain`이 `OPL_DEVSERVER`의 `opl-devserver`를 `--exit-on-stdin-eof`로 띄우고, terraform 실행 파일은
 `TF_ACC_TERRAFORM_PATH`(OpenTofu면 `TF_ACC_PROVIDER_HOST=registry.opentofu.org`도)로 준다. `opl-devserver`는 메모리 스토리지 노드 하나
 (풀 `local`·`backup`, SDN을 세운 것처럼 적음 — OVN 없음, ACME 계정 `dev` — CA에 등록하지 않음, 노드 기능 모두와 `http01`)를 클러스터 CA가
-서명한 HTTPS(127.0.0.1)로 띄우고 `{"url","token","ca_pem","ca_fingerprint","admin_password","node","dir"}` 한 줄을 찍는다. 스키마를 바꾸면
+서명한 HTTPS(127.0.0.1)로 띄우고 `{"url","token","ca_pem","ca_fingerprint","admin_password","node","dir"}` 한 줄을 찍는다(admin 비밀번호는
+실행마다 무작위, `--address`는 루프백만 — 다른 주소는 `--insecure-expose`가 있어야 한다). 스키마를 바꾸면
 `terraform/docs/`를 `tfplugindocs`로 다시 만든다(명령은 `terraform/main.go` 머리). CI **`terraform`** 작업(행렬 terraform 1.17.2·tofu 1.13.9,
 SHA-256 핀, setup-go 1.26.11, staticcheck v0.8.2, govulncheck v1.9.0)이 `opl-devserver`·OpenAPI를 cargo로 만들고 위 검사 전부와 수용 시험을
 돌린다.

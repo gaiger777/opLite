@@ -39,7 +39,7 @@ variable "orbivisor_token" {
 ### Optional
 
 - `api_token` (String, Sensitive) API token (or `OPL_TOKEN`). Make one with `orbivisorctl token create`.
-- `ca_fingerprint` (String) Pin the cluster CA by its fingerprint `sha256:<hex>` (or `OPL_CA_FINGERPRINT`): without `ca_pem` the CA is read from the server and accepted only with this fingerprint.
+- `ca_fingerprint` (String) Pin the cluster CA by its fingerprint `sha256:<hex>` (or `OPL_CA_FINGERPRINT`): without `ca_pem` the CA is read from the server and accepted only with this fingerprint. The CA (read or `ca_pem`) must then be exactly one certificate.
 - `ca_pem` (String) Cluster CA certificate (PEM) the API certificate is checked against (or `OPL_CA_PEM`). Empty: the system roots (an ACME certificate).
 - `endpoint` (String) API URL, e.g. `https://node1:8006` (or `OPL_SERVER`).
 - `force_conflicts` (Boolean) Take over objects an apply set (`orbivisorctl apply --set`) manages instead of failing with `managed_elsewhere`.

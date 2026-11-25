@@ -148,3 +148,42 @@ func TestFingerprintPin(t *testing.T) {
 		t.Fatal("bad endpoint accepted")
 	}
 }
+
+// A man in the middle serving the public cluster CA plus its own CA must not pass the pin (review 1).
+func TestFingerprintPinRejectsABundle(t *testing.T) {
+	_, realCA := newTLS(t, func(w http.ResponseWriter, r *http.Request) {})
+	var sent atomic.Bool
+	var evilCA string
+	evil, evilPEM := newTLS(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/cluster/ca" {
+			_, _ = io.WriteString(w, realCA+evilCA)
+			return
+		}
+		if r.Header.Get("Authorization") != "" {
+			sent.Store(true)
+		}
+		_, _ = io.WriteString(w, `{"items":[]}`)
+	})
+	evilCA = evilPEM
+	pin, err := Fingerprint(realCA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Config{Endpoint: evil.URL, Token: "secret-token", CAFingerprint: pin})
+	if err == nil {
+		_ = c.Get(context.Background(), "/nodes", &map[string]any{})
+		t.Fatalf("bundle passed the pin (token sent: %v)", sent.Load())
+	}
+	if !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("error %v", err)
+	}
+	// The same for a user-supplied ca_pem bundle.
+	if _, err := New(Config{Endpoint: evil.URL, CAPEM: realCA + evilCA, CAFingerprint: pin}); err == nil {
+		t.Fatal("ca_pem bundle passed the pin")
+	}
+	for _, bad := range []string{realCA + "junk", strings.Replace(realCA, "CERTIFICATE", "PRIVATE KEY", 2), ""} {
+		if _, err := Fingerprint(bad); err == nil {
+			t.Fatalf("Fingerprint accepted %q", bad)
+		}
+	}
+}

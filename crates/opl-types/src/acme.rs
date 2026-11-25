@@ -582,16 +582,110 @@ pub struct CertificateStatus {
     /// 진행 중 주문 URL(열쇠 = 노드 id 또는 `shared` — Task가 다시 떠도 새 주문 대신 이어 본다)
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub orders: BTreeMap<String, String>,
-    /// 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+    /// 다음 주문을 해도 되는 때(유닉스 초, 물러서기). 공유 인증서만 쓴다(노드마다는 `node_failures`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub next_attempt_at: Option<i64>,
-    /// 이어진 실패 수
+    /// 이어진 실패 수. 노드마다 인증서면 가장 많이 실패한 노드의 수(요약)
     #[serde(skip_serializing_if = "is_zero")]
     pub failures: u32,
+    /// 마지막 오류. 노드마다 인증서면 가장 많이 실패한 노드의 것(`노드 이름: …`, 요약)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub error: Option<String>,
+    /// 노드마다 인증서의 노드별 실패(노드 id → 실패 수·물러서기·오류). 한 노드의 실패가 다른 노드의 주문을 막거나 다른
+    /// 노드의 성공이 그 실패를 지우지 않게 따로 센다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_failures: BTreeMap<Uuid, SlotFailure>,
+}
+
+/// 노드 하나의 이어진 주문 실패
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SlotFailure {
+    pub failures: u32,
+    /// 다음 주문을 해도 되는 때(유닉스 초)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub next_attempt_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub error: Option<String>,
+}
+
+impl CertificateStatus {
+    /// `node`(공유면 None)가 물러서는 중인가
+    pub fn backing_off(&self, node: Option<Uuid>, now: i64) -> bool {
+        let at = match node {
+            None => self.next_attempt_at,
+            Some(n) => self.node_failures.get(&n).and_then(|f| f.next_attempt_at),
+        };
+        at.is_some_and(|t| t > now)
+    }
+
+    /// 주문 실패를 적는다. `wait`는 새 실패 수로 다음 주문까지의 초를 정한다.
+    pub fn record_failure(
+        &mut self,
+        node: Option<Uuid>,
+        error: String,
+        now: i64,
+        wait: impl FnOnce(u32) -> i64,
+    ) {
+        match node {
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                self.next_attempt_at = Some(now + wait(self.failures));
+                self.error = Some(error);
+            }
+            Some(n) => {
+                let f = self.node_failures.entry(n).or_default();
+                f.failures = f.failures.saturating_add(1);
+                f.next_attempt_at = Some(now + wait(f.failures));
+                f.error = Some(error);
+                self.summarize_nodes();
+            }
+        }
+    }
+
+    /// 주문 성공: 그 노드(공유면 인증서)의 실패만 지운다.
+    pub fn record_success(&mut self, node: Option<Uuid>) {
+        match node {
+            None => {
+                self.failures = 0;
+                self.next_attempt_at = None;
+                self.error = None;
+            }
+            Some(n) => {
+                self.node_failures.remove(&n);
+                self.summarize_nodes();
+            }
+        }
+    }
+
+    /// 물러서기를 모두 지운다(지금 갱신). 실패 수·오류는 남긴다.
+    pub fn clear_backoff(&mut self) {
+        self.next_attempt_at = None;
+        for f in self.node_failures.values_mut() {
+            f.next_attempt_at = None;
+        }
+    }
+
+    /// `keep`에 없는 노드의 실패를 지운다(노드를 뺐거나 인증서가 더는 덮지 않음).
+    pub fn retain_nodes(&mut self, keep: impl Fn(&Uuid) -> bool) {
+        let before = self.node_failures.len();
+        self.node_failures.retain(|n, _| keep(n));
+        if self.node_failures.len() != before {
+            self.summarize_nodes();
+        }
+    }
+
+    /// 노드마다의 요약(`failures`·`error` — 가장 많이 실패한 노드)
+    fn summarize_nodes(&mut self) {
+        let worst = self.node_failures.values().max_by_key(|f| f.failures);
+        self.failures = worst.map_or(0, |f| f.failures);
+        self.error = worst.and_then(|f| f.error.clone());
+        self.next_attempt_at = None;
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -627,10 +721,14 @@ pub struct IssuedCert {
     #[serde(default, skip_serializing_if = "CertificateKey::is_default")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub key: CertificateKey,
-    /// 끼우지 못한 까닭(이름 빠짐·키 맞지 않음)
+    /// 알릴 것(갱신 정책이 이 인증서의 수명에 맞지 않아 바꾼 것 등)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub error: Option<String>,
+    /// ARI 창 없이 마지막으로 물은 때(CA가 창을 주지 않음·닿지 않음 — 그 뒤 하루(닿지 않았으면 한 시간) 동안 다시 묻지 않는다)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub ari_checked_at: Option<i64>,
 }
 
 /// CA가 알려 준 갱신 창(ARI)
@@ -796,6 +894,7 @@ mod tests {
                 renew_at: 2,
                 key: CertificateKey::EcdsaP256,
                 error: None,
+                ari_checked_at: None,
             }),
             shared_key: Secret::new("-----BEGIN PRIVATE KEY-----"),
             failures: 1,
@@ -814,5 +913,43 @@ mod tests {
             serde_json::to_value(CertificateStatus::default()).unwrap(),
             json!({})
         );
+    }
+
+    /// 리뷰 1: 노드마다 인증서는 노드마다 실패·물러서기를 센다.
+    #[test]
+    fn per_node_failures_are_separate() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut s = CertificateStatus::default();
+        s.record_failure(Some(a), "n1: boom".into(), 100, |n| 300 * i64::from(n));
+        s.record_failure(Some(a), "n1: boom again".into(), 200, |n| {
+            300 * i64::from(n)
+        });
+        assert!(s.backing_off(Some(a), 500));
+        assert!(!s.backing_off(Some(b), 500), "a's backoff must not block b");
+        assert!(!s.backing_off(None, 500));
+        assert_eq!(
+            (s.failures, s.error.as_deref()),
+            (2, Some("n1: boom again"))
+        );
+        // b가 성공해도 a의 실패는 남는다.
+        s.record_success(Some(b));
+        assert_eq!(s.failures, 2);
+        assert!(s.backing_off(Some(a), 500));
+        s.clear_backoff();
+        assert!(!s.backing_off(Some(a), 500));
+        assert_eq!(s.failures, 2, "renew now keeps the count");
+        s.record_success(Some(a));
+        assert_eq!((s.failures, s.error.as_deref()), (0, None));
+        assert!(s.node_failures.is_empty());
+        // 뺀 노드의 실패는 지운다.
+        s.record_failure(Some(b), "n2: x".into(), 0, |_| 1);
+        s.retain_nodes(|n| *n != b);
+        assert_eq!(s.failures, 0);
+        // 공유는 위 칸을 쓴다.
+        s.record_failure(None, "shared".into(), 0, |_| 10);
+        assert_eq!(s.next_attempt_at, Some(10));
+        assert!(s.backing_off(None, 5));
+        s.record_success(None);
+        assert_eq!(serde_json::to_value(&s).unwrap(), json!({}));
     }
 }

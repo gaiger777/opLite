@@ -108,8 +108,14 @@ pub fn chain_root_issuer(pem: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 갱신할 때(유닉스 초): `DaysBefore`면 만료 그 날 전, ARI 창이 있으면 창 안(`jitter`(0~1)로 흩뜨림), 없으면 유효
-/// 기간의 1/3이 남았을 때.
+/// `DaysBefore { days }`가 이 인증서의 수명보다 짧은가. 아니면(예: 6일짜리 `shortlived`에 7일, 45일 인증서에 60일) 받자마자
+/// 갱신할 때가 되어 틱마다 다시 주문하므로 [`renew_at`]은 1/3 규칙으로 바꾼다.
+pub fn days_before_fits(days: u16, not_before: i64, not_after: i64) -> bool {
+    i64::from(days) * 86_400 < (not_after - not_before).max(0)
+}
+
+/// 갱신할 때(유닉스 초): `DaysBefore`면 만료 그 날 전(수명보다 길면 1/3 규칙), ARI 창이 있으면 창 안(`jitter`(0~1)로
+/// 흩뜨림), 없으면 유효 기간의 1/3이 남았을 때.
 pub fn renew_at(
     policy: RenewPolicy,
     not_before: i64,
@@ -118,7 +124,10 @@ pub fn renew_at(
     jitter: f64,
 ) -> i64 {
     match (policy, ari) {
-        (RenewPolicy::DaysBefore { days }, _) => not_after - i64::from(days) * 86_400,
+        (RenewPolicy::DaysBefore { days }, _) if days_before_fits(days, not_before, not_after) => {
+            not_after - i64::from(days) * 86_400
+        }
+        (RenewPolicy::DaysBefore { .. }, _) => not_after - (not_after - not_before).max(0) / 3,
         (RenewPolicy::Ari, Some(w)) => {
             let span = (w.end - w.start).max(0) as f64;
             w.start + (span * jitter.clamp(0.0, 1.0)) as i64
@@ -158,6 +167,26 @@ mod tests {
         assert_eq!(renew_at(RenewPolicy::Ari, nb, na, Some(&w), 0.0), 100);
         assert_eq!(renew_at(RenewPolicy::Ari, nb, na, Some(&w), 0.5), 150);
         assert_eq!(renew_at(RenewPolicy::Ari, nb, na, Some(&w), 7.0), 200);
+        // 리뷰 1: 수명 이상의 days는 받자마자 갱신하지 않게 1/3 규칙으로
+        assert_eq!(
+            renew_at(RenewPolicy::DaysBefore { days: 90 }, nb, na, None, 0.5),
+            60 * 86_400
+        );
+        assert_eq!(
+            renew_at(
+                RenewPolicy::DaysBefore { days: 7 },
+                0,
+                6 * 86_400,
+                None,
+                0.5
+            ),
+            4 * 86_400
+        );
+        assert_eq!(
+            renew_at(RenewPolicy::DaysBefore { days: 89 }, nb, na, None, 0.5),
+            86_400
+        );
+        assert!(!days_before_fits(90, nb, na) && days_before_fits(89, nb, na));
     }
 
     #[test]

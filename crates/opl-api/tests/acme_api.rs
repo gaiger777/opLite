@@ -161,8 +161,23 @@ async fn accounts_dns_and_certificates_are_redacted_and_checked() {
             .unwrap()
             .unwrap();
         if c.status.failures >= 1 {
-            assert!(c.status.next_attempt_at.is_some());
-            assert!(c.status.error.is_some());
+            // 노드마다 인증서: 물러서기는 그 노드의 것, 위 칸은 요약(오류에 노드 이름)
+            let f = &c.status.node_failures[&env.node];
+            assert!(f.next_attempt_at.is_some());
+            assert!(c.status.next_attempt_at.is_none());
+            let node = env
+                .cluster
+                .get::<opl_types::node::NodeSpec>(env.node)
+                .unwrap()
+                .unwrap();
+            assert!(
+                c.status
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(&format!("{}: ", node.name))),
+                "{:?}",
+                c.status.error
+            );
             break;
         }
         assert!(Instant::now() < deadline, "the order never failed");
@@ -357,6 +372,7 @@ async fn acme_certificates_are_installed_and_picked_by_sni() {
         renew_at: opl_api_now() + 3600,
         key: Default::default(),
         error: None,
+        ari_checked_at: None,
     };
     // 공유 인증서(키는 Raft)
     let (vip_pem, vip_key) = ca.issue(&["vip.example.com"]);
@@ -373,7 +389,7 @@ async fn acme_certificates_are_installed_and_picked_by_sni() {
     let (node_pem, node_key) = ca.issue(&["node1.example.com"]);
     let node_serial = opl_api::acme::ari::leaf(&node_pem).unwrap().serial;
     std::fs::write(
-        opl_api::acme::order::key_path(keys.path(), uuid::Uuid::nil()),
+        opl_api::acme::order::key_path(keys.path(), uuid::Uuid::nil(), "1"),
         "unused",
     )
     .unwrap();
@@ -383,7 +399,7 @@ async fn acme_certificates_are_installed_and_picked_by_sni() {
         .unwrap();
     let mut per: opl_types::acme::Certificate = opl_types::resource::Resource::new("per", spec);
     std::fs::write(
-        opl_api::acme::order::key_path(keys.path(), per.id),
+        opl_api::acme::order::key_path(keys.path(), per.id, &node_serial),
         node_key,
     )
     .unwrap();
@@ -463,11 +479,20 @@ async fn record(State(seen): State<Seen>, req: Request) -> impl IntoResponse {
         ("GET", "/api/v1/servers/localhost/zones") => {
             axum::Json(json!([{ "name": "example.com." }, { "name": "sub.example.com." }])).into_response()
         }
+        // 다른 쪽이 둔 TXT 값 "keep"(다른 주문·SPF) — 우리 값만 더하고 빼야 한다.
+        ("GET", "/api/v1/servers/localhost/zones/sub.example.com.") => axum::Json(json!({ "rrsets": [
+            { "name": "_acme-challenge.a.sub.example.com.", "type": "TXT", "ttl": 120,
+              "records": [{ "content": "\"keep\"", "disabled": false }] }] })).into_response(),
         ("PATCH", "/api/v1/servers/localhost/zones/sub.example.com.") => StatusCode::NO_CONTENT.into_response(),
         // Route 53
         ("GET", "/2013-04-01/hostedzonesbyname") => (
             StatusCode::OK,
             "<ListHostedZonesByNameResponse><HostedZones><HostedZone><Id>/hostedzone/H1</Id><Name>example.com.</Name></HostedZone></HostedZones></ListHostedZonesByNameResponse>",
+        )
+            .into_response(),
+        ("GET", "/2013-04-01/hostedzone/H1/rrset") => (
+            StatusCode::OK,
+            "<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.a.sub.example.com.</Name><Type>TXT</Type><TTL>120</TTL><ResourceRecords><ResourceRecord><Value>&quot;keep&quot;</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>",
         )
             .into_response(),
         ("POST", "/2013-04-01/hostedzone/H1/rrset") => (
@@ -534,7 +559,7 @@ async fn dns_providers_send_the_right_requests() {
     }
     seen.0.lock().unwrap().clear();
 
-    // PowerDNS: 가장 긴 영역, REPLACE에 값 둘, DELETE
+    // PowerDNS: 가장 긴 영역, 있던 "keep"에 값 둘을 더해 REPLACE, 지울 때는 "keep"만 남겨 REPLACE
     let spec: AcmeDnsSpec = serde_json::from_value(
         json!({ "provider": { "kind": "power_dns", "url": base, "api_key": "K" } }),
     )
@@ -555,8 +580,22 @@ async fn dns_providers_send_the_right_requests() {
             .collect();
         assert_eq!(patches[0]["rrsets"][0]["changetype"], "REPLACE");
         assert_eq!(patches[0]["rrsets"][0]["name"], format!("{fqdn}."));
-        assert_eq!(patches[0]["rrsets"][0]["records"][1]["content"], "\"v2\"");
-        assert_eq!(patches[1]["rrsets"][0]["changetype"], "DELETE");
+        assert_eq!(patches[0]["rrsets"][0]["ttl"], 120);
+        let contents = |p: &Value| -> Vec<String> {
+            p["rrsets"][0]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["content"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(contents(&patches[0]), ["\"keep\"", "\"v1\"", "\"v2\""]);
+        // 지우기: 서버는 아직 "keep"만 돌려주므로(가짜) 우리 값이 없어 아무것도 쓰지 않는다 — 여기서는 읽기만 확인
+        assert_eq!(patches.len(), 1, "nothing of ours to remove: {patches:?}");
+        assert!(
+            s.iter()
+                .any(|r| r.0 == "GET" && r.1.contains("zones/sub.example.com.?rrset_name="))
+        );
     }
     seen.0.lock().unwrap().clear();
 
@@ -568,16 +607,20 @@ async fn dns_providers_send_the_right_requests() {
     let h = p.add(fqdn, &values, &spec.zones).await.unwrap();
     p.remove(fqdn, &values, &h).await.unwrap();
     let s = seen.0.lock().unwrap();
+    // 넣기: 있던 rrset("keep", TTL 120)을 그대로 DELETE하고 우리 값을 더한 것을 CREATE(한 묶음)
     let post = s.iter().find(|r| r.0 == "POST").unwrap();
     assert!(
-        post.3.contains("<Action>UPSERT</Action>") && post.3.contains("&quot;v2&quot;"),
+        post.3.contains("<Action>DELETE</Action>")
+            && post.3.contains("<Action>CREATE</Action>")
+            && post.3.contains("<TTL>120</TTL>")
+            && post.3.matches("&quot;keep&quot;").count() == 2
+            && post.3.contains("&quot;v2&quot;")
+            && !post.3.contains("UPSERT"),
         "{}",
         post.3
     );
-    assert!(
-        s.iter()
-            .any(|r| r.0 == "POST" && r.3.contains("<Action>DELETE</Action>"))
-    );
+    // 지우기: 가짜 서버는 "keep"만 돌려주므로 우리 값이 없어 바꾸지 않는다.
+    assert_eq!(s.iter().filter(|r| r.0 == "POST").count(), 1);
     for (method, uri, headers, body) in s.iter() {
         let get = |k: &str| {
             headers

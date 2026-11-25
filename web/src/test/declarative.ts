@@ -186,6 +186,7 @@ export function certificate(
       failures: 0,
       orders: {},
       nodes: {},
+      node_failures: {},
       next_attempt_at: null as unknown as number,
       error: null as unknown as string,
       shared: {

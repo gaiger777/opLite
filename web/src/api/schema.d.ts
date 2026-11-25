@@ -6383,20 +6383,31 @@ export interface components {
              * @default []
              */
             challenges: components["schemas"]["Http01Answer"][];
-            /** @default null */
+            /**
+             * @description 마지막 오류. 노드마다 인증서면 가장 많이 실패한 노드의 것(`노드 이름: …`, 요약)
+             * @default null
+             */
             error: string;
             /**
              * Format: int32
-             * @description 이어진 실패 수
+             * @description 이어진 실패 수. 노드마다 인증서면 가장 많이 실패한 노드의 수(요약)
              * @default 0
              */
             failures: number;
             /**
              * Format: int64
-             * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+             * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기). 공유 인증서만 쓴다(노드마다는 `node_failures`).
              * @default null
              */
             next_attempt_at: number;
+            /**
+             * @description 노드마다 인증서의 노드별 실패(노드 id → 실패 수·물러서기·오류). 한 노드의 실패가 다른 노드의 주문을 막거나 다른
+             *     노드의 성공이 그 실패를 지우지 않게 따로 센다.
+             * @default {}
+             */
+            node_failures: {
+                [key: string]: components["schemas"]["SlotFailure"];
+            };
             /**
              * @description 노드마다 받은 인증서(노드 id → 인증서)
              * @default {}
@@ -9176,9 +9187,14 @@ export interface components {
         /** @description 받은 인증서 하나. 시각은 유닉스 초다. */
         IssuedCert: {
             ari?: components["schemas"]["AriWindow"];
+            /**
+             * Format: int64
+             * @description ARI 창 없이 마지막으로 물은 때(CA가 창을 주지 않음·닿지 않음 — 그 뒤 하루(닿지 않았으면 한 시간) 동안 다시 묻지 않는다)
+             */
+            ari_checked_at?: number;
             /** @description 사슬(PEM, 공개) */
             chain_pem: string;
-            /** @description 끼우지 못한 까닭(이름 빠짐·키 맞지 않음) */
+            /** @description 알릴 것(갱신 정책이 이 인증서의 수명에 맞지 않아 바꾼 것 등) */
             error?: string;
             /** @description 키 종류(스펙의 `key`가 바뀌면 다시 받는다) */
             key?: components["schemas"]["CertificateKey"];
@@ -10051,20 +10067,31 @@ export interface components {
                      * @default []
                      */
                     challenges: components["schemas"]["Http01Answer"][];
-                    /** @default null */
+                    /**
+                     * @description 마지막 오류. 노드마다 인증서면 가장 많이 실패한 노드의 것(`노드 이름: …`, 요약)
+                     * @default null
+                     */
                     error: string;
                     /**
                      * Format: int32
-                     * @description 이어진 실패 수
+                     * @description 이어진 실패 수. 노드마다 인증서면 가장 많이 실패한 노드의 수(요약)
                      * @default 0
                      */
                     failures: number;
                     /**
                      * Format: int64
-                     * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+                     * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기). 공유 인증서만 쓴다(노드마다는 `node_failures`).
                      * @default null
                      */
                     next_attempt_at: number;
+                    /**
+                     * @description 노드마다 인증서의 노드별 실패(노드 id → 실패 수·물러서기·오류). 한 노드의 실패가 다른 노드의 주문을 막거나 다른
+                     *     노드의 성공이 그 실패를 지우지 않게 따로 센다.
+                     * @default {}
+                     */
+                    node_failures: {
+                        [key: string]: components["schemas"]["SlotFailure"];
+                    };
                     /**
                      * @description 노드마다 받은 인증서(노드 id → 인증서)
                      * @default {}
@@ -13712,7 +13739,7 @@ export interface components {
         };
         /** @description 만든 주문 Task들 */
         RenewStarted: {
-            tasks: components["schemas"]["Resource"][];
+            tasks: components["schemas"]["Resource_TaskSpec_TaskStatus"][];
         };
         /** @description HA가 VM을 복제본으로 다시 켠 마지막 복구(VM `status.last_recovery`). 다음 복구가 덮고, 그 뒤 복제가 성공해도 남는다. */
         ReplicaRecovery: {
@@ -14366,20 +14393,31 @@ export interface components {
                  * @default []
                  */
                 challenges: components["schemas"]["Http01Answer"][];
-                /** @default null */
+                /**
+                 * @description 마지막 오류. 노드마다 인증서면 가장 많이 실패한 노드의 것(`노드 이름: …`, 요약)
+                 * @default null
+                 */
                 error: string;
                 /**
                  * Format: int32
-                 * @description 이어진 실패 수
+                 * @description 이어진 실패 수. 노드마다 인증서면 가장 많이 실패한 노드의 수(요약)
                  * @default 0
                  */
                 failures: number;
                 /**
                  * Format: int64
-                 * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기)
+                 * @description 다음 주문을 해도 되는 때(유닉스 초, 물러서기). 공유 인증서만 쓴다(노드마다는 `node_failures`).
                  * @default null
                  */
                 next_attempt_at: number;
+                /**
+                 * @description 노드마다 인증서의 노드별 실패(노드 id → 실패 수·물러서기·오류). 한 노드의 실패가 다른 노드의 주문을 막거나 다른
+                 *     노드의 성공이 그 실패를 지우지 않게 따로 센다.
+                 * @default {}
+                 */
+                node_failures: {
+                    [key: string]: components["schemas"]["SlotFailure"];
+                };
                 /**
                  * @description 노드마다 받은 인증서(노드 id → 인증서)
                  * @default {}
@@ -16367,6 +16405,17 @@ export interface components {
          * @enum {string}
          */
         ShutdownPolicy: "conditional" | "freeze" | "failover" | "migrate";
+        /** @description 노드 하나의 이어진 주문 실패 */
+        SlotFailure: {
+            error?: string;
+            /** Format: int32 */
+            failures: number;
+            /**
+             * Format: int64
+             * @description 다음 주문을 해도 되는 때(유닉스 초)
+             */
+            next_attempt_at?: number;
+        };
         /** @description 메일(일반 텍스트 본문) */
         SmtpTarget: {
             /** @description 보내는 주소 */

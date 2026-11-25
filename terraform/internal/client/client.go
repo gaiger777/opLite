@@ -141,13 +141,31 @@ func fetchCA(base string) (string, error) {
 	return string(b), err
 }
 
-// Fingerprint is the "sha256:<hex>" fingerprint of the first certificate in pemText.
+// Fingerprint is the "sha256:<hex>" fingerprint of the one certificate in pemText. A bundle of several
+// certificates (or anything besides one CERTIFICATE block) is refused: the TLS pool trusts every
+// certificate it is given, so pinning only the first would let a man in the middle append its own CA
+// to the public cluster CA.
 func Fingerprint(pemText string) (string, error) {
-	block, _ := pem.Decode([]byte(pemText))
-	if block == nil {
+	var der []byte
+	rest := []byte(pemText)
+	for {
+		block, r := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = r
+		if block.Type != "CERTIFICATE" || der != nil {
+			return "", errors.New("must be exactly one PEM certificate")
+		}
+		der = block.Bytes
+	}
+	if der == nil {
 		return "", errors.New("no PEM certificate")
 	}
-	sum := sha256.Sum256(block.Bytes)
+	if len(bytes.TrimSpace(rest)) != 0 {
+		return "", errors.New("must be exactly one PEM certificate (trailing data)")
+	}
+	sum := sha256.Sum256(der)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
