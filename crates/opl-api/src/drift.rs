@@ -24,9 +24,12 @@ use utoipa::ToSchema;
 
 use crate::audit::AuditNote;
 use crate::auth::Principal;
+use crate::authz::Owners;
 use crate::cluster::{missing_feature, require_feature};
 use crate::declarative::diff::diff;
-use crate::declarative::kinds::{Live, World, adapter, check_route, readable, tree_of_doc};
+use crate::declarative::kinds::{
+    Live, World, adapter, check_route, gone_readable, gone_updatable, readable, tree_of_doc,
+};
 use crate::declarative::plan::compare;
 use crate::error::{ApiError, Json};
 use crate::state::AppState;
@@ -421,14 +424,17 @@ fn adopted(declared: &Value, now: &Manifest) -> Value {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdoptRequest {
-    /// 받아들일 객체(`종류/이름` 또는 id). 비면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 객체 모두(밖에서 지운 것 포함)
+    /// 받아들일 객체(`종류/이름` 또는 id). 빼면(`{}`) 드리프트 보고에서 볼 수 있고 바꿀 수 있는 객체 모두(밖에서 지운 것은
+    /// 마지막으로 알던 폴더에서 그럴 수 있는 것). 빈 목록은 400이다(모두가 아니다).
     #[serde(default)]
-    pub objects: Vec<String>,
+    #[schema(nullable = false)]
+    pub objects: Option<Vec<String>>,
 }
 
-/// 실제를 선언으로 받아들인다(§12.5): 고른 객체(없으면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 모두)의 묶음 선언을 지금
-/// 값으로 바꾼다 — 리소스는 바꾸지 않는다. 밖에서 지운 객체는 묶음에서 뺀다. 그 뒤 `orbivisorctl export --set`으로 git의
-/// 파일을 맞춘다. 고른 객체 모두의 바꾸기 권한이 든다(하나라도 없으면 403, 아무것도 바꾸지 않음).
+/// 실제를 선언으로 받아들인다(§12.5): 고른 객체(`objects`를 빼면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 모두)의 묶음
+/// 선언을 지금 값으로 바꾼다 — 리소스는 바꾸지 않는다. 밖에서 지운 객체는 묶음에서 뺀다(마지막 이력 줄의 폴더에서 바꾸기
+/// 권한이 든다). 그 뒤 `orbivisorctl export --set`으로 git의 파일을 맞춘다. 고른 객체 모두의 바꾸기 권한이 든다(하나라도
+/// 없으면 403, 아무것도 바꾸지 않음).
 #[utoipa::path(post, path = "/apply-sets/{key}/adopt", tag = "declarative",
     params(("key" = String, Path, description = "id or name")),
     request_body = AdoptRequest,
@@ -444,6 +450,12 @@ pub async fn adopt(
     state
         .authz
         .require_anywhere(&principal, Privilege::SystemRead)?;
+    if req.objects.as_ref().is_some_and(Vec::is_empty) {
+        return Err(ApiError::bad_request(
+            "objects is empty; leave it out to adopt every drifted object",
+        ));
+    }
+    let owners = Owners::load(&state.cluster)?;
     for _ in 0..5 {
         let set = crate::resources::lookup::<ApplySetSpec>(&state.cluster, &key)?;
         let world = World::load(&state.cluster)?;
@@ -453,7 +465,23 @@ pub async fn adopt(
             .as_ref()
             .map(|d| d.items.iter().map(|i| i.id).collect())
             .unwrap_or_default();
-        let chosen: Vec<&AppliedObject> = if req.objects.is_empty() {
+        let chosen: Vec<&AppliedObject> = if let Some(wanted) = &req.objects {
+            let mut out = Vec::new();
+            for want in wanted {
+                let found = set.status.objects.iter().find(|o| {
+                    o.id.to_string() == *want
+                        || want.split_once('/').is_some_and(|(k, n)| {
+                            n == o.name
+                                && ManifestKind::from_kind(o.kind)
+                                    .is_some_and(|mk| mk.as_str() == k || o.kind.as_str() == k)
+                        })
+                });
+                out.push(found.ok_or_else(|| {
+                    ApiError::not_found(format!("apply set {:?} has no object {want:?}", set.name))
+                })?);
+            }
+            out
+        } else {
             // 모두 = 이 주체가 볼 수 있고 바꿀 수 있는 드리프트 객체(밖에서 지운 것 포함 — 리뷰 1: 폴더 하나만 맡은
             // 운영자도 보이는 것을 모두 받아들인다. 보이지 않는 것은 그대로 둔다)
             set.status
@@ -470,36 +498,32 @@ pub async fn adopt(
                                 && check_route(&state, &principal, a.update_route(), Some(live.id))
                                     .is_ok()
                         }
-                        (_, None) => true,
+                        // 밖에서 지운 것: 마지막으로 알던 폴더에서 볼 수 있고 바꿀 수 있어야(리뷰 2)
+                        (_, None) => {
+                            gone_readable(&state, &principal, &owners, &world, o)
+                                && gone_updatable(&state, &principal, &owners, &world, o)
+                        }
                         (None, Some(_)) => false,
                     }
                 })
                 .collect()
-        } else {
-            let mut out = Vec::new();
-            for want in &req.objects {
-                let found = set.status.objects.iter().find(|o| {
-                    o.id.to_string() == *want
-                        || want.split_once('/').is_some_and(|(k, n)| {
-                            n == o.name
-                                && ManifestKind::from_kind(o.kind)
-                                    .is_some_and(|mk| mk.as_str() == k || o.kind.as_str() == k)
-                        })
-                });
-                out.push(found.ok_or_else(|| {
-                    ApiError::not_found(format!("apply set {:?} has no object {want:?}", set.name))
-                })?);
-            }
-            out
         };
         // 권한 먼저(하나라도 없으면 아무것도 바꾸지 않는다)
         for o in &chosen {
             let Some(kind) = ManifestKind::from_kind(o.kind) else {
                 continue;
             };
-            if let (Some(a), Some(live)) = (adapter(kind), world.by_id(kind, o.id)) {
-                check_route(&state, &principal, a.update_route(), Some(live.id))
-                    .map_err(|_| ApiError::forbidden())?;
+            match (adapter(kind), world.by_id(kind, o.id)) {
+                (Some(a), Some(live)) => {
+                    check_route(&state, &principal, a.update_route(), Some(live.id))
+                        .map_err(|_| ApiError::forbidden())?;
+                }
+                (Some(_), None) => {
+                    if !gone_updatable(&state, &principal, &owners, &world, o) {
+                        return Err(ApiError::forbidden());
+                    }
+                }
+                (None, _) => {}
             }
         }
         let mut status = set.status.clone();

@@ -533,3 +533,13 @@ opld 수용 시험·Terraform·웹 데모가 함께 쓰는 실행 파일(`crates
 - 웹: 갱신 응답 `tasks`의 형 변환(`as unknown as Task`)은 그대로 둔다 — 서버가 `RenewStarted.tasks`를 `Task`로 고쳐 `schema.d.ts`를 다시 만들어도 그대로 컴파일된다(그때 지우면 된다).
 - 합치기: **되돌리기는 spec 전체(위 "본 것"을 고침).** `plan::Request.replace`(되돌리기 둘만 켬)면 바꾸기 단계의 "앞 선언"을 지금 값의 매니페스트 spec 전체(비밀 칸 뺌)로 두어 `forget_dropped`가 문서에 없는 끝 칸을 지운다 — 그 줄에서 기본값이라 빠진 칸(알림 대상 `enabled`, VM `max_memory_mib` 등)이 기본값으로 돌아간다. 타입으로 기본값을 적어 내는 길(왕복)은 `skip_serializing_if`가 다시 빼므로 쓰지 않았다. 비밀 칸은 문서에 없어도 지금 값(그 줄 뒤에 넣은 토큰도 남음), 이름·전원·노드·MAC 같은 서버 칸은 `keep_server_fields`가 그대로 둔다. 적용 묶음의 앞 선언 세 갈래 비교는 되돌리기에서 쓰지 않는다(되돌리기는 묶음 없이 계획한다).
 - 합치기: `RenewStarted.tasks`가 `Task` 형이 되어 웹의 `as unknown as Task` 형 변환을 지웠다. `schema.d.ts`는 세 갈래를 합친 트리에서 다시 만들었다.
+
+### 리뷰 2
+
+- 엔진: **되돌리기의 갈래 바뀜.** `whole_spec`은 비밀 칸의 부모 `kind`(DNS 공급자·알림 대상 종류)가 문서와 지금 값에서 같을 때만 그 지금 비밀을 남긴다 — 다르면 `forget_dropped`가 지워 다른 갈래의 칸(`deny_unknown_fields`)이 남지 않는다. `fill_secrets`는 갈래가 바뀐 객체의 비밀 표시를 지우지 않고 빈 `secretRef`로 두어(필수 비밀이 빠져 문서가 400이 되지 않게) 그 단계만 `secret_missing`으로 막힌다. 같은 갈래에서 지금 비밀이 없는 경우는 전처럼 그 칸을 뺀다.
+- 엔진: **설정 지문은 서버가 쓰는 칸을 뺀다.** `Adapter::server_fields`(VM `node`·`power`, Settings `subscription`·`image_catalog`)를 `Live::config_fingerprint`가 넣지 않는다 — HA 넘기기·옮기기·균형·켜고 끄기가 계획을 412로 낡게 하거나 긴 적용 단계를 깨지 않는다. 적용의 바꾸기 단계는 이미 지금 값(`seen_live`)에 대고 `keep_server_fields`를 다시 돌리므로 PUT이 VM을 옛 노드로 되돌리지 않는다(시험 `a_vm_moved_after_the_plan_stays_on_its_new_node`). 선언한 `state`는 적용 때 그대로 이긴다(선언형).
+- 엔진: **이력 404 본문.** 네 끝점(목록·리소스 이력·줄 하나·하나 되돌리기)의 없음·볼 수 없음이 한 문구 `{kind} "{key}" not found`다. 리소스를 볼 수 있을 때만 "has no history row N"이다.
+- 엔진: **진행 기록은 몇 단계마다.** 적용 묶음 status는 50단계마다 또는 5초가 지나면, 그리고 끝에(실패해도) 쓴다(단계마다 쓰면 묶음 전체를 N번 — 1 000 객체면 GB 단위 Raft 로그). 그 사이에 노드가 멈추면 마지막 기록 뒤에 만든 객체는 묶음 레이블만 달고 있고, 같은 파일을 다시 적용하면 `unchanged`로 찾아 기록한다. 압축 진행 칸(새 status 칸)은 옛 노드 호환·스키마 비용에 비해 얻는 것이 적어 쓰지 않았다.
+- 엔진: **지운 객체 받아들이기는 마지막 폴더의 권한.** 밖에서 지운 객체의 권한 대상은 마지막 이력 줄(그때의 폴더·풀), 줄이 없으면 묶음 선언의 `metadata.folder`, 그것도 없으면 루트다(`kinds::gone_readable`·`gone_updatable` — 바꾸기 경로 규칙, 처리기 규칙이면 지우기 경로, 둘 다 처리기면 루트 `cluster.admin`). "모두" 받아들이기는 볼 수 있고 바꿀 수 있는 것만, 고른 받아들이기는 없으면 403.
+- 엔진: **빈 목록은 모두가 아니다.** `AdoptRequest.objects`가 `Option`이 되어 `{}`(뺌)만 "모두"이고 `{objects: []}`는 400이다. CLI `set adopt`(객체 없음)는 `{}`를 보낸다.
+- 엔진: **지운 객체를 묶음 보기에.** `visible_set`은 밖에서 지운 객체를 마지막 폴더로 보아 볼 수 있으면 `status.objects`에 남긴다(전에는 늘 뺐다) — 웹은 드리프트 `missing` 줄을 그 id로 고를 수 있다. 볼 수 없는 객체의 드리프트 줄도 함께 뺀다(전에는 지운 것의 줄은 누구에게나 보였다). 새 칸은 없다.

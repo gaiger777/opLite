@@ -682,12 +682,18 @@ pub(crate) fn compare(
 }
 
 /// 되돌리기의 "앞 선언": 지금 값의 매니페스트 spec 전체에서 비밀 칸을 뺀 것. 문서에 없는 끝 칸은 [`forget_dropped`]가
-/// 지워 기본값으로 돌아가고, 비밀 칸은 지금 값 그대로다.
-fn whole_spec(a: &dyn super::kinds::Adapter, live: &Live, world: &World) -> Value {
+/// 지워 기본값으로 돌아가고, 비밀 칸은 지금 값 그대로다 — 단 그 칸의 갈래(부모의 `kind` — DNS 공급자·알림 대상 종류)가
+/// 문서와 같을 때만이다. 갈래가 바뀌었으면 지금 비밀도 지워진다(리뷰 2 — 다른 갈래의 칸이 남아 문서 전체가 400이 되지
+/// 않게. 문서 갈래의 비밀은 되돌리기가 참조로 두어 그 단계만 `secret_missing`으로 막힌다).
+fn whole_spec(a: &dyn super::kinds::Adapter, live: &Live, world: &World, doc: &Value) -> Value {
     let mut spec = a.to_manifest(&live.spec, world);
     for path in a.secret_paths() {
         let path: Vec<String> = path.split('.').map(str::to_string).collect();
-        super::diff::remove_path(&mut spec, &path);
+        let parent = &path[..path.len() - 1];
+        let tag = |v: &Value| super::diff::get_path(v, parent).map(|p| p.get("kind").cloned());
+        if tag(&spec) == tag(doc) {
+            super::diff::remove_path(&mut spec, &path);
+        }
     }
     spec
 }
@@ -870,7 +876,7 @@ async fn plan_doc(
                 .iter()
                 .find(|o| o.id == live.id && o.kind == kind.kind())
                 .map(|o| &o.declared);
-            let whole = req.replace.then(|| whole_spec(a, live, world));
+            let whole = req.replace.then(|| whole_spec(a, live, world, &doc.spec));
             let (merged, desired, mut changes) = match compare(
                 state,
                 world,

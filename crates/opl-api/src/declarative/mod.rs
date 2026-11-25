@@ -9,7 +9,7 @@ pub(crate) mod export;
 pub(crate) mod kinds;
 pub(crate) mod plan;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use opl_cluster::ChangeContext;
-use opl_types::apply_set::{ApplySet, ApplySetSpec, ApplySetStatus};
+use opl_types::apply_set::{AppliedObject, ApplySet, ApplySetSpec, ApplySetStatus};
 use opl_types::authz::Privilege;
 use opl_types::manifest::{APPLY_SET_LABEL, Manifest, ManifestKind};
 use opl_types::node::DECLARATIVE;
@@ -494,24 +494,42 @@ pub async fn delete_manifest(
     Ok(Json(ManifestDeleted { task: done.task }))
 }
 
-/// 적용 묶음에서 볼 수 없는 객체를 뺀다(§13 — 묶음 안 객체는 보이는 것만).
+/// 적용 묶음에서 볼 수 없는 객체를 뺀다(§13 — 묶음 안 객체는 보이는 것만). 밖에서 지운 객체(드리프트 `missing`)는
+/// 마지막으로 알던 폴더로 보고, 볼 수 있으면 `status.objects`에도 남긴다(리뷰 2 — 화면이 받아들이기에 고를 수 있게).
 pub(crate) fn visible_set(
     state: &AppState,
     principal: &Principal,
     mut set: ApplySet,
 ) -> Result<ApplySet, ApiError> {
     let world = World::load(&state.cluster)?;
-    set.status.objects.retain(|o| {
-        ManifestKind::from_kind(o.kind)
-            .and_then(|k| world.by_id(k, o.id))
-            .is_some_and(|l| readable(state, principal, l))
-    });
+    let mut owners = None;
+    let mut visible = |o: &AppliedObject| -> Result<bool, ApiError> {
+        let Some(k) = ManifestKind::from_kind(o.kind) else {
+            return Ok(false);
+        };
+        Ok(match world.by_id(k, o.id) {
+            Some(l) => readable(state, principal, l),
+            None => {
+                if owners.is_none() {
+                    owners = Some(crate::authz::Owners::load(&state.cluster)?);
+                }
+                let owners = owners.as_ref().expect("just loaded");
+                kinds::gone_readable(state, principal, owners, &world, o)
+            }
+        })
+    };
+    let mut objects = Vec::with_capacity(set.status.objects.len());
+    let mut hidden = BTreeSet::new();
+    for o in std::mem::take(&mut set.status.objects) {
+        if visible(&o)? {
+            objects.push(o);
+        } else {
+            hidden.insert((o.kind, o.id));
+        }
+    }
+    set.status.objects = objects;
     if let Some(drift) = set.status.drift.as_mut() {
-        drift.items.retain(|i| {
-            ManifestKind::from_kind(i.kind)
-                .and_then(|k| world.by_id(k, i.id))
-                .is_none_or(|l| readable(state, principal, l))
-        });
+        drift.items.retain(|i| !hidden.contains(&(i.kind, i.id)));
     }
     Ok(set)
 }

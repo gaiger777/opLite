@@ -118,6 +118,11 @@ impl Adapter for SettingsAdapter {
         lives_of::<SettingsSpec>(cluster, ManifestKind::Settings)
     }
 
+    /// 제 API(구독·이미지 목록)가 쓰는 칸
+    fn server_fields(&self) -> &'static [&'static str] {
+        &SERVER
+    }
+
     fn to_manifest(&self, spec: &Value, _world: &World) -> Value {
         without(spec, &SERVER)
     }

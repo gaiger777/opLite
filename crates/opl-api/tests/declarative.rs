@@ -551,9 +551,10 @@ async fn saved_plans_go_stale_and_belong_to_their_user() {
     assert_eq!(group.spec.description.as_deref(), Some("z"));
 }
 
-/// 리뷰 1: 적용 묶음 status는 단계마다 쓰인다(노드가 도중에 다시 시작해도 만든 객체를 묶음이 안다).
+/// 리뷰 1·2: 적용 묶음 status는 도중에도 쓰이지만(노드가 도중에 다시 시작해도 만든 객체를 묶음이 안다) 단계마다는
+/// 아니다 — 몇 단계마다와 끝에. 노드가 멈춘 뒤 같은 파일을 다시 적용하면 기록하지 못한 객체도 묶음에 든다.
 #[tokio::test]
-async fn the_apply_set_is_recorded_after_each_step() {
+async fn the_apply_set_is_recorded_in_batches() {
     let (env, admin) = start().await;
     let mut watch = env.cluster.watch(env.cluster.revision()).unwrap();
     let docs = json!({
@@ -563,7 +564,7 @@ async fn the_apply_set_is_recorded_after_each_step() {
         ],
         "apply_set": "net",
     });
-    let task = apply(&admin, docs).await;
+    let task = apply(&admin, docs.clone()).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
     let mut counts = Vec::new();
     while let Ok(Ok(event)) =
@@ -576,10 +577,77 @@ async fn the_apply_set_is_recorded_after_each_step() {
         }
     }
     assert!(
-        counts.contains(&1),
-        "a write after the first step: {counts:?}"
+        !counts.contains(&1),
+        "no write after every step: {counts:?}"
     );
     assert_eq!(counts.last(), Some(&2), "{counts:?}");
+
+    // 기록하기 전에 멈춘 것처럼 묶음에서 하나를 지운다: 같은 파일을 다시 적용하면 다시 든다.
+    let set = env
+        .cluster
+        .get_by_name::<ApplySetSpec>("net")
+        .unwrap()
+        .unwrap();
+    let mut status = set.status.clone();
+    status.objects.truncate(1);
+    env.cluster
+        .update_status::<ApplySetSpec>(set.id, &status)
+        .await
+        .unwrap();
+    let task = apply(&admin, docs).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let set = env
+        .cluster
+        .get_by_name::<ApplySetSpec>("net")
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.status.objects.len(), 2, "{:?}", set.status);
+}
+
+/// 리뷰 2: 서버가 쓰는 VM 노드(HA 넘기기·옮기기·균형)가 계획 뒤에 바뀌어도 계획은 낡지 않고, 적용(PUT)은 VM을 옛
+/// 노드로 되돌리지 않는다.
+#[tokio::test]
+async fn a_vm_moved_after_the_plan_stays_on_its_new_node() {
+    let (env, admin) = start().await;
+    let task = apply(&admin, json!({ "documents": web(256) })).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let plan = dry_run(&admin, json!({ "documents": web(512) })).await;
+    assert_eq!(summary(&plan), [0, 1, 0, 3, 0], "{plan}");
+
+    // 다른 노드로 옮겨진 것처럼(멤버가 아닌 Node 리소스)
+    let mut other: Resource<NodeSpec, _> = Resource::new(
+        "node2",
+        NodeSpec {
+            sdn: None,
+            host_resources: None,
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    other.status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    env.cluster.create(&other).await.unwrap();
+    let vm = env.cluster.get_by_name::<VmSpec>("web01").unwrap().unwrap();
+    let mut spec = vm.spec.clone();
+    spec.node = Some(other.id);
+    env.cluster
+        .update_spec(vm.id, Some(vm.revision), vm.labels.clone(), &spec)
+        .await
+        .unwrap();
+
+    let (status, started) = admin.post("/apply", json!({ "plan": plan["plan"] })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let task = admin.wait_task(&started["task"]).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let vm = env.cluster.get_by_name::<VmSpec>("web01").unwrap().unwrap();
+    assert_eq!(vm.spec.memory_mib, 512);
+    assert_eq!(vm.spec.node, Some(other.id), "the PUT kept the new node");
 }
 
 #[tokio::test]

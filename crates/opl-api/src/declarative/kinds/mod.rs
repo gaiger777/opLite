@@ -38,7 +38,11 @@ use std::sync::Arc;
 
 use axum::http::header::IF_MATCH;
 use axum::http::{HeaderMap, HeaderValue, Method};
+use opl_cluster::types::RawResource;
 use opl_cluster::{Cluster, Typed};
+use opl_types::apply_set::AppliedObject;
+use opl_types::authz::Privilege;
+use opl_types::authz_eval::AuthzTarget;
 use opl_types::folder::{FolderKind, FolderSpec};
 use opl_types::manifest::{Manifest, ManifestKind, ManifestState, SecretValue, folder_path};
 use opl_types::node::NodeSpec;
@@ -51,7 +55,8 @@ use uuid::Uuid;
 
 use super::Problem;
 use crate::auth::{Action, Principal};
-use crate::authz_routes::{Obj, check, resolve, rule};
+use crate::authz::{Owned, Owners};
+use crate::authz_routes::{Obj, Rule, check, resolve, rule};
 use crate::error::ApiError;
 use crate::resources::CreateRequest;
 use crate::state::AppState;
@@ -139,13 +144,16 @@ pub(crate) struct Live {
 }
 
 impl Live {
-    /// 설정(이름·레이블·spec)의 지문: 같은 노드의 계획과 적용 사이에서만 견준다(저장하지 않는다).
+    /// 설정(이름·레이블·spec)의 지문: 같은 노드의 계획과 적용 사이에서만 견준다(저장하지 않는다). 서버가 쓰는 칸
+    /// ([`Adapter::server_fields`] — HA·옮기기·균형의 VM 노드, 켜고 끄기의 전원)은 넣지 않는다(리뷰 2 — 그 쓰기가
+    /// 계획을 낡게 하거나 긴 적용의 단계를 깨지 않게. 적용은 그 칸을 지금 값으로 다시 맞춘다).
     pub(crate) fn config_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         self.name.hash(&mut h);
         self.labels.hash(&mut h);
-        self.spec.to_string().hash(&mut h);
+        let fields = adapter(self.kind).map_or(&[][..], |a| a.server_fields());
+        without(&self.spec, fields).to_string().hash(&mut h);
         h.finish()
     }
 
@@ -263,6 +271,12 @@ pub(crate) trait Adapter: Sync {
     }
 
     fn updatable(&self) -> Update;
+
+    /// 서버가 쓰는 맨 위 spec 칸: 설정 지문([`Live::config_fingerprint`])에 넣지 않는다. 적용 단계는 지금 값에 대고
+    /// `keep_server_fields`를 다시 돌려(선언하지 않았으면 지금 값) 그 칸을 되돌리지 않는다.
+    fn server_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// 참조(종류, 문서 열쇠): 같은 계획 안이면 그 단계 뒤에 하고, 아니면 지금 있어야(볼 수 있어야) 한다.
     fn refs(&self, _spec: &Value) -> Vec<(ManifestKind, String)> {
@@ -498,6 +512,121 @@ pub(crate) fn readable(state: &AppState, principal: &Principal, live: &Live) -> 
         },
         None => state
             .authorize(principal, Action::Read, live.kind.kind())
+            .is_ok(),
+    }
+}
+
+/// 밖에서 지운 객체(묶음 status가 기억한다)의 권한 대상(리뷰 2): 마지막 이력 줄(그때의 폴더·풀·레이블), 줄이 없으면
+/// 묶음 선언의 `metadata.folder`, 그것도 없으면 루트. 폴더는 부모 폴더다(지운 폴더 자신의 id는 권한 트리에 없다).
+fn gone_target(
+    state: &AppState,
+    owners: &Owners,
+    world: &World,
+    obj: &AppliedObject,
+) -> Option<Owned> {
+    let kind = ManifestKind::from_kind(obj.kind)?;
+    let field = if kind == ManifestKind::Folder {
+        "parent"
+    } else {
+        "folder"
+    };
+    let raw = match state
+        .cluster
+        .history_of(obj.kind, obj.id)
+        .ok()
+        .and_then(|rows| rows.into_iter().last())
+    {
+        Some(rec) => RawResource {
+            id: rec.id,
+            name: rec.name,
+            revision: rec.revision,
+            labels: rec.labels,
+            spec: rec.spec,
+            status: Value::Null,
+        },
+        None => {
+            let folder = adapter(kind)
+                .and_then(|a| a.tree())
+                .zip(
+                    obj.declared
+                        .pointer("/metadata/folder")
+                        .and_then(Value::as_str),
+                )
+                .and_then(|(tree, path)| world.folder_id(tree, path));
+            RawResource {
+                id: obj.id,
+                name: obj.name.clone(),
+                revision: obj.revision,
+                labels: BTreeMap::new(),
+                spec: serde_json::json!({ field: folder.map(|f| f.to_string()) }),
+                status: Value::Null,
+            }
+        }
+    };
+    if kind == ManifestKind::Folder {
+        let parent = raw
+            .spec
+            .get("parent")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok());
+        return Some(Owned::object(
+            parent.map_or(AuthzTarget::Root, AuthzTarget::Folder),
+        ));
+    }
+    owners.of_event(obj.kind, &raw)
+}
+
+/// 밖에서 지운 객체를 볼 수 있는지(지금 객체의 [`readable`]과 같은 규칙을 마지막으로 알던 폴더에 — 리뷰 2)
+pub(crate) fn gone_readable(
+    state: &AppState,
+    principal: &Principal,
+    owners: &Owners,
+    world: &World,
+    obj: &AppliedObject,
+) -> bool {
+    match gone_target(state, owners, world, obj) {
+        Some(owned) => state
+            .authz
+            .effective(principal, &owned)
+            .is_ok_and(|set| set.contains(owned.read)),
+        None => state.authorize(principal, Action::Read, obj.kind).is_ok(),
+    }
+}
+
+/// 밖에서 지운 객체를 묶음에서 받아들일(뺄) 수 있는지: 그 종류의 바꾸기 경로 규칙(처리기 규칙이면 지우기 경로)을
+/// 마지막으로 알던 폴더에 본다. 둘 다 처리기 규칙이면 루트 `cluster.admin`(리뷰 2).
+pub(crate) fn gone_updatable(
+    state: &AppState,
+    principal: &Principal,
+    owners: &Owners,
+    world: &World,
+    obj: &AppliedObject,
+) -> bool {
+    let Some(a) = ManifestKind::from_kind(obj.kind).and_then(adapter) else {
+        return false;
+    };
+    let found = [a.update_route(), a.delete_route()]
+        .into_iter()
+        .find_map(|(m, t)| {
+            let m = Method::from_bytes(m.as_bytes()).ok()?;
+            rule(&m, t).filter(|r| !matches!(r, Rule::Handler | Rule::List | Rule::Public))
+        });
+    let owned = || {
+        gone_target(state, owners, world, obj).unwrap_or_else(|| Owned::object(AuthzTarget::Root))
+    };
+    match found {
+        Some(Rule::Object(_, p)) => state.authz.require(principal, p, &owned()).is_ok(),
+        Some(Rule::Read(_)) => {
+            let owned = owned();
+            state
+                .authz
+                .effective(principal, &owned)
+                .is_ok_and(|set| set.contains(owned.read))
+        }
+        Some(r @ Rule::Root(_)) => check(state, principal, r, None).is_ok(),
+        _ => state
+            .authz
+            .require_root(principal, Privilege::ClusterAdmin)
             .is_ok(),
     }
 }
@@ -816,5 +945,24 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// 리뷰 2: 서버가 쓰는 VM 노드·전원은 설정 지문에 들지 않고, 다른 칸은 든다.
+    #[test]
+    fn the_fingerprint_skips_server_written_fields() {
+        let live = |spec: Value| Live {
+            kind: ManifestKind::Vm,
+            id: Uuid::nil(),
+            name: "web01".into(),
+            revision: 1,
+            labels: BTreeMap::new(),
+            spec,
+        };
+        let base = live(serde_json::json!({ "memory_mib": 256, "node": "a", "power": "stopped" }));
+        let moved = live(serde_json::json!({ "memory_mib": 256, "node": "b", "power": "running" }));
+        let resized =
+            live(serde_json::json!({ "memory_mib": 512, "node": "a", "power": "stopped" }));
+        assert_eq!(base.config_fingerprint(), moved.config_fingerprint());
+        assert_ne!(base.config_fingerprint(), resized.config_fingerprint());
     }
 }

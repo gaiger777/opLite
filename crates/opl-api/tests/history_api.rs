@@ -413,6 +413,63 @@ async fn restore_brings_back_fields_that_were_at_their_default() {
     assert_eq!(web01.spec.max_memory_mib, None);
 }
 
+/// 리뷰 2: 갈래(알림 대상 종류)가 바뀐 뒤 되돌리면 지금 갈래의 비밀이 남지 않는다 — 그 단계만 `secret_missing`으로
+/// 막히고 계획(시점 되돌리기의 다른 객체도)은 선다(전에는 문서 전체가 400 `manifest_invalid`).
+#[tokio::test]
+async fn restoring_across_a_target_kind_switch_blocks_only_that_step() {
+    let (_env, admin) = start().await;
+    let smtp = doc(
+        "NotificationTarget",
+        "mail",
+        json!({ "target": { "kind": "smtp", "host": "127.0.0.1", "port": 2525, "tls": "none", "user": "ops",
+            "password": "SMTP-PASSWORD", "from": "o@example.com", "to": ["a@example.com"] } }),
+    );
+    let hook = doc(
+        "NotificationTarget",
+        "mail",
+        json!({ "target": { "kind": "webhook", "url": "https://hooks.example.com/T0",
+            "format": "ntfy", "token": "HOOK-TOKEN" } }),
+    );
+    let sg = |d: &str| {
+        doc(
+            "SecurityGroup",
+            "sg",
+            json!({ "description": d, "rules": [] }),
+        )
+    };
+    apply(&admin, json!({ "documents": [smtp, sg("a")] })).await;
+    let point = rows(&admin, "notification-target", "mail").await[0]["revision"]
+        .as_u64()
+        .unwrap();
+    apply(&admin, json!({ "documents": [hook, sg("b")] })).await;
+
+    let (status, plan) = admin
+        .post(
+            "/history/notification-target/mail/restore",
+            json!({ "revision": point, "dry_run": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(summary(&plan), [0, 0, 0, 0, 1], "{plan}");
+    assert_eq!(
+        plan["steps"][0]["problems"][0]["code"], "secret_missing",
+        "{plan}"
+    );
+    assert_eq!(
+        plan["steps"][0]["problems"][0]["path"], "target.password",
+        "{plan}"
+    );
+    let (status, plan) = admin
+        .post(
+            "/history/restore",
+            json!({ "at": { "revision": point },
+                    "scope": { "keys": ["NotificationTarget/mail", "SecurityGroup/sg"] }, "dry_run": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(summary(&plan), [0, 1, 0, 0, 1], "{plan}");
+}
+
 #[tokio::test]
 async fn deleted_objects_come_back_with_their_id_unless_they_hold_data() {
     let (env, admin) = start().await;
@@ -628,6 +685,39 @@ async fn history_hides_objects_the_caller_cannot_read() {
         let (status, body) = alice.get(&format!("/history?{q}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{q}: {body}");
     }
+    // 본문도 같다(이름만 다르다 — 리뷰 2): 목록·리소스 이력·줄 하나·되돌리기
+    let rev = admin_rows[0]["revision"].as_u64().unwrap();
+    let answers = |key: &'static str| {
+        let alice = &alice;
+        async move {
+            let mut out = Vec::new();
+            for path in [
+                format!("/history?kind=vm&key={key}"),
+                format!("/history/vm/{key}"),
+                format!("/history/vm/{key}/{rev}"),
+            ] {
+                let (status, body) = alice.get(&path).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+                out.push(body.to_string());
+            }
+            let (status, body) = alice
+                .post(
+                    &format!("/history/vm/{key}/restore"),
+                    json!({ "revision": rev, "dry_run": true }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            out.push(body.to_string());
+            out
+        }
+    };
+    let hidden = answers("b").await;
+    let missing: Vec<String> = answers("no-such-vm")
+        .await
+        .into_iter()
+        .map(|b| b.replace("no-such-vm", "b"))
+        .collect();
+    assert_eq!(hidden, missing);
     // 읽을 수 없는 폴더에서 옮겨 온 객체: 그때의 줄은 보이지 않는다(리뷰 1).
     let (status, moved) = admin
         .post(
@@ -794,6 +884,107 @@ async fn adopting_all_takes_only_what_the_caller_may_change() {
     let items = set["status"]["drift"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "{set}");
     assert_eq!(items[0]["name"], "b");
+    checker.shutdown().await;
+}
+
+/// 리뷰 2: 밖에서 지운 객체는 마지막으로 알던 폴더로 본다 — 묶음 보기·"모두" 받아들이기·고른 받아들이기 모두. 빈
+/// 목록은 "모두"가 아니라 400이다.
+#[tokio::test]
+async fn deleted_objects_are_adopted_only_from_folders_the_caller_may_change() {
+    let (env, admin) = start().await;
+    let checker = opl_api::DriftChecker::spawn(
+        env.state.clone(),
+        opl_api::DriftCheckerConfig {
+            tick: Duration::from_millis(100),
+            full: Duration::from_secs(1),
+        },
+    );
+    let (_, mine) = admin
+        .post("/folders", json!({ "name": "mine", "kind": "vm" }))
+        .await;
+    admin
+        .post("/folders", json!({ "name": "theirs", "kind": "vm" }))
+        .await;
+    apply(
+        &admin,
+        json!({ "documents": [volume("a-root"), volume("b-root"), volume("c-root"),
+                    vm("a", "/mine", 256), vm("b", "/theirs", 256), vm("c", "/mine", 256)],
+                "apply_set": "web" }),
+    )
+    .await;
+    for name in ["a", "b"] {
+        let (status, body) = admin.delete(&format!("/vms/{name}")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    wait_drift(&admin, |items| {
+        items.len() == 2 && items.iter().all(|i| i["state"] == "missing")
+    })
+    .await;
+    let (_, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "alice", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": user["id"] },
+                "role": { "type": "builtin", "role": "operator" },
+                "target": { "type": "folder", "id": mine["id"] },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let alice = env.login("alice", "password-1").await;
+    let vms = |set: &Value, at: &str| -> Vec<String> {
+        let mut names: Vec<String> = set["status"][at]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|o| o["kind"] == "vm")
+            .map(|o| o["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    // 지운 a(/mine)는 보이고 b(/theirs)는 보이지 않는다(받아들이기의 답은 이 주체의 묶음 보기다 — 그대로인 c만 고른다).
+    let (status, set) = alice
+        .post("/apply-sets/web/adopt", json!({ "objects": ["Vm/c"] }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    assert_eq!(vms(&set, "objects"), ["a", "c"], "{set}");
+    let items: Vec<_> = set["status"]["drift"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(items, ["a"], "{set}");
+    // 빈 목록은 모두가 아니다.
+    let (status, body) = alice
+        .post("/apply-sets/web/adopt", json!({ "objects": [] }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // /theirs의 지운 것은 고를 수 없다.
+    let (status, body) = alice
+        .post("/apply-sets/web/adopt", json!({ "objects": ["Vm/b"] }))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // 모두: a만 묶음에서 빠지고 b는 남는다(드리프트도).
+    let (status, body) = alice.post("/apply-sets/web/adopt", json!({})).await;
+    let (_, set) = admin.get("/apply-sets/web").await;
+    assert_eq!(status, StatusCode::OK, "{body} {set}");
+    assert_eq!(vms(&set, "objects"), ["b", "c"], "{set}");
+    let items: Vec<_> = set["status"]["drift"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(items, ["b"], "{set}");
     checker.shutdown().await;
 }
 

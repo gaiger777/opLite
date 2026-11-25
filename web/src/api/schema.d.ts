@@ -302,9 +302,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 실제를 선언으로 받아들인다(§12.5): 고른 객체(없으면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 모두)의 묶음 선언을 지금
-         *     값으로 바꾼다 — 리소스는 바꾸지 않는다. 밖에서 지운 객체는 묶음에서 뺀다. 그 뒤 `orbivisorctl export --set`으로 git의
-         *     파일을 맞춘다. 고른 객체 모두의 바꾸기 권한이 든다(하나라도 없으면 403, 아무것도 바꾸지 않음).
+         * 실제를 선언으로 받아들인다(§12.5): 고른 객체(`objects`를 빼면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 모두)의 묶음
+         *     선언을 지금 값으로 바꾼다 — 리소스는 바꾸지 않는다. 밖에서 지운 객체는 묶음에서 뺀다(마지막 이력 줄의 폴더에서 바꾸기
+         *     권한이 든다). 그 뒤 `orbivisorctl export --set`으로 git의 파일을 맞춘다. 고른 객체 모두의 바꾸기 권한이 든다(하나라도
+         *     없으면 403, 아무것도 바꾸지 않음).
          */
         post: operations["adopt"];
         delete?: never;
@@ -5262,7 +5263,10 @@ export interface components {
         AddressSource: "given" | "guest-agent" | "cloud-init" | "ipam";
         /** @description `POST /apply-sets/{key}/adopt`의 본문 */
         AdoptRequest: {
-            /** @description 받아들일 객체(`종류/이름` 또는 id). 비면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 객체 모두(밖에서 지운 것 포함) */
+            /**
+             * @description 받아들일 객체(`종류/이름` 또는 id). 빼면(`{}`) 드리프트 보고에서 볼 수 있고 바꿀 수 있는 객체 모두(밖에서 지운 것은
+             *     마지막으로 알던 폴더에서 그럴 수 있는 것). 빈 목록은 400이다(모두가 아니다).
+             */
             objects?: string[];
         };
         /**

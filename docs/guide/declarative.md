@@ -172,7 +172,9 @@ grant면 `permission.modify`와 위임 규칙, ACME 셋은 루트 `cluster.admin
   단계만 쓰기 권한을 보고, 그대로인 단계는 읽기만 본다. 권한이 없으면 그 단계는 `blocked: forbidden`이고 그 단계의 나머지 검사를
   하지 않는다. 볼 수 없는 폴더·참조는 없는 것과 같은 문구다(`folder "/x" not found`·`Network "x" not found`).
 - 적용 묶음 보기(`set list|get`, `GET /apply-sets*`)는 루트 `system.read`, 묶음 지우기·`adopt`는 그 객체 모두의 바꾸기 권한이다
-  (`adopt`에 객체를 주지 않으면 볼 수 있고 바꿀 수 있는 드리프트만 받아들인다).
+  (`adopt`에 `objects`를 빼면(`{}`) 볼 수 있고 바꿀 수 있는 드리프트만 받아들인다 — 빈 목록 `objects: []`는 400). 밖에서 지운
+  객체(드리프트 `missing`)는 마지막 이력 줄의 폴더로 보고, 그 폴더에서 볼 수 있으면 묶음 보기의 `status.objects`에 남으며, 받아들이기
+  (묶음에서 빼기)는 그 폴더의 바꾸기 권한이 든다.
 - 내보내기와 설정 기록은 지금 읽을 수 있는 리소스만 보인다(지운 리소스는 마지막 폴더 기준). 설정 기록의 줄은 그때의 폴더도 읽을 수
   있어야 보인다(읽을 수 없는 폴더에서 옮겨 온 객체의 그때 줄은 숨는다). 비밀은 기록·감사·계획 어디에도 평문으로 남지 않는다 —
   webhook URL은 `https://host/…`, 헤더 값은 `$secret` 표시, 이미지 카탈로그 URL은 질의·사용자 정보를 가린 글로 남는다(이 셋은 숨긴
@@ -248,7 +250,9 @@ orbivisorctl restore --at 81000 --set web --kind vm --key Network/web-net --dele
   (`--no-recreate`면 살리지 않음), 그 뒤 만든 것은 `--delete-created`일 때만 지운다(VM·볼륨·백업 저장소는 `--allow-data-loss`도).
   보존 한도로 그 시점을 모르는 리소스는 `blocked: history_expired`다.
 - **되돌리지 않는 것.** 비밀(기록에 평문이 없다 — 지금 비밀을 그대로 두고 경고 `secret_not_restored`, 지운 리소스면 그 칸을 빼고
-  경고), 이름(`name_not_restored`), 전원(`state`)은 되돌리지 않는다. 바꿀 수 없는 칸이 다르면(예: 볼륨 풀) 막힘이다.
+  경고), 이름(`name_not_restored`), 전원(`state`)은 되돌리지 않는다. 그 뒤 갈래가 바뀌었으면(SMTP → webhook 알림 대상, DNS 공급자
+  종류) 지금 갈래의 비밀은 남지 않고, 그 줄 갈래의 비밀은 채울 값이 없어 그 단계만 `secret_missing`으로 막힌다(비밀을 넣어
+  `apply`한다). 바꿀 수 없는 칸이 다르면(예: 볼륨 풀) 막힘이다.
 - 모든 되돌리기에 `--dry-run`·`--yes`·`--reason`·`--force-conflicts`·`--no-wait`가 있다. API는 `POST /history/{kind}/{key}/restore
   {revision, name?, dry_run?, reason?}`, `POST /history/restore {at: {revision}|{time}, scope, recreate_deleted, delete_created,
   allow_data_loss, dry_run?}`이고 답은 `POST /apply`와 같다.

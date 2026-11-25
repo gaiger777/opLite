@@ -670,6 +670,15 @@ fn export_file(kind: &str) -> String {
 }
 
 /// 문서들을 YAML(`---`로 잇기)로
+/// `set adopt` 본문: `--object`가 없으면 `{}`(드리프트 보고의 모두 — 빈 목록은 서버가 400으로 받지 않는다)
+fn adopt_body(objects: &[String]) -> Value {
+    if objects.is_empty() {
+        json!({})
+    } else {
+        json!({ "objects": objects })
+    }
+}
+
 pub(crate) fn to_yaml(docs: &[Value]) -> anyhow::Result<String> {
     let mut out = String::new();
     for d in docs {
@@ -767,7 +776,7 @@ pub(crate) async fn set(
             let set = post(
                 client,
                 &format!("/apply-sets/{}/adopt", seg(&name)),
-                &json!({ "objects": objects }),
+                &adopt_body(&objects),
                 None,
             )
             .await?;
@@ -795,6 +804,16 @@ pub(crate) async fn set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 리뷰 2: `--object` 없는 받아들이기는 `objects`를 빼고 보낸다(빈 목록은 "모두"가 아니다).
+    #[test]
+    fn adopting_everything_leaves_objects_out() {
+        assert_eq!(adopt_body(&[]), json!({}));
+        assert_eq!(
+            adopt_body(&["Vm/web01".into()]),
+            json!({ "objects": ["Vm/web01"] })
+        );
+    }
     use crate::fake_api::fake_api;
 
     fn files(paths: &[&Path]) -> Files {

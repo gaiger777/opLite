@@ -193,6 +193,11 @@ impl Adapter for VmAdapter {
         }
     }
 
+    /// HA 넘기기·옮기기·자동 균형이 쓰는 노드, 켜고 끄기가 쓰는 전원
+    fn server_fields(&self) -> &'static [&'static str] {
+        &["node", "power"]
+    }
+
     fn create_defaults(
         &self,
         state: &AppState,

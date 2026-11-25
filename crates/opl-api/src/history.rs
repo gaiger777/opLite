@@ -22,7 +22,7 @@ use opl_types::folder::{FolderKind, FolderSpec};
 use opl_types::history::{
     Actor, ChangeMeta, ChangeSource, HistoryOp, HistoryRecord, SECRET_MARK, clean_reason,
 };
-use opl_types::manifest::{APPLY_SET_LABEL, Manifest, ManifestKind};
+use opl_types::manifest::{APPLY_SET_LABEL, Manifest, ManifestKind, SecretValue};
 use opl_types::node::{CONFIG_HISTORY, DECLARATIVE};
 use opl_types::resource::Kind;
 use opl_types::storage::VolumeSpec;
@@ -343,10 +343,32 @@ async fn resolve_key(state: &AppState, kind: Kind, key: &str) -> Result<Uuid, Ap
             break;
         }
     }
-    Err(ApiError::not_found(format!(
-        "{} {key:?} not found",
-        kind.as_str()
-    )))
+    Err(not_found_key(kind, key))
+}
+
+/// 이 리소스가 없다 — 있지만 읽을 수 없는 것과 없는 것이 같은 본문이다(리뷰 2: 문구로도 폴더 너머의 있음을 알 수
+/// 없게). 이력의 네 끝점이 모두 이것을 쓴다.
+fn not_found_key(kind: Kind, key: &str) -> ApiError {
+    ApiError::not_found(format!("{} {key:?} not found", kind.as_str()))
+}
+
+/// 줄 `revision`이 없거나 읽을 수 없다: 리소스를 볼 수 있으면 "그 줄이 없다", 아니면 [`not_found_key`]
+fn no_row(
+    access: &Access,
+    kind: Kind,
+    key: &str,
+    id: Uuid,
+    records: &[HistoryRecord],
+    revision: u64,
+) -> ApiError {
+    if access.resource_readable(kind, id, records.last()) {
+        ApiError::not_found(format!(
+            "{} {key:?} has no history row {revision}",
+            kind.as_str()
+        ))
+    } else {
+        not_found_key(kind, key)
+    }
 }
 
 // ---------------------------------------------------------------- GET /history
@@ -559,11 +581,7 @@ pub async fn timeline(
         let records = records_of(&state, kind, id).await?;
         // 거르기 전에 본다(거른 결과로 있는지 알 수 없게 — 리뷰 1).
         if !access.resource_readable(kind, id, records.last()) {
-            return Err(ApiError::not_found(format!(
-                "{} {} not found",
-                kind.as_str(),
-                q.key.as_deref().unwrap_or_default()
-            )));
+            return Err(not_found_key(kind, q.key.as_deref().unwrap_or_default()));
         }
         let mut items = Vec::new();
         for (i, rec) in records.iter().enumerate().rev() {
@@ -711,12 +729,7 @@ pub async fn history_row(
     let id = resolve_key(&state, kind, &key).await?;
     let records = records_of(&state, kind, id).await?;
     let access = Access::new(&state, &principal)?;
-    let missing = || {
-        ApiError::not_found(format!(
-            "{} {key:?} has no history row {revision}",
-            kind.as_str()
-        ))
-    };
+    let missing = || no_row(&access, kind, &key, id, &records, revision);
     let i = records
         .iter()
         .position(|r| r.revision == revision)
@@ -864,6 +877,10 @@ fn restore_doc(
 fn fill_secrets(v: &mut Value, live: Option<&Value>, found: &mut bool) {
     match v {
         Value::Object(m) => {
+            // 갈래(`kind`)가 지금과 다르다: 그 갈래의 비밀은 지금 값에 없다(리뷰 2)
+            let switched = live.is_some_and(|l| {
+                l.is_object() && m.get("kind").is_some() && l.get("kind") != m.get("kind")
+            });
             let keys: Vec<String> = m.keys().cloned().collect();
             for k in keys {
                 let child = m.get_mut(&k).expect("key");
@@ -875,6 +892,14 @@ fn fill_secrets(v: &mut Value, live: Option<&Value>, found: &mut bool) {
                     *found = true;
                     match now {
                         Some(n) if !n.is_null() => *child = n.clone(),
+                        // 참조로 둔다: 채울 지금 값이 없어 그 단계만 `secret_missing`으로 막힌다(빼면 꼭 있어야 할
+                        // 칸이 없어 계획 전체가 400이다).
+                        _ if switched => {
+                            *child = serde_json::to_value(SecretValue::Ref {
+                                secret_ref: String::new(),
+                            })
+                            .expect("secret ref");
+                        }
                         _ => {
                             m.remove(&k);
                         }
@@ -1045,23 +1070,15 @@ pub async fn restore_one(
     let mk = parse_kind(&kind)?;
     let id = resolve_key(&state, mk.kind(), &key).await?;
     let records = records_of(&state, mk.kind(), id).await?;
+    let access = Access::new(&state, &principal)?;
+    let missing = || no_row(&access, mk.kind(), &key, id, &records, req.revision);
     let rec = records
         .iter()
         .find(|r| r.revision == req.revision)
         .cloned()
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "{} {key:?} has no history row {}",
-                mk.as_str(),
-                req.revision
-            ))
-        })?;
-    if !Access::new(&state, &principal)?.can_read(&rec) {
-        return Err(ApiError::not_found(format!(
-            "{} {key:?} has no history row {}",
-            mk.as_str(),
-            req.revision
-        )));
+        .ok_or_else(missing)?;
+    if !access.can_read(&rec) {
+        return Err(missing());
     }
     let world = World::load(&state.cluster)?;
     let live = world.by_id(mk, id).cloned();

@@ -1,6 +1,7 @@
 //! Task `apply`(계획 73 §8.3): 저장한 계획의 단계를 차례로 — 권한 다시 보기 → 계획 때 revision(`If-Match`) → 지금
 //! 처리기로 쓰기 → 그 쓰기가 만든 Task 기다리기. 첫 실패에서 멈추고 성공한 단계는 되돌리지 않는다(다시 적용하면 남은 것만
-//! 한다). 단계마다, 그리고 끝나면(실패해도) 적용 묶음 status에 성공한 단계까지의 선언을 남긴다. 받은 노드에서만 돌고 이어
+//! 한다). 몇 단계마다(리뷰 2 — [`RECORD_EVERY`]·[`RECORD_AFTER`]), 그리고 끝나면(실패해도) 적용 묶음 status에 성공한
+//! 단계까지의 선언을 남긴다. 받은 노드에서만 돌고 이어
 //! 가지 않는다.
 
 use std::collections::BTreeSet;
@@ -27,6 +28,37 @@ use crate::state::AppState;
 
 /// 쓰기가 만든 Task를 다시 보는 간격
 const POLL: Duration = Duration::from_millis(100);
+/// 적용 묶음 진행 기록: 이만큼의 단계마다 또는 이 시간이 지나면(그리고 끝에 늘). 단계마다 쓰면 묶음 전체(객체 1 000개·
+/// 4 MiB까지)를 단계 수만큼 Raft에 쓴다(리뷰 2).
+const RECORD_EVERY: usize = 50;
+const RECORD_AFTER: Duration = Duration::from_secs(5);
+
+/// 진행 기록 때를 센다.
+struct Pace {
+    since: usize,
+    last: std::time::Instant,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            since: 0,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// 단계 하나가 끝났다: 지금 기록할 때인지
+    fn step(&mut self) -> bool {
+        self.since += 1;
+        if self.since >= RECORD_EVERY || self.last.elapsed() >= RECORD_AFTER {
+            self.since = 0;
+            self.last = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Task `apply`를 돈다(Task 실행기가 부른다).
 pub(crate) async fn run(
@@ -101,6 +133,7 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
     let mut removed: BTreeSet<(Kind, Uuid)> = BTreeSet::new();
     let mut failure = None;
     let mut done = 0;
+    let mut pace = Pace::new();
     for step in &plan.steps {
         if step.action == StepAction::Unchanged {
             if let Some((id, revision)) = step.seen {
@@ -132,14 +165,18 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
             Ok(Some(obj)) => {
                 record(state, &plan.owner, plan.id, step, None);
                 applied.push(obj);
-                record_progress(state, plan, &applied, &removed).await;
+                if pace.step() {
+                    record_progress(state, plan, &applied, &removed).await;
+                }
             }
             Ok(None) => {
                 record(state, &plan.owner, plan.id, step, None);
                 if let Some((id, _)) = step.seen {
                     removed.insert((step.kind.kind(), id));
                 }
-                record_progress(state, plan, &applied, &removed).await;
+                if pace.step() {
+                    record_progress(state, plan, &applied, &removed).await;
+                }
             }
             Err(e) => {
                 record(state, &plan.owner, plan.id, step, Some(&e.message));
@@ -166,8 +203,10 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
     }
 }
 
-/// 단계마다 적용 묶음 status에 여기까지를 남긴다(리뷰 1 — 노드가 도중에 다시 시작해 Task가 "계획이 없다"로 끝나도
-/// 만든 객체를 묶음이 안다: 드리프트·가지치기·묶음 지우기). 상태 쓰기라 이력 줄이 없다. 못 쓰면 끝에서 다시 쓴다.
+/// 적용 묶음 status에 여기까지를 남긴다(리뷰 1 — 노드가 도중에 다시 시작해 Task가 "계획이 없다"로 끝나도 만든 객체를
+/// 묶음이 안다: 드리프트·가지치기·묶음 지우기). [`RECORD_EVERY`] 단계 또는 [`RECORD_AFTER`]마다, 끝에(실패해도) 늘
+/// 쓴다(리뷰 2). 그 사이에 노드가 멈추면 마지막 기록 뒤에 만든 것은 묶음 레이블만 달고 있다 — 같은 파일을 다시
+/// 적용하면 그대로(`unchanged`)로 찾아 다시 기록한다. 상태 쓰기라 이력 줄이 없다. 못 쓰면 끝에서 다시 쓴다.
 async fn record_progress(
     state: &AppState,
     plan: &StoredPlan,
@@ -485,4 +524,20 @@ async fn record_set(
         "busy",
         "the apply set kept changing; apply again",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 리뷰 2: 진행 기록은 단계마다가 아니라 [`RECORD_EVERY`] 단계마다(또는 [`RECORD_AFTER`]가 지나면)다.
+    #[test]
+    fn progress_is_recorded_every_few_steps() {
+        let mut pace = Pace::new();
+        let due: Vec<usize> = (1..=2 * RECORD_EVERY + 3).filter(|_| pace.step()).collect();
+        assert_eq!(due, [RECORD_EVERY, 2 * RECORD_EVERY]);
+        pace.last -= RECORD_AFTER;
+        assert!(pace.step(), "time also makes it due");
+        assert!(!pace.step());
+    }
 }
