@@ -109,7 +109,8 @@ export function ApplySetPage() {
     ...extra.map((d) => ({ id: d.id, kind: d.kind, name: d.name, item: d })),
   ];
   // 받아들일 수 있는 줄: 관리 밖이 아닌 드리프트(관리 밖은 묶음에 없어 받아들일 것이 없다). 밖에서 지운 객체는 서버가
-  // `status.objects`에서 빼므로 `extra`의 `missing` 줄로만 온다 — 받아들이면 묶음에서 빠진다.
+  // 마지막 폴더를 볼 수 있으면 `status.objects`에 남기고 드리프트 `missing`으로 알린다(id로 이어 붙음, 옛 서버는
+  // `extra` 줄로) — 받아들이면 묶음에서 빠진다.
   const candidates = rows.filter((r) => r.item !== undefined && isAdoptable(r.item));
   const adoptable = canRestoreAnything(perms) && candidates.length > 0;
   // 고른 것은 늘 지금 후보와 겹친 것만(묶음을 다시 받을 때마다 정리 — 사라진 id가 "모두"로 넓어지지 않게)
