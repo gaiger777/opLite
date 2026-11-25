@@ -90,12 +90,12 @@
 
 - 스테이지: 설계 `4c56d51a`, 1 타입·변경 기록 `9b08a333`, 2 선언형 적용 엔진 `ba029f54`, 4 ACME(따로 작업 트리 — 2 위에 cherry-pick) `22ab861b`, 3 나머지 종류·이력 API·되돌리기·드리프트 `8b9c593b`, 6 웹 `6f5cbfeb`, 5 Terraform(3 위에서 만들어 6 위에 cherry-pick) `ae8b25d1`, 7 실제 시험·브라우저 E2E·문서(이 커밋). 차례는 1 → 2 → 4 → 3 → 6 → 5 → 7이다(설계 §17 "함께").
 - Mac 시험(aarch64, 스테이지 5·6을 합친 트리): `cargo test --workspace` 4 453 통과·0 실패(무시 3), `clippy --all-features -D warnings`·`fmt` 깨끗, opld `qemu-it` `--test declarative` 통과(노드 둘·진짜 QEMU, 약 48초 — apply → diff 0 → plan 재시작 알림 → apply·다시 켬 → 쿠키 세션으로 vCPU 바꿈 → drift `modified`+`by web` → `restore --revision`(사유) → 드리프트 없음 → export 왕복 diff 0 → `--minimal`을 접두 app으로 다른 묶음 → `restore --at`(폴더) → `--prune --prune-data`), 브라우저 E2E(`web-it --test web` 여섯 모두, 새 `history.spec.ts` 약 10초), `pnpm typecheck`·`lint`·`build`. 스테이지마다: ACME `acme-it`(Pebble 2.10.1·challtestsrv·BIND 9.20, 다섯 번 연달아 통과), Terraform `go vet`·`go test`·수용 시험 여덟(terraform 1.17.2 약 32초·tofu 1.13.9 약 34초), 웹 vitest.
-- 리뷰: TODO
-- svc01 일반 시험: TODO
-- GitHub 탐침: TODO(`acme`·`terraform` 작업, `linux-kvm`의 `declarative` 실제 시험·브라우저 E2E)
+- 리뷰: 두 번 × 세 갈래(엔진·이력 / ACME·Terraform / 웹). 1차 27건(심각 1 — Terraform 클라이언트 CA 지문이 PEM 첫 인증서만 보고 전부를 믿음, `orbivisorctl login`도 같음; 중요 9 — 이력·묶음에 웹훅 URL·헤더·서명 URL 평문, `plan --out` 파일에 비밀·0644, 갱신 기간이 수명보다 길면 60초마다 주문, 노드마다 실패가 하나, DNS TXT 통째 바꿈, 새 키를 체인 저장 전에 씀, 시점 되돌리기 늦은 계획, 인증서 경보 규칙 값 잃음, 412 뒤 다시 세우기 없음) → `90a6343c`·`3de52e0b`·`ed2e6838`, 합치며 되돌리기 기본값 칸 되살리기 `e1308795`. 2차 15건(중요 2 — 받아들이기 선택이 새로 고친 뒤 빈 목록=모두로, 상태 저장 시간 초과·겹친 주문이 상태가 가리키는 키를 지움) → `95c82d5a`·`20cd6ce5`·`351cee2f`.
+- svc01 일반 시험(`266bd841`·`b7868ba3`, Rust 1.100): fmt·clippy·starve·scale(100노드 쓰기 p99 3.8 ms)·storage-dir·storage-api·vmware 넷·devserver 통과. 전체 시험은 한 번에 빌드하면 디스크(34 GB)가 차서 opl-api를 따로 나눠 4 480 통과·0 실패. `qemu-it` `declarative`는 처음 30초 넘김 → 180초 기다림·마지막 상태 보이기(`b7868ba3`) 뒤 `failed to start: No such file`(시험 데몬은 데비안 경로 `/usr/bin/qemu-system-aarch64`를 찾는데 svc01은 `/opt/qemu`) — svc01에 그 링크 하나를 더하고(패키지 밖 경로) 통과.
+- GitHub 탐침(`ci-probe/p73`, `266bd841`): 19/19 첫 회에 통과 — 새 `acme`(Pebble·challtestsrv·BIND)·`terraform (terraform)`·`terraform (tofu)` 포함.
 - 웹 번들(스테이지 6, `eager.sh` gzip -9): 첫 화면 JS +795 B·CSS +73 B, 합 **+868 B**(목표 1.5 KB 밑). 새 늦은 조각은 이력·선언 묶음 보기 하나, 인증서 하나.
 - 잰 값(이 Mac, 릴리스 빌드 — 스테이지 1): 상태 머신에 2 KiB VM spec 바꾸기 1 000번 — 파일 저장소 5.10 → 5.15 s **+1.0%**, 메모리 저장소(CPU만) +57%(쓰기당 약 25 µs), 쓰기 길 전체(노드 하나, 300번) 4.53 → 4.59 s **+1.3%**(목표 5% 밑). 64 MiB 이력 스냅샷 보내기·1 000 문서 계획·5 000 리소스 내보내기: TODO(재지 않음).
-- 배포: TODO(svc02 → svc01, `examples/declarative/web/` 흐름·Terraform VM 하나·Pebble 공유 인증서)
+- 배포(2026-11-26, svc02 → svc01, `bin73` — 처음 `8e6ce8ad`, 고친 뒤 `7108a0e4` orbivisord `d47ce8f3…`): 두 노드가 `declarative`·`config-history`·`acme`를 알리고, test-vm(PID 40553)은 두 번 바꿔 끼우는 동안 그대로. 실제 API로 네트워크 하나를 묶음 `p73live`로 만들기 → 레이블 바꾸기 → 이력(출처 `apply`, 사용자 admin) → 첫 줄로 되돌리기(사유·`restored_from` 기록) → 가지치기·묶음 지우기 확인. 이때 **레이블만 바꾼 변경의 되돌리기가 '그대로'로 나오는 것**을 찾아 고쳤다(`7108a0e4` — 되돌리기는 레이블도 그 줄 그대로, 서버 레이블만 둠). 바꿀 수 없는 칸(`vlan`)은 `immutable`로 막히고, AlertRule 대상 수 같은 처리기 검사는 미리 확인이 아니라 적용 Task에서 걸린다. Terraform VM·Pebble 인증서는 실험실에서 돌리지 않았다(실험실에 Go·공개 DNS 없음 — GitHub 작업이 맡음).
 - 스테이지 7에서 고친 것: `orbivisorctl apply`·`restore`의 `--reason`이 이력에 남지 않았다(계획을 세우는 요청에 사유 머리가 없었음) — 이제 미리 확인 요청에도 보낸다(설계 §18 스테이지 7).
 
 ## 다음 계획으로 넘길 사항
