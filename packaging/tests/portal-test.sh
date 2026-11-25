@@ -21,7 +21,7 @@ fail() {
 
 run() {
 	code=0
-	OPL_WEB_DIST=${DIST-$WORK/dist} sh "$SCRIPT" "$@" >"$WORK/stdout" 2>"$WORK/stderr" || code=$?
+	ORBIVISOR_WEB_DIST=${DIST-$WORK/dist} sh "$SCRIPT" "$@" >"$WORK/stdout" 2>"$WORK/stderr" || code=$?
 }
 
 # 인자 검사: 종료 코드 2

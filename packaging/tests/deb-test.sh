@@ -25,7 +25,7 @@ apt-get install -y --no-install-recommends "$DEB"
 VERSION=$(dpkg-query -W -f '${Version}' orbivisor)
 echo "deb-test: orbivisor $VERSION"
 
-# 바이너리가 패키지 버전을 보인다(OPL_VERSION으로 빌드). 옛 이름(링크)으로 불러도 --version의 이름은
+# 바이너리가 패키지 버전을 보인다(ORBIVISOR_VERSION으로 빌드). 옛 이름(링크)으로 불러도 --version의 이름은
 # clap의 name(새 이름)이다 — 사용법 줄만 argv[0]을 따른다.
 [ "$(orbivisord --version)" = "orbivisord $VERSION" ] || fail "orbivisord --version: $(orbivisord --version)"
 [ "$(orbivisorctl --version)" = "orbivisorctl $VERSION" ] || fail "orbivisorctl --version: $(orbivisorctl --version)"

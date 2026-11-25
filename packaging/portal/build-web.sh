@@ -2,7 +2,7 @@
 # 웹 UI 정적 파일 묶음 orbivisor-web-<version>.tar.gz를 만든다(설계 §4 "UI 따로 내보내기"). 노드의 내장 UI를
 # 끄고(`[web] enabled = false`) 포털(nginx, packaging/portal/Dockerfile)이 UI를 줄 때 쓴다.
 # 쓰는 법: packaging/portal/build-web.sh <version> <out dir>
-# 먼저 `pnpm -C web build`로 web/dist를 만든다. 위치는 OPL_WEB_DIST로 바꾼다.
+# 먼저 `pnpm -C web build`로 web/dist를 만든다. 위치는 ORBIVISOR_WEB_DIST로 바꾼다.
 # 묶음 안은 orbivisor-web-<version>/ 아래에 dist의 파일(index.html, assets/…)이다.
 set -eu
 umask 022
@@ -21,7 +21,7 @@ case $VERSION in
 esac
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-DIST=${OPL_WEB_DIST:-$ROOT/web/dist}
+DIST=${ORBIVISOR_WEB_DIST:-$ROOT/web/dist}
 if [ ! -f "$DIST/index.html" ]; then
 	echo "build-web: $DIST/index.html is missing; run pnpm -C web build first" >&2
 	exit 1

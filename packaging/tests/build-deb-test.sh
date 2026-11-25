@@ -1,14 +1,14 @@
 #!/bin/bash
 # build-deb.sh가 orbivisor 패키지(옛 이름 링크·유닛 별칭)와 빈 전환 패키지 oplite를 만드는지, 바이너리의
-# --version이 패키지 버전과 같은지 확인하는지, ORBIVISOR_APT_KEY의 키링을 싣는지, OPL_LICENSE_KEYS 없이는
-# ORBIVISOR_DEV_LICENSE=1일 때만 만드는지, OPL_LICENSE_KEYS의 항목·개발 키·orbivisord에 든 값을 확인하는지 본다.
+# --version이 패키지 버전과 같은지 확인하는지, ORBIVISOR_APT_KEY의 키링을 싣는지, ORBIVISOR_LICENSE_KEYS 없이는
+# ORBIVISOR_DEV_LICENSE=1일 때만 만드는지, ORBIVISOR_LICENSE_KEYS의 항목·개발 키·orbivisord에 든 값을 확인하는지 본다.
 # 가짜 orbivisord·orbivisorctl(버전을 찍는 스크립트)과 가짜 dpkg-deb(만들 파일과 패키지 트리 사본만 만듦)를 쓴다.
 # bash만 있으면 되고 macOS에서도 돈다.
 # 쓰는 법: bash packaging/tests/build-deb-test.sh
 set -eu
 
 # 사용자 셸의 값에 결과가 흔들리지 않게 한다(아래 run이 ORBIVISOR_DEV_LICENSE 기본 1을 준다).
-unset ORBIVISOR_DEV_LICENSE OPL_LICENSE_KEYS
+unset ORBIVISOR_DEV_LICENSE ORBIVISOR_LICENSE_KEYS
 
 DEB_DIR="$(cd "$(dirname "$0")/../deb" && pwd)"
 WORK="$(mktemp -d)"
@@ -39,7 +39,7 @@ fail() {
 }
 
 # fake_bins <orbivisord 버전> <orbivisorctl 버전> [orbivisord에 넣을 문자열]: <bin> --version이
-# "<bin> <버전>"을 찍는 가짜 바이너리. 세 번째 인자는 OPL_LICENSE_KEYS로 빌드한 orbivisord처럼 바이너리 안에 둔다.
+# "<bin> <버전>"을 찍는 가짜 바이너리. 세 번째 인자는 ORBIVISOR_LICENSE_KEYS로 빌드한 orbivisord처럼 바이너리 안에 둔다.
 fake_bins() {
 	rm -rf "${WORK:?}/bin"
 	mkdir -p "$WORK/bin"
@@ -179,9 +179,9 @@ else
 	fail "전환 패키지: $(find "$O" | sort) $(cat "$O/DEBIAN/control")"
 fi
 
-# check_mismatch <이름>: 종료 코드 1, OPL_VERSION 안내, 패키지 없음
+# check_mismatch <이름>: 종료 코드 1, ORBIVISOR_VERSION 안내, 패키지 없음
 check_mismatch() {
-	if [ "$code" -eq 1 ] && grep -q 'OPL_VERSION=0.2.0' "$WORK/stderr" && [ ! -e "$WORK/out" ]; then
+	if [ "$code" -eq 1 ] && grep -q 'ORBIVISOR_VERSION=0.2.0' "$WORK/stderr" && [ ! -e "$WORK/out" ]; then
 		ok "$1"
 	else
 		fail "$1: 종료 코드 $code"
@@ -195,7 +195,7 @@ check_mismatch "orbivisord 버전이 다르면 실패"
 fake_bins 0.2.0 0.1.0
 run 0.2.0
 check_mismatch "orbivisorctl 버전이 다르면 실패"
-# OPL_VERSION 없이 빌드한 바이너리는 크레이트 버전을 보인다. 앞부분만 같아도 안 된다.
+# ORBIVISOR_VERSION 없이 빌드한 바이너리는 크레이트 버전을 보인다. 앞부분만 같아도 안 된다.
 fake_bins 0.2.0~ci1 0.2.0~ci1
 run 0.2.0
 check_mismatch "버전 앞부분만 같으면 실패"
@@ -237,16 +237,16 @@ else
 	fail "armor ORBIVISOR_APT_KEY: 종료 코드 $code"
 fi
 
-# 구독 키 공개 키: OPL_LICENSE_KEYS도 ORBIVISOR_DEV_LICENSE=1도 없으면 만들지 않는다.
+# 구독 키 공개 키: ORBIVISOR_LICENSE_KEYS도 ORBIVISOR_DEV_LICENSE=1도 없으면 만들지 않는다.
 fake_bins 0.1.0 0.1.0
-OPL_LICENSE_KEYS='' ORBIVISOR_DEV_LICENSE='' run 0.1.0
-if [ "$code" -eq 1 ] && grep -q 'build-deb: OPL_LICENSE_KEYS is not set; set it for a release build or ORBIVISOR_DEV_LICENSE=1 for a development package' "$WORK/stderr" &&
+ORBIVISOR_LICENSE_KEYS='' ORBIVISOR_DEV_LICENSE='' run 0.1.0
+if [ "$code" -eq 1 ] && grep -q 'build-deb: ORBIVISOR_LICENSE_KEYS is not set; set it for a release build or ORBIVISOR_DEV_LICENSE=1 for a development package' "$WORK/stderr" &&
 	[ ! -e "$WORK/out" ]; then
-	ok "OPL_LICENSE_KEYS 없이 개발 패키지가 아니면 실패"
+	ok "ORBIVISOR_LICENSE_KEYS 없이 개발 패키지가 아니면 실패"
 else
-	fail "OPL_LICENSE_KEYS 없음: 종료 코드 $code"
+	fail "ORBIVISOR_LICENSE_KEYS 없음: 종료 코드 $code"
 fi
-OPL_LICENSE_KEYS='' ORBIVISOR_DEV_LICENSE=0 run 0.1.0
+ORBIVISOR_LICENSE_KEYS='' ORBIVISOR_DEV_LICENSE=0 run 0.1.0
 if [ "$code" -eq 1 ] && [ ! -e "$WORK/out" ]; then
 	ok "ORBIVISOR_DEV_LICENSE가 1이 아니면 실패"
 else
@@ -256,11 +256,11 @@ fi
 RELEASE_KEYS='Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyM=,mR8vT2wX4yZ6aB8cD0eF2gH4iJ6kL8mN0oP2qR4sT6U='
 DEV_KEY=$(cat "$DEB_DIR/../../crates/orbivisor-types/keys/dev-license.pub")
 fake_bins 0.1.0 0.1.0 "$RELEASE_KEYS"
-OPL_LICENSE_KEYS=$RELEASE_KEYS ORBIVISOR_DEV_LICENSE='' run 0.1.0
+ORBIVISOR_LICENSE_KEYS=$RELEASE_KEYS ORBIVISOR_DEV_LICENSE='' run 0.1.0
 if [ "$code" -eq 0 ] && [ -f "$WORK/out/orbivisor_0.1.0_amd64.deb" ] && [ -f "$WORK/out/oplite_0.1.0_amd64.deb" ]; then
-	ok "OPL_LICENSE_KEYS가 있으면 만든다"
+	ok "ORBIVISOR_LICENSE_KEYS가 있으면 만든다"
 else
-	fail "OPL_LICENSE_KEYS 있음: 종료 코드 $code"
+	fail "ORBIVISOR_LICENSE_KEYS 있음: 종료 코드 $code"
 	cat "$WORK/stderr"
 fi
 # check_key_error <이름> <문구>: 종료 코드 1, 그 문구, 패키지 없음
@@ -273,30 +273,30 @@ check_key_error() {
 	fi
 }
 fake_bins 0.1.0 0.1.0 "$DEV_KEY"
-OPL_LICENSE_KEYS=$DEV_KEY ORBIVISOR_DEV_LICENSE='' run 0.1.0
-check_key_error "OPL_LICENSE_KEYS의 개발 키는 거절" \
-	'build-deb: OPL_LICENSE_KEYS contains the development key; use ORBIVISOR_DEV_LICENSE=1 for a development package'
+ORBIVISOR_LICENSE_KEYS=$DEV_KEY ORBIVISOR_DEV_LICENSE='' run 0.1.0
+check_key_error "ORBIVISOR_LICENSE_KEYS의 개발 키는 거절" \
+	'build-deb: ORBIVISOR_LICENSE_KEYS contains the development key; use ORBIVISOR_DEV_LICENSE=1 for a development package'
 fake_bins 0.1.0 0.1.0 "${RELEASE_KEYS%%,*},$DEV_KEY"
-OPL_LICENSE_KEYS="${RELEASE_KEYS%%,*},$DEV_KEY" ORBIVISOR_DEV_LICENSE='' run 0.1.0
-check_key_error "목록에 섞인 개발 키도 거절" 'OPL_LICENSE_KEYS contains the development key'
+ORBIVISOR_LICENSE_KEYS="${RELEASE_KEYS%%,*},$DEV_KEY" ORBIVISOR_DEV_LICENSE='' run 0.1.0
+check_key_error "목록에 섞인 개발 키도 거절" 'ORBIVISOR_LICENSE_KEYS contains the development key'
 # 패딩 없는 키, 끝 비트가 0이 아닌(정규형이 아닌) 키도 거절한다.
 for bad in 'not-base64!' 'AAAA' 'Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyMA' \
 	'Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyM' 'Hk3pQ0m2u8Yx1bVd7cNf4sLw9gTzR6aJe5iKoP3qUyN='; do
 	fake_bins 0.1.0 0.1.0 "${RELEASE_KEYS%%,*},$bad"
-	OPL_LICENSE_KEYS="${RELEASE_KEYS%%,*},$bad" ORBIVISOR_DEV_LICENSE='' run 0.1.0
+	ORBIVISOR_LICENSE_KEYS="${RELEASE_KEYS%%,*},$bad" ORBIVISOR_DEV_LICENSE='' run 0.1.0
 	check_key_error "32바이트 base64가 아닌 항목 거절: $bad" \
-		"build-deb: OPL_LICENSE_KEYS entry is not a base64 Ed25519 public key: $bad"
+		"build-deb: ORBIVISOR_LICENSE_KEYS entry is not a base64 Ed25519 public key: $bad"
 done
 # 공백·쉼표뿐이면 키가 하나도 없다.
 for none in ' ' ','; do
 	fake_bins 0.1.0 0.1.0 "$none"
-	OPL_LICENSE_KEYS=$none ORBIVISOR_DEV_LICENSE='' run 0.1.0
-	check_key_error "키가 없는 OPL_LICENSE_KEYS 거절: '$none'" 'build-deb: OPL_LICENSE_KEYS has no keys'
+	ORBIVISOR_LICENSE_KEYS=$none ORBIVISOR_DEV_LICENSE='' run 0.1.0
+	check_key_error "키가 없는 ORBIVISOR_LICENSE_KEYS 거절: '$none'" 'build-deb: ORBIVISOR_LICENSE_KEYS has no keys'
 done
 fake_bins 0.1.0 0.1.0 "${RELEASE_KEYS%%,*}"
-OPL_LICENSE_KEYS=$RELEASE_KEYS ORBIVISOR_DEV_LICENSE='' run 0.1.0
-check_key_error "orbivisord에 OPL_LICENSE_KEYS가 그대로 없으면 거절" \
-	'build-deb: orbivisord was not built with this OPL_LICENSE_KEYS'
+ORBIVISOR_LICENSE_KEYS=$RELEASE_KEYS ORBIVISOR_DEV_LICENSE='' run 0.1.0
+check_key_error "orbivisord에 ORBIVISOR_LICENSE_KEYS가 그대로 없으면 거절" \
+	'build-deb: orbivisord was not built with this ORBIVISOR_LICENSE_KEYS'
 
 # 파일 복원 도우미 이미지(계획 69): ORBIVISOR_RESTORE_IMAGE_DIR이 있으면 셋째 패키지 orbivisor-restore-image를 만든다.
 # manifest.json의 이미지 판은 패키지 버전과 저장소 debian.lock 해시 앞 12자여야 하고, 아키텍처는 x86_64여야 한다.

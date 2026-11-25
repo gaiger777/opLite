@@ -3,14 +3,14 @@
 # oplite_<version>_amd64.deb(옛 이름의 빈 전환 패키지 — 설치된 oplite가 dist-upgrade로 orbivisor로 넘어가게 함).
 # 쓰는 법: packaging/deb/build-deb.sh <version> <out dir>
 # (ORBIVISOR_RESTORE_IMAGE_DIR가 있으면 셋째 패키지 orbivisor-restore-image_<version>_amd64.deb도 — 아래)
-# 바이너리(orbivisord, orbivisorctl)는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
-#   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p orbivisord --features web-ui -p orbivisorctl
+# 바이너리(orbivisord, orbivisorctl)는 ORBIVISOR_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
+#   pnpm -C web build && ORBIVISOR_VERSION=<version> cargo build --release -p orbivisord --features web-ui -p orbivisorctl
 # 바이너리 위치는 기본 target/release이고 ORBIVISOR_BIN_DIR로 바꾼다.
 # ORBIVISOR_APT_KEY(APT 저장소 공개 키 파일, armor가 아닌 gpg --export)가 있으면
 # /usr/share/keyrings/oplite-archive-keyring.gpg로 싣는다.
-# 구독 키 공개 키: 바이너리를 OPL_LICENSE_KEYS로 빌드한 정식 패키지는 그 값을 여기에도 준다. 없으면
+# 구독 키 공개 키: 바이너리를 ORBIVISOR_LICENSE_KEYS로 빌드한 정식 패키지는 그 값을 여기에도 준다. 없으면
 # 저장소의 개발 키를 믿는 바이너리이므로 ORBIVISOR_DEV_LICENSE=1(개발 패키지)일 때만 만든다.
-# OPL_LICENSE_KEYS에는 정규 base64(44자, 32바이트) 항목이 하나 이상 있어야 하고, 개발 키가 들어 있으면
+# ORBIVISOR_LICENSE_KEYS에는 정규 base64(44자, 32바이트) 항목이 하나 이상 있어야 하고, 개발 키가 들어 있으면
 # 안 되며, orbivisord에 그 값이 그대로 들어 있어야 한다(그 값으로 빌드했는지).
 # 파일 복원 도우미 이미지(계획 69): ORBIVISOR_RESTORE_IMAGE_DIR이 있으면 셋째 패키지
 # orbivisor-restore-image_<version>_amd64.deb(/usr/share/orbivisor/restore/x86_64)도 만든다. 그 디렉터리는
@@ -30,8 +30,11 @@ VERSION=$1
 OUT_DIR=$2
 [ -n "$VERSION" ] || usage
 
-if [ -z "${OPL_LICENSE_KEYS:-}" ] && [ "${ORBIVISOR_DEV_LICENSE:-}" != 1 ]; then
-	echo "build-deb: OPL_LICENSE_KEYS is not set; set it for a release build or ORBIVISOR_DEV_LICENSE=1 for a development package" >&2
+# 옛 이름 OPL_LICENSE_KEYS로 빌드하는 릴리스 파이프라인도 한 릴리스 동안 받는다(계획 74).
+ORBIVISOR_LICENSE_KEYS=${ORBIVISOR_LICENSE_KEYS:-${OPL_LICENSE_KEYS:-}}
+
+if [ -z "${ORBIVISOR_LICENSE_KEYS:-}" ] && [ "${ORBIVISOR_DEV_LICENSE:-}" != 1 ]; then
+	echo "build-deb: ORBIVISOR_LICENSE_KEYS is not set; set it for a release build or ORBIVISOR_DEV_LICENSE=1 for a development package" >&2
 	exit 1
 fi
 
@@ -39,13 +42,13 @@ DEB_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$DEB_DIR/../.." && pwd)
 BIN_DIR=${ORBIVISOR_BIN_DIR:-$ROOT/target/release}
 
-if [ -n "${OPL_LICENSE_KEYS:-}" ]; then
+if [ -n "${ORBIVISOR_LICENSE_KEYS:-}" ]; then
 	DEV_KEY=$(cat "$ROOT/crates/orbivisor-types/keys/dev-license.pub")
 	set -f
 	old_ifs=$IFS
 	IFS=,
 	n=0
-	for k in $OPL_LICENSE_KEYS; do
+	for k in $ORBIVISOR_LICENSE_KEYS; do
 		k=$(printf %s "$k" | tr -d ' \t\n')
 		[ -n "$k" ] || continue
 		n=$((n + 1))
@@ -54,18 +57,18 @@ if [ -n "${OPL_LICENSE_KEYS:-}" ]; then
 		if [ "${#k}" != 44 ] || [ "${k%=}" = "$k" ] ||
 			[ "$(printf %s "$k" | base64 -d 2>/dev/null | base64)" != "$k" ] ||
 			[ "$(printf %s "$k" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" != 32 ]; then
-			echo "build-deb: OPL_LICENSE_KEYS entry is not a base64 Ed25519 public key: $k" >&2
+			echo "build-deb: ORBIVISOR_LICENSE_KEYS entry is not a base64 Ed25519 public key: $k" >&2
 			exit 1
 		fi
 		if [ "$k" = "$DEV_KEY" ]; then
-			echo "build-deb: OPL_LICENSE_KEYS contains the development key; use ORBIVISOR_DEV_LICENSE=1 for a development package" >&2
+			echo "build-deb: ORBIVISOR_LICENSE_KEYS contains the development key; use ORBIVISOR_DEV_LICENSE=1 for a development package" >&2
 			exit 1
 		fi
 	done
 	IFS=$old_ifs
 	set +f
 	if [ "$n" -eq 0 ]; then
-		echo "build-deb: OPL_LICENSE_KEYS has no keys" >&2
+		echo "build-deb: ORBIVISOR_LICENSE_KEYS has no keys" >&2
 		exit 1
 	fi
 fi
@@ -79,13 +82,13 @@ for bin in orbivisord orbivisorctl; do
 	got=$("$BIN_DIR/$bin" --version)
 	if [ "$got" != "$bin $VERSION" ]; then
 		echo "build-deb: $BIN_DIR/$bin --version이 '$got'이다(기대 '$bin $VERSION')." >&2
-		echo "build-deb: OPL_VERSION=$VERSION cargo build --release -p orbivisord --features web-ui -p orbivisorctl 로 다시 빌드한다" >&2
+		echo "build-deb: ORBIVISOR_VERSION=$VERSION cargo build --release -p orbivisord --features web-ui -p orbivisorctl 로 다시 빌드한다" >&2
 		exit 1
 	fi
 done
-# 정식 패키지: orbivisord가 이 OPL_LICENSE_KEYS로 빌드됐는지(빌드 값은 바이너리에 그대로 들어간다)
-if [ -n "${OPL_LICENSE_KEYS:-}" ] && ! grep -qaF -- "$OPL_LICENSE_KEYS" "$BIN_DIR/orbivisord"; then
-	echo "build-deb: orbivisord was not built with this OPL_LICENSE_KEYS" >&2
+# 정식 패키지: orbivisord가 이 ORBIVISOR_LICENSE_KEYS로 빌드됐는지(빌드 값은 바이너리에 그대로 들어간다)
+if [ -n "${ORBIVISOR_LICENSE_KEYS:-}" ] && ! grep -qaF -- "$ORBIVISOR_LICENSE_KEYS" "$BIN_DIR/orbivisord"; then
+	echo "build-deb: orbivisord was not built with this ORBIVISOR_LICENSE_KEYS" >&2
 	exit 1
 fi
 
