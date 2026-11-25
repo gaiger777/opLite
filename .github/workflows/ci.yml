@@ -843,6 +843,70 @@ jobs:
         if: failure()
         run: tail -n 100 "$RUNNER_TEMP/bind/named.log" || true
 
+  # 계획 73 스테이지 5: Terraform/OpenTofu 공급자(terraform/, Go) — go vet·gofmt·go mod verify·staticcheck·govulncheck·단위와 OpenAPI 스키마 맞춤,
+  # 수용 시험은 opl-devserver(가짜 하이퍼바이저·메모리 스토리지)에 대해 terraform과 tofu(핀한 판, SHA-256) 둘로
+  terraform:
+    strategy:
+      fail-fast: false
+      matrix:
+        cli: [terraform, tofu]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      TERRAFORM_VERSION: 1.17.2
+      TERRAFORM_SHA256: e6f16b2f0b137ee5729caa8c4e79a3bae4ee261acd198a1fcfa8584a6296605b
+      TOFU_VERSION: 1.13.9
+      TOFU_SHA256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce
+      GOVULNCHECK_VERSION: v1.9.0
+      STATICCHECK_VERSION: v0.8.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+          cache-dependency-path: terraform/go.sum
+      - name: OpenSSL headers (native-tls)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - name: ${{ matrix.cli }} (pinned release, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tf" && cd "$RUNNER_TEMP/tf"
+          if [ "${{ matrix.cli }}" = terraform ]; then
+            curl -fsSL -o cli.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+            echo "$TERRAFORM_SHA256  cli.zip" | sha256sum -c -
+          else
+            curl -fsSL -o cli.zip "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip"
+            echo "$TOFU_SHA256  cli.zip" | sha256sum -c -
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org" >> "$GITHUB_ENV"
+          fi
+          unzip -q cli.zip "${{ matrix.cli }}"
+          "./${{ matrix.cli }}" version
+          echo "TF_ACC_TERRAFORM_PATH=$RUNNER_TEMP/tf/${{ matrix.cli }}" >> "$GITHUB_ENV"
+      - name: opl-devserver and the OpenAPI document
+        run: |
+          cargo build -p opld --features devserver --bin opl-devserver
+          cargo test -p opld --features devserver --test devserver
+          cargo run -q -p opl-api --bin opl-api-openapi > "$RUNNER_TEMP/openapi.json"
+          echo "OPL_DEVSERVER=$PWD/target/debug/opl-devserver" >> "$GITHUB_ENV"
+          echo "OPL_OPENAPI=$RUNNER_TEMP/openapi.json" >> "$GITHUB_ENV"
+      - name: go mod verify, gofmt, go vet, staticcheck, govulncheck
+        working-directory: terraform
+        run: |
+          go mod verify
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
+          go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
+      - name: Unit tests and schema match (OpenAPI)
+        working-directory: terraform
+        run: go test ./...
+      - name: Acceptance tests (${{ matrix.cli }} against opl-devserver)
+        working-directory: terraform
+        run: TF_ACC=1 go test ./internal/provider/ -count=1 -v -timeout 30m
+
   deny:
     runs-on: ubuntu-24.04
     steps:

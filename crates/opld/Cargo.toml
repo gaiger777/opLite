@@ -13,6 +13,12 @@ autobins = false
 name = "orbivisord"
 path = "src/main.rs"
 
+# 개발·시험 서버(계획 73 §10.3 — Terraform 수용 시험·웹 데모). 배포 빌드에는 없다.
+[[bin]]
+name = "opl-devserver"
+path = "src/bin/opl-devserver.rs"
+required-features = ["devserver"]
+
 [features]
 # 실제 QEMU로 CLI부터 콘솔, kill -9 뒤 재연결까지 확인하는 E2E 테스트.
 # macOS는 brew install qemu, Linux는 apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils가 필요하다.
@@ -121,6 +127,10 @@ restore-it = ["backup-it"]
 # orbivisorctl로 본다. Linux에서 root, docker와 이미지, 커널 모듈 openvswitch·geneve, tcpdump가 필요하고 호스트에 도커 망·
 # 브리지를 잠시 만든다(CI `sdn-multinode` 작업).
 sdn-multinode-it = []
+
+# 노드 하나·가짜 하이퍼바이저·메모리 스토리지로 API를 내는 실행 파일 `opl-devserver`(계획 73 — Terraform 공급자 수용 시험,
+# GitHub `terraform` 작업). 배포 빌드에는 없다.
+devserver = []
 
 [dependencies]
 anyhow.workspace = true

@@ -272,7 +272,9 @@ fn cycle(docs: &[Manifest], keys: &[String], deps: &[BTreeSet<usize>], done: &[b
     .with_code("manifest_cycle")
 }
 
-/// 원하는 레이블: 지금 레이블에 선언을 얹고, 앞 선언에서 빠진 것을 지우고, 묶음·관리자 레이블을 단다.
+/// 원하는 레이블: 지금 레이블에 선언을 얹고, 앞 선언에서 빠진 것을 지우고, 묶음·관리자 레이블을 단다. Terraform은 객체의
+/// 레이블을 통째로 맡는다(선언하지 않은 레이블은 뗀다 — 서버가 다는 `orbivisor.io/` 레이블만 남김): 공급자 상태가 앞 선언이라
+/// 묶음의 세 갈래 기억이 없고, 설정에서 뺀 레이블이 서버에 남으면 다음 plan이 늘 다르다.
 fn labels_of(
     live: Option<&Live>,
     doc: &Manifest,
@@ -294,6 +296,9 @@ fn labels_of(
     out.extend(doc.metadata.labels.clone());
     match manager {
         Some(Manager::Terraform) => {
+            out.retain(|k, _| {
+                k.starts_with("orbivisor.io/") || doc.metadata.labels.contains_key(k)
+            });
             // Terraform이 넘겨받으면 묶음 레이블을 뗀다(그 묶음의 가지치기가 지우지 않게).
             out.remove(APPLY_SET_LABEL);
             out.insert(MANAGED_BY_LABEL.into(), "terraform".into());
@@ -1065,6 +1070,36 @@ mod tests {
         };
         let labels = labels_of(Some(&live), &doc, None, None, Some(Manager::Terraform));
         assert!(!labels.contains_key(APPLY_SET_LABEL));
+    }
+
+    #[test]
+    fn terraform_owns_all_labels_but_the_servers() {
+        let mut doc = Manifest::new(ManifestKind::SecurityGroup, "sg", json!({}));
+        doc.metadata.labels = BTreeMap::from([("tier".to_string(), "web".to_string())]);
+        let live = Live {
+            kind: ManifestKind::SecurityGroup,
+            id: Uuid::nil(),
+            name: "sg".into(),
+            revision: 1,
+            labels: BTreeMap::from([
+                ("tier".to_string(), "db".to_string()),
+                ("added-in-web".to_string(), "x".to_string()),
+                ("orbivisor.io/other".to_string(), "keep".to_string()),
+            ]),
+            spec: json!({}),
+        };
+        let labels = labels_of(Some(&live), &doc, None, None, Some(Manager::Terraform));
+        assert_eq!(
+            labels,
+            BTreeMap::from([
+                ("orbivisor.io/other".to_string(), "keep".to_string()),
+                (MANAGED_BY_LABEL.to_string(), "terraform".to_string()),
+                ("tier".to_string(), "web".to_string()),
+            ])
+        );
+        // 다른 손님(묶음 없는 적용)은 선언하지 않은 레이블을 그대로 둔다.
+        let labels = labels_of(Some(&live), &doc, None, None, None);
+        assert!(labels.contains_key("added-in-web"));
     }
 
     #[test]
