@@ -310,10 +310,64 @@ impl SecretValue {
     }
 }
 
+/// 비밀 칸(`.`로 잇는 spec 안 경로). 서버 어댑터의 비밀 칸과 같다(opl-api 시험이 본다).
+pub fn secret_fields(kind: ManifestKind) -> &'static [&'static str] {
+    match kind {
+        ManifestKind::Vm => &["cloud_init.password"],
+        ManifestKind::BackupStore => &["encryption.key", "backend.s3.secret_access_key"],
+        ManifestKind::Remote => &["token"],
+        ManifestKind::NotificationTarget => &["target.password", "target.token"],
+        ManifestKind::Realm => &["backend.bind_password", "backend.client_secret"],
+        ManifestKind::AcmeAccount => &["eab.hmac_key"],
+        ManifestKind::AcmeDns => &[
+            "provider.api_token",
+            "provider.secret_access_key",
+            "provider.secret",
+            "provider.api_key",
+        ],
+        _ => &[],
+    }
+}
+
+/// CLI `secretFrom`을 받는 칸: 비밀 칸과 보기가 가리는 칸(webhook URL·헤더 값 — `*`는 아무 이름). 그 밖의 칸(설명·레이블·
+/// user_data)은 평문으로 저장되고 보이므로 받지 않는다(저장소의 매니페스트가 운영자 비밀을 끌어오지 못하게 — 계획 73 리뷰 1).
+pub fn secret_from_allowed(kind: ManifestKind, path: &[&str]) -> bool {
+    let matches = |pattern: &str| {
+        let segs: Vec<&str> = pattern.split('.').collect();
+        segs.len() == path.len() && segs.iter().zip(path).all(|(s, p)| *s == "*" || s == p)
+    };
+    secret_fields(kind).iter().any(|f| matches(f))
+        || (kind == ManifestKind::NotificationTarget
+            && (matches("target.url") || matches("target.headers.*")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn secret_from_is_only_for_secret_fields() {
+        assert!(secret_from_allowed(
+            ManifestKind::Vm,
+            &["cloud_init", "password"]
+        ));
+        assert!(!secret_from_allowed(
+            ManifestKind::Vm,
+            &["cloud_init", "user_data"]
+        ));
+        assert!(!secret_from_allowed(ManifestKind::Vm, &["description"]));
+        assert!(!secret_from_allowed(ManifestKind::Vm, &["cloud_init"]));
+        let t = ManifestKind::NotificationTarget;
+        assert!(secret_from_allowed(t, &["target", "token"]));
+        assert!(secret_from_allowed(t, &["target", "url"]));
+        assert!(secret_from_allowed(
+            t,
+            &["target", "headers", "Authorization"]
+        ));
+        assert!(!secret_from_allowed(t, &["target", "headers"]));
+        assert!(!secret_from_allowed(ManifestKind::Folder, &["description"]));
+    }
 
     #[test]
     fn manifest_kinds_map_to_store_kinds() {

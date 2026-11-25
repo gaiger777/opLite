@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Client, Env, FakeStorage};
+use opl_types::alert::{NotificationTargetSpec, TargetConfig};
 use opl_types::manifest::{APPLY_SET_LABEL, MANAGED_BY_LABEL};
 use opl_types::security_group::SecurityGroupSpec;
 use opl_types::vm::VmSpec;
@@ -276,6 +277,60 @@ async fn restoring_one_object_plans_and_marks_the_row() {
     assert_eq!(summary(&plan), [0, 0, 0, 1, 0], "{plan}");
 }
 
+/// 리뷰 1: webhook URL은 줄인 글, 헤더 값은 표시로 남는다. 되돌리기는 저장한 URL·헤더 값을 그대로 두고, 지운 대상은
+/// 줄인 URL을 채울 값이 없어 막힌다.
+#[tokio::test]
+async fn webhook_targets_restore_without_their_hidden_url_and_headers() {
+    let (env, admin) = start().await;
+    let hook = |format: &str| {
+        doc(
+            "NotificationTarget",
+            "hook",
+            json!({ "target": { "kind": "webhook", "url": "https://hooks.example.com/T0/PATHSECRET",
+                "format": format, "headers": { "X-Api-Key": "HEADERSECRET" } } }),
+        )
+    };
+    apply(&admin, json!({ "documents": [hook("ntfy")] })).await;
+    apply(&admin, json!({ "documents": [hook("slack")] })).await;
+    let items = rows(&admin, "notification-target", "hook").await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    let created = items[1]["revision"].as_u64().unwrap();
+    restore(
+        &admin,
+        "/history/notification-target/hook/restore",
+        json!({ "revision": created }),
+    )
+    .await;
+    let now = env
+        .cluster
+        .get_by_name::<NotificationTargetSpec>("hook")
+        .unwrap()
+        .unwrap();
+    let TargetConfig::Webhook(w) = &now.spec.target else {
+        panic!("webhook")
+    };
+    assert_eq!(w.format, opl_types::alert::WebhookFormat::Ntfy);
+    assert_eq!(w.url, "https://hooks.example.com/T0/PATHSECRET");
+    assert_eq!(w.headers["X-Api-Key"], "HEADERSECRET");
+
+    let (status, _) = admin.delete("/notification-targets/hook").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let items = rows(&admin, "notification-target", "hook").await;
+    assert!(!Value::Array(items.clone()).to_string().contains("SECRET"));
+    let (status, plan) = admin
+        .post(
+            "/history/notification-target/hook/restore",
+            json!({ "revision": items[0]["revision"], "dry_run": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(summary(&plan), [0, 0, 0, 0, 1], "{plan}");
+    assert_eq!(
+        plan["steps"][0]["problems"][0]["code"], "secret_missing",
+        "{plan}"
+    );
+}
+
 #[tokio::test]
 async fn deleted_objects_come_back_with_their_id_unless_they_hold_data() {
     let (env, admin) = start().await;
@@ -483,6 +538,38 @@ async fn history_hides_objects_the_caller_cannot_read() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // 있지만 읽을 수 없는 것과 없는 것은 거르기와 관계없이 같은 404다(리뷰 1).
+    for q in [
+        "kind=vm&key=b&user=nobody",
+        "kind=vm&key=no-such-vm&user=nobody",
+    ] {
+        let (status, body) = alice.get(&format!("/history?{q}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{q}: {body}");
+    }
+    // 읽을 수 없는 폴더에서 옮겨 온 객체: 그때의 줄은 보이지 않는다(리뷰 1).
+    let (status, moved) = admin
+        .post(
+            &format!("/folders/{}/members", mine["id"].as_str().unwrap()),
+            json!({ "items": [{ "kind": "vm", "key": "b" }] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert_eq!(moved["items"][0]["ok"], true, "{moved}");
+    let all = rows(&admin, "vm", "b").await;
+    let seen = rows(&alice, "vm", "b").await;
+    assert!(!seen.is_empty() && seen.len() < all.len(), "{seen:?}");
+    assert_eq!(seen[0]["revision"], all[0]["revision"]);
+    let hidden = all.last().unwrap()["revision"].as_u64().unwrap();
+    let (status, _) = alice.get(&format!("/history/vm/b/{hidden}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, row) = alice
+        .get(&format!("/history/vm/b/{}", all[0]["revision"]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert!(
+        row["against"].is_null(),
+        "the /theirs row is not compared: {row}"
+    );
 }
 
 #[tokio::test]
@@ -554,6 +641,77 @@ async fn drift_names_who_changed_it_and_adopt_accepts_it() {
     let item = &set["status"]["drift"]["items"][0];
     assert_eq!(item["state"], "missing", "{set}");
     assert_eq!(item["by"]["actor"]["user"], "admin");
+    checker.shutdown().await;
+}
+
+/// 리뷰 1(웹 5): 받아들이기 "모두"(`{}`)는 이 주체가 볼 수 있고 바꿀 수 있는 드리프트만 받아들인다.
+#[tokio::test]
+async fn adopting_all_takes_only_what_the_caller_may_change() {
+    let (env, admin) = start().await;
+    let checker = opl_api::DriftChecker::spawn(
+        env.state.clone(),
+        opl_api::DriftCheckerConfig {
+            tick: Duration::from_millis(100),
+            full: Duration::from_secs(1),
+        },
+    );
+    let (_, mine) = admin
+        .post("/folders", json!({ "name": "mine", "kind": "vm" }))
+        .await;
+    admin
+        .post("/folders", json!({ "name": "theirs", "kind": "vm" }))
+        .await;
+    apply(
+        &admin,
+        json!({ "documents": [volume("a-root"), volume("b-root"), vm("a", "/mine", 256), vm("b", "/theirs", 256)],
+                "apply_set": "web" }),
+    )
+    .await;
+    for name in ["a", "b"] {
+        let v = env.cluster.get_by_name::<VmSpec>(name).unwrap().unwrap();
+        let mut spec = v.spec.clone();
+        spec.memory_mib = 512;
+        env.cluster
+            .update_spec(v.id, None, v.labels.clone(), &spec)
+            .await
+            .unwrap();
+    }
+    wait_drift(&admin, |items| items.len() == 2).await;
+    let (_, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "alice", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": user["id"] },
+                "role": { "type": "builtin", "role": "operator" },
+                "target": { "type": "folder", "id": mine["id"] },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let alice = env.login("alice", "password-1").await;
+    let (status, adopted) = alice.post("/apply-sets/web/adopt", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{adopted}");
+    let (_, set) = admin.get("/apply-sets/web").await;
+    let declared = |name: &str| {
+        set["status"]["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap()["declared"]["spec"]["memory_mib"]
+            .clone()
+    };
+    assert_eq!(declared("a"), 512, "{set}");
+    assert_eq!(declared("b"), 256, "the hidden one stays: {set}");
+    let items = set["status"]["drift"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{set}");
+    assert_eq!(items[0]["name"], "b");
     checker.shutdown().await;
 }
 

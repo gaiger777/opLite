@@ -534,3 +534,34 @@ fn draft(
     }
     Ok(draft)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 계획 73 리뷰 1: 관리자 아닌 주체에게 가리는 카탈로그 URL의 서명·사용자 정보는 설정 이력에도 평문으로 남지 않는다.
+    #[test]
+    fn history_masks_what_the_catalog_view_hides() {
+        let image: CatalogImage = serde_json::from_value(serde_json::json!({
+            "id": "signed", "title": "Signed", "os": "ubuntu", "version": "24.04", "arch": "x86_64",
+            "url": "https://u:PASSWORD@s3.example.com/img.qcow2?X-Amz-Signature=SIGNATURE",
+            "checksum": { "kind": "sums", "url": "https://s3.example.com/SUMS?token=SUMSTOKEN" },
+            "source_format": "qcow2", "firmware": "uefi"
+        }))
+        .unwrap();
+        let mut shown = image.clone();
+        redact_image(&mut shown);
+        let spec = serde_json::json!({ "image_catalog": [image] });
+        let masked =
+            opl_types::history::history_mask(opl_types::resource::Kind::Settings, None, &spec);
+        assert_eq!(masked["image_catalog"][0]["url"], shown.url);
+        let Checksum::Sums { url } = &shown.checksum else {
+            panic!("sums")
+        };
+        assert_eq!(masked["image_catalog"][0]["checksum"]["url"], *url);
+        for secret in ["PASSWORD", "SIGNATURE", "SUMSTOKEN"] {
+            assert!(spec.to_string().contains(secret));
+            assert!(!masked.to_string().contains(secret), "{masked}");
+        }
+    }
+}

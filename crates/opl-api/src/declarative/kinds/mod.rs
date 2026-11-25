@@ -139,6 +139,16 @@ pub(crate) struct Live {
 }
 
 impl Live {
+    /// 설정(이름·레이블·spec)의 지문: 같은 노드의 계획과 적용 사이에서만 견준다(저장하지 않는다).
+    pub(crate) fn config_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        self.name.hash(&mut h);
+        self.labels.hash(&mut h);
+        self.spec.to_string().hash(&mut h);
+        h.finish()
+    }
+
     pub(crate) fn of<S: ResourceSpec>(kind: ManifestKind, r: &Typed<S>) -> Self {
         Self {
             kind,
@@ -263,6 +273,10 @@ pub(crate) trait Adapter: Sync {
     fn secret_paths(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// 묶음에 남길 선언(`AppliedObject.declared`)에서 비밀 칸 말고도 보기가 가리는 칸을 가린다(webhook URL·헤더 값 —
+    /// `keep_server_fields`가 가린 값을 "저장한 값 그대로"로 받으므로 드리프트 비교는 그대로다).
+    fn redact_declared(&self, _spec: &mut Value) {}
 
     /// 만들 권한. `folder`는 든 폴더(아직 없으면 있는 가장 가까운 조상)다.
     fn may_create(
@@ -785,4 +799,22 @@ pub(crate) fn refs_of(
 /// 처리기 오류를 미리 확인 문제로
 pub(crate) fn problem(path: Option<&str>, e: ApiError) -> Problem {
     Problem::error(e.code, e.message, path.map(str::to_string))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CLI가 `secretFrom`을 받는 칸(opl-types 표)과 어댑터의 비밀 칸이 같다(계획 73 리뷰 1).
+    #[test]
+    fn cli_secret_fields_match_the_adapters() {
+        for kind in ManifestKind::ALL {
+            let a = adapter(kind).expect("every manifest kind has an adapter");
+            assert_eq!(
+                a.secret_paths(),
+                opl_types::manifest::secret_fields(kind),
+                "{kind:?}"
+            );
+        }
+    }
 }

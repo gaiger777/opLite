@@ -46,9 +46,9 @@ VM만 `state`(`running`·`stopped`)다. 한 파일에 여러 문서(`---`)를 �
   move`로 옮긴 뒤(옮기기 권한을 따로 보는 지금 규칙) 파일을 맞춘다.
 - **크기 문자열.** `_bytes`로 끝나는 칸은 `40Gi`·`512Mi`·`2G`(정수와 `K`·`Ki`·`M`·`Mi`·`G`·`Gi`·`T`·`Ti`)를, `_mib` 칸은 단위 없는
   MiB 수나 MiB로 나누어떨어지는 크기 문자열을 받는다. CLI가 보내기 전에 숫자로 바꾼다(서버는 숫자만 받는다, `1.5Gi`는 거절).
-- **비밀.** 비밀 칸(cloud-init 비밀번호, 백업 저장소 키·S3 비밀, 원격 토큰, realm 비밀, 알림 비밀, ACME EAB·DNS 공급자 비밀)에
-  `{secretFrom: {env: WEB_PW}}`·`{secretFrom: {file: pw.txt}}`(상대 경로는 매니페스트 파일 옆, 끝 줄바꿈은 뺌)를 쓰면 CLI가 평문으로
-  풀어 보낸다. 내보낸 파일의 비밀은 `{secretRef: …}`이고, 다시 적용하면 서버가 저장한 값을 그대로 둔다(파일에 비밀이 없어도
+- **비밀.** 비밀 칸(cloud-init 비밀번호, 백업 저장소 키·S3 비밀, 원격 토큰, realm 비밀, 알림 비밀, ACME EAB·DNS 공급자 비밀)과
+  webhook URL·헤더 값에 `{secretFrom: {env: WEB_PW}}`·`{secretFrom: {file: pw.txt}}`(상대 경로는 매니페스트 파일 옆, 끝 줄바꿈은 뺌)를
+  쓰면 CLI가 평문으로 풀어 보낸다. 다른 칸(설명·레이블·`user_data`)의 `secretFrom`은 오류다 — 그 칸은 평문으로 저장되어 보인다. 내보낸 파일의 비밀은 `{secretRef: …}`이고, 다시 적용하면 서버가 저장한 값을 그대로 둔다(파일에 비밀이 없어도
   왕복이 같다). 저장한 값이 없는데 참조만 오면 막힘 `secret_missing`.
 - **순서는 서버가 정한다.** 참조를 따라 같은 계획 안에서 만들 것까지 풀고, 아래 표의 차례로 적용한다(지우기는 거꾸로).
 
@@ -105,7 +105,7 @@ orbivisorctl plan -f web/ --set web
 #     ~ memory_mib: 256 -> 512
 #     note: the VM is running; this hardware change applies by hotplug or at its next restart
 # Plan: 0 to create, 1 to update, 0 to delete, 6 unchanged.
-orbivisorctl plan -f web/ --set web --out plan.json          # 계획을 저장한다(30분, 계획을 세운 노드에서)
+orbivisorctl plan -f web/ --set web --out plan.json          # 계획 id를 저장한다(0600, 문서·비밀 없음 — 계획은 서버에 30분)
 orbivisorctl apply --plan plan.json --yes                    # 저장한 계획 그대로. 그사이 바뀌었으면 거절
 orbivisorctl export --dir ./cluster                          # 종류마다 파일(10-folders.yaml … 적용 차례 번호)
 orbivisorctl export --kind vm --folder /demo/web --minimal   # 표준 출력에 YAML, --set NAME은 그 묶음이 기억하는 것만
@@ -122,12 +122,14 @@ orbivisorctl export --kind vm --folder /demo/web --minimal   # 표준 출력에 
 - **막힘.** 권한 없음(`forbidden`), 없는 참조(`missing_reference`), 바꿀 수 없는 칸(`immutable` — 손으로 할 일 문구), 가지치기 보호
   (`protected`), 다른 관리자(`managed_elsewhere`), 기능 없음(`cluster_upgrading`) 등은 그 단계를 `!`로 보인다. 막힌 단계가 하나라도
   있으면 `apply`는 **하나도 하지 않는다**(서버는 409 `plan_blocked`, `diff`는 끝 코드 2).
-- **저장한 계획.** `POST /apply?dry_run`이 돌려준 계획 id는 받은 노드 메모리에 30분(노드마다 256개) 있다. 같은 사용자만 적용하고,
-  다른 노드·30분 지남·노드 재시작이면 404 `plan_not_found`, 문서가 다르거나 계획이 본 리소스의 revision이 바뀌었으면 412
+- **저장한 계획.** `POST /apply?dry_run`이 돌려준 계획 id는 받은 노드 메모리에 30분(노드마다 256개) 있다. 같은 사용자의 같은
+  자격(세션 또는 같은 API 토큰)만 적용하고(단계는 계획을 세운 자격의 권한으로 돈다), 다른 자격·다른 노드·30분 지남·노드 재시작이면
+  404 `plan_not_found`, 문서가 다르거나 계획이 본 리소스의 설정(이름·레이블·spec — 상태만 바뀐 것은 아니다)이 바뀌었으면 412
   `plan_stale`(다시 계획한다 — Terraform 저장 계획과 같은 약속)이다. `apply --plan`은 같은 `--server`일 때만 보낸다. 로드밸런서 뒤에서는
   요청이 다른 노드로 갈 수 있으니 `--plan` 대신 바로 `apply`를 쓴다(그것도 보인 계획 id를 그대로 적용한다).
-- **원자 적용이 아니다.** 적용 Task `apply`는 단계를 차례로 하고(단계마다 권한을 다시 보고 계획 때 revision으로 `If-Match`, 그 쓰기가
-  만든 Task를 기다림) **첫 실패에서 멈춘다.** 끝난 단계는 되돌리지 않는다. 같은 파일을 다시 적용하면 남은 것만 한다(몇 번 해도 같다).
+- **원자 적용이 아니다.** 적용 Task `apply`는 단계를 차례로 하고(단계마다 권한과 계획 때 설정을 다시 보고 지금 revision으로
+  `If-Match`, 그 쓰기가 만든 Task를 기다림) **첫 실패에서 멈춘다.** 끝난 단계는 되돌리지 않는다. 적용 묶음 status는 단계마다 쓴다(도중에
+  노드가 다시 시작해도 만든 객체를 묶음이 안다). 같은 파일을 다시 적용하면 남은 것만 한다(몇 번 해도 같다).
   Task 진행에 "n/m, 실패 단계, 오류"가 보이고 묶음 status의 `last_error`에 남는다. 같은 적용에서 만든 풀에 볼륨을 만들면 노드가
   풀을 알리기 전이라 `pool_unavailable`로 멈출 수 있다 — 다시 적용한다.
 - **내보내기.** `GET /manifests`가 읽을 수 있는 것만 적용 차례로, id 대신 이름·폴더 경로, 비밀은 `secretRef`, status 없이 준다.
@@ -169,9 +171,12 @@ grant면 `permission.modify`와 위임 규칙, ACME 셋은 루트 `cluster.admin
 - `POST /apply`(계획·적용)와 되돌리기는 **어딘가의** `system.read`가 있어야 한다(폴더 사용자도 자기 폴더에 적용한다). 바꿀 것이 있는
   단계만 쓰기 권한을 보고, 그대로인 단계는 읽기만 본다. 권한이 없으면 그 단계는 `blocked: forbidden`이고 그 단계의 나머지 검사를
   하지 않는다. 볼 수 없는 폴더·참조는 없는 것과 같은 문구다(`folder "/x" not found`·`Network "x" not found`).
-- 적용 묶음 보기(`set list|get`, `GET /apply-sets*`)는 루트 `system.read`, 묶음 지우기·`adopt`는 그 객체 모두의 바꾸기 권한이다.
-- 내보내기와 설정 기록은 지금 읽을 수 있는 리소스만 보인다(지운 리소스는 마지막 폴더 기준). 비밀은 기록·감사·계획 어디에도
-  평문으로 남지 않는다([접근과 보안](access.md#선언형-적용과-설정-기록의-권한)).
+- 적용 묶음 보기(`set list|get`, `GET /apply-sets*`)는 루트 `system.read`, 묶음 지우기·`adopt`는 그 객체 모두의 바꾸기 권한이다
+  (`adopt`에 객체를 주지 않으면 볼 수 있고 바꿀 수 있는 드리프트만 받아들인다).
+- 내보내기와 설정 기록은 지금 읽을 수 있는 리소스만 보인다(지운 리소스는 마지막 폴더 기준). 설정 기록의 줄은 그때의 폴더도 읽을 수
+  있어야 보인다(읽을 수 없는 폴더에서 옮겨 온 객체의 그때 줄은 숨는다). 비밀은 기록·감사·계획 어디에도 평문으로 남지 않는다 —
+  webhook URL은 `https://host/…`, 헤더 값은 `$secret` 표시, 이미지 카탈로그 URL은 질의·사용자 정보를 가린 글로 남는다(이 셋은 숨긴
+  부분만 바뀐 것을 기록이 보이지 않는다)([접근과 보안](access.md#선언형-적용과-설정-기록의-권한)).
 
 ## 설정 기록
 

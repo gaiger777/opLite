@@ -132,6 +132,28 @@ async fn alerting_realms_and_settings_apply_round_trip() {
     // 알림 대상이 규칙보다 먼저
     assert!(step(&plan, "hook")["n"].as_u64() < step(&plan, "vm-failed")["n"].as_u64());
     apply(&admin, body.clone()).await;
+    // 리뷰 1: 처음 적용한 묶음 선언과 설정 이력(목록·줄·지금 값과 비교)에도 URL 경로·헤더 값·비밀이 없다.
+    let (_, set) = admin.get("/apply-sets/ops").await;
+    assert_hidden(&set.to_string(), &OPS_SECRETS);
+    let (status, rows) = admin.get("/history/notification-target/hook").await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_hidden(&rows.to_string(), &OPS_SECRETS);
+    let rev = rows["items"][0]["revision"].as_u64().unwrap();
+    for q in ["", "?compare=live"] {
+        let (status, row) = admin
+            .get(&format!("/history/notification-target/hook/{rev}{q}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{row}");
+        assert_hidden(&row.to_string(), &OPS_SECRETS);
+        assert_eq!(
+            row["record"]["spec"]["target"]["url"],
+            "https://hooks.example.com/…"
+        );
+        assert!(
+            row["record"]["spec"]["target"]["headers"]["X-Api-Key"]["$secret"].is_string(),
+            "{row}"
+        );
+    }
 
     let settings = env
         .cluster

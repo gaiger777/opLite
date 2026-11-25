@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::image_catalog::redact_source_url;
 use crate::resource::Kind;
 
 /// 사유(`Orbivisor-Change-Reason`) 최대 글자 수
@@ -316,9 +317,14 @@ enum SecretPath {
     Key(&'static str),
     /// spec 뿌리에서 이 경로의 칸
     Pointer(&'static [&'static str]),
+    /// spec 뿌리에서 이 경로의 맵: 값마다 비밀(webhook 헤더 값 — 이름은 남긴다)
+    Values(&'static [&'static str]),
+    /// spec 뿌리에서 이 경로의 URL: 보기처럼 줄인 글로 남긴다(`*`는 목록의 모든 항목). 줄여 숨긴 부분만 바뀌면 이력의
+    /// 바뀜에 보이지 않는다(되돌리기는 그 칸을 지금 값으로 — 줄인 글을 받는 처리기 규칙과 같다).
+    Url(&'static [&'static str], fn(&str) -> String),
 }
 
-use SecretPath::{Key, Pointer};
+use SecretPath::{Key, Pointer, Url, Values};
 
 /// 종류별 비밀 칸. 보기 가림 함수(`redact_*`)가 빼거나 가리는 칸을 모두 담는다(시험이 본다).
 fn secret_paths(kind: Kind) -> &'static [SecretPath] {
@@ -328,13 +334,25 @@ fn secret_paths(kind: Kind) -> &'static [SecretPath] {
         Kind::Realm => &[Key("bind_password"), Key("client_secret")],
         Kind::NodeFence => &[Key("password")],
         Kind::Remote => &[Key("token")],
-        Kind::NotificationTarget => &[Key("password"), Key("token")],
+        Kind::NotificationTarget => &[
+            Key("password"),
+            Key("token"),
+            Values(&["target", "headers"]),
+            Url(&["target", "url"], crate::alert::redact_url),
+        ],
         Kind::BackupStore => &[
             Pointer(&["encryption", "key"]),
             Pointer(&["backend", "s3", "secret_access_key"]),
         ],
         Kind::VmwareSource => &[Key("password")],
-        Kind::Settings => &[Pointer(&["subscription"])],
+        Kind::Settings => &[
+            Pointer(&["subscription"]),
+            Url(&["image_catalog", "*", "url"], redact_source_url),
+            Url(
+                &["image_catalog", "*", "checksum", "url"],
+                redact_source_url,
+            ),
+        ],
         Kind::AcmeAccount => &[Pointer(&["eab", "hmac_key"]), Pointer(&["key"])],
         Kind::AcmeDns => &[
             Key("api_token"),
@@ -404,6 +422,8 @@ pub fn history_mask(kind: Kind, prev: Option<&Value>, next: &Value) -> Value {
         match path {
             Pointer(segs) => mask_pointer(&mut out, prev, segs),
             Key(key) => mask_key(&mut out, prev, key),
+            Values(segs) => mask_values(&mut out, prev, segs),
+            Url(segs, redact) => redact_at(&mut out, segs, *redact),
         }
     }
     out
@@ -426,6 +446,46 @@ fn mask_pointer(out: &mut Value, prev: Option<&Value>, segs: &[&str]) {
     };
     if let Some(change) = SecretChange::between(prev_v, parent.get(*last)) {
         parent.insert(last.to_string(), change.mark());
+    }
+}
+
+fn mask_values(out: &mut Value, prev: Option<&Value>, segs: &[&str]) {
+    let mut prev_v = prev;
+    let mut here = Some(out);
+    for s in segs {
+        prev_v = prev_v.and_then(|p| p.get(*s));
+        here = here.and_then(|h| h.get_mut(*s));
+    }
+    let Some(map) = here.and_then(Value::as_object_mut) else {
+        return;
+    };
+    // 앞 규칙(`Key`)이 이미 가린 값(이름이 `token`인 헤더)은 그대로 둔다.
+    for (k, v) in map.iter_mut().filter(|(_, v)| secret_mark(v).is_none()) {
+        if let Some(change) = SecretChange::between(prev_v.and_then(|p| p.get(k)), Some(&*v)) {
+            *v = change.mark();
+        }
+    }
+}
+
+fn redact_at(out: &mut Value, segs: &[&str], redact: fn(&str) -> String) {
+    match segs.split_first() {
+        None => {
+            if let Some(s) = out.as_str() {
+                *out = Value::String(redact(s));
+            }
+        }
+        Some((&"*", rest)) => {
+            if let Some(items) = out.as_array_mut() {
+                for item in items {
+                    redact_at(item, rest, redact);
+                }
+            }
+        }
+        Some((s, rest)) => {
+            if let Some(child) = out.get_mut(*s) {
+                redact_at(child, rest, redact);
+            }
+        }
     }
 }
 
@@ -587,6 +647,48 @@ mod tests {
         assert_eq!(secret_mark(&json!({ "$secret": "same", "x": 1 })), None);
     }
 
+    /// 리뷰 1: webhook URL은 줄인 글, 헤더 값은 표시(이름은 남김), 카탈로그 URL은 질의·사용자 정보를 가린 글.
+    #[test]
+    fn masks_webhook_urls_headers_and_catalog_urls() {
+        let prev = json!({ "target": { "kind": "webhook",
+            "url": "https://hooks.slack.com/services/T0/B0/OLDPATH",
+            "headers": { "Authorization": "Bearer OLD", "X-Same": "s", "token": "h" }, "token": "t" } });
+        let next = json!({ "target": { "kind": "webhook",
+            "url": "https://hooks.slack.com/services/T0/B0/SECRETPATH",
+            "headers": { "Authorization": "Bearer SECRETHDR", "X-Same": "s", "X-New": "n", "token": "h" },
+            "token": "t" } });
+        let masked = history_mask(Kind::NotificationTarget, Some(&prev), &next);
+        assert_eq!(
+            masked,
+            json!({ "target": { "kind": "webhook", "url": "https://hooks.slack.com/…",
+                "headers": { "Authorization": mark("changed"), "X-Same": mark("same"),
+                             "X-New": mark("set"), "token": mark("same") },
+                "token": mark("same") } })
+        );
+        assert!(!masked.to_string().contains("SECRET"));
+        // SMTP 대상에는 URL·헤더가 없다.
+        let smtp = json!({ "target": { "kind": "smtp", "host": "mx", "password": "p" } });
+        assert_eq!(
+            history_mask(Kind::NotificationTarget, None, &smtp)["target"]["host"],
+            "mx"
+        );
+        let settings = json!({ "image_catalog": [
+            { "id": "a", "url": "https://u:pw@s3.example/a.qcow2?X-Amz-Signature=SIG",
+              "checksum": { "kind": "sums", "url": "https://s3.example/SHA256SUMS?sig=SIG" } },
+            { "id": "b", "url": "https://cloud.example/b.img", "checksum": { "kind": "sha256", "value": "00" } } ] });
+        let masked = history_mask(Kind::Settings, None, &settings);
+        assert_eq!(
+            masked["image_catalog"][0]["url"],
+            "https://***@s3.example/a.qcow2?***"
+        );
+        assert_eq!(
+            masked["image_catalog"][0]["checksum"]["url"],
+            "https://s3.example/SHA256SUMS?***"
+        );
+        assert_eq!(masked["image_catalog"][1], settings["image_catalog"][1]);
+        assert!(!masked.to_string().contains("SIG") && !masked.to_string().contains("pw"));
+    }
+
     /// 보기 가림 함수가 빼거나 가리는 칸은 모두 이력에서도 가린다(가림 ⊆ 이력 가림). opl-api의 가림 함수는 그쪽 시험이 본다.
     #[test]
     fn view_redaction_is_covered_by_history_mask() {
@@ -628,6 +730,30 @@ mod tests {
                 json!({ "provider": { "kind": "route53", "access_key_id": "A",
                                       "secret_access_key": "S", "region": "us-east-1" } }),
                 crate::acme::redact_dns_json,
+            ),
+            (
+                Kind::NotificationTarget,
+                json!({ "target": { "kind": "webhook",
+                    "url": "https://hooks.slack.com/services/T0/B0/SECRETPATH",
+                    "headers": { "Authorization": "Bearer SECRETHDR" }, "token": "t" } }),
+                |v| {
+                    let spec: crate::alert::NotificationTargetSpec =
+                        serde_json::from_value(v.clone()).unwrap();
+                    *v = json!({ "target": crate::alert::TargetConfigView::from(spec.target) });
+                },
+            ),
+            (
+                Kind::Settings,
+                json!({ "image_catalog": [{ "url": "https://u:p@s3.example/a?sig=S",
+                    "checksum": { "kind": "sums", "url": "https://s3.example/SUMS?sig=S" } }] }),
+                // opl-api `images::redact_image`와 같은 가림(그쪽 시험이 진짜 함수로 본다)
+                |v| {
+                    for image in v["image_catalog"].as_array_mut().unwrap() {
+                        image["url"] = redact_source_url(image["url"].as_str().unwrap()).into();
+                        let sums = image["checksum"]["url"].as_str().unwrap();
+                        image["checksum"]["url"] = redact_source_url(sums).into();
+                    }
+                },
             ),
         ];
         for (kind, value, redact) in cases {

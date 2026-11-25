@@ -42,7 +42,7 @@ use crate::firmware::{
 use crate::guest::{
     GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
 };
-use crate::history::{HistoryReadReply, HistoryRequest, MAX_HISTORY_READ};
+use crate::history::{HistoryReadReply, HistoryRequest, MAX_HISTORY_READ, fit_reply};
 use crate::metrics::{
     MAX_HISTORY_BYTES, MetricsReply, MetricsSource, PushMetricsHistoryReply,
     PushMetricsHistoryRequest,
@@ -604,12 +604,14 @@ impl Peer for PeerService {
         let cluster = self.cluster.clone();
         let records = self
             .offload(async move {
-                match req.into_inner() {
-                    HistoryRequest::Resource { kind, id } => cluster.history_of(kind, id),
+                let req = req.into_inner();
+                let records = match &req {
+                    HistoryRequest::Resource { kind, id } => cluster.history_of(*kind, *id),
                     HistoryRequest::Timeline { before, limit } => {
-                        cluster.history_timeline(before, limit.min(MAX_HISTORY_READ))
+                        cluster.history_timeline(*before, (*limit).min(MAX_HISTORY_READ))
                     }
-                }
+                };
+                records.map(|r| fit_reply(&req, r))
             })
             .await?
             .map_err(|e| Status::internal(e.to_string()))?;

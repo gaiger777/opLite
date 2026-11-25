@@ -179,6 +179,11 @@ impl Adapter for TargetAdapter {
         SECRETS
     }
 
+    /// 줄인 URL·빈 헤더 값(내보내기와 같다)
+    fn redact_declared(&self, spec: &mut Value) {
+        *spec = export(spec);
+    }
+
     fn may_create(
         &self,
         state: &AppState,

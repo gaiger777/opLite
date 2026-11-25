@@ -126,19 +126,17 @@ async fn all_records(state: &AppState) -> Result<Vec<HistoryRecord>, ApiError> {
             },
         )
         .await?;
+        // 빈 쪽까지 읽는다: 구성원이 바이트 예산으로 쪽을 줄일 수 있다(`fit_reply`).
         let Some(last) = page.last() else { break };
         before = Some(last.revision);
-        let n = page.len();
         out.extend(page);
-        if n < MAX_HISTORY_READ {
-            break;
-        }
     }
     out.reverse();
     Ok(out)
 }
 
-/// 이력 줄의 리소스를 이 주체가 지금 읽을 수 있는지(지운 것은 마지막 spec의 폴더로 — §13). 목록·watch와 같은 규칙이다.
+/// 이력 줄을 이 주체가 지금 읽을 수 있는지(§13, 목록·watch와 같은 규칙): 그 줄의 spec(그때의 폴더)과 지금 객체(있으면)를 둘
+/// 다 읽을 수 있어야 한다 — 읽을 수 없는 폴더에서 옮겨 온 객체의 그때 줄은 보이지 않는다(리뷰 1).
 struct Access<'a> {
     state: &'a AppState,
     principal: &'a Principal,
@@ -155,18 +153,32 @@ impl<'a> Access<'a> {
     }
 
     fn can_read(&self, rec: &HistoryRecord) -> bool {
-        let raw = match self.state.cluster.get_raw(rec.kind, rec.id) {
-            Ok(Some(live)) => live,
-            _ => RawResource {
-                id: rec.id,
-                name: rec.name.clone(),
-                revision: rec.revision,
-                labels: rec.labels.clone(),
-                spec: rec.spec.clone(),
-                status: Value::Null,
-            },
+        self.live_readable(rec.kind, rec.id).unwrap_or(true) && self.row_readable(rec)
+    }
+
+    /// 지금 객체를 읽을 수 있는지(없으면 None)
+    fn live_readable(&self, kind: Kind, id: Uuid) -> Option<bool> {
+        match self.state.cluster.get_raw(kind, id) {
+            Ok(Some(live)) => Some(self.readable(kind, &live)),
+            _ => None,
+        }
+    }
+
+    /// 그 줄의 spec(그때의 폴더·레이블)으로 읽을 수 있는지
+    fn row_readable(&self, rec: &HistoryRecord) -> bool {
+        let raw = RawResource {
+            id: rec.id,
+            name: rec.name.clone(),
+            revision: rec.revision,
+            labels: rec.labels.clone(),
+            spec: rec.spec.clone(),
+            status: Value::Null,
         };
-        match self.owners.of_event(rec.kind, &raw) {
+        self.readable(rec.kind, &raw)
+    }
+
+    fn readable(&self, kind: Kind, raw: &RawResource) -> bool {
+        match self.owners.of_event(kind, raw) {
             Some(owned) => self
                 .state
                 .authz
@@ -174,9 +186,17 @@ impl<'a> Access<'a> {
                 .is_ok_and(|set| set.contains(owned.read)),
             None => self
                 .state
-                .authorize(self.principal, Action::Read, rec.kind)
+                .authorize(self.principal, Action::Read, kind)
                 .is_ok(),
         }
+    }
+
+    /// 리소스 하나를 볼 수 있는지(거르기 전에 — 있는데 읽을 수 없는 것과 없는 것이 같은 404): 지금 객체, 지운 것은 가장
+    /// 새 줄
+    fn resource_readable(&self, kind: Kind, id: Uuid, newest: Option<&HistoryRecord>) -> bool {
+        self.live_readable(kind, id)
+            .or_else(|| newest.map(|r| self.row_readable(r)))
+            .unwrap_or(false)
     }
 }
 
@@ -319,7 +339,7 @@ async fn resolve_key(state: &AppState, kind: Kind, key: &str) -> Result<Uuid, Ap
         if let Some(r) = page.iter().find(|r| r.kind == kind && r.name == key) {
             return Ok(r.id);
         }
-        if page.len() < MAX_HISTORY_READ || scanned >= MAX_SCAN {
+        if scanned >= MAX_SCAN {
             break;
         }
     }
@@ -537,17 +557,21 @@ pub async fn timeline(
     // 리소스 하나면 그 줄만 읽는다.
     if let (Some(kind), Some(id)) = (kind, id) {
         let records = records_of(&state, kind, id).await?;
+        // 거르기 전에 본다(거른 결과로 있는지 알 수 없게 — 리뷰 1).
+        if !access.resource_readable(kind, id, records.last()) {
+            return Err(ApiError::not_found(format!(
+                "{} {} not found",
+                kind.as_str(),
+                q.key.as_deref().unwrap_or_default()
+            )));
+        }
         let mut items = Vec::new();
         for (i, rec) in records.iter().enumerate().rev() {
             if q.before.is_some_and(|b| rec.revision >= b) || !filter.matches(rec, &folders) {
                 continue;
             }
-            if !access.can_read(rec) {
-                return Err(ApiError::not_found(format!(
-                    "{} {} not found",
-                    kind.as_str(),
-                    q.key.as_deref().unwrap_or_default()
-                )));
+            if !access.row_readable(rec) {
+                continue;
             }
             if items.len() == limit {
                 return Ok(Json(HistoryList {
@@ -567,7 +591,7 @@ pub async fn timeline(
     let mut before = q.before;
     let mut scanned = 0;
     let mut prevs: BTreeMap<(Kind, Uuid), Vec<HistoryRecord>> = BTreeMap::new();
-    let mut readable: BTreeMap<(Kind, Uuid), bool> = BTreeMap::new();
+    let mut readable: BTreeMap<(Kind, Uuid), Option<bool>> = BTreeMap::new();
     let mut more = false;
     'pages: loop {
         let page = read(
@@ -579,17 +603,16 @@ pub async fn timeline(
         )
         .await?;
         let Some(last) = page.last() else { break };
-        let full = page.len() >= MAX_HISTORY_READ.min(limit * 4).max(200);
         let last_rev = last.revision;
         for rec in &page {
             scanned += 1;
             if !filter.matches(rec, &folders) {
                 continue;
             }
-            let ok = *readable
+            let live_ok = *readable
                 .entry((rec.kind, rec.id))
-                .or_insert_with(|| access.can_read(rec));
-            if !ok {
+                .or_insert_with(|| access.live_readable(rec.kind, rec.id));
+            if !live_ok.unwrap_or(true) || !access.row_readable(rec) {
                 continue;
             }
             if items.len() == limit {
@@ -614,10 +637,8 @@ pub async fn timeline(
             };
             items.push(entry(rec, changed(prev.as_ref(), rec)));
         }
+        // 빈 쪽까지 읽는다(구성원이 바이트 예산으로 쪽을 줄일 수 있다).
         before = Some(last_rev);
-        if !full {
-            break;
-        }
         if scanned >= MAX_SCAN {
             more = true;
             break;
@@ -706,7 +727,12 @@ pub async fn history_row(
     }
     let compare = q.compare.unwrap_or_else(|| "prev".into());
     let (against, diff) = match compare.as_str() {
-        "prev" => match i.checked_sub(1).map(|p| &records[p]) {
+        // 읽을 수 없는 앞 줄(그때 다른 폴더)은 없는 것처럼
+        "prev" => match i
+            .checked_sub(1)
+            .map(|p| &records[p])
+            .filter(|p| access.row_readable(p))
+        {
             Some(prev) => (Some(prev.revision), diff(&prev.spec, &rec.spec)),
             None => (None, diff(&Value::Object(Default::default()), &rec.spec)),
         },
@@ -726,7 +752,7 @@ pub async fn history_row(
                 .map_err(|_| ApiError::bad_request("compare must be prev, live or a revision"))?;
             let base = records
                 .iter()
-                .find(|x| x.revision == r)
+                .find(|x| x.revision == r && access.row_readable(x))
                 .ok_or_else(|| ApiError::not_found(format!("no history row {r}")))?;
             (Some(r), diff(&base.spec, &rec.spec))
         }
@@ -940,6 +966,7 @@ fn push_blocked(
         name: name.to_string(),
         action: StepAction::Blocked,
         seen: None,
+        seen_config: 0,
         doc: None,
         declared_spec: Value::Null,
         declared: Value::Null,

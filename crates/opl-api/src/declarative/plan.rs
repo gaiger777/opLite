@@ -99,6 +99,9 @@ pub(crate) struct Step {
     pub action: StepAction,
     /// 계획 때 본 객체(id, revision)
     pub seen: Option<(Uuid, u64)>,
+    /// 계획 때 본 객체의 설정 지문([`Live::config_fingerprint`] — 이름·레이블·spec). 상태만 쓴 것(revision은 오른다)은
+    /// 계획을 낡게 하지 않는다(리뷰 1).
+    pub seen_config: u64,
     /// 원하는 매니페스트(만들기는 선언, 바꾸기는 지금 값에 선언을 얹은 것)
     pub doc: Option<Manifest>,
     /// 선언한 spec 그대로(서버 칸을 지금 값에서 가져올 때 "선언했는지"를 본다)
@@ -313,7 +316,8 @@ fn labels_of(
     out
 }
 
-/// 묶음에 남길 선언: 매니페스트에서 판·종류·이름을 뺀 것. 비밀 칸의 평문은 `{"$secret": "set"}`(지문 없이).
+/// 묶음에 남길 선언: 매니페스트에서 판·종류·이름을 뺀 것. 비밀 칸의 평문은 `{"$secret": "set"}`(지문 없이), 보기가
+/// 가리는 칸(webhook URL·헤더 값)은 보기처럼 줄인다.
 pub(crate) fn declared_of(doc: &Manifest) -> Value {
     let mut spec = doc.spec.clone();
     if let Some(a) = adapter(doc.kind) {
@@ -325,6 +329,7 @@ pub(crate) fn declared_of(doc: &Manifest) -> Value {
                 *v = json!({ "$secret": "set" });
             }
         }
+        a.redact_declared(&mut spec);
     }
     let mut out = json!({ "spec": spec });
     let meta = serde_json::to_value(&doc.metadata).expect("metadata");
@@ -628,6 +633,7 @@ fn delete_step(
         name: live.name.clone(),
         action,
         seen: Some((live.id, live.revision)),
+        seen_config: live.config_fingerprint(),
         doc: None,
         declared_spec: Value::Null,
         declared,
@@ -696,6 +702,7 @@ async fn plan_doc(
         name: name.clone(),
         action: StepAction::Blocked,
         seen: live.map(|l| (l.id, l.revision)),
+        seen_config: live.map_or(0, |l| l.config_fingerprint()),
         doc: None,
         declared_spec: doc.spec.clone(),
         declared: declared_of(doc),
@@ -960,9 +967,9 @@ pub(crate) fn still_valid(state: &AppState, plan: &StoredPlan) -> Result<(), Api
     for step in &plan.steps {
         let ok = match step.seen {
             None => !world.objects.contains_key(&(step.kind, step.key.clone())),
-            Some((id, revision)) => world
+            Some((id, _)) => world
                 .by_id(step.kind, id)
-                .is_some_and(|l| l.revision == revision),
+                .is_some_and(|l| l.config_fingerprint() == step.seen_config),
         };
         if !ok {
             return Err(ApiError::new(
@@ -1117,5 +1124,26 @@ mod tests {
         assert_eq!(declared["spec"]["cloud_init"]["user"], "rocky");
         assert!(!declared.to_string().contains("hunter2"));
         assert!(declared["metadata"].get("name").is_none());
+    }
+
+    /// 리뷰 1: webhook URL의 경로·헤더 값도 묶음에 남지 않는다.
+    #[test]
+    fn declared_webhook_url_and_headers_are_redacted() {
+        let doc = Manifest::new(
+            ManifestKind::NotificationTarget,
+            "slack",
+            json!({ "target": { "kind": "webhook",
+                "url": "https://hooks.slack.com/services/T0/B0/SECRETPATH",
+                "headers": { "Authorization": "Bearer SECRETHDR" }, "token": "TOKEN" } }),
+        );
+        let declared = declared_of(&doc);
+        assert_eq!(
+            declared["spec"]["target"],
+            json!({ "kind": "webhook", "url": "https://hooks.slack.com/…",
+                    "headers": { "Authorization": "" }, "token": { "$secret": "set" } })
+        );
+        assert!(
+            !declared.to_string().contains("SECRET") && !declared.to_string().contains("TOKEN")
+        );
     }
 }

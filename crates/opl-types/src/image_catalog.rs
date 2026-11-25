@@ -24,6 +24,25 @@ const MAX_TITLE_CHARS: usize = 128;
 const MAX_LABEL_CHARS: usize = 64;
 const MAX_USER_CHARS: usize = 32;
 
+/// URL의 사용자 정보(`user:password@`)를 `***@`로, 쿼리 문자열(서명·토큰이 흔히 든다)을 `?***`로 가린다. 관리자가
+/// 아닌 주체에게 내는 카탈로그 항목·받기 Task와 설정 이력(계획 73)에 쓴다.
+pub fn redact_source_url(url: &str) -> String {
+    let (url, tail) = match url.find('?') {
+        Some(q) => (&url[..q], "?***"),
+        None => (url, ""),
+    };
+    let Some(start) = url.find("://").map(|i| i + 3) else {
+        return format!("{url}{tail}");
+    };
+    let end = url[start..]
+        .find(['/', '#'])
+        .map_or(url.len(), |i| start + i);
+    match url[start..end].rfind('@') {
+        Some(at) => format!("{}***{}{tail}", &url[..start], &url[start + at..]),
+        None => format!("{url}{tail}"),
+    }
+}
+
 /// 카탈로그 이미지 하나
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

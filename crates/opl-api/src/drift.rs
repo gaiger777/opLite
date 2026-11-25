@@ -26,7 +26,7 @@ use crate::audit::AuditNote;
 use crate::auth::Principal;
 use crate::cluster::{missing_feature, require_feature};
 use crate::declarative::diff::diff;
-use crate::declarative::kinds::{Live, World, adapter, check_route, tree_of_doc};
+use crate::declarative::kinds::{Live, World, adapter, check_route, readable, tree_of_doc};
 use crate::declarative::plan::compare;
 use crate::error::{ApiError, Json};
 use crate::state::AppState;
@@ -421,14 +421,14 @@ fn adopted(declared: &Value, now: &Manifest) -> Value {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdoptRequest {
-    /// 받아들일 객체(`종류/이름` 또는 id). 비면 드리프트 보고의 모든 객체
+    /// 받아들일 객체(`종류/이름` 또는 id). 비면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 객체 모두(밖에서 지운 것 포함)
     #[serde(default)]
     pub objects: Vec<String>,
 }
 
-/// 실제를 선언으로 받아들인다(§12.5): 고른 객체(없으면 드리프트 보고의 모두)의 묶음 선언을 지금 값으로 바꾼다 — 리소스는
-/// 바꾸지 않는다. 밖에서 지운 객체는 묶음에서 뺀다. 그 뒤 `orbivisorctl export --set`으로 git의 파일을 맞춘다. 고른 객체
-/// 모두의 바꾸기 권한이 든다(하나라도 없으면 403, 아무것도 바꾸지 않음).
+/// 실제를 선언으로 받아들인다(§12.5): 고른 객체(없으면 드리프트 보고에서 볼 수 있고 바꿀 수 있는 모두)의 묶음 선언을 지금
+/// 값으로 바꾼다 — 리소스는 바꾸지 않는다. 밖에서 지운 객체는 묶음에서 뺀다. 그 뒤 `orbivisorctl export --set`으로 git의
+/// 파일을 맞춘다. 고른 객체 모두의 바꾸기 권한이 든다(하나라도 없으면 403, 아무것도 바꾸지 않음).
 #[utoipa::path(post, path = "/apply-sets/{key}/adopt", tag = "declarative",
     params(("key" = String, Path, description = "id or name")),
     request_body = AdoptRequest,
@@ -454,10 +454,26 @@ pub async fn adopt(
             .map(|d| d.items.iter().map(|i| i.id).collect())
             .unwrap_or_default();
         let chosen: Vec<&AppliedObject> = if req.objects.is_empty() {
+            // 모두 = 이 주체가 볼 수 있고 바꿀 수 있는 드리프트 객체(밖에서 지운 것 포함 — 리뷰 1: 폴더 하나만 맡은
+            // 운영자도 보이는 것을 모두 받아들인다. 보이지 않는 것은 그대로 둔다)
             set.status
                 .objects
                 .iter()
                 .filter(|o| drifted.contains(&o.id))
+                .filter(|o| {
+                    let Some(kind) = ManifestKind::from_kind(o.kind) else {
+                        return false;
+                    };
+                    match (adapter(kind), world.by_id(kind, o.id)) {
+                        (Some(a), Some(live)) => {
+                            readable(&state, &principal, live)
+                                && check_route(&state, &principal, a.update_route(), Some(live.id))
+                                    .is_ok()
+                        }
+                        (_, None) => true,
+                        (None, Some(_)) => false,
+                    }
+                })
                 .collect()
         } else {
             let mut out = Vec::new();

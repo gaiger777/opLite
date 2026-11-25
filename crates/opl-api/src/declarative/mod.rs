@@ -329,7 +329,9 @@ pub async fn apply(
             let stored = state
                 .plans
                 .get(id)
-                .filter(|p| p.owner.user == principal.user)
+                // 계획을 세운 사용자의 같은 자격(세션 또는 같은 API 토큰)만: 단계는 세운 주체의 권한으로 돈다(리뷰 1 —
+                // 좁은 토큰이 넓은 세션의 계획을 쓰지 못하게).
+                .filter(|p| p.owner.user == principal.user && p.owner.token == principal.token)
                 .ok_or_else(|| {
                     ApiError::not_found(format!(
                         "plan {id} not found on this node (plans live 30 minutes on the node that made them)"

@@ -477,6 +477,22 @@ async fn saved_plans_go_stale_and_belong_to_their_user() {
     let (status, body) = bob.post("/apply", json!({ "plan": id })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["code"], "plan_not_found");
+    // 같은 사용자라도 다른 자격(세션의 계획을 API 토큰으로)은 그 계획을 쓰지 못한다(리뷰 1).
+    let (status, created) = admin.post("/tokens", json!({ "name": "ci" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let ci = Client {
+        base: admin.base.clone(),
+        http: admin.http.clone(),
+        token: Some(created["secret"].as_str().unwrap().to_string()),
+    };
+    let (status, body) = ci.post("/apply", json!({ "plan": id })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "plan_not_found");
+    let token_plan = dry_run(&ci, changed.clone()).await;
+    let (status, body) = admin
+        .post("/apply", json!({ "plan": token_plan["plan"] }))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     // 문서가 다르면 412
     let (status, body) = admin
         .post("/apply", json!({ "plan": id, "documents": web(256) }))
@@ -512,6 +528,58 @@ async fn saved_plans_go_stale_and_belong_to_their_user() {
         .unwrap()
         .unwrap();
     assert_eq!(group.spec.description.as_deref(), Some("x"));
+
+    // 상태만 쓴 것(조정기 — revision은 오른다)은 계획을 낡게 하지 않는다(리뷰 1).
+    let z = json!({ "documents": [doc("SecurityGroup", "web-sg", json!({ "description": "z", "rules": [] }))] });
+    let plan = dry_run(&admin, z).await;
+    let before = group.revision;
+    let after = env
+        .cluster
+        .update_status::<SecurityGroupSpec>(group.id, &Default::default())
+        .await
+        .unwrap();
+    assert!(after > before);
+    let (status, started) = admin.post("/apply", json!({ "plan": plan["plan"] })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let task = admin.wait_task(&started["task"]).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let group = env
+        .cluster
+        .get_by_name::<SecurityGroupSpec>("web-sg")
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.spec.description.as_deref(), Some("z"));
+}
+
+/// 리뷰 1: 적용 묶음 status는 단계마다 쓰인다(노드가 도중에 다시 시작해도 만든 객체를 묶음이 안다).
+#[tokio::test]
+async fn the_apply_set_is_recorded_after_each_step() {
+    let (env, admin) = start().await;
+    let mut watch = env.cluster.watch(env.cluster.revision()).unwrap();
+    let docs = json!({
+        "documents": [
+            doc("Folder", "a", json!({ "kind": "network" })),
+            doc("Folder", "b", json!({ "kind": "network" })),
+        ],
+        "apply_set": "net",
+    });
+    let task = apply(&admin, docs).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let mut counts = Vec::new();
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), watch.next()).await
+    {
+        if let opl_cluster::watch::WatchEvent::Put { kind, resource } = event
+            && kind == Kind::ApplySet
+        {
+            counts.push(resource.status["objects"].as_array().map_or(0, Vec::len));
+        }
+    }
+    assert!(
+        counts.contains(&1),
+        "a write after the first step: {counts:?}"
+    );
+    assert_eq!(counts.last(), Some(&2), "{counts:?}");
 }
 
 #[tokio::test]

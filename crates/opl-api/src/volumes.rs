@@ -457,23 +457,8 @@ pub struct VolumeDownloadRequest {
 }
 
 /// URL의 사용자 정보(`user:password@`)를 `***@`로, 쿼리 문자열(서명·토큰이 흔히 든다)을 `?***`로 가린다. 감사
-/// 설명, Task 오류 문구, 응답·watch로 내보내는 받기 Task에 쓴다.
-pub(crate) fn redact_url(url: &str) -> String {
-    let (url, tail) = match url.find('?') {
-        Some(q) => (&url[..q], "?***"),
-        None => (url, ""),
-    };
-    let Some(start) = url.find("://").map(|i| i + 3) else {
-        return format!("{url}{tail}");
-    };
-    let end = url[start..]
-        .find(['/', '#'])
-        .map_or(url.len(), |i| start + i);
-    match url[start..end].rfind('@') {
-        Some(at) => format!("{}***{}{tail}", &url[..start], &url[start + at..]),
-        None => format!("{url}{tail}"),
-    }
-}
+/// 설명, Task 오류 문구, 응답·watch로 내보내는 받기 Task에 쓴다(설정 이력도 같은 가림 — 계획 73 리뷰 1).
+pub(crate) use opl_types::image_catalog::redact_source_url as redact_url;
 
 /// 응답으로 낼 Task: 받기 Task의 URL·체크섬 파일 URL을 가리고([`redact_url`]), 템플릿 초안(받기)과 배포 덮어쓰기
 /// (복제)의 cloud-init 비밀번호(해시)를 [`PASSWORD_MASK`]로 가린다(계획 58). 저장은 그대로다(Task 실행은 원래 값을

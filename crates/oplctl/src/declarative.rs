@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
+use opl_types::manifest::{ManifestKind, secret_from_allowed};
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
@@ -84,7 +85,7 @@ pub(crate) struct ApplyArgs {
 pub(crate) struct PlanArgs {
     #[command(flatten)]
     files: Files,
-    /// 계획(id·서버·문서)을 이 파일에 저장한다 — `apply --plan FILE`
+    /// 계획(id·서버 — 문서·비밀은 담지 않는다, 0600)을 이 파일에 저장한다 — `apply --plan FILE`
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
 }
@@ -194,7 +195,7 @@ pub(crate) fn read_documents(files: &Files) -> anyhow::Result<Vec<Value>> {
             bail!("{} is larger than {MAX_BYTES} bytes", p.display());
         }
         for mut doc in parse_text(&text, &p)? {
-            resolve(&mut doc, &p)?;
+            resolve_doc(&mut doc, &p)?;
             total += serde_json::to_vec(&doc)?.len();
             if total > MAX_BYTES {
                 bail!(
@@ -229,13 +230,53 @@ pub(crate) fn parse_size(s: &str) -> anyhow::Result<u64> {
         .with_context(|| format!("size {s:?} is too large"))
 }
 
-/// 문서를 보내기 전에 푼다: `{"secretFrom": {"env": X}|{"file": P}}` → 평문, `_bytes`·`_mib` 칸의 크기 문자열 → 숫자.
-fn resolve(v: &mut Value, source: &Path) -> anyhow::Result<()> {
+/// 문서를 보내기 전에 푼다: 비밀 칸의 `{"secretFrom": {"env": X}|{"file": P}}` → 평문(다른 칸이면 오류 —
+/// [`secret_from_allowed`]), `_bytes`·`_mib` 칸의 크기 문자열 → 숫자.
+fn resolve_doc(doc: &mut Value, source: &Path) -> anyhow::Result<()> {
+    let kind = doc
+        .get("kind")
+        .cloned()
+        .and_then(|k| serde_json::from_value::<ManifestKind>(k).ok());
+    let mut at = SecretAt {
+        kind,
+        path: Vec::new(),
+    };
+    resolve(doc, source, &mut at)
+}
+
+/// `resolve`가 지나는 곳: 문서 종류와 문서 뿌리에서의 경로
+struct SecretAt {
+    kind: Option<ManifestKind>,
+    path: Vec<String>,
+}
+
+impl SecretAt {
+    /// 여기 `secretFrom`을 받는지(spec 안의 비밀 칸만)
+    fn check(&self) -> anyhow::Result<()> {
+        let path: Vec<&str> = self.path.iter().map(String::as_str).collect();
+        let ok = match (self.kind, path.split_first()) {
+            (Some(kind), Some((&"spec", rest))) => secret_from_allowed(kind, rest),
+            _ => false,
+        };
+        if !ok {
+            bail!(
+                "secretFrom at {} is not a secret field; use it only for secret fields (passwords, keys, tokens)",
+                self.path.join(".")
+            );
+        }
+        Ok(())
+    }
+}
+
+fn resolve(v: &mut Value, source: &Path, at: &mut SecretAt) -> anyhow::Result<()> {
     match v {
         Value::Object(m) => {
             for (k, child) in m.iter_mut() {
+                at.path.push(k.clone());
                 if let Some(from) = secret_from(child) {
+                    at.check()?;
                     *child = Value::String(read_secret(from, source)?);
+                    at.path.pop();
                     continue;
                 }
                 if let Value::String(s) = child {
@@ -254,18 +295,23 @@ fn resolve(v: &mut Value, source: &Path) -> anyhow::Result<()> {
                         };
                         *child = json!(mib);
                     }
+                    at.path.pop();
                     continue;
                 }
-                resolve(child, source)?;
+                resolve(child, source, at)?;
+                at.path.pop();
             }
         }
         Value::Array(items) => {
-            for item in items {
+            for (i, item) in items.iter_mut().enumerate() {
+                at.path.push(i.to_string());
                 if let Some(from) = secret_from(item) {
+                    at.check()?;
                     *item = Value::String(read_secret(from, source)?);
                 } else {
-                    resolve(item, source)?;
+                    resolve(item, source, at)?;
                 }
+                at.path.pop();
             }
         }
         _ => {}
@@ -438,9 +484,8 @@ pub(crate) async fn apply(
                 cell(&saved["server"])
             );
         }
-        let mut b = saved["request"].clone();
-        b["plan"] = saved["plan"].clone();
-        post(client, "/apply", &b, reason).await?
+        // 서버가 계획(문서·묶음·가지치기)을 기억한다 — id만 보낸다.
+        post(client, "/apply", &json!({ "plan": saved["plan"] }), reason).await?
     } else {
         let documents = read_documents(&args.files)?;
         let b = body(&args.files, documents);
@@ -502,6 +547,19 @@ pub(crate) async fn apply(
     Ok(())
 }
 
+/// 주인만 읽을 수 있게(0600) 쓴다(이미 있던 파일도).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
+}
+
 /// `plan`: 계획을 보이고(`--out`이면 저장한다)
 pub(crate) async fn plan(
     client: &Client,
@@ -518,8 +576,9 @@ pub(crate) async fn plan(
         print_plan(out, &plan)?;
     }
     if let Some(path) = &args.out {
-        let saved = json!({ "server": client.base, "plan": plan["plan"], "request": b });
-        std::fs::write(path, serde_json::to_vec_pretty(&saved)?)
+        // 문서는 담지 않는다(`secretFrom`을 푼 평문 비밀이 든다 — 리뷰 1). 서버가 계획을 기억하므로 id면 된다.
+        let saved = json!({ "server": client.base, "plan": plan["plan"] });
+        write_private(path, &serde_json::to_vec_pretty(&saved)?)
             .with_context(|| format!("cannot write {}", path.display()))?;
         if !json_out {
             writeln!(
@@ -763,28 +822,47 @@ mod tests {
             &yaml,
             "apiVersion: orbivisor.io/v1\nkind: Volume\nmetadata: { name: d }\nspec: { pool: local, size_bytes: 40Gi }\n---\n\
              apiVersion: orbivisor.io/v1\nkind: Vm\nmetadata: { name: v }\nspec:\n  memory_mib: 2Gi\n  cpu: { cores: 1 }\n\
-             \x20 cloud_init: { password: { secretFrom: { file: pw.txt } }, user_data: { secretFrom: { env: PATH } } }\n---\n",
+             \x20 cloud_init: { password: { secretFrom: { file: pw.txt } }, user_data: plain }\n---\n\
+             apiVersion: orbivisor.io/v1\nkind: NotificationTarget\nmetadata: { name: hook }\nspec:\n\
+             \x20 target: { kind: webhook, url: { secretFrom: { env: PATH } }, headers: { X-Key: { secretFrom: { file: pw.txt } } } }\n",
         )
         .unwrap();
         let docs = read_documents(&files(&[&yaml])).unwrap();
-        assert_eq!(docs.len(), 2);
+        assert_eq!(docs.len(), 3);
         assert_eq!(docs[0]["spec"]["size_bytes"], json!(40u64 << 30));
         assert_eq!(docs[1]["spec"]["memory_mib"], json!(2048));
         assert_eq!(docs[1]["spec"]["cloud_init"]["password"], "s3cret");
         assert_eq!(
-            docs[1]["spec"]["cloud_init"]["user_data"],
+            docs[2]["spec"]["target"]["url"],
             std::env::var("PATH").unwrap()
         );
+        assert_eq!(docs[2]["spec"]["target"]["headers"]["X-Key"], "s3cret");
+        // 비밀 칸이 아닌 곳(user_data·설명·레이블·종류 없는 문서)의 secretFrom은 오류다(리뷰 1).
+        for bad in [
+            "kind: Vm\nspec: { cloud_init: { user_data: { secretFrom: { env: PATH } } } }\n",
+            "kind: Vm\nspec: { description: { secretFrom: { file: pw.txt } } }\n",
+            "kind: Vm\nmetadata: { labels: { a: { secretFrom: { env: PATH } } } }\n",
+            "spec: { token: { secretFrom: { env: PATH } } }\n",
+        ] {
+            let one = dir.path().join("bad.yaml");
+            std::fs::write(&one, bad).unwrap();
+            let e = read_documents(&files(&[&one])).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("not a secret field"),
+                "{bad}: {e:#}"
+            );
+        }
+        std::fs::remove_file(dir.path().join("bad.yaml")).unwrap();
         // 디렉터리는 이름 차례로, 다른 확장자는 건너뛴다.
         std::fs::write(dir.path().join("a.json"), r#"[{"kind":"Folder"}]"#).unwrap();
         std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
         let docs = read_documents(&files(&[dir.path()])).unwrap();
-        assert_eq!(docs.len(), 3);
+        assert_eq!(docs.len(), 4);
         assert_eq!(docs[0]["kind"], "Folder");
         // 없는 환경 변수는 오류
         std::fs::write(
             &yaml,
-            "spec: { token: { secretFrom: { env: OPLCTL_TEST_UNSET_VAR } } }\n",
+            "kind: Remote\nspec: { token: { secretFrom: { env: OPLCTL_TEST_UNSET_VAR } } }\n",
         )
         .unwrap();
         let e = read_documents(&files(&[&yaml])).unwrap_err();
@@ -879,13 +957,13 @@ mod tests {
             text.contains("+ Folder a") && text.contains("Applied: 1 created"),
             "{text}"
         );
-        let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen[0].line, "POST /api/v1/apply?dry_run=true HTTP/1.1");
-        assert_eq!(seen[0].body["apply_set"], "web");
-        assert_eq!(seen[0].body["documents"][0]["kind"], "Folder");
+        let first = seen.lock().unwrap().clone();
+        assert_eq!(first[0].line, "POST /api/v1/apply?dry_run=true HTTP/1.1");
+        assert_eq!(first[0].body["apply_set"], "web");
+        assert_eq!(first[0].body["documents"][0]["kind"], "Folder");
         // 보인 계획 id로 적용한다.
-        assert_eq!(seen[1].line, "POST /api/v1/apply HTTP/1.1");
-        assert_eq!(seen[1].body["plan"], "p1");
+        assert_eq!(first[1].line, "POST /api/v1/apply HTTP/1.1");
+        assert_eq!(first[1].body["plan"], "p1");
 
         // diff: 바뀜이 있으면 끝 코드 1
         let e = diff(&client, f.clone(), false, &mut Vec::new())
@@ -909,6 +987,11 @@ mod tests {
         let saved_json: Value =
             serde_json::from_str(&std::fs::read_to_string(&saved).unwrap()).unwrap();
         assert_eq!(saved_json["plan"], "p1");
+        // 문서(풀어 둔 비밀)는 담지 않고, 주인만 읽는다(리뷰 1).
+        assert!(saved_json.get("request").is_none(), "{saved_json}");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&saved).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         let args = ApplyArgs {
             files: files(&[]),
             plan: Some(saved),
@@ -923,6 +1006,8 @@ mod tests {
                 .unwrap()
                 .contains("apply started (task t1)")
         );
+        let last = seen.lock().unwrap().last().unwrap().body.clone();
+        assert_eq!(last, json!({ "plan": "p1" }));
     }
 
     async fn plan_cmd(client: &Client, files: Files, out_file: &Path) {

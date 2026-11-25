@@ -1,6 +1,7 @@
 //! Task `apply`(계획 73 §8.3): 저장한 계획의 단계를 차례로 — 권한 다시 보기 → 계획 때 revision(`If-Match`) → 지금
 //! 처리기로 쓰기 → 그 쓰기가 만든 Task 기다리기. 첫 실패에서 멈추고 성공한 단계는 되돌리지 않는다(다시 적용하면 남은 것만
-//! 한다). 끝나면(실패해도) 적용 묶음 status에 성공한 단계까지의 선언을 남긴다. 받은 노드에서만 돌고 이어 가지 않는다.
+//! 한다). 단계마다, 그리고 끝나면(실패해도) 적용 묶음 status에 성공한 단계까지의 선언을 남긴다. 받은 노드에서만 돌고 이어
+//! 가지 않는다.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -131,12 +132,14 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
             Ok(Some(obj)) => {
                 record(state, &plan.owner, plan.id, step, None);
                 applied.push(obj);
+                record_progress(state, plan, &applied, &removed).await;
             }
             Ok(None) => {
                 record(state, &plan.owner, plan.id, step, None);
                 if let Some((id, _)) = step.seen {
                     removed.insert((step.kind.kind(), id));
                 }
+                record_progress(state, plan, &applied, &removed).await;
             }
             Err(e) => {
                 record(state, &plan.owner, plan.id, step, Some(&e.message));
@@ -160,6 +163,22 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
     match failure {
         Some(f) => Err(f),
         None => Ok(()),
+    }
+}
+
+/// 단계마다 적용 묶음 status에 여기까지를 남긴다(리뷰 1 — 노드가 도중에 다시 시작해 Task가 "계획이 없다"로 끝나도
+/// 만든 객체를 묶음이 안다: 드리프트·가지치기·묶음 지우기). 상태 쓰기라 이력 줄이 없다. 못 쓰면 끝에서 다시 쓴다.
+async fn record_progress(
+    state: &AppState,
+    plan: &StoredPlan,
+    applied: &[AppliedObject],
+    removed: &BTreeSet<(Kind, Uuid)>,
+) {
+    let Some(name) = &plan.apply_set else {
+        return;
+    };
+    if let Err(e) = record_set(state, plan, name, applied.to_vec(), removed, None).await {
+        tracing::warn!(set = %name, error = %e.message, "cannot record the apply progress");
     }
 }
 
@@ -188,15 +207,22 @@ fn record(state: &AppState, owner: &Principal, plan: Uuid, step: &Step, error: O
     state.audit.record(entry);
 }
 
-/// 계획 때 본 객체를 다시 찾는다(revision이 바뀌었으면 412 — 다시 계획하라).
-fn seen_live(world: &World, step: &Step) -> Result<super::kinds::Live, ApiError> {
+/// 계획 때 본 객체를 다시 찾는다(설정 — 이름·레이블·spec — 이 바뀌었으면 412: 다시 계획하라). 상태만 바뀐 것은 지금
+/// revision으로 쓴다(리뷰 1 — 조정기의 상태 쓰기가 긴 적용을 깨지 않게).
+fn seen_live(state: &AppState, step: &Step) -> Result<super::kinds::Live, ApiError> {
     let (id, revision) = step
         .seen
         .ok_or_else(|| ApiError::internal("a step without an object"))?;
-    let live = world.by_id(step.kind, id).cloned().ok_or_else(|| {
-        ApiError::not_found(format!("{} {:?} is gone", step.kind.as_str(), step.name))
-    })?;
-    if live.revision != revision {
+    let a = adapter(step.kind).ok_or_else(|| ApiError::internal("no adapter"))?;
+    // 세계(앞 단계 뒤에 읽음)가 아니라 지금 값 — 그 뒤 상태 쓰기로 오른 revision을 `If-Match`에 쓴다.
+    let live = a
+        .lives(&state.cluster)?
+        .into_iter()
+        .find(|l| l.id == id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("{} {:?} is gone", step.kind.as_str(), step.name))
+        })?;
+    if live.config_fingerprint() != step.seen_config {
         return Err(ClusterError::Rejected(Rejection::RevisionMismatch {
             expected: revision,
             actual: live.revision,
@@ -287,7 +313,7 @@ async fn run_step(
             done.id
         }
         StepAction::Update => {
-            let live = seen_live(world, step)?;
+            let live = seen_live(state, step)?;
             check_route(state, owner, a.update_route(), Some(live.id))?;
             a.may_update_extra(state, owner, &live)?;
             if step.spec_changed {
@@ -321,7 +347,7 @@ async fn run_step(
             live.id
         }
         StepAction::Delete => {
-            let live = seen_live(world, step)?;
+            let live = seen_live(state, step)?;
             check_route(state, owner, a.delete_route(), Some(live.id))?;
             let done = a.delete(state, owner, &live).await?;
             if let Some(t) = done.task {
