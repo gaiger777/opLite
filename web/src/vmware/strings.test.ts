@@ -28,6 +28,16 @@ it("adds the VMware and export strings of both languages when their views load",
   expect(fresh.i18n.t("vmware.wizard.title")).toBe("새 VMware 이전");
   expect(fresh.i18n.getFixedT("en")("vmware.wizard.title")).toBe("New VMware migration");
   expect(fresh.i18n.t("vmExports.dialog.submit")).toBe("내보내기");
+  // 서버 오류 코드와 다듬은 문구(계획 72 리뷰 2)
+  expect(fresh.i18n.t("vmware.errors.password_required")).toBe(
+    "호스트·포트·사용자를 바꾸면 비밀번호를 다시 넣으세요.",
+  );
+  expect(fresh.i18n.getFixedT("en")("vmware.errors.password_required")).toBe(
+    "Enter the password again when you change the host, port or user.",
+  );
+  expect(fresh.i18n.t("vmware.wizard.errors.tooMany")).toBe(
+    "계획 하나에 VM은 200대까지입니다. 여러 계획으로 나누세요.",
+  );
   // 원래 문구는 그대로
   expect(fresh.i18n.t("nav.imports")).toBe("가져오기");
   await loadVmwareStrings();

@@ -25,7 +25,7 @@
       "port": "포트",
       "user": "사용자",
       "password": "비밀번호",
-      "passwordKeep": "비우면 저장한 비밀번호를 그대로 씁니다.",
+      "passwordKeep": "비우면 저장한 비밀번호를 그대로 씁니다(호스트·포트·사용자를 바꾸지 않을 때만).",
       "datacenter": "데이터센터 힌트",
       "datacenterHint": "선택. ESXi 호스트는 ha-datacenter입니다.",
       "vddk": "VDDK로 디스크 읽기",
@@ -63,7 +63,8 @@
         "password": "비밀번호를 넣으세요.",
         "host": "호스트를 넣으세요.",
         "port": "1에서 65535 사이의 포트를 넣으세요.",
-        "user": "사용자를 넣으세요."
+        "user": "사용자를 넣으세요.",
+        "passwordAgain": "호스트·포트·사용자를 바꾸면 비밀번호를 다시 넣으세요."
       }
     },
     "migrations": {
@@ -132,7 +133,9 @@
         "resume": "{{name}}을(를) 이어 갑니다."
       },
       "cancelTitle": "{{name}}을(를) 취소할까요?",
-      "cancelDescription": "우리 스냅샷과 대상 볼륨을 지웁니다. 원본 VM은 그대로이고 이미 전환한 VM도 남습니다.",
+      "cancelDescription": "우리 스냅샷과 대상 볼륨을 지웁니다. 원본 VM은 그대로입니다. 이미 전환했거나 전환 중인 VM은 남으니 뒤에 마무리하거나 되돌리세요.",
+      "cutOverLeft_one": "전환했지만 끝내지 않은 VM이 {{count}}대 있습니다. 계획을 지우기 전에 마무리하거나 되돌리세요.",
+      "cutOverLeft_other": "전환했지만 끝내지 않은 VM이 {{count}}대 있습니다. 계획을 지우기 전에 마무리하거나 되돌리세요.",
       "deleteTitle": "{{name}}을(를) 지울까요?",
       "deleteDescription": "계획과 항목을 지웁니다. 만든 VM·볼륨과 원본 VM은 남습니다.",
       "deleted": "{{name}}을(를) 지웠습니다.",
@@ -257,7 +260,7 @@
         "name": "소문자·숫자·하이픈으로 63자까지 쓰세요.",
         "nameTaken": "같은 이름의 이전 계획이 있습니다.",
         "vms": "VM을 하나 이상 고르세요.",
-        "tooMany": "계획 하나에 VM은 200대까지입니다. 물결로 나누세요.",
+        "tooMany": "계획 하나에 VM은 200대까지입니다. 여러 계획으로 나누세요.",
         "pool": "풀이나 기본 풀을 고르세요.",
         "range": "범위 안의 정수를 넣으세요.",
         "time": "맞는 시각을 넣으세요."
@@ -365,7 +368,8 @@
       "migration_running": "바꾸기 전에 계획을 멈추세요.",
       "migration_not_draft": "이미 시작한 계획입니다.",
       "migration_state": "지금은 계획이 그렇게 할 수 없습니다: {{message}}",
-      "migration_active": "옮기는 중인 VM이 있습니다. 먼저 계획을 취소하세요.",
+      "migration_active": "끝나지 않은 VM이 있습니다. 전환한 VM은 마무리하거나 되돌리고, 나머지는 취소한 뒤 계획을 지우세요.",
+      "password_required": "호스트·포트·사용자를 바꾸면 비밀번호를 다시 넣으세요.",
       "migration_busy": "다른 바꾸기가 도는 중입니다. 다시 해 보세요.",
       "vm_started": "시작한 VM은 뺄 수 없습니다. 취소하세요.",
       "vmware_vm_state": "지금은 이 VM이 그렇게 할 수 없습니다: {{message}}",

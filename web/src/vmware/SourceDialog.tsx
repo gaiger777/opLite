@@ -49,11 +49,15 @@ function formOf(source?: VmwareSource): SourceForm {
   };
 }
 
-/** 입력 오류(칸 → 번역 키). 고치기에서 비밀번호를 비우면 그대로 둔다. */
+/**
+ * 입력 오류(칸 → 번역 키). 고치기에서 비밀번호를 비우면 그대로 두지만, 호스트·포트·사용자를 바꾸면 서버처럼(400
+ * `password_required`) 다시 넣어야 한다. `was`는 고치기 전의 칸이다.
+ */
 export function checkSourceForm(
   form: SourceForm,
   editing: boolean,
   taken: readonly string[],
+  was?: SourceForm,
 ): Record<string, string> {
   const errors: Record<string, string> = {};
   if (!editing) {
@@ -65,6 +69,12 @@ export function checkSourceForm(
     if (!form.password) {
       errors.password = "vmware.source.errors.password";
     }
+  } else if (
+    was &&
+    !form.password &&
+    (form.host.trim() !== was.host || form.port !== was.port || form.user.trim() !== was.user)
+  ) {
+    errors.password = "vmware.source.errors.passwordAgain";
   }
   if (!form.host.trim()) {
     errors.host = "vmware.source.errors.host";
@@ -178,7 +188,7 @@ export function SourceDialog({
     if (step === "trust") {
       return send(offered!.fingerprint);
     }
-    const found = checkSourceForm(form, editing, taken);
+    const found = checkSourceForm(form, editing, taken, formOf(source));
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return false;

@@ -128,8 +128,19 @@ it("changes only the edited fields and checks a source again", async () => {
   let patch: unknown;
   let checked = false;
   server.use(
+    // 서버(`patch_source`)처럼: 호스트·포트·사용자를 바꾸며 비밀번호를 주지 않으면 400 `password_required`
     http.patch(apiUrl("/vmware-sources/:key"), async ({ request }) => {
-      patch = await request.json();
+      const body = (await request.json()) as Record<string, unknown>;
+      if (("host" in body || "port" in body || "user" in body) && !body.password) {
+        return HttpResponse.json(
+          {
+            code: "password_required",
+            message: "give the password again when changing the host, port or user",
+          },
+          { status: 400 },
+        );
+      }
+      patch = body;
       return HttpResponse.json(VC1);
     }),
     http.post(apiUrl("/vmware-sources/:key/actions/check"), () => {
@@ -141,13 +152,42 @@ it("changes only the edited fields and checks a source again", async () => {
   await user.click(await screen.findByRole("button", { name: "Change vc1" }));
   const dialog = screen.getByRole("dialog", { name: "Change vc1" });
   expect(within(dialog).getByLabelText("Password")).toHaveValue("");
+  expect(dialog).toHaveTextContent(
+    "Leave empty to keep the saved password (only if host, port and user stay the same).",
+  );
   await user.clear(within(dialog).getByLabelText("User"));
   await user.type(within(dialog).getByLabelText("User"), "admin@vsphere.local");
   await user.click(within(dialog).getByRole("button", { name: "Save" }));
-  await waitFor(() => expect(patch).toEqual({ user: "admin@vsphere.local" }));
+  expect(
+    await within(dialog).findByText(
+      "Enter the password again when you change the host, port or user.",
+    ),
+  ).toBeInTheDocument();
+  expect(patch).toBeUndefined();
+  await user.type(within(dialog).getByLabelText("Password"), "secret");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(patch).toEqual({ user: "admin@vsphere.local", password: "secret" }));
   await user.click(screen.getByRole("button", { name: "Check vc1 again" }));
   await waitFor(() => expect(checked).toBe(true));
   expect(await screen.findByText("vc1: vCenter 8.0.2")).toBeInTheDocument();
+});
+
+it("keeps the saved password when only other fields change", async () => {
+  const user = userEvent.setup();
+  mockSources();
+  let patch: unknown;
+  server.use(
+    http.patch(apiUrl("/vmware-sources/:key"), async ({ request }) => {
+      patch = await request.json();
+      return HttpResponse.json(VC1);
+    }),
+  );
+  renderPage(<SourcesPage />, { path: "/vmware-sources" });
+  await user.click(await screen.findByRole("button", { name: "Change vc1" }));
+  const dialog = screen.getByRole("dialog", { name: "Change vc1" });
+  await user.type(within(dialog).getByLabelText("Datacenter hint"), "dc1");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(patch).toEqual({ datacenter_hint: "dc1" }));
 });
 
 it("explains a source that migrations still use", async () => {

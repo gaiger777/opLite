@@ -64,11 +64,11 @@ const DB = migrationItem("db01", 3, {
   },
 });
 
-function setup(items: MigrationItem[] = [WEB, APP, DB]) {
+function setup(items: MigrationItem[] = [WEB, APP, DB], plan = WAVE) {
   mockLists({ vm: [TARGET] });
   const posted: { path: string; body: unknown }[] = [];
   server.use(
-    http.get(apiUrl("/vmware-migrations/:key"), () => HttpResponse.json(WAVE)),
+    http.get(apiUrl("/vmware-migrations/:key"), () => HttpResponse.json(plan)),
     http.get(apiUrl("/vmware-vms"), () => HttpResponse.json({ revision: 1, items })),
     http.get(apiUrl("/vmware-sources"), () =>
       HttpResponse.json({ revision: 1, items: [vmwareSource("vc1")] }),
@@ -410,4 +410,96 @@ it("cancels every chosen VM even if one fails, then reads the list again", async
   // 취소한 것은 고른 것에서 빠지고, 실패한 것은 남는다.
   expect(within(table).getByRole("checkbox", { name: "Select web01" })).not.toBeChecked();
   expect(within(table).getByRole("checkbox", { name: "Select app01" })).toBeChecked();
+});
+
+/** 루트 `vm.create`는 있고 대상 폴더(루트)에 `vm.power`가 없는 사용자 */
+function withoutPower() {
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read", "cluster.read", "vm.create"],
+        root_contents: ["system.read", "cluster.read", "vm.create"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+}
+
+it("offers rollback retry and cancel of power-touching VMs only with vm.power on the target folder", async () => {
+  // 서버의 `retry_item`·`cancel_item`·`cancel_migration`은 이런 항목에 대상 폴더 vm.create + vm.power를 본다(리뷰 2).
+  const user = userEvent.setup();
+  const stuck = migrationItem("web01", 1, { state: "failed", cutover_step: "creating-vm" });
+  const failed = migrationItem("old01", 4, { state: "failed", error: "vmware_stall: no progress" });
+  setup([stuck, failed]);
+  withoutPower();
+  open();
+  await user.click(await screen.findByRole("button", { name: "Open web01" }));
+  const sheet = screen.getByRole("dialog", { name: "web01" });
+  expect(within(sheet).queryByRole("button", { name: "Retry rollback" })).not.toBeInTheDocument();
+  expect(within(sheet).queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  // 전원을 다루지 않는 실패 항목은 루트 vm.create로 된다
+  await user.click(screen.getByRole("button", { name: "Open old01" }));
+  const other = screen.getByRole("dialog", { name: "old01" });
+  expect(within(other).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  expect(within(other).getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  // 고른 것에 전원을 다루는 항목이 있으면 일괄 취소도, 계획 취소도 없다
+  await user.click(screen.getByRole("checkbox", { name: "Select web01" }));
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Cancel migration" })).not.toBeInTheDocument();
+});
+
+it("offers plan cancel without vm.power when no unfinished VM touches power", async () => {
+  setup([WEB, APP, DB]);
+  withoutPower();
+  open();
+  await screen.findByRole("table", { name: "wave1" });
+  // db01은 done이라 서버가 건너뛴다
+  expect(await screen.findByRole("button", { name: "Cancel migration" })).toBeInTheDocument();
+});
+
+it("tells what to do with cut-over VMs that a cancelled plan still holds", async () => {
+  const user = userEvent.setup();
+  const cancelled = migration("wave1", 1, {
+    status: { phase: "cancelled", counts: { done: 1, cancelled: 1 } },
+  });
+  setup([DB, migrationItem("app01", 2, { state: "cancelled" })], cancelled);
+  server.use(
+    http.delete(apiUrl("/vmware-migrations/:key"), () =>
+      HttpResponse.json(
+        {
+          code: "migration_active",
+          message: 'vmware-migration "wave1" is cancelled and db01 is done; cancel it first',
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  open();
+  expect(
+    await screen.findByText(
+      "1 VM is cut over but not finished. Finalize or revert it before you delete this migration.",
+    ),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Delete" }));
+  const dialog = screen.getByRole("alertdialog");
+  await user.type(within(dialog).getByRole("textbox"), "wave1");
+  await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Some VMs are not finished. Finalize or revert cut-over VMs and cancel the others, then delete the migration.",
+  );
+});
+
+it("says in the cancel dialog that cut-over VMs stay to be finalized or reverted", async () => {
+  const user = userEvent.setup();
+  setup();
+  open();
+  await user.click(await screen.findByRole("button", { name: "Cancel migration" }));
+  expect(screen.getByRole("alertdialog")).toHaveTextContent(
+    "VMs already cut over (or cutting over) stay; finalize or revert them afterwards.",
+  );
 });

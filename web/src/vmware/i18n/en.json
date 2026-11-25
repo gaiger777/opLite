@@ -25,7 +25,7 @@
       "port": "Port",
       "user": "User",
       "password": "Password",
-      "passwordKeep": "Leave empty to keep the saved password.",
+      "passwordKeep": "Leave empty to keep the saved password (only if host, port and user stay the same).",
       "datacenter": "Datacenter hint",
       "datacenterHint": "Optional. ESXi hosts use ha-datacenter.",
       "vddk": "Read disks with VDDK",
@@ -63,7 +63,8 @@
         "password": "Enter the password.",
         "host": "Enter the host.",
         "port": "Enter a port between 1 and 65535.",
-        "user": "Enter the user."
+        "user": "Enter the user.",
+        "passwordAgain": "Enter the password again when you change the host, port or user."
       }
     },
     "migrations": {
@@ -132,7 +133,9 @@
         "resume": "Resumed {{name}}."
       },
       "cancelTitle": "Cancel {{name}}?",
-      "cancelDescription": "Our snapshots and target volumes are removed. Source VMs stay as they are; VMs already cut over stay.",
+      "cancelDescription": "Our snapshots and target volumes are removed. Source VMs stay as they are. VMs already cut over (or cutting over) stay; finalize or revert them afterwards.",
+      "cutOverLeft_one": "{{count}} VM is cut over but not finished. Finalize or revert it before you delete this migration.",
+      "cutOverLeft_other": "{{count}} VMs are cut over but not finished. Finalize or revert them before you delete this migration.",
       "deleteTitle": "Delete {{name}}?",
       "deleteDescription": "The plan and its items are deleted. Created VMs, volumes and the source VMs stay.",
       "deleted": "Deleted {{name}}.",
@@ -365,7 +368,8 @@
       "migration_running": "Pause the migration before changing it.",
       "migration_not_draft": "The migration has already started.",
       "migration_state": "The migration cannot do that now: {{message}}",
-      "migration_active": "Cancel the migration first; some VMs are still migrating.",
+      "migration_active": "Some VMs are not finished. Finalize or revert cut-over VMs and cancel the others, then delete the migration.",
+      "password_required": "Enter the password again when you change the host, port or user.",
       "migration_busy": "Another change is running. Try again.",
       "vm_started": "A started VM cannot be removed; cancel it instead.",
       "vmware_vm_state": "This VM cannot do that now: {{message}}",

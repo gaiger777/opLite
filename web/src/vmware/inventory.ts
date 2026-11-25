@@ -466,6 +466,25 @@ export function canCancel(item: MigrationItem): boolean {
   );
 }
 
+/**
+ * 전원을 다루는 항목(서버 `touches_power`와 같다): 전환 중이거나 전환 걸음·대상 VM이 남았거나 우리가 원본을 껐다. 이런 항목의
+ * 취소(항목·계획)와 되돌림 다시 하기는 대상 폴더의 `vm.create` + `vm.power`가 있어야 한다.
+ */
+export function touchesPower(item: MigrationItem): boolean {
+  const s = item.status;
+  return (
+    s.state === "cutting-over" ||
+    s.cutover_step !== undefined ||
+    s.target_vm !== undefined ||
+    s.source_changes?.powered_off_by_us === true
+  );
+}
+
+/** 계획을 취소해도 남는(전환했거나 전환 중인) 항목 — 마무리하거나 되돌려야 계획을 지울 수 있다 */
+export function cutOverLeft(item: MigrationItem): boolean {
+  return item.status.state === "done" || item.status.state === "cutting-over";
+}
+
 /** 초를 `4m 12s`·`1h 3m` 꼴로 */
 export function formatDuration(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));

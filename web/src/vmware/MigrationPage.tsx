@@ -39,8 +39,11 @@ import {
   canCutover,
   canRetry,
   copyProgress,
+  cutOverLeft,
   formatDuration,
   lastDelta,
+  rollbackFailed,
+  touchesPower,
 } from "@/vmware/inventory";
 import { ItemStateChip, Progress } from "@/vmware/ItemState";
 import { CountsText, MigrationPhaseChip } from "@/vmware/MigrationsPage";
@@ -106,6 +109,16 @@ export function MigrationPage() {
     const target = targetOf(migration, item);
     return perms.has("vm.create", target) && perms.has("vm.power", target);
   };
+  // 서버(`cancel_item`·`cancel_migration`·`retry_item`)처럼 전원을 다루는 항목은 대상 폴더 권한도 본다
+  const cancellable = (item: MigrationItem) =>
+    canCancel(item) && (!touchesPower(item) || switchable(item));
+  const planCancellable = rows.every(
+    (i) =>
+      ["done", "finalized", "reverted", "cancelled"].includes(i.status.state) ||
+      !touchesPower(i) ||
+      switchable(i),
+  );
+  const left = phase === "cancelled" ? rows.filter(cutOverLeft).length : 0;
   const time = (s: number) => formatTime(new Date(s * 1000), i18n.language);
 
   async function act(action: "start" | "pause" | "resume") {
@@ -165,8 +178,12 @@ export function MigrationPage() {
                 finalize: () => setDialog({ kind: "finalize", item }),
               }
             : {}),
-          ...(canRetry(phase, item) ? { retry: () => void retry(item) } : {}),
-          cancel: () => setDialog({ kind: "cancel", items: [item] }),
+          ...(canRetry(phase, item) && (!rollbackFailed(item) || switchable(item))
+            ? { retry: () => void retry(item) }
+            : {}),
+          ...(cancellable(item)
+            ? { cancel: () => setDialog({ kind: "cancel", items: [item] }) }
+            : {}),
         }
       : {};
 
@@ -210,7 +227,7 @@ export function MigrationPage() {
                   {t("vmware.migration.resume")}
                 </Button>
               )}
-              {(phase === "running" || phase === "paused") && (
+              {(phase === "running" || phase === "paused") && planCancellable && (
                 <Button variant="outline" onClick={() => setDialog({ kind: "cancel-plan" })}>
                   {t("vmware.migration.cancel")}
                 </Button>
@@ -229,6 +246,11 @@ export function MigrationPage() {
           {migration.status.error}
         </p>
       )}
+      {left > 0 && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {t("vmware.migration.cutOverLeft", { count: left })}
+        </p>
+      )}
       {preflight && <PreflightTable vms={preflight} />}
       {write && (
         <div className="flex flex-wrap items-center gap-2">
@@ -245,7 +267,7 @@ export function MigrationPage() {
           <Button
             size="sm"
             variant="outline"
-            disabled={chosen.length === 0 || !chosen.every(canCancel)}
+            disabled={chosen.length === 0 || !chosen.every(cancellable)}
             onClick={() => setDialog({ kind: "cancel", items: chosen })}
           >
             {t("vmware.migration.cancelSelected")}
