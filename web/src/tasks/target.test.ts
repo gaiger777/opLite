@@ -67,4 +67,19 @@ it("links alert subjects", () => {
   expect(alertHref({ ...s, kind: "load_balancer" })).toBe("/load-balancers?open=x");
   expect(alertHref({ ...s, kind: "backup" })).toBe("/backups?q=a%20b");
   expect(alertHref({ ...s, kind: "backup_store" })).toBe("/backup-stores?open=x");
+  // 계획 73: 인증서는 설정 › 보안 › 인증서, 적용 묶음은 그 묶음의 상세
+  expect(alertHref({ ...s, kind: "certificate" })).toBe("/settings/certificates");
+  expect(alertHref({ ...s, kind: "apply_set" })).toBe("/apply-sets/a%20b");
+});
+
+it("links declarative apply and ACME order tasks (plan 73)", () => {
+  const set = "019a0f3c-0000-7000-8073-0000000000a1";
+  expect(taskTarget(op("apply", set, { plan: "p", set }), lookup)).toEqual({
+    name: set.slice(-8),
+    href: "/apply-sets",
+  });
+  expect(taskTarget(op("apply", "p", { plan: "p" }), lookup).href).toBe("/history");
+  expect(taskTarget(op("acme-order", "c", { certificate: "c" }), lookup).href).toBe(
+    "/settings/certificates",
+  );
 });

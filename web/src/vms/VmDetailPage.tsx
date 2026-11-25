@@ -42,6 +42,7 @@ import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import { diskVolumes, isTemplate, linkedClones } from "@/templates/templates";
 import { exportReason } from "@/exports/exports";
+import { TerraformChip, useConfigMenu } from "@/declarative/ConfigMenu";
 import { availability, useVmActions, type VmAction, type VmOperation } from "@/vms/actions";
 import { bootList, deviceName } from "@/vms/boot";
 import { cloudInitSummary } from "@/vms/cloudInit";
@@ -218,6 +219,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   const host = useVmActionHost();
   // 케밥에서 연 대화상자가 닫히면 케밥 단추로 포커스를 돌린다.
   const kebab = useRef<HTMLButtonElement>(null);
+  const config = useConfigMenu({ kind: "vm", id: vm.id, name: vm.name });
   const setConfirm = (which: VmDialog) =>
     host.open({ vm, which, returnFocus: kebab, afterRemove: () => void navigate("/vms") });
   const template = isTemplate(vm);
@@ -271,7 +273,8 @@ function VmHeader({ vm }: { vm: Vm }) {
   );
   // 주 동작(시작·정지·콘솔·옮기기)은 단추, 나머지는 케밥이다(설계 §5.3).
   const exportable = can("vm.export");
-  const menu = (operate || write || exportable || can("vm.clone") || can("vm.delete")) && (
+  // 설정 기록·YAML 내보내기(계획 73)는 VM을 읽을 수 있으면 늘 있으므로 케밥도 늘 있다.
+  const menu = (
     <>
       {operate &&
         SECONDARY.map((action) => (
@@ -315,6 +318,7 @@ function VmHeader({ vm }: { vm: Vm }) {
           {t("vms.action.export")}
         </ReasonMenuItem>
       )}
+      {config.items}
       {can("vm.delete") && (
         <>
           <DropdownMenuSeparator />
@@ -340,6 +344,7 @@ function VmHeader({ vm }: { vm: Vm }) {
           {template && <Badge variant="secondary">{t("vms.template")}</Badge>}
           {/* 실행 중에 적용하지 못한 하드웨어 변경이 있다. */}
           {needsRestart(vm) && <Badge variant="secondary">{t("vms.restartNeeded")}</Badge>}
+          <TerraformChip labels={vm.labels} />
         </>
       }
       meta={
@@ -397,6 +402,7 @@ function VmHeader({ vm }: { vm: Vm }) {
       menuRef={kebab}
     >
       <ReasonList base={hint} reasons={reasons} className="basis-full" />
+      {config.host}
     </ResourceHeader>
   );
 }

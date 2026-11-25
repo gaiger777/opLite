@@ -3,6 +3,7 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { RowConfigMenu } from "@/declarative/ConfigMenu";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Network, Node } from "@/api/types";
@@ -328,6 +329,9 @@ export function NetworksPage() {
                         <Trash2 />
                       </Button>
                     )}
+                    <RowConfigMenu
+                      target={{ kind: "network", id: network.id, name: network.name }}
+                    />
                   </TableCell>
                 )}
               </TableRow>

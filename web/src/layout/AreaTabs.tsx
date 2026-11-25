@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
 import { usePermissions } from "@/auth/usePermissions";
-import { areaOf, viewVisible, visibleTabs } from "@/layout/nav";
+import { areaOf, tabHome, viewVisible, visibleTabs } from "@/layout/nav";
 
 /**
  * 영역 탭: 본문 위의 링크 목록이다. 경로가 바뀌므로 `role=tablist`가 아니라 `<nav>`이고 지금 탭은
@@ -30,7 +30,7 @@ export function AreaTabs() {
         {tabs.map((tab) => (
           <li key={tab.to}>
             <Link
-              to={tab.to}
+              to={tabHome(tab, gate)}
               aria-current={tab === hit.tab ? "page" : undefined}
               className={cn(
                 "-mb-px flex h-10 items-center border-b-2 border-transparent px-3 text-sm whitespace-nowrap text-muted-foreground hover:text-foreground",

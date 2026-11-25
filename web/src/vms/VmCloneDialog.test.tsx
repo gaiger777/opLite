@@ -383,10 +383,15 @@ it("offers no pools until it knows the node", async () => {
 });
 
 it("hides cloning from viewers", async () => {
+  const user = userEvent.setup();
   mockLists({ vm: [db], node: [NODE] });
   openDetail(db, VIEWER);
   await screen.findByRole("heading", { name: "db" });
-  // viewer에게는 케밥 메뉴가 없다.
-  expect(screen.queryByRole("button", { name: "Actions for db" })).not.toBeInTheDocument();
+  // viewer의 케밥에는 읽기 항목(설정 기록·YAML 내보내기, 계획 73)만 있다.
+  await user.click(screen.getByRole("button", { name: "Actions for db" }));
+  expect(screen.getAllByRole("menuitem").map((m) => m.textContent)).toEqual([
+    "Config history…",
+    "Export as YAML",
+  ]);
   expect(screen.queryByRole("menuitem", { name: "Clone" })).not.toBeInTheDocument();
 });

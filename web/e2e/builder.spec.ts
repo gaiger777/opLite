@@ -284,3 +284,41 @@ test("opens the VMware and export views at phone width", async ({ page }) => {
   }
   await page.emulateMedia({ colorScheme: null });
 });
+
+// 계획 73: 감사 탭의 설정 기록·선언 묶음 보기와 보안 탭의 인증서 보기가 휴대폰 폭에서 가로로 넘치지 않는다(어둠 테마도).
+// 이 파일의 앞 시험이 만든 VM이 설정 기록에 줄로 남는다(만들기 — 웹 출처). 되돌리기 흐름은 스테이지 7의 `history.spec.ts`가 본다.
+test("opens the config history, apply sets and certificates views at phone width", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page);
+  for (const [path, heading] of [
+    ["/history", "Config history"],
+    ["/apply-sets", "Apply sets"],
+    ["/settings/certificates", "Certificates"],
+  ] as const) {
+    for (const colorScheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme });
+      await page.goto(path);
+      await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible();
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+        ),
+        `${path} (${colorScheme}) scrolls sideways`,
+      ).toBe(true);
+    }
+  }
+  // 설정 기록에 앞 시험이 만든 VM의 "만듦" 줄이 있고, 누르면 서랍이 열린다(휴대폰 폭에서도 넘치지 않음).
+  await page.emulateMedia({ colorScheme: null });
+  await page.goto("/history?kind=vm");
+  const row = page.getByRole("button", { name: /Created.*vm b1/ });
+  await expect(row).toBeVisible();
+  await row.click();
+  await expect(page.getByRole("dialog", { name: "vm b1" })).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    ),
+  ).toBe(true);
+});

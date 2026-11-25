@@ -255,7 +255,14 @@
     "vmExports": "내보내기",
     "vmwareMigrationsKeywords": "vmware, vcenter, esxi, 이전, 마이그레이션, 따뜻한, 전환",
     "vmwareSourcesKeywords": "vmware, vcenter, esxi, 연결",
-    "vmExportsKeywords": "내보내기, export, ova, ovf, vmdk"
+    "vmExportsKeywords": "내보내기, export, ova, ovf, vmdk",
+    "auditTab": "감사",
+    "history": "설정 기록",
+    "historyKeywords": "설정 기록, 이력, history, 바뀜, revision, 되돌리기, 드리프트, drift",
+    "applySets": "선언 묶음",
+    "applySetsKeywords": "선언 묶음, 적용 묶음, apply set, 선언형, 매니페스트, yaml, gitops, 드리프트, drift",
+    "certificates": "인증서",
+    "certificatesKeywords": "인증서, certificate, ACME, Let's Encrypt, TLS, https"
   },
   "header": {
     "language": "언어",
@@ -399,7 +406,9 @@
       "vmware-revert": "VMware VM {{target}} 되돌리기",
       "vmware-cleanup": "VMware VM {{target}} 정리",
       "vm-export": "VM {{target}} 내보내기",
-      "vm-export-delete": "내보내기 {{target}} 삭제"
+      "vm-export-delete": "내보내기 {{target}} 삭제",
+      "apply": "{{target}} 적용",
+      "acme-order": "인증서 {{target}} 주문"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -476,6 +485,12 @@
     "yes": "예",
     "no": "아니요",
     "back": "뒤로"
+  },
+  "configMenu": {
+    "history": "설정 기록…",
+    "yaml": "YAML로 내보내기",
+    "more": "{{name}} 더 보기",
+    "terraform": "Terraform이 관리"
   },
   "confirm": {
     "typeName": "확인하려면 {{name}}을(를) 입력하세요",

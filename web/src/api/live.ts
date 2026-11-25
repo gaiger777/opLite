@@ -37,6 +37,11 @@ export const VIEW_KINDS = [
   "vmware-source",
   "vmware-migration",
   "vmware-vm",
+  // 계획 73: 적용 묶음(드리프트는 리더가 status에 쓴다)과 ACME 셋(비밀을 뺀 보기)
+  "apply-set",
+  "acme-account",
+  "acme-dns",
+  "certificate",
 ] as const;
 export type ViewKind = (typeof VIEW_KINDS)[number];
 
@@ -59,6 +64,10 @@ export const REFRESH_ON: Partial<Record<ViewKind | WatchKind, readonly (readonly
   "vmware-source": [["vmware-sources"]],
   "vmware-migration": [["vmware-migrations"]],
   "vmware-vm": [["vmware-vms"]],
+  "apply-set": [["apply-sets"]],
+  "acme-account": [["acme-accounts"]],
+  "acme-dns": [["acme-dns"]],
+  certificate: [["certificates"]],
   // VM 내보내기(계획 72)는 watch 종류가 아니다 — 내보내기·지우기 Task가 바뀌면 목록을 다시 읽는다.
   task: [["vm-exports"]],
   network: [["network-topology"], ["load-balancers"]],

@@ -206,6 +206,29 @@ it.each([
   ).toEqual(["Imports", "VMware migrations", "VMware sources", "Exports"]);
 });
 
+// 설정 기록·선언 묶음(계획 73)은 감사 탭의, 인증서는 보안 탭의 보기로 늦게 받는 화면과 문구로 열린다.
+it.each([
+  ["/history", "Config history", "Audit views", ["Audit log", "Config history", "Apply sets"]],
+  ["/apply-sets", "Apply sets", "Audit views", ["Audit log", "Config history", "Apply sets"]],
+  ["/settings/certificates", "Certificates", "Security views", ["Security", "Certificates"]],
+] as const)("opens %s as a view", async (path, title, nav, views) => {
+  server.use(
+    http.get(apiUrl("/history"), () => HttpResponse.json({ items: [] })),
+    ...["/apply-sets", "/acme-accounts", "/acme-dns", "/certificates"].map((p) =>
+      http.get(apiUrl(p), () => HttpResponse.json({ revision: 1, items: [] })),
+    ),
+  );
+  renderApp(path);
+  expect(
+    await screen.findByRole("heading", { level: 1, name: title }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  expect(
+    within(screen.getByRole("navigation", { name: nav }))
+      .getAllByRole("link")
+      .map((l) => l.textContent),
+  ).toEqual(views);
+});
+
 it.each([
   ["/infra", "/nodes"],
   ["/protect", "/backups"],
@@ -222,10 +245,12 @@ it("opens the remembered tab of an area address", async () => {
   await vi.waitFor(() => expect(where(router)).toBe("/volumes?q=root"));
 });
 
-it("ignores a remembered tab the user may not see", async () => {
+it("ignores a remembered view the user may not see", async () => {
   localStorage.setItem("opl.nav.last.activity", "/audit");
+  // 감사 로그 보기는 admin만 — 감사 탭의 보이는 첫 보기(설정 기록, 계획 73)로 간다.
+  server.use(http.get(apiUrl("/history"), () => HttpResponse.json({ items: [] })));
   const router = renderApp("/activity", { ...ADMIN, role: "viewer" });
-  await vi.waitFor(() => expect(where(router)).toBe("/tasks"));
+  await vi.waitFor(() => expect(where(router)).toBe("/history"));
 });
 
 it("returns to the last tab from the sidebar and moves focus to the new page", async () => {

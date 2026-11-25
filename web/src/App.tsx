@@ -41,6 +41,20 @@ function vmwarePage(name: "MigrationsPage" | "MigrationWizard" | "MigrationPage"
   };
 }
 
+/**
+ * 설정 기록·선언 묶음·인증서(계획 73)의 보기 하나. 세 영역의 보기는 한 조각(`history/pages`)이고 문구(첫 화면 묶음 밖)를 더한
+ * 뒤 그린다.
+ */
+function declarativePage(
+  name: "HistoryPage" | "ApplySetsPage" | "ApplySetPage" | "CertificatesPage",
+) {
+  return async () => {
+    const m = await import("@/history/pages");
+    await (name === "CertificatesPage" ? m.loadCertStrings() : m.loadDeclarativeStrings());
+    return { Component: m[name] };
+  };
+}
+
 /** 앱의 경로 표. 넘기기 시험(`routes.test.tsx`)이 같은 표로 메모리 라우터를 만든다. */
 export const appRoutes: RouteObject[] = [
   { path: "/login", element: <LoginPage /> },
@@ -220,6 +234,10 @@ export const appRoutes: RouteObject[] = [
               { path: "tasks", element: <TasksPage /> },
               { path: "alerts", lazy: page(() => import("@/alerts/AlertsPage"), "AlertsPage") },
               { path: "audit", lazy: page(() => import("@/audit/AuditPage"), "AuditPage") },
+              // 설정 기록·선언 묶음(계획 73): 감사 탭의 보기
+              { path: "history", lazy: declarativePage("HistoryPage") },
+              { path: "apply-sets", lazy: declarativePage("ApplySetsPage") },
+              { path: "apply-sets/:name", lazy: declarativePage("ApplySetPage") },
               { path: "cluster", lazy: page(() => import("@/cluster/ClusterPage"), "ClusterPage") },
               {
                 path: "cluster/map",
@@ -267,6 +285,8 @@ export const appRoutes: RouteObject[] = [
                 path: "settings/security",
                 lazy: page(() => import("@/accounts/TwoFactorPages"), "SecurityPage"),
               },
+              // ACME 인증서(계획 73): 보안 탭의 보기
+              { path: "settings/certificates", lazy: declarativePage("CertificatesPage") },
               {
                 path: "settings/account",
                 lazy: page(() => import("@/accounts/TwoFactorPages"), "AccountPage"),

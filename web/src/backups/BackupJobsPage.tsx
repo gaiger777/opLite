@@ -3,6 +3,7 @@ import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { RowConfigMenu } from "@/declarative/ConfigMenu";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { BackupJob } from "@/api/types";
@@ -247,6 +248,7 @@ export function BackupJobsPage() {
                     >
                       <Trash2 />
                     </Button>
+                    <RowConfigMenu target={{ kind: "backup-job", id: job.id, name: job.name }} />
                   </TableCell>
                 )}
               </TableRow>

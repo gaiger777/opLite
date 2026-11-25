@@ -130,7 +130,7 @@ pub(crate) enum SetCmd {
 }
 
 /// 파일 하나를 문서들로
-fn parse_text(text: &str, path: &Path) -> anyhow::Result<Vec<Value>> {
+pub(crate) fn parse_text(text: &str, path: &Path) -> anyhow::Result<Vec<Value>> {
     let json = path.extension().is_some_and(|e| e == "json");
     if json {
         let v: Value = serde_json::from_str(text).with_context(|| format!("{}", path.display()))?;

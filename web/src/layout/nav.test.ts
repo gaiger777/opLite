@@ -12,6 +12,8 @@ import {
   LEGACY_REDIRECTS,
   lastTab,
   rememberTab,
+  tabHome,
+  tabVisible,
   viewVisible,
   visibleAreas,
   visibleTabs,
@@ -125,9 +127,11 @@ it("shows every area and tab to admins", () => {
 it.each(["operator", "viewer"] as const)("hides account and admin tabs from %s", (role) => {
   const tabs = visible(role);
   expect(Object.keys(tabs)).toEqual(["home", "vms", "infra", "protect", "activity", "settings"]);
-  expect(tabs.activity).toEqual(["/tasks", "/alerts"]);
+  // 감사 탭은 설정 기록 보기(누구나)로 보이고, 보안 탭은 인증서 보기(루트 cluster.read)로 보인다(계획 73).
+  expect(tabs.activity).toEqual(["/tasks", "/alerts", "/audit"]);
   expect(tabs.settings).toEqual([
     "/settings",
+    "/settings/security",
     "/settings/tokens",
     "/settings/account",
     "/settings/subscription",
@@ -154,8 +158,8 @@ it("falls back to the first visible tab", () => {
   expect(lastTab(area("activity"), as("viewer"))).toBe("/tasks");
   rememberTab(U1, "/audit", "");
   expect(lastTab(area("activity"), as("admin"))).toBe("/audit");
-  // 권한 밖의 기억은 쓰지 않는다.
-  expect(lastTab(area("activity"), as("viewer"))).toBe("/tasks");
+  // 권한 밖의 기억은 쓰지 않는다: 감사 로그 보기를 못 읽으면 그 탭의 보이는 첫 보기(설정 기록, 계획 73)
+  expect(lastTab(area("activity"), as("viewer"))).toBe("/history");
   // 다른 영역의 경로나 상세 경로를 손으로 넣어도 쓰지 않는다.
   localStorage.setItem(`opl.${U1}.nav.last.activity`, "/vms");
   expect(lastTab(area("activity"), as("admin"))).toBe("/tasks");
@@ -280,4 +284,59 @@ it("puts the cluster map between the node table and the cluster view (plan 70)",
   // 영역은 마지막 보기를 기억한다
   rememberTab(U1, "/cluster/map", "?focus=node:n3");
   expect(lastTab(area("infra"), as("admin"))).toBe("/cluster/map?focus=node:n3");
+});
+
+it("splits the audit tab into audit log, config history and apply sets (plan 73)", () => {
+  const audit = area("activity").tabs.find((tab) => tab.to === "/audit")!;
+  expect(audit.admin).toBeUndefined();
+  expect(audit.views?.map((v) => [v.to, v.admin ?? false, v.kind])).toEqual([
+    ["/audit", true, undefined],
+    ["/history", false, undefined],
+    ["/apply-sets", false, "apply-set"],
+  ]);
+  // 사이드바·영역 탭은 그대로다.
+  expect(area("activity").tabs.map((tab) => tab.to)).toEqual(["/tasks", "/alerts", "/audit"]);
+  expect(areaOf("/apply-sets/web-prod")?.view?.to).toBe("/apply-sets");
+  expect(areaOf("/history")?.tab).toBe(audit);
+  // admin이 아닌 사용자에게도 탭이 보이고, 탭 링크는 보이는 첫 보기다.
+  expect(tabVisible(audit, as("viewer").gate)).toBe(true);
+  expect(tabHome(audit, as("viewer").gate)).toBe("/history");
+  expect(tabHome(audit, as("admin").gate)).toBe("/audit");
+  // 폴더 권한만 있는 사용자: 선언 묶음(루트 system.read)은 없고 설정 기록만
+  const folderOnly = new Permissions({
+    all: false,
+    root: [],
+    root_contents: [],
+    folders: {},
+    contents: { "00000000-0000-0000-0000-0000000000f1": ["system.read", "vm.create"] },
+    objects: [],
+  });
+  expect(audit.views!.filter((v) => viewVisible(v, folderOnly)).map((v) => v.to)).toEqual([
+    "/history",
+  ]);
+  expect(t(audit.views![1]!.keywords!)).toContain("drift");
+  expect(t(audit.views![2]!.keywords!)).toContain("drift");
+  rememberTab(U1, "/apply-sets/web-prod", "");
+  expect(lastTab(area("activity"), as("admin"))).toBe("/apply-sets");
+});
+
+it("adds a certificates view to the security tab (plan 73)", () => {
+  const security = area("settings").tabs.find((tab) => tab.to === "/settings/security")!;
+  expect(security.views?.map((v) => v.to)).toEqual([
+    "/settings/security",
+    "/settings/certificates",
+  ]);
+  expect(tabHome(security, as("operator").gate)).toBe("/settings/certificates");
+  expect(tabHome(security, as("admin").gate)).toBe("/settings/security");
+  expect(t(security.views![1]!.keywords!)).toContain("ACME");
+  // 루트 cluster.read가 없는 폴더 사용자에게는 보안 탭이 없다
+  const folderOnly = new Permissions({
+    all: false,
+    root: [],
+    root_contents: [],
+    folders: {},
+    contents: { "00000000-0000-0000-0000-0000000000f1": ["system.read"] },
+    objects: [],
+  });
+  expect(tabVisible(security, folderOnly)).toBe(false);
 });

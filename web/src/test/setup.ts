@@ -15,15 +15,25 @@ import exportsEn from "@/exports/i18n/en.json";
 import exportsKo from "@/exports/i18n/ko.json";
 import vmwareEn from "@/vmware/i18n/en.json";
 import vmwareKo from "@/vmware/i18n/ko.json";
+import historyEn from "@/history/i18n/en.json";
+import historyKo from "@/history/i18n/ko.json";
+import declarativeEn from "@/declarative/i18n/en.json";
+import declarativeKo from "@/declarative/i18n/ko.json";
+import certsEn from "@/certs/i18n/en.json";
+import certsKo from "@/certs/i18n/ko.json";
 
 // 늦게 받는 문구(클러스터 지도 — `clusterMap/strings.ts`, 끌기 틀 — `dnd/strings.ts`, VM 빌더 —
-// `vmBuilder/strings.ts`, VMware 이전 — `vmware/strings.ts`, VM 내보내기 — `exports/strings.ts`)도 시험에서는 처음부터 둔다.
+// `vmBuilder/strings.ts`, VMware 이전 — `vmware/strings.ts`, VM 내보내기 — `exports/strings.ts`, 설정 기록·선언 묶음·인증서 —
+// `declarative/strings.ts`)도 시험에서는 처음부터 둔다.
 for (const [en, ko] of [
   [mapEn, mapKo],
   [dndEn, dndKo],
   [builderEn, builderKo],
   [vmwareEn, vmwareKo],
   [exportsEn, exportsKo],
+  [historyEn, historyKo],
+  [declarativeEn, declarativeKo],
+  [certsEn, certsKo],
 ] as const) {
   i18n.addResourceBundle("en", "translation", en, false, false);
   i18n.addResourceBundle("ko", "translation", ko, false, false);

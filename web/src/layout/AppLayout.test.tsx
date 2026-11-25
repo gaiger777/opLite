@@ -118,6 +118,8 @@ it("hides account and admin settings tabs from operators", async () => {
   const tabs = await screen.findByRole("navigation", { name: "Settings menu" });
   expect(links(tabs)).toEqual([
     ["General", "/settings"],
+    // 보안 탭은 인증서 보기로 보인다(계획 73)
+    ["Security", "/settings/certificates"],
     ["API tokens", "/settings/tokens"],
     ["Two-step verification", "/settings/account"],
     ["Subscription", "/settings/subscription"],
@@ -143,12 +145,13 @@ it("shows every settings tab to admins", async () => {
   ]);
 });
 
-it("hides the audit log from operators", async () => {
+it("hides the audit log from operators but keeps the audit tab for config history", async () => {
   shell("/tasks", { ...ADMIN, role: "operator" });
   const tabs = await screen.findByRole("navigation", { name: "Activity menu" });
   expect(links(tabs)).toEqual([
     ["Tasks", "/tasks"],
     ["Alerts", "/alerts"],
+    ["Audit", "/history"],
   ]);
 });
 

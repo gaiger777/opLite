@@ -11,6 +11,7 @@ import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { ResourceHeader } from "@/components/ResourceHeader";
+import { TerraformChip, useConfigMenu } from "@/declarative/ConfigMenu";
 import { useVisit } from "@/components/PinButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -63,6 +64,8 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
   // 단순 NIC(nftables)와 SDN NIC(OVN ACL, 계획 66)
   const nics = vms.data && networks.data ? groupNics(group, vms.data, networks.data) : undefined;
   useVisit({ kind: "security-group", id: group.id, name: group.name });
+  // 설정 기록·YAML 내보내기(계획 73)
+  const config = useConfigMenu({ kind: "security-group", id: group.id, name: group.name });
   const [description, setDescription] = useState(group.spec.description ?? "");
   const [rows, setRows] = useState(() => (group.spec.rules ?? []).map(fromRule));
   // 읽은 revision. 그 사이 다른 사람이 바꿨으면 저장이 실패한다(If-Match).
@@ -146,6 +149,8 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
     <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-4" noValidate>
       <ResourceHeader
         name={group.name}
+        status={<TerraformChip labels={group.labels} />}
+        menu={config.items}
         summary={[
           { label: t("securityGroups.rules"), value: (group.spec.rules ?? []).length },
           { label: t("securityGroups.vms"), value: vms.data ? groupUsers(group, vms.data) : "—" },
@@ -154,7 +159,9 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
             value: nics ? t("securityGroups.nicCounts", nics) : "—",
           },
         ]}
-      />
+      >
+        {config.host}
+      </ResourceHeader>
       <p className="text-sm text-muted-foreground">{t("securityGroups.sdnNote")}</p>
       <p className="text-sm text-muted-foreground">{t("securityGroups.order")}</p>
       <p className="text-sm text-muted-foreground">{t("securityGroups.always")}</p>

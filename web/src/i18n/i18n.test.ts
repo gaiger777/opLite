@@ -13,6 +13,12 @@ import exportsEn from "@/exports/i18n/en.json";
 import exportsKo from "@/exports/i18n/ko.json";
 import vmwareEn from "@/vmware/i18n/en.json";
 import vmwareKo from "@/vmware/i18n/ko.json";
+import historyEn from "@/history/i18n/en.json";
+import historyKo from "@/history/i18n/ko.json";
+import declarativeEn from "@/declarative/i18n/en.json";
+import declarativeKo from "@/declarative/i18n/ko.json";
+import certsEn from "@/certs/i18n/en.json";
+import certsKo from "@/certs/i18n/ko.json";
 
 function keys(value: unknown, prefix = ""): string[] {
   if (typeof value !== "object" || value === null) {
@@ -41,6 +47,16 @@ it("has the same keys in every language", () => {
   expect(Object.keys(exportsEn)).toEqual(["vmExports"]);
   expect(Object.keys(en)).not.toContain("vmware");
   expect(Object.keys(en)).not.toContain("vmExports");
+  // 설정 기록·선언 묶음·인증서(계획 73 — `declarative/strings.ts`)
+  for (const [one, two, top] of [
+    [historyEn, historyKo, "history"],
+    [declarativeEn, declarativeKo, "declarative"],
+    [certsEn, certsKo, "certs"],
+  ] as const) {
+    expect(keys(two).sort()).toEqual(keys(one).sort());
+    expect(Object.keys(one)).toEqual([top]);
+    expect(Object.keys(en)).not.toContain(top);
+  }
 });
 
 // `common.*`으로 옮긴 키. 같은 뜻의 개별 키를 다시 만들지 않는다.

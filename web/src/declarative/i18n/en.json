@@ -1,0 +1,64 @@
+{
+  "declarative": {
+    "action": {
+      "create": "Create",
+      "update": "Change",
+      "unchanged": "Unchanged",
+      "delete": "Delete",
+      "blocked": "Blocked"
+    },
+    "state": {
+      "same": "Same",
+      "modified": "Different",
+      "missing": "Missing",
+      "unmanaged": "Not managed"
+    },
+    "plan": {
+      "summary": "{{create}} to create, {{update}} to change, {{delete}} to delete, {{unchanged}} unchanged, {{blocked}} blocked",
+      "steps": "Plan steps",
+      "changesOf": "Changed fields of {{kind}} {{name}}",
+      "restart": "Takes effect after hot-plug or the next restart"
+    },
+    "export": {
+      "title": "{{name}} as YAML",
+      "hint": "Secrets are written as secretRef. orbivisorctl apply -f reads this file as it is.",
+      "yaml": "YAML",
+      "copy": "Copy the YAML",
+      "download": "Download"
+    },
+    "sets": {
+      "title": "Apply sets",
+      "pageHint": "Each apply set remembers what orbivisorctl apply last declared and compares it with the cluster. Drift shows who changed what since.",
+      "empty": "No apply sets.",
+      "emptyHint": "orbivisorctl apply --set NAME -f DIR creates one.",
+      "objects": "Objects",
+      "lastApplied": "Last applied",
+      "appliedBy": "{{time}} by {{user}}",
+      "drift": "Drift",
+      "drifted_one": "{{count}} drifted",
+      "drifted_other": "{{count}} drifted",
+      "inSync": "In sync",
+      "unchecked": "Not checked yet",
+      "failed": "Last apply failed"
+    },
+    "set": {
+      "history": "Config history",
+      "appliedBy": "Applied by",
+      "checked": "Drift checked",
+      "lastError": "The last apply stopped: {{error}}",
+      "driftHint_one": "{{count}} object differs from its declaration. Apply again to put it back, or accept the actual value as the declaration (then update your files with orbivisorctl export --set).",
+      "driftHint_other": "{{count}} objects differ from their declarations. Apply again to put them back, or accept the actual values as the declarations (then update your files with orbivisorctl export --set).",
+      "adoptAll": "Accept all actual values as declared",
+      "adoptChosen_one": "Accept {{count}} actual value as declared",
+      "adoptChosen_other": "Accept {{count}} actual values as declared",
+      "adopted": "Apply set {{name}} now declares the actual values.",
+      "objectsOf": "Objects of {{name}}",
+      "choose": "Choose",
+      "chooseNamed": "Choose {{name}}",
+      "difference": "Difference",
+      "paths_one": "{{count}} field differs",
+      "paths_other": "{{count}} fields differ",
+      "by": "Changed by {{user}} at {{time}} ({{source}}, revision {{revision}})"
+    }
+  }
+}

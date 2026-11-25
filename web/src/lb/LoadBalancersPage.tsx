@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
+import { RowConfigMenu } from "@/declarative/ConfigMenu";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { objectTarget } from "@/auth/permissions";
@@ -246,6 +247,7 @@ export function LoadBalancersPage() {
                       <Trash2 />
                     </Button>
                   )}
+                  <RowConfigMenu target={{ kind: "load-balancer", id: l.id, name: l.name }} />
                 </TableCell>
               </TableRow>
             ))}

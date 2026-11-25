@@ -3,6 +3,7 @@ import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { RowConfigMenu } from "@/declarative/ConfigMenu";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { PlacementRule, RuleKind } from "@/api/types";
@@ -159,6 +160,9 @@ export function PlacementRulesPage() {
                     >
                       <Trash2 />
                     </Button>
+                    <RowConfigMenu
+                      target={{ kind: "placement-rule", id: rule.id, name: rule.name }}
+                    />
                   </TableCell>
                 )}
               </TableRow>

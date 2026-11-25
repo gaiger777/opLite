@@ -62,6 +62,10 @@ const TEXT: [string, string][] = [
   // VM 빌더 칸의 문제 글(계획 71 §11)
   ["--warning-fg", "--card"],
   ["--danger-fg", "--card"],
+  // 설정 기록 서랍·계획 표의 글(계획 73 — 서랍과 대화상자 바탕은 popover)
+  ["--muted-foreground", "--popover"],
+  ["--warning-fg", "--popover"],
+  ["--danger-fg", "--popover"],
 ];
 
 /** 아이콘·포커스 링·차트 선·상태 점/바탕: 3:1 */

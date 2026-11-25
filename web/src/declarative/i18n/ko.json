@@ -1,0 +1,64 @@
+{
+  "declarative": {
+    "action": {
+      "create": "만들기",
+      "update": "바꾸기",
+      "unchanged": "그대로",
+      "delete": "지우기",
+      "blocked": "막힘"
+    },
+    "state": {
+      "same": "같음",
+      "modified": "다름",
+      "missing": "없음",
+      "unmanaged": "관리 밖"
+    },
+    "plan": {
+      "summary": "만들기 {{create}} · 바꾸기 {{update}} · 지우기 {{delete}} · 그대로 {{unchanged}} · 막힘 {{blocked}}",
+      "steps": "계획 단계",
+      "changesOf": "{{kind}} {{name}}의 바뀌는 칸",
+      "restart": "핫플러그나 다음 재시작 때 적용됩니다"
+    },
+    "export": {
+      "title": "{{name}} YAML",
+      "hint": "비밀은 secretRef로 씁니다. orbivisorctl apply -f가 이 파일을 그대로 읽습니다.",
+      "yaml": "YAML",
+      "copy": "YAML 복사",
+      "download": "내려받기"
+    },
+    "sets": {
+      "title": "선언 묶음",
+      "pageHint": "선언 묶음은 orbivisorctl apply가 마지막에 선언한 것을 기억하고 클러스터와 견줍니다. 드리프트는 그 뒤 누가 무엇을 바꿨는지 보입니다.",
+      "empty": "선언 묶음이 없습니다.",
+      "emptyHint": "orbivisorctl apply --set 이름 -f 디렉터리가 만듭니다.",
+      "objects": "객체",
+      "lastApplied": "마지막 적용",
+      "appliedBy": "{{time}} · {{user}}",
+      "drift": "드리프트",
+      "drifted_one": "{{count}}개 다름",
+      "drifted_other": "{{count}}개 다름",
+      "inSync": "같음",
+      "unchecked": "아직 견주지 않음",
+      "failed": "마지막 적용 실패"
+    },
+    "set": {
+      "history": "설정 기록",
+      "appliedBy": "적용한 사용자",
+      "checked": "드리프트 견준 때",
+      "lastError": "마지막 적용이 멈췄습니다: {{error}}",
+      "driftHint_one": "객체 {{count}}개가 선언과 다릅니다. 다시 적용해 선언대로 되돌리거나, 실제를 선언으로 받아들이세요(그 뒤 orbivisorctl export --set으로 파일을 맞추세요).",
+      "driftHint_other": "객체 {{count}}개가 선언과 다릅니다. 다시 적용해 선언대로 되돌리거나, 실제를 선언으로 받아들이세요(그 뒤 orbivisorctl export --set으로 파일을 맞추세요).",
+      "adoptAll": "실제를 모두 선언으로 받아들이기",
+      "adoptChosen_one": "고른 {{count}}개의 실제를 선언으로 받아들이기",
+      "adoptChosen_other": "고른 {{count}}개의 실제를 선언으로 받아들이기",
+      "adopted": "선언 묶음 {{name}}이(가) 이제 실제 값을 선언합니다.",
+      "objectsOf": "{{name}}의 객체",
+      "choose": "고르기",
+      "chooseNamed": "{{name}} 고르기",
+      "difference": "차이",
+      "paths_one": "칸 {{count}}개 다름",
+      "paths_other": "칸 {{count}}개 다름",
+      "by": "{{time}}에 {{user}}이(가) 바꿈({{source}}, revision {{revision}})"
+    }
+  }
+}

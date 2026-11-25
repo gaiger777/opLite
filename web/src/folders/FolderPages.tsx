@@ -13,6 +13,7 @@ import { useTableState } from "@/components/data-table/state";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { ResourceHeader } from "@/components/ResourceHeader";
+import { useConfigMenu } from "@/declarative/ConfigMenu";
 import { Button } from "@/components/ui/button";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -403,6 +404,8 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
   const [dialog, setDialog] = useState<"create" | "rename" | "quota" | null>(null);
   const [deleting, setDeleting] = useState(false);
   const kebab = useRef<HTMLButtonElement>(null);
+  // 설정 기록·YAML 내보내기(계획 73): 폴더 id가 이력·매니페스트 열쇠다.
+  const config = useConfigMenu(folder && { kind: "folder", id: folder.id, name: folder.spec.name });
   // 할당량은 VM 폴더와(계획 62) 네트워크 폴더(라우터·유동 IP, 계획 66)
   const quotas = kind === "vm" || kind === "network";
   const usage = useFolderUsage(id, quotas && folder !== undefined);
@@ -440,7 +443,7 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
   const canQuota = quotas && perms.has("inventory.quota", parent);
   const members = membersOf(tree, (list.data ?? []) as Member[], folder.id, true);
   const children = tree.children.get(folder.id) ?? [];
-  const menu = (canFolder || canQuota) && (
+  const menu = (
     <>
       {canFolder && (
         <DropdownMenuItem onSelect={() => setDialog("create")}>{t("folders.new")}</DropdownMenuItem>
@@ -455,6 +458,7 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
           {t("folders.setQuota")}
         </DropdownMenuItem>
       )}
+      {config.items}
       {canFolder && (
         <>
           <DropdownMenuSeparator />
@@ -477,7 +481,9 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
           { label: t(`folders.count.${kind}`), value: members.length },
           { label: t("folders.subfolders"), value: children.length },
         ]}
-      />
+      >
+        {config.host}
+      </ResourceHeader>
       {quotas && usage.data && <UsageBars view={usage.data} kind={kind} />}
       <Tabs
         value={tab}

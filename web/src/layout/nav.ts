@@ -4,11 +4,15 @@ import type { Kind, Permissions } from "@/auth/permissions";
 import type { AreaId } from "@/components/icons";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 
-/** 탭 안의 보기(segmented). 이것도 경로 링크다. `kind`가 있으면 그 종류를 읽을 수 있는 사용자에게만 보인다. */
+/**
+ * 탭 안의 보기(segmented). 이것도 경로 링크다. `kind`가 있으면 그 종류를 읽을 수 있는 사용자에게만, `admin`이면 루트
+ * `cluster.admin`이 있는 사용자에게만 보인다(계획 73 — 감사 탭의 감사 로그).
+ */
 export interface NavView {
   to: string;
   key: string;
   kind?: Kind;
+  admin?: boolean;
   /** 팔레트 이동 항목이 더 찾는 낱말(번역 키 — 쉼표로 나눔) */
   keywords?: string;
 }
@@ -18,7 +22,7 @@ export type Gate = Pick<Permissions, "has" | "reads">;
 
 /**
  * 영역 탭. `kind`가 있으면 그 종류를 읽을 수 있는 사용자에게만, `admin`이면 루트 `cluster.admin`이 있는 사용자에게만
- * 보인다. `match`는 이 탭에
+ * 보인다. 보기가 있으면 보이는 보기가 하나라도 있어야 보이고, 탭 링크는 보이는 첫 보기다(`tabHome`). `match`는 이 탭에
  * 속하는 경로 접두사이고 주지 않으면 `to`와 보기들의 `to`다(상세 경로 `/vms/web`은 `/vms`에 속한다).
  */
 export interface NavTab {
@@ -160,7 +164,22 @@ export const AREAS: NavArea[] = [
     tabs: [
       { to: "/tasks", key: "nav.tasks" },
       { to: "/alerts", key: "nav.alerts" },
-      { to: "/audit", key: "nav.audit", admin: true },
+      {
+        to: "/audit",
+        key: "nav.auditTab",
+        // 설정 기록·선언 묶음(계획 73)도 사이드바 항목이 아니라 감사 탭의 보기다. 감사 로그만 admin이고, 설정 기록은
+        // 누구나(서버가 읽을 수 있는 리소스의 줄만 준다), 선언 묶음은 루트 `system.read`다.
+        views: [
+          { to: "/audit", key: "nav.audit", admin: true },
+          { to: "/history", key: "nav.history", keywords: "nav.historyKeywords" },
+          {
+            to: "/apply-sets",
+            key: "nav.applySets",
+            kind: "apply-set",
+            keywords: "nav.applySetsKeywords",
+          },
+        ],
+      },
     ],
   },
   {
@@ -175,7 +194,20 @@ export const AREAS: NavArea[] = [
       { to: "/settings/permissions", key: "nav.permissions", admin: true },
       { to: "/settings/roles", key: "nav.roles", admin: true },
       { to: "/settings/groups", key: "nav.groups", kind: "group" },
-      { to: "/settings/security", key: "nav.security", admin: true },
+      {
+        to: "/settings/security",
+        key: "nav.security",
+        // ACME 인증서(계획 73)는 보안 탭의 보기다. 2단계 인증 정책은 admin, 인증서는 루트 `cluster.read`로 읽는다.
+        views: [
+          { to: "/settings/security", key: "nav.security", admin: true },
+          {
+            to: "/settings/certificates",
+            key: "nav.certificates",
+            kind: "certificate",
+            keywords: "nav.certificatesKeywords",
+          },
+        ],
+      },
       // 토큰과 2단계 인증은 누구나 자기 것을 다룬다.
       { to: "/settings/tokens", key: "nav.tokens" },
       { to: "/settings/account", key: "nav.account" },
@@ -199,11 +231,20 @@ export function isFullWidth(pathname: string) {
 }
 
 export function viewVisible(view: NavView, gate: Gate) {
-  return !view.kind || gate.reads(view.kind);
+  return (!view.kind || gate.reads(view.kind)) && (!view.admin || gate.has("cluster.admin"));
 }
 
 export function tabVisible(tab: NavTab, gate: Gate) {
-  return (!tab.kind || gate.reads(tab.kind)) && (!tab.admin || gate.has("cluster.admin"));
+  return (
+    (!tab.kind || gate.reads(tab.kind)) &&
+    (!tab.admin || gate.has("cluster.admin")) &&
+    (!tab.views || tab.views.some((view) => viewVisible(view, gate)))
+  );
+}
+
+/** 탭 링크가 가는 곳: 보기가 있으면 보이는 첫 보기(감사 로그를 못 읽는 사용자의 감사 탭은 설정 기록) */
+export function tabHome(tab: NavTab, gate: Gate) {
+  return tab.views?.find((view) => viewVisible(view, gate))?.to ?? tab.to;
 }
 
 export function visibleTabs(area: NavArea, gate: Gate) {
@@ -271,10 +312,11 @@ export function lastTab(area: NavArea, { user, gate }: NavUser): string {
     const hit = areaOf(pathname);
     if (hit && hit.area.id === area.id && hit.prefix === pathname && tabVisible(hit.tab, gate)) {
       // 기억한 보기를 이제 읽을 수 없으면 그 탭의 첫 주소다(리뷰 1 #6).
-      return !hit.view || viewVisible(hit.view, gate) ? saved : hit.tab.to;
+      return !hit.view || viewVisible(hit.view, gate) ? saved : tabHome(hit.tab, gate);
     }
   }
-  return visibleTabs(area, gate)[0]?.to ?? area.to;
+  const first = visibleTabs(area, gate)[0];
+  return first ? tabHome(first, gate) : area.to;
 }
 
 /** 지금 화면을 그 영역의 마지막 탭으로 기억한다. 상세 경로는 그 탭의 목록을 기억한다. */

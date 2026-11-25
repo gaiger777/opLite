@@ -1,0 +1,123 @@
+{
+  "certs": {
+    "pageHint": "ACME CA(Let's Encrypt·ZeroSSL·사내 step-ca)에서 API·웹 리스너의 공개 인증서를 받습니다. 리더가 주문하고 갱신하며, 노드는 다시 시작하지 않고 바꿔 끼웁니다.",
+    "certificates": "인증서",
+    "accounts": "ACME 계정",
+    "dnsProviders": "DNS 공급자",
+    "emptyCertificates": "인증서가 없습니다.",
+    "emptyCertificatesHint": "인증서를 더하면 브라우저가 믿는 API 인증서를 받습니다.",
+    "needAccount": "먼저 ACME 계정을 더하세요.",
+    "emptyAccounts": "ACME 계정이 없습니다.",
+    "emptyDns": "DNS 공급자가 없습니다. DNS-01(와일드카드 이름에 필요)이 씁니다.",
+    "issued": "받은 인증서",
+    "notIssued": "아직 받지 않음",
+    "expired": "만료됨",
+    "expiresIn_one": "{{count}}일 남음",
+    "expiresIn_other": "{{count}}일 남음",
+    "renewAt": "{{date}} 갱신",
+    "failures_one": "실패 {{count}}번",
+    "failures_other": "실패 {{count}}번",
+    "renewNamed": "{{name}} 지금 갱신",
+    "secretOnce": "저장한 뒤 다시 보이지 않습니다.",
+    "deleteTitle": "{{name}}을(를) 지울까요?",
+    "deleteHint": {
+      "account": "계정을 클러스터에서 지웁니다. 이 계정을 쓰는 인증서를 먼저 지워야 합니다.",
+      "dns": "DNS 공급자를 지웁니다. 이 공급자를 쓰는 인증서를 먼저 지워야 합니다.",
+      "certificate": "인증서를 더 갱신하거나 끼우지 않습니다. 리스너는 내부 CA 인증서로 돌아갑니다."
+    },
+    "scope": {
+      "shared": "공유",
+      "per_node": "노드마다"
+    },
+    "directories": {
+      "letsencrypt": "Let's Encrypt",
+      "letsencrypt-staging": "Let's Encrypt(스테이징)",
+      "zerossl": "ZeroSSL",
+      "google": "Google Trust Services",
+      "custom": "다른 ACME 디렉터리(URL)"
+    },
+    "dnsKinds": {
+      "cloudflare": "Cloudflare",
+      "route53": "Amazon Route 53",
+      "rfc2136": "RFC 2136(BIND·Knot …)",
+      "power_dns": "PowerDNS",
+      "hook": "훅 스크립트"
+    },
+    "dnsFields": {
+      "api_token": "API 토큰",
+      "zone_id": "영역 id",
+      "access_key_id": "액세스 키 id",
+      "secret_access_key": "비밀 액세스 키",
+      "region": "리전",
+      "hosted_zone_id": "호스팅 영역 id",
+      "server": "서버(ip:53)",
+      "key_name": "TSIG 키 이름",
+      "secret": "TSIG 비밀(base64)",
+      "zone": "영역",
+      "url": "API URL",
+      "api_key": "API 키",
+      "server_id": "서버 id",
+      "path": "훅 경로"
+    },
+    "errors": {
+      "name": "소문자·숫자·하이픈으로(63자까지) 쓰세요.",
+      "url": "ACME 디렉터리의 https:// URL을 주세요.",
+      "tos": "CA 약관에 동의해야 합니다.",
+      "eab": "EAB 키 id와 HMAC 키를 둘 다 주거나 둘 다 비우세요.",
+      "required": "필요합니다.",
+      "hook": "훅은 /etc/opl/acme-hooks/ 아래 파일이어야 합니다.",
+      "names": "이름을 하나 이상 주세요.",
+      "wildcard": "와일드카드 이름은 DNS-01이 필요합니다.",
+      "account": "계정을 고르세요.",
+      "dns": "DNS 공급자를 고르세요."
+    },
+    "account": {
+      "open": "계정 더하기",
+      "title": "ACME 계정 더하기",
+      "hint": "클러스터가 계정 키를 만들고 곧 CA에 등록합니다.",
+      "submit": "등록",
+      "directory": "디렉터리",
+      "url": "디렉터리 URL",
+      "email": "연락처 이메일",
+      "tos": "CA 약관에 동의합니다",
+      "eab": "외부 계정 묶기(EAB)",
+      "eabHint": "ZeroSSL·Google과 많은 사내 CA가 요구합니다. Let's Encrypt는 비워 두세요.",
+      "kid": "EAB 키 id",
+      "hmac": "EAB HMAC 키",
+      "ca": "CA 루트(PEM)",
+      "caHint": "브라우저가 믿지 않는 사내 CA일 때만.",
+      "check": "확인",
+      "checked": "계정 {{name}}이(가) CA에 등록되어 있습니다.",
+      "registered": "등록됨",
+      "pending": "등록 안 됨",
+      "error": "오류"
+    },
+    "dns": {
+      "open": "DNS 공급자 더하기",
+      "title": "DNS 공급자 더하기",
+      "hint": "DNS-01은 이 공급자로 TXT 레코드를 써서 이름의 주인임을 보입니다.",
+      "submit": "더하기",
+      "kind": "공급자",
+      "zones": "영역",
+      "zonesHint": "쉼표로 나눕니다. 인증서는 이름을 덮는 영역의 공급자를 고릅니다.",
+      "hookHint": "모든 노드의 /etc/opl/acme-hooks/ 아래 실행 파일."
+    },
+    "cert": {
+      "open": "인증서 더하기",
+      "title": "인증서 더하기",
+      "hint": "리더가 1분 안에 주문하고 만료 전에 갱신합니다.",
+      "submit": "더하기",
+      "names": "이름",
+      "namesHint": "쉼표로 나눕니다. {node}는 노드 이름(노드마다만), *. 이름은 DNS-01이 필요합니다.",
+      "account": "ACME 계정",
+      "scope": "인증서",
+      "challenge": "도전",
+      "dns": "DNS 공급자",
+      "key": "키",
+      "keyHint": "이 빌드는 RSA 키를 쓰지 못합니다.",
+      "profile": "프로필",
+      "defaultProfile": "CA 기본",
+      "http01Missing": "HTTP-01은 덮는 모든 노드에 포트 80 리스너([api] http_listen)가 필요합니다. 없는 노드: {{nodes}}."
+    }
+  }
+}

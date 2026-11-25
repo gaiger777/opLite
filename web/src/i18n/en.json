@@ -255,7 +255,14 @@
     "vmExports": "Exports",
     "vmwareMigrationsKeywords": "vmware, vcenter, esxi, migrate, warm, cutover, wave",
     "vmwareSourcesKeywords": "vmware, vcenter, esxi, connection",
-    "vmExportsKeywords": "export, ova, ovf, vmdk"
+    "vmExportsKeywords": "export, ova, ovf, vmdk",
+    "auditTab": "Audit",
+    "history": "Config history",
+    "historyKeywords": "history, config history, changes, revision, rollback, restore, drift",
+    "applySets": "Apply sets",
+    "applySetsKeywords": "apply set, declarative, manifest, yaml, gitops, drift",
+    "certificates": "Certificates",
+    "certificatesKeywords": "certificate, ACME, Let's Encrypt, TLS, https"
   },
   "header": {
     "language": "Language",
@@ -399,7 +406,9 @@
       "vmware-revert": "Revert VMware VM {{target}}",
       "vmware-cleanup": "Clean up VMware VM {{target}}",
       "vm-export": "Export VM {{target}}",
-      "vm-export-delete": "Delete export {{target}}"
+      "vm-export-delete": "Delete export {{target}}",
+      "apply": "Apply {{target}}",
+      "acme-order": "Order certificate {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -476,6 +485,12 @@
     "yes": "Yes",
     "no": "No",
     "back": "Back"
+  },
+  "configMenu": {
+    "history": "Config history…",
+    "yaml": "Export as YAML",
+    "more": "More for {{name}}",
+    "terraform": "Managed by Terraform"
   },
   "confirm": {
     "typeName": "Type {{name}} to confirm",

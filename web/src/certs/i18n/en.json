@@ -1,0 +1,123 @@
+{
+  "certs": {
+    "pageHint": "Public certificates for the API and web listener from an ACME CA (Let's Encrypt, ZeroSSL, your own step-ca). The leader orders and renews them; nodes swap them in without a restart.",
+    "certificates": "Certificates",
+    "accounts": "ACME accounts",
+    "dnsProviders": "DNS providers",
+    "emptyCertificates": "No certificates.",
+    "emptyCertificatesHint": "Add a certificate to get a browser-trusted certificate for the API.",
+    "needAccount": "Add an ACME account first.",
+    "emptyAccounts": "No ACME accounts.",
+    "emptyDns": "No DNS providers. DNS-01 (needed for wildcard names) uses one.",
+    "issued": "Issued",
+    "notIssued": "Not issued yet",
+    "expired": "Expired",
+    "expiresIn_one": "{{count}} day left",
+    "expiresIn_other": "{{count}} days left",
+    "renewAt": "renews {{date}}",
+    "failures_one": "{{count}} failure",
+    "failures_other": "{{count}} failures",
+    "renewNamed": "Renew {{name}} now",
+    "secretOnce": "Not shown again after saving.",
+    "deleteTitle": "Delete {{name}}?",
+    "deleteHint": {
+      "account": "The account is removed from the cluster. Certificates that use it must be deleted first.",
+      "dns": "The DNS provider is removed. Certificates that use it must be deleted first.",
+      "certificate": "The certificate is no longer renewed or installed. Listeners fall back to the internal CA certificate."
+    },
+    "scope": {
+      "shared": "Shared",
+      "per_node": "Per node"
+    },
+    "directories": {
+      "letsencrypt": "Let's Encrypt",
+      "letsencrypt-staging": "Let's Encrypt (staging)",
+      "zerossl": "ZeroSSL",
+      "google": "Google Trust Services",
+      "custom": "Other ACME directory (URL)"
+    },
+    "dnsKinds": {
+      "cloudflare": "Cloudflare",
+      "route53": "Amazon Route 53",
+      "rfc2136": "RFC 2136 (BIND, Knot …)",
+      "power_dns": "PowerDNS",
+      "hook": "Hook script"
+    },
+    "dnsFields": {
+      "api_token": "API token",
+      "zone_id": "Zone id",
+      "access_key_id": "Access key id",
+      "secret_access_key": "Secret access key",
+      "region": "Region",
+      "hosted_zone_id": "Hosted zone id",
+      "server": "Server (ip:53)",
+      "key_name": "TSIG key name",
+      "secret": "TSIG secret (base64)",
+      "zone": "Zone",
+      "url": "API URL",
+      "api_key": "API key",
+      "server_id": "Server id",
+      "path": "Hook path"
+    },
+    "errors": {
+      "name": "Use lower-case letters, digits and hyphens (up to 63).",
+      "url": "Give the https:// URL of the ACME directory.",
+      "tos": "You must agree to the CA's terms of service.",
+      "eab": "Give both the EAB key id and the HMAC key, or neither.",
+      "required": "Required.",
+      "hook": "The hook must be a file under /etc/opl/acme-hooks/.",
+      "names": "Give at least one name.",
+      "wildcard": "Wildcard names need DNS-01.",
+      "account": "Choose an account.",
+      "dns": "Choose a DNS provider."
+    },
+    "account": {
+      "open": "Add account",
+      "title": "Add an ACME account",
+      "hint": "The cluster creates the account key and registers with the CA right away.",
+      "submit": "Register",
+      "directory": "Directory",
+      "url": "Directory URL",
+      "email": "Contact email",
+      "tos": "I agree to the CA's terms of service",
+      "eab": "External account binding",
+      "eabHint": "ZeroSSL, Google and many in-house CAs require it. Leave empty for Let's Encrypt.",
+      "kid": "EAB key id",
+      "hmac": "EAB HMAC key",
+      "ca": "CA root (PEM)",
+      "caHint": "Only for an in-house CA whose root browsers do not trust.",
+      "check": "Check",
+      "checked": "Account {{name}} is registered with the CA.",
+      "registered": "Registered",
+      "pending": "Not registered",
+      "error": "Error"
+    },
+    "dns": {
+      "open": "Add DNS provider",
+      "title": "Add a DNS provider",
+      "hint": "DNS-01 writes a TXT record through this provider to prove you own the name.",
+      "submit": "Add",
+      "kind": "Provider",
+      "zones": "Zones",
+      "zonesHint": "Comma-separated. Certificates pick the provider whose zone covers the name.",
+      "hookHint": "An executable under /etc/opl/acme-hooks/ on every node."
+    },
+    "cert": {
+      "open": "Add certificate",
+      "title": "Add a certificate",
+      "hint": "The leader orders it within a minute and renews it before it expires.",
+      "submit": "Add",
+      "names": "Names",
+      "namesHint": "Comma-separated. {node} is the node name (per node only); *. names need DNS-01.",
+      "account": "ACME account",
+      "scope": "Certificate",
+      "challenge": "Challenge",
+      "dns": "DNS provider",
+      "key": "Key",
+      "keyHint": "RSA keys are not supported by this build.",
+      "profile": "Profile",
+      "defaultProfile": "CA default",
+      "http01Missing": "HTTP-01 needs the port 80 listener ([api] http_listen) on every node it covers. Missing on: {{nodes}}."
+    }
+  }
+}

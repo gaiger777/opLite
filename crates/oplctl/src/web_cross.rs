@@ -7,6 +7,9 @@
 //! `vm start`이므로 웹의 `power: running`은 `--start`와 그 켜기 요청이 있을 때만이다(맞춰 본 뒤 뺀다). HA 정책의 서버 기본값을 적지 않고, `--boot`가 없으면 첫 디스크만 `boot_order: 1`이고(웹은 모두 비워
 //! "디스크 차례, CD는 뒤"), `host` 모델은 보내지 않고, 게스트 에이전트 기본은 `{}`(웹은 `{freeze_fs: true}`)이며,
 //! 배포의 노드는 준 이름 그대로(웹은 id — 서버가 둘 다 받음)이고, 값이 null인 칸은 서버 기본과 같다.
+//!
+//! 계획 73: 웹의 "YAML로 내보내기"(`web/src/declarative/toYaml.ts`)가 쓴 YAML을 CLI의 매니페스트 읽개(`apply -f`)가 같은
+//! 값으로 읽는지도 본다(고정 파일 `web/src/declarative/__fixtures__/yaml.json`).
 
 use std::path::Path;
 
@@ -280,5 +283,29 @@ async fn web_cli_preview_sends_the_same_body_as_the_web() {
             body["node"] = nodes[id].clone();
         }
         assert_eq!(cli, body, "{name}: CLI body differs from the web body");
+    }
+}
+
+const YAML_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../web/src/declarative/__fixtures__/yaml.json"
+);
+
+#[test]
+fn web_yaml_export_reads_back_as_the_same_documents() {
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(YAML_FIXTURE).unwrap()).unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert!(cases.len() >= 3);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let docs =
+            crate::declarative::parse_text(case["yaml"].as_str().unwrap(), Path::new("web.yaml"))
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(
+            Value::Array(docs),
+            case["value"],
+            "{name}: the CLI reads the web YAML differently"
+        );
     }
 }

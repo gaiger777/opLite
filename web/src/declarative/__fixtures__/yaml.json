@@ -1,0 +1,140 @@
+{
+  "cases": [
+    {
+      "name": "vm",
+      "value": [
+        {
+          "apiVersion": "orbivisor.io/v1",
+          "kind": "Vm",
+          "metadata": {
+            "name": "web01",
+            "folder": "/prod/web",
+            "labels": {
+              "orbivisor.io/apply-set": "web-prod",
+              "tier": "front end"
+            },
+            "annotations": {
+              "orbivisor.io/prune": "false"
+            }
+          },
+          "spec": {
+            "vcpus": 4,
+            "memory_mib": 8192,
+            "cpu": {
+              "model": "x86-64-v2",
+              "flags": []
+            },
+            "disks": [
+              {
+                "volume": "web01-disk0",
+                "bus": "virtio",
+                "boot_order": 1
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "mac": "52:54:00:12:34:56",
+                "security_groups": [
+                  "web",
+                  "ssh"
+                ]
+              }
+            ],
+            "cloud_init": {
+              "user": "ubuntu",
+              "password": {
+                "secretRef": "web01-password"
+              },
+              "ssh_keys": []
+            },
+            "description": "",
+            "ha": null,
+            "tpm": false
+          },
+          "state": "running"
+        }
+      ],
+      "yaml": "---\napiVersion: orbivisor.io/v1\nkind: Vm\nmetadata:\n  name: web01\n  folder: /prod/web\n  labels:\n    orbivisor.io/apply-set: web-prod\n    tier: front end\n  annotations:\n    orbivisor.io/prune: \"false\"\nspec:\n  vcpus: 4\n  memory_mib: 8192\n  cpu:\n    model: x86-64-v2\n    flags: []\n  disks:\n    - volume: web01-disk0\n      bus: virtio\n      boot_order: 1\n  nics:\n    - network: lan\n      mac: \"52:54:00:12:34:56\"\n      security_groups:\n        - web\n        - ssh\n  cloud_init:\n    user: ubuntu\n    password:\n      secretRef: web01-password\n    ssh_keys: []\n  description: \"\"\n  ha: null\n  tpm: false\nstate: running\n"
+    },
+    {
+      "name": "many",
+      "value": [
+        {
+          "apiVersion": "orbivisor.io/v1",
+          "kind": "Folder",
+          "metadata": {
+            "name": "prod"
+          },
+          "spec": {}
+        },
+        {
+          "apiVersion": "orbivisor.io/v1",
+          "kind": "Network",
+          "metadata": {
+            "name": "lan",
+            "folder": "/prod"
+          },
+          "spec": {
+            "kind": "bridge",
+            "bridge": "br0",
+            "vlan": 100,
+            "subnets": []
+          }
+        }
+      ],
+      "yaml": "---\napiVersion: orbivisor.io/v1\nkind: Folder\nmetadata:\n  name: prod\nspec: {}\n---\napiVersion: orbivisor.io/v1\nkind: Network\nmetadata:\n  name: lan\n  folder: /prod\nspec:\n  kind: bridge\n  bridge: br0\n  vlan: 100\n  subnets: []\n"
+    },
+    {
+      "name": "awkward",
+      "value": [
+        {
+          "123": "number key",
+          "strings": [
+            "true",
+            "No",
+            "null",
+            "~",
+            "123",
+            "1.5",
+            "0x1f",
+            ".inf",
+            "a: b",
+            "#x",
+            "- x"
+          ],
+          "spaces": [
+            "x ",
+            " x",
+            "a  b",
+            ""
+          ],
+          "multi": "line 1\nline 2\ttab \"quoted\" \\",
+          "ko": "웹 서버 — 설명",
+          "key with: colon": 1,
+          "numbers": [
+            0,
+            -1,
+            1.5,
+            4294967296
+          ],
+          "nested": [
+            [
+              1,
+              2
+            ],
+            [],
+            [
+              {
+                "a": false
+              }
+            ]
+          ],
+          "empty": {},
+          "nothing": null
+        }
+      ],
+      "yaml": "---\n\"123\": number key\nstrings:\n  - \"true\"\n  - \"No\"\n  - \"null\"\n  - \"~\"\n  - \"123\"\n  - \"1.5\"\n  - \"0x1f\"\n  - \".inf\"\n  - \"a: b\"\n  - \"#x\"\n  - \"- x\"\nspaces:\n  - \"x \"\n  - \" x\"\n  - \"a  b\"\n  - \"\"\nmulti: \"line 1\\nline 2\\ttab \\\"quoted\\\" \\\\\"\nko: \"웹 서버 — 설명\"\n\"key with: colon\": 1\nnumbers:\n  - 0\n  - -1\n  - 1.5\n  - 4294967296\nnested:\n  -\n    - 1\n    - 2\n  - []\n  -\n    - a: false\nempty: {}\nnothing: null\n"
+    }
+  ]
+}

@@ -88,6 +88,13 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
   if (op.kind === "vm-export-delete") {
     return { name, href: "/vm-exports" };
   }
+  // 선언 적용(계획 73)의 대상은 적용 묶음(없으면 계획), ACME 주문은 인증서다.
+  if (op.kind === "apply") {
+    return { name, href: op.set ? "/apply-sets" : "/history" };
+  }
+  if (op.kind === "acme-order") {
+    return { name, href: "/settings/certificates" };
+  }
   return op.kind.startsWith("ceph-")
     ? { name, href: "/ceph" }
     : op.kind.startsWith("sdn-")
@@ -121,10 +128,10 @@ export function alertHref(subject: AlertSubject): string {
       return `/backups?q=${enc(subject.name)}`;
     case "backup_store":
       return `/backup-stores?open=${enc(subject.id)}`;
-    // 인증서·적용 묶음(계획 73): 화면은 스테이지 6이 더한다. 그때까지는 그 영역의 지금 화면
+    // 인증서·적용 묶음(계획 73): 설정 › 보안 › 인증서, 활동 › 감사 › 선언 묶음의 그 묶음
     case "certificate":
-      return "/settings/security";
+      return "/settings/certificates";
     case "apply_set":
-      return "/audit";
+      return `/apply-sets/${enc(subject.name)}`;
   }
 }

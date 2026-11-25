@@ -3,6 +3,7 @@ import { type RefObject, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
+import { RowConfigMenu } from "@/declarative/ConfigMenu";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
@@ -260,6 +261,7 @@ export function VolumesPage() {
               base={reasons}
               reasons={[base != null ? flattenReason : null, resizeReason, deleteReason]}
             />
+            <RowConfigMenu target={{ kind: "volume", id: volume.id, name: volume.name }} />
           </>
         );
       },

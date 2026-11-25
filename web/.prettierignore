@@ -2,3 +2,4 @@ pnpm-lock.yaml
 src/api/schema.d.ts
 src/components/ui/
 src/vmBuilder/model/__fixtures__/
+src/declarative/__fixtures__/

@@ -4,6 +4,7 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { RowConfigMenu } from "@/declarative/ConfigMenu";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Network } from "@/api/types";
@@ -192,6 +193,7 @@ export function RoutersPage() {
                     <PermissionsButton name={r.name} onClick={() => setSharing(r)} />
                   )}
                   {writes(r) && <DeleteRouterButton router={r} onDelete={() => setDeleting(r)} />}
+                  <RowConfigMenu target={{ kind: "router", id: r.id, name: r.name }} />
                 </TableCell>
               </TableRow>
             ))}
