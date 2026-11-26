@@ -58,6 +58,15 @@ const ALERT = {
   threshold: 90,
 };
 
+// 노드 부하·풀·용량 위젯은 섞인 판 클러스터의 홈에만 있다(계획 75 — 새 홈은 할당·사용 표가 맡는다).
+beforeEach(() => {
+  server.use(
+    http.get(apiUrl("/capacity"), () =>
+      HttpResponse.json({ code: "cluster_upgrading", message: "upgrading" }, { status: 409 }),
+    ),
+  );
+});
+
 function cluster() {
   return http.get(apiUrl("/cluster"), () =>
     HttpResponse.json({ name: "lab", ca_fingerprint: "x", leader: "n1", node: "n1", members: [] }),

@@ -48,3 +48,20 @@ export function useCapacity(enabled = true) {
     enabled,
   });
 }
+
+/** 노드의 가장 새 표본(`GET /nodes/{key}/metrics`, 지난 1분) — 인터페이스별 rx/tx·오류는 마지막 점에만 있다(계획 75 §3.1). */
+export function useNodeSample(key: string, enabled = true) {
+  return useQuery({
+    queryKey: ["metrics", "node", key, "latest"],
+    queryFn: () =>
+      call(
+        api.GET("/nodes/{key}/metrics", {
+          params: { path: { key }, query: { since: Date.now() - 60_000 } },
+        }),
+      ),
+    select: (series) => series.samples.at(-1),
+    refetchInterval: PHYSICAL_REFRESH_MS,
+    retry: false,
+    enabled,
+  });
+}

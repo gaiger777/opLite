@@ -1,0 +1,237 @@
+// 노드 하나의 네트워크 사슬도(계획 75 §4.1 자세히 판 4칸): 물리 포트 → 본딩 → VLAN → 브리지 → underlay → 네트워크. 서버의
+// `NodePhysical`(포트·브리지·underlay·영향)과 레일(네트워크)로 칸과 선을 만들고, 장애 포트(`impact`)에서 앞으로 닿는 칸·선에
+// 심각도를 붙인다. VM 경로(NIC → 네트워크 → 브리지 → 포트)도 같은 그래프를 거꾸로 걷는다. 그리기와 떨어진 순수 함수다.
+import type { NetRail, NodePhysical, PhysicalPort } from "@/physical/api";
+
+export type LinkHealth = "up" | "degraded" | "down";
+export type Fault = "down" | "degraded";
+export type ChainKind = "ethernet" | "bond" | "vlan" | "bridge" | "underlay" | "network";
+
+/** 칸의 열(빈 열은 그리는 쪽이 접는다) */
+export const CHAIN_COLUMNS: readonly ChainKind[] = [
+  "ethernet",
+  "bond",
+  "vlan",
+  "bridge",
+  "underlay",
+  "network",
+];
+
+export interface ChainItem {
+  /** `i:<인터페이스>`, `u:underlay`, `n:<네트워크 id>` */
+  id: string;
+  kind: ChainKind;
+  label: string;
+  /** 이 노드에서 본 상태. 레일이 이 노드에 없으면 `absent`다. */
+  health: LinkHealth | "absent";
+  /** 장애 포트에서 닿으면 그 심각도(둘이면 `down`) */
+  fault?: Fault;
+  /** 포트(이더넷·본딩·VLAN)면 서버 값 */
+  port?: PhysicalPort;
+  /** 네트워크면 이 노드에서 NIC가 붙은 VM 수, 브리지면 `vm_nics` */
+  vms?: number;
+  /** VLAN id·physnet 이름 같은 짧은 덧말 */
+  note?: string;
+}
+
+export interface ChainEdge {
+  from: string;
+  to: string;
+  fault?: Fault;
+}
+
+export interface Chain {
+  items: ChainItem[];
+  edges: ChainEdge[];
+  /** 보이지 않는 쓰지 않는 이더넷 포트 수 */
+  unused: number;
+}
+
+const UNDERLAY = "u:underlay";
+const OVERLAY_KINDS: readonly NetRail["kind"][] = ["vxlan", "sdn-overlay"];
+
+const iface = (name: string) => `i:${name}`;
+
+function worse(a: Fault | undefined, b: Fault): Fault {
+  return a === "down" || b === "down" ? "down" : "degraded";
+}
+
+/**
+ * 노드의 사슬. `rails`는 클러스터의 네트워크(이 노드에 쓸 수단이 없는 것은 빠진다), `vmsByNetwork`는 이 노드에서 그 네트워크에
+ * NIC가 있는 VM 수(네트워크 id → 수, 없으면 칸에 수를 쓰지 않는다).
+ */
+export function buildChain(
+  node: NodePhysical,
+  rails: readonly NetRail[],
+  vmsByNetwork?: ReadonlyMap<string, number>,
+): Chain {
+  const items: ChainItem[] = [];
+  const edges: ChainEdge[] = [];
+  const has = new Set<string>();
+  const add = (item: ChainItem) => {
+    if (!has.has(item.id)) {
+      has.add(item.id);
+      items.push(item);
+    }
+  };
+  let unused = 0;
+  for (const p of node.ports) {
+    if (p.kind !== "ethernet" && p.kind !== "bond" && p.kind !== "vlan") {
+      continue;
+    }
+    if (p.role === "unused") {
+      unused += 1;
+      continue;
+    }
+    add({
+      id: iface(p.name),
+      kind: p.kind,
+      label: p.name,
+      health: p.health,
+      port: p,
+      note: p.kind === "vlan" && p.vlan_id != null ? `VLAN ${p.vlan_id}` : undefined,
+    });
+  }
+  for (const b of node.bridges) {
+    add({ id: iface(b.name), kind: "bridge", label: b.name, health: b.health, vms: b.vm_nics });
+  }
+  const onNode = (rail: NetRail) => rail.nodes.find((n) => n.node === node.node)?.state ?? "absent";
+  if (node.underlay) {
+    const overlays = rails.filter((r) => OVERLAY_KINDS.includes(r.kind));
+    const holder = node.underlay.port ? iface(node.underlay.port) : undefined;
+    add({
+      id: UNDERLAY,
+      kind: "underlay",
+      label: node.underlay.address,
+      health: holder && has.has(holder) ? healthOf(items, holder) : "up",
+      note: node.underlay.port,
+    });
+    for (const r of overlays) {
+      if (onNode(r) !== "absent") {
+        edges.push({ from: UNDERLAY, to: `n:${r.id}` });
+      }
+    }
+    if (holder && has.has(holder)) {
+      edges.push({ from: holder, to: UNDERLAY });
+    }
+  }
+  for (const p of node.ports) {
+    const from = iface(p.name);
+    if (!has.has(from)) {
+      continue;
+    }
+    if (p.master && has.has(iface(p.master))) {
+      edges.push({ from, to: iface(p.master) });
+    }
+    if (p.kind === "vlan" && p.parent && has.has(iface(p.parent))) {
+      edges.push({ from: iface(p.parent), to: from });
+    }
+  }
+  for (const b of node.bridges) {
+    for (const id of b.networks) {
+      edges.push({ from: iface(b.name), to: `n:${id}` });
+    }
+  }
+  // 네트워크 칸: 선이 닿는 것만(레일 순 — 이름 순)
+  const wanted = new Set(edges.filter((e) => e.to.startsWith("n:")).map((e) => e.to));
+  for (const r of rails) {
+    const id = `n:${r.id}`;
+    if (!wanted.has(id)) {
+      continue;
+    }
+    const notes = [
+      r.vlan != null ? `VLAN ${r.vlan}` : undefined,
+      r.kind === "sdn-provider" ? `physnet ${r.carrier}` : undefined,
+    ].filter((x) => x !== undefined);
+    add({
+      id,
+      kind: "network",
+      label: r.name,
+      health: onNode(r),
+      vms: vmsByNetwork?.get(r.id),
+      note: notes.length > 0 ? notes.join(" · ") : undefined,
+    });
+  }
+  // 모르는 네트워크로 가는 선(레일에 없음)은 버린다.
+  const kept = edges.filter((e) => has.has(e.from) && has.has(e.to));
+  markFaults(node, items, kept);
+  return { items, edges: kept, unused };
+}
+
+function healthOf(items: readonly ChainItem[], id: string): LinkHealth {
+  const h = items.find((i) => i.id === id)?.health;
+  return h === "absent" || h === undefined ? "up" : h;
+}
+
+/** 장애마다 그 포트(없으면 본딩)에서 앞으로 걸어 닿는 칸·선에 심각도를 붙인다. */
+function markFaults(node: NodePhysical, items: ChainItem[], edges: ChainEdge[]) {
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const out = new Map<string, ChainEdge[]>();
+  for (const e of edges) {
+    out.set(e.from, [...(out.get(e.from) ?? []), e]);
+  }
+  for (const impact of node.impact ?? []) {
+    const start = iface(impact.port);
+    const seen = new Set<string>();
+    const stack = [start];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (seen.has(id)) {
+        continue;
+      }
+      seen.add(id);
+      const item = byId.get(id);
+      if (item) {
+        item.fault = worse(item.fault, impact.severity);
+      }
+      for (const e of out.get(id) ?? []) {
+        e.fault = worse(e.fault, impact.severity);
+        stack.push(e.to);
+      }
+    }
+  }
+}
+
+/** 칸 `id` 아래(뒤로 걸어)의 이더넷 포트들 — VM 경로의 "→ 포트". 이름 순. */
+export function lowerPorts(chain: Chain, id: string): ChainItem[] {
+  const into = new Map<string, string[]>();
+  for (const e of chain.edges) {
+    into.set(e.to, [...(into.get(e.to) ?? []), e.from]);
+  }
+  const byId = new Map(chain.items.map((i) => [i.id, i]));
+  const seen = new Set<string>();
+  const found: ChainItem[] = [];
+  const stack = [id];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (seen.has(cur)) {
+      continue;
+    }
+    seen.add(cur);
+    const item = byId.get(cur);
+    if (item?.kind === "ethernet") {
+      found.push(item);
+    }
+    stack.push(...(into.get(cur) ?? []));
+  }
+  return found.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/** 네트워크 칸 바로 앞의 운반자(브리지 또는 underlay) */
+export function carrierOf(chain: Chain, networkId: string): ChainItem | undefined {
+  const from = chain.edges.find((e) => e.to === `n:${networkId}`)?.from;
+  return chain.items.find((i) => i.id === from);
+}
+
+/** 클러스터의 지금 장애(노드 이름 순, 노드 안은 서버 순서) — "물리 장애 n" 배지 */
+export function faultList(nodes: readonly NodePhysical[]) {
+  return nodes.flatMap((n) =>
+    (n.impact ?? []).map((i) => ({
+      id: n.id,
+      node: n.node,
+      port: i.port,
+      severity: i.severity,
+      vms: i.vms,
+    })),
+  );
+}

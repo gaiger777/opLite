@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
-import { useId } from "react";
+import { lazy, Suspense, useId } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -22,9 +22,19 @@ import { TopVmsWidget } from "@/dashboard/TopVmsWidget";
 import { WidgetCard } from "@/dashboard/WidgetCard";
 import { errorMessage } from "@/i18n/errors";
 import { compareVersions } from "@/lib/version";
+import { isUpgrading, useCapacity } from "@/physical/api";
 import { SubscriptionBanner } from "@/settings/SubscriptionBanner";
 import { isRinging } from "@/tasks/center";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
+
+// 운영자 대시보드(계획 75 §4.1 — 지도·자세히 판·할당 표)는 늦게 읽는 칸이다(첫 화면 묶음 < 3KB). 문구도 함께 받는다.
+const OperatorBoard = lazy(async () => {
+  const [board] = await Promise.all([
+    import("@/dashboard/OperatorBoard"),
+    import("@/physical/strings").then((s) => s.loadPhysicalStrings()),
+  ]);
+  return board;
+});
 
 /** 노드들이 돌리는 서로 다른 버전(낮은 것부터). 버전을 모르는 노드(옛 노드)는 뺀다. */
 function nodeVersions(nodes: Node[]): string[] {
@@ -180,40 +190,87 @@ function RecentTasksWidget() {
 }
 
 /**
- * 홈(설계 §8.1): 첫 걸음, 건강 띠, 경보, 용량(클러스터·풀), 차트, 노드 부하·상위 VM, 최근 작업, 즐겨찾기.
- * 위젯은 카드 하나씩만 그리고 배치는 여기서 한다. 휴대폰(당직 보기, §5.9)은 경보 → 상태 요약 → 즐겨찾기를
- * 먼저 쌓는다(화면 읽기 순서도 같게 DOM 순서를 바꾼다).
+ * 홈(설계 §8.1, 계획 75 §4.1): 첫 걸음, 건강 띠, 운영자 대시보드([지도 | 자세히 판], 노드별 할당·사용 표), 경보, 차트, 상위 VM,
+ * 최근 작업, 즐겨찾기. 위젯은 카드 하나씩만 그리고 배치는 여기서 한다. 휴대폰(당직 보기, §5.9)은 건강 띠 → 경보 → 지도 →
+ * 표(카드)를 먼저 쌓는다(화면 읽기 순서도 같게 DOM 순서를 바꾼다). 섞인 판 클러스터(`/capacity`가 409)는 지난 홈(용량·풀·노드
+ * 부하 위젯)과 안내 한 줄이다.
  */
 export function DashboardPage() {
   const { t } = useTranslation();
   const phone = useIsPhone();
-  // 용량·풀·차트·노드 부하·상위 VM은 클러스터 지표(`/metrics/cluster`)와 노드 목록을 읽어 루트 `cluster.read`가 있어야
-  // 한다. 없으면(폴더 사용자) 숨기고 한 줄로 알린다.
+  // 용량·풀·차트·노드 부하·상위 VM·대시보드는 클러스터 지표(`/metrics/cluster`)와 노드 목록을 읽어 루트 `cluster.read`가
+  // 있어야 한다. 없으면(폴더 사용자) 숨기고 한 줄로 알린다.
   const clusterRead = usePermissions().has("cluster.read");
+  const capacity = useCapacity(clusterRead);
+  const legacy = isUpgrading(capacity.error);
   const grid2 = "grid grid-cols-1 gap-(--gap) lg:grid-cols-2";
   const hidden = !clusterRead && (
     <p className="text-sm text-muted-foreground">{t("dashboard.clusterHidden")}</p>
   );
+  const upgrading = legacy && (
+    <p className="text-sm text-muted-foreground">{t("dashboard.boardAfterUpgrade")}</p>
+  );
+  const board = (
+    <Suspense fallback={<p className="text-sm text-muted-foreground">{t("common.loading")}</p>}>
+      <OperatorBoard phone={phone} />
+    </Suspense>
+  );
+  const operator = clusterRead && !legacy;
+  // 어느 홈인지 알 때까지(첫 `/capacity`) 클러스터 칸을 그리지 않는다 — 두 홈 사이를 오가며 위젯을 다시 올리지 않게.
+  const pending = clusterRead && capacity.isPending;
+  const loading = <p className="text-sm text-muted-foreground">{t("common.loading")}</p>;
+  // 휴대폰은 홈마다 순서가 달라 열쇠로 같은 위젯을 지킨다.
+  const phoneItems = pending
+    ? [<HealthStrip key="health" clusterRead={clusterRead} />, <div key="loading">{loading}</div>]
+    : operator
+      ? [
+          <HealthStrip key="health" clusterRead={clusterRead} />,
+          <ActiveAlertsWidget key="alerts" />,
+          <div key="board" className="contents">
+            {board}
+          </div>,
+          <FavoritesWidget key="favorites" />,
+          <RecentTasksWidget key="tasks" />,
+        ]
+      : [
+          <ActiveAlertsWidget key="alerts" />,
+          <HealthStrip key="health" clusterRead={clusterRead} />,
+          <div key="upgrading" className="contents">
+            {upgrading}
+          </div>,
+          <FavoritesWidget key="favorites" />,
+          ...(clusterRead
+            ? [<CapacityWidget key="capacity" />, <PoolUsageWidget key="pools" />]
+            : []),
+          <RecentTasksWidget key="tasks" />,
+          <div key="hidden" className="contents">
+            {hidden}
+          </div>,
+        ];
   return (
     <div className="flex flex-col gap-(--gap)">
       <PageHeader title={t("nav.area.home")} />
       <SubscriptionBanner />
       <FirstSteps />
       {phone ? (
-        <>
-          <ActiveAlertsWidget />
-          <HealthStrip clusterRead={clusterRead} />
-          <FavoritesWidget />
-          {clusterRead && <CapacityWidget />}
-          {clusterRead && <PoolUsageWidget />}
-          <RecentTasksWidget />
-          {hidden}
-        </>
+        phoneItems
       ) : (
         <>
           <HealthStrip clusterRead={clusterRead} />
-          {clusterRead ? (
+          {pending ? (
+            loading
+          ) : operator ? (
             <>
+              {board}
+              <div className={grid2}>
+                <ActiveAlertsWidget />
+                <TopVmsWidget />
+              </div>
+              <ClusterChartsWidget />
+            </>
+          ) : clusterRead ? (
+            <>
+              {upgrading}
               <div className="grid grid-cols-1 gap-(--gap) lg:grid-cols-3">
                 <ActiveAlertsWidget />
                 <CapacityWidget />
@@ -228,10 +285,12 @@ export function DashboardPage() {
           ) : (
             <ActiveAlertsWidget />
           )}
-          <div className={grid2}>
-            <RecentTasksWidget />
-            <FavoritesWidget />
-          </div>
+          {!pending && (
+            <div className={grid2}>
+              <RecentTasksWidget />
+              <FavoritesWidget />
+            </div>
+          )}
           {hidden}
         </>
       )}

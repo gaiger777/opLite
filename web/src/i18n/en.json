@@ -2333,7 +2333,8 @@
     "alerts": "Alerts firing",
     "ringing": "View alerts",
     "failedCount": "{{count}} failed",
-    "clusterHidden": "Nodes, capacity and cluster charts need permission to read the cluster."
+    "clusterHidden": "Nodes, capacity and cluster charts need permission to read the cluster.",
+    "boardAfterUpgrade": "Upgrade every node to see the operator dashboard (map, details and allocation by node)."
   },
   "settings": {
     "updates": "Updates",

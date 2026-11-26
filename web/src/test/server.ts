@@ -103,6 +103,26 @@ export const server = setupServer(
   http.get(apiUrl("/alerts"), () =>
     HttpResponse.json({ alerts: [], unreachable: [], unsupported: [] }),
   ),
+  // 운영자 대시보드(계획 75): 노드가 없는 클러스터의 물리 관계·용량. 홈과 지도가 읽는다.
+  http.get(apiUrl("/topology/physical"), () => HttpResponse.json({ nodes: [], networks: [] })),
+  http.get(apiUrl("/capacity"), () => {
+    const cpu = {
+      threads: 0,
+      reserved: 0,
+      dedicated_total: 0,
+      dedicated_used: 0,
+      vcpus_allocated: 0,
+      vcpus_running: 0,
+      vcpus_shared: 0,
+    };
+    const memory = { total_mib: 0, reserved_mib: 0, allocated_mib: 0 };
+    const storage = { total_bytes: 0, used_bytes: 0, provisioned_bytes: 0, volumes: 0 };
+    return HttpResponse.json({
+      nodes: [],
+      shared_pools: [],
+      totals: { nodes: 0, cpu, memory, storage },
+    });
+  }),
   http.get(apiUrl("/subscription"), () =>
     HttpResponse.json({
       state: "active",

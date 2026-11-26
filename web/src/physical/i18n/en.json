@@ -1,0 +1,152 @@
+{
+  "physical": {
+    "badge_one": "{{count}} physical fault",
+    "badge_other": "{{count}} physical faults",
+    "map": {
+      "title": "Infrastructure map",
+      "full": "Open the map",
+      "open": "Open the infrastructure map"
+    },
+    "bar": {
+      "cpu": "{{allocated}} vCPU / {{total}} shared threads",
+      "use": "use {{pct}} %",
+      "allocated": "allocated {{allocated}} / {{total}}",
+      "used": "used {{used}}",
+      "provisioned": "provisioned {{allocated}} / {{total}}",
+      "noStorage": "no local pools"
+    },
+    "table": {
+      "title": "Allocation and use by node",
+      "cpu": "CPU",
+      "memory": "Memory",
+      "storage": "Storage",
+      "problems": "Problems",
+      "cpuOf": "CPU of {{node}}",
+      "memoryOf": "Memory of {{node}}",
+      "storageOf": "Storage of {{node}}",
+      "ok": "OK",
+      "offline": "offline",
+      "problemsOnly": "Problems only",
+      "noProblems": "No node has a problem.",
+      "noNodes": "No nodes.",
+      "shared": "Shared pools:",
+      "sharedPool": "{{pool}} used {{used}} / {{total}}, provisioned {{provisioned}} ({{ready}}/{{nodes}} nodes)"
+    },
+    "problem": {
+      "offline": "offline",
+      "overcommit": "overcommitted",
+      "hot": "over 90 %",
+      "pool_one": "{{count}} pool not ready",
+      "pool_other": "{{count}} pools not ready",
+      "link_one": "{{count}} link fault",
+      "link_other": "{{count}} link faults"
+    },
+    "health": {
+      "up": "up",
+      "degraded": "degraded",
+      "down": "down",
+      "absent": "not here"
+    },
+    "chain": {
+      "summaryOk_one": "Network chain, {{count}} element, no faults",
+      "summaryOk_other": "Network chain, {{count}} elements, no faults",
+      "summaryFault": "Network chain with faults: {{items}}",
+      "empty": "This node reported no uplinks or bridges.",
+      "vms_one": "{{count}} VM",
+      "vms_other": "{{count}} VMs",
+      "unused_one": "{{count}} unused port not shown.",
+      "unused_other": "{{count}} unused ports not shown.",
+      "ports": "Ports",
+      "port": "Port",
+      "state": "State",
+      "switch": "Switch / port",
+      "traffic": "Traffic",
+      "speed": "{{speed}} Mb/s",
+      "noCarrier": "no carrier",
+      "errors_one": "{{count}} error/drop",
+      "errors_other": "{{count}} errors/drops",
+      "lldpHint": "Install lldpd on the node to see the switch and port each link plugs into."
+    },
+    "cpu": {
+      "title": "CPU",
+      "numa": "NUMA node {{id}}",
+      "kind": {
+        "reserved": "reserved",
+        "dedicated": "dedicated",
+        "shared": "shared"
+      },
+      "gridSummary": "{{threads}} threads: {{reserved}} reserved, {{dedicated}} dedicated ({{used}} in use), {{shared}} shared",
+      "legend": "Hatched: reserved for the host. Filled: dedicated (dark when a VM is pinned). Outlined: shared.",
+      "shared": "{{vcpus}} shared vCPUs on {{threads}} threads — overcommit {{times}}",
+      "vms": "VMs on this node",
+      "pinned_one": "{{count}} vCPU pinned to {{cpus}}",
+      "pinned_other": "{{count}} vCPUs pinned to {{cpus}}",
+      "floating_one": "{{count}} vCPU on the shared threads",
+      "floating_other": "{{count}} vCPUs on the shared threads"
+    },
+    "memory": {
+      "title": "Memory",
+      "hugepages": "Hugepages (size used/total): {{pages}} — {{reserved}} set aside",
+      "numa": "bound {{bound}} / {{total}}",
+      "numaPages": "Hugepages: {{pages}}",
+      "vms": "Largest VMs by memory"
+    },
+    "storage": {
+      "title": "Storage",
+      "none": "No pools.",
+      "ready": "ready",
+      "notReady": "not ready",
+      "poolOf": "Pool {{pool}}",
+      "thin": "thin ×{{times}}",
+      "shared": "Shared pools",
+      "nodesReady": "{{ready}}/{{nodes}} nodes"
+    },
+    "network": {
+      "title": "Network",
+      "legacy": "Older Orbivisor on this node — some details are missing.",
+      "unknown": "No physical network information for this node."
+    },
+    "panel": {
+      "title": "Details",
+      "cluster": "Cluster",
+      "clusterHint_one": "Totals of {{count}} online node. Pick a node, VM, port or network on the map or in the table.",
+      "clusterHint_other": "Totals of {{count}} online nodes. Pick a node, VM, port or network on the map or in the table.",
+      "faults": "Physical faults",
+      "noFaults": "No link or bond faults.",
+      "faultAt": "{{port}} on {{node}}",
+      "rails": "{{count}} networks, {{broken}} with a degraded or down node.",
+      "node": "Node {{node}}",
+      "port": "{{port}} on {{node}}",
+      "wholeNode": "Whole node",
+      "rail": "Rail {{name}}",
+      "railNodes": "Nodes on {{name}}",
+      "gone": "What you picked is gone.",
+      "back": "Show the cluster"
+    },
+    "rail": {
+      "bridge": "bridge",
+      "vlan": "VLAN",
+      "vxlan": "VXLAN",
+      "sdn-overlay": "SDN overlay",
+      "sdn-provider": "SDN provider"
+    },
+    "vm": {
+      "path": "Path of this VM",
+      "notPlaced": "Not running on a node.",
+      "cpu": "vCPU",
+      "memory": "Memory",
+      "disk": "Disk",
+      "nic": "NIC",
+      "numa": "NUMA {{nodes}}",
+      "unbound": "not bound to a NUMA node"
+    },
+    "alerts": {
+      "title": "Link alerts",
+      "none": "No rule watches uplink ports or bonds yet.",
+      "enable": "Turn on link alerts",
+      "dialogDescription": "Creates the recommended link rules (uplink port down, bond degraded). They are ordinary rules afterwards. Rules that already exist are skipped.",
+      "created_one": "Created {{count}} link alert rule; {{existing}} already existed.",
+      "created_other": "Created {{count}} link alert rules; {{existing}} already existed."
+    }
+  }
+}

@@ -1,0 +1,152 @@
+{
+  "physical": {
+    "badge_one": "물리 장애 {{count}}",
+    "badge_other": "물리 장애 {{count}}",
+    "map": {
+      "title": "인프라 지도",
+      "full": "지도 열기",
+      "open": "인프라 지도 열기"
+    },
+    "bar": {
+      "cpu": "vCPU {{allocated}} / 공유 스레드 {{total}}",
+      "use": "사용 {{pct}} %",
+      "allocated": "할당 {{allocated}} / {{total}}",
+      "used": "사용 {{used}}",
+      "provisioned": "프로비전 {{allocated}} / {{total}}",
+      "noStorage": "로컬 풀 없음"
+    },
+    "table": {
+      "title": "노드별 할당·사용",
+      "cpu": "CPU",
+      "memory": "메모리",
+      "storage": "스토리지",
+      "problems": "문제",
+      "cpuOf": "{{node}}의 CPU",
+      "memoryOf": "{{node}}의 메모리",
+      "storageOf": "{{node}}의 스토리지",
+      "ok": "정상",
+      "offline": "오프라인",
+      "problemsOnly": "문제만",
+      "noProblems": "문제가 있는 노드가 없습니다.",
+      "noNodes": "노드가 없습니다.",
+      "shared": "공유 풀:",
+      "sharedPool": "{{pool}} 사용 {{used}} / {{total}}, 프로비전 {{provisioned}} (노드 {{ready}}/{{nodes}})"
+    },
+    "problem": {
+      "offline": "오프라인",
+      "overcommit": "오버커밋",
+      "hot": "90 % 넘음",
+      "pool_one": "준비 안 된 풀 {{count}}",
+      "pool_other": "준비 안 된 풀 {{count}}",
+      "link_one": "링크 장애 {{count}}",
+      "link_other": "링크 장애 {{count}}"
+    },
+    "health": {
+      "up": "정상",
+      "degraded": "저하",
+      "down": "끊김",
+      "absent": "없음"
+    },
+    "chain": {
+      "summaryOk_one": "네트워크 사슬, 원소 {{count}}개, 장애 없음",
+      "summaryOk_other": "네트워크 사슬, 원소 {{count}}개, 장애 없음",
+      "summaryFault": "장애가 있는 네트워크 사슬: {{items}}",
+      "empty": "이 노드가 알린 업링크·브리지가 없습니다.",
+      "vms_one": "VM {{count}}개",
+      "vms_other": "VM {{count}}개",
+      "unused_one": "쓰지 않는 포트 {{count}}개는 보이지 않습니다.",
+      "unused_other": "쓰지 않는 포트 {{count}}개는 보이지 않습니다.",
+      "ports": "포트",
+      "port": "포트",
+      "state": "상태",
+      "switch": "스위치 / 포트",
+      "traffic": "트래픽",
+      "speed": "{{speed}} Mb/s",
+      "noCarrier": "carrier 없음",
+      "errors_one": "오류·버림 {{count}}",
+      "errors_other": "오류·버림 {{count}}",
+      "lldpHint": "노드에 lldpd를 설치하면 링크마다 스위치와 포트가 보입니다."
+    },
+    "cpu": {
+      "title": "CPU",
+      "numa": "NUMA 노드 {{id}}",
+      "kind": {
+        "reserved": "예약",
+        "dedicated": "전용",
+        "shared": "공유"
+      },
+      "gridSummary": "스레드 {{threads}}개: 예약 {{reserved}}, 전용 {{dedicated}}(쓰는 중 {{used}}), 공유 {{shared}}",
+      "legend": "빗금: 호스트 예약. 채움: 전용(VM이 고정되면 진함). 테두리: 공유.",
+      "shared": "공유 vCPU {{vcpus}}개가 스레드 {{threads}}개 위 — 오버커밋 {{times}}",
+      "vms": "이 노드의 VM",
+      "pinned_one": "vCPU {{count}}개, {{cpus}}에 고정",
+      "pinned_other": "vCPU {{count}}개, {{cpus}}에 고정",
+      "floating_one": "vCPU {{count}}개, 공유 스레드 위",
+      "floating_other": "vCPU {{count}}개, 공유 스레드 위"
+    },
+    "memory": {
+      "title": "메모리",
+      "hugepages": "Hugepages(크기 사용/전체): {{pages}} — {{reserved}} 떼어 둠",
+      "numa": "묶임 {{bound}} / {{total}}",
+      "numaPages": "Hugepages: {{pages}}",
+      "vms": "메모리가 큰 VM"
+    },
+    "storage": {
+      "title": "스토리지",
+      "none": "풀이 없습니다.",
+      "ready": "준비됨",
+      "notReady": "준비 안 됨",
+      "poolOf": "풀 {{pool}}",
+      "thin": "씬 ×{{times}}",
+      "shared": "공유 풀",
+      "nodesReady": "노드 {{ready}}/{{nodes}}"
+    },
+    "network": {
+      "title": "네트워크",
+      "legacy": "이 노드는 옛 판입니다 — 일부 정보가 없습니다.",
+      "unknown": "이 노드의 물리 네트워크 정보가 없습니다."
+    },
+    "panel": {
+      "title": "자세히",
+      "cluster": "클러스터",
+      "clusterHint_one": "온라인 노드 {{count}}개의 합입니다. 지도나 표에서 노드·VM·포트·네트워크를 고르세요.",
+      "clusterHint_other": "온라인 노드 {{count}}개의 합입니다. 지도나 표에서 노드·VM·포트·네트워크를 고르세요.",
+      "faults": "물리 장애",
+      "noFaults": "링크·본딩 장애가 없습니다.",
+      "faultAt": "{{node}}의 {{port}}",
+      "rails": "네트워크 {{count}}개, 저하·끊긴 노드가 있는 것 {{broken}}개.",
+      "node": "노드 {{node}}",
+      "port": "{{node}}의 {{port}}",
+      "wholeNode": "노드 전체",
+      "rail": "레일 {{name}}",
+      "railNodes": "{{name}}의 노드",
+      "gone": "고른 것이 없어졌습니다.",
+      "back": "클러스터 보기"
+    },
+    "rail": {
+      "bridge": "브리지",
+      "vlan": "VLAN",
+      "vxlan": "VXLAN",
+      "sdn-overlay": "SDN 오버레이",
+      "sdn-provider": "SDN 공급자"
+    },
+    "vm": {
+      "path": "이 VM의 경로",
+      "notPlaced": "어느 노드에서도 돌지 않습니다.",
+      "cpu": "vCPU",
+      "memory": "메모리",
+      "disk": "디스크",
+      "nic": "NIC",
+      "numa": "NUMA {{nodes}}",
+      "unbound": "NUMA 노드에 묶지 않음"
+    },
+    "alerts": {
+      "title": "링크 경보",
+      "none": "업링크 포트·본딩을 보는 규칙이 아직 없습니다.",
+      "enable": "링크 경보 켜기",
+      "dialogDescription": "권하는 링크 규칙(업링크 포트 끊김, 본딩 저하)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
+      "created_one": "링크 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개).",
+      "created_other": "링크 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개)."
+    }
+  }
+}

@@ -122,9 +122,15 @@ it("counts only VMs whose QEMU runs on the node", () => {
   });
 });
 
+/** 섞인 판 클러스터(기능 `operator-dashboard`가 모두에 없음): 지난 홈의 위젯과 안내 한 줄 */
+const upgrading = () =>
+  http.get(apiUrl("/capacity"), () =>
+    HttpResponse.json({ code: "cluster_upgrading", message: "upgrading" }, { status: 409 }),
+  );
+
 it("shows how much CPU and memory running VMs take", async () => {
   mockLists({ node: [NODE], vm: [vm("web", "running"), vm("off", "stopped")] });
-  server.use(cluster("n1"));
+  server.use(cluster("n1"), upgrading());
   renderPage(<DashboardPage />);
   const capacity = await screen.findByRole("region", { name: "Capacity" });
   const cpu = await within(capacity).findByRole("meter", { name: "vCPUs given to running VMs" });
@@ -133,6 +139,9 @@ it("shows how much CPU and memory running VMs take", async () => {
   expect(
     within(capacity).getByRole("meter", { name: "Memory given to running VMs" }),
   ).toHaveAttribute("aria-valuetext", "2 GiB / 16 GiB, 13 %");
+  // 섞인 판이라 대시보드 대신 안내 한 줄
+  expect(screen.getByText(/^Upgrade every node to see the operator dashboard/)).toBeInTheDocument();
+  expect(screen.queryByRole("complementary", { name: "Details" })).not.toBeInTheDocument();
 });
 
 it("shows loading instead of zeros, then errors", async () => {
@@ -372,7 +381,7 @@ it("tells an operator to ask an admin for the pool instead of leaving them stuck
   expect(within(steps).queryByRole("link")).not.toBeInTheDocument();
 });
 
-it("puts alerts, the health strip and favorites first on a phone", async () => {
+it("puts alerts, the health strip and favorites first on a phone while upgrading", async () => {
   const media = vi.spyOn(window, "matchMedia").mockImplementation(
     (query: string) =>
       ({
@@ -384,7 +393,7 @@ it("puts alerts, the health strip and favorites first on a phone", async () => {
   );
   try {
     mockLists({ node: [NODE], vm: [vm("web", "running")] });
-    server.use(cluster("n1"));
+    server.use(cluster("n1"), upgrading());
     renderPage(<DashboardPage />);
     await screen.findByText("1 / 1");
     const names = screen.getAllByRole("region").map((r) => {
