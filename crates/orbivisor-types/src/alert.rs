@@ -10,6 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::metrics::{NodeSample, VmSample};
+pub use crate::physical::LinkRole;
 use crate::resource::{Kind, NameError, Resource, ResourceSpec, validate_name};
 
 pub mod sdn;
@@ -320,6 +321,20 @@ pub enum AlertCondition {
     },
     /// 적용 묶음의 선언과 실제가 다름(계획 73, 리더, 대상 묶음)
     ApplySetDrift,
+    /// 노드의 랜 포트(이더넷) 링크가 끊김(계획 75, 리더가 노드 상태 `interfaces`로 평가, 대상 노드). `ports`(`*`·`?` 글롭,
+    /// 예: `eno*`)가 있으면 그 이름의 포트만, `role`이 `uplink`(기본)면 브리지·본딩·underlay 아래 포트만 본다
+    /// ([`crate::physical::link_faults`]).
+    NodeLinkDown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        ports: Option<String>,
+        #[serde(default)]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        role: LinkRole,
+    },
+    /// 본딩이 저하(포트 일부만 살아 이중화를 잃음)되거나 끊김(계획 75, 리더, 대상 노드 —
+    /// [`crate::physical::bond_faults`])
+    BondDegraded,
 }
 
 fn default_expiring_days() -> u16 {
@@ -364,6 +379,8 @@ impl AlertCondition {
             Self::CertificateExpiring { .. } => "certificate_expiring",
             Self::CertificateRenewFailed { .. } => "certificate_renew_failed",
             Self::ApplySetDrift => "apply_set_drift",
+            Self::NodeLinkDown { .. } => "node_link_down",
+            Self::BondDegraded => "bond_degraded",
         }
     }
 
@@ -414,11 +431,16 @@ impl AlertCondition {
         matches!(self, Self::ApplySetDrift)
     }
 
+    /// 링크 조건(계획 75 — 기능 `link-alerts`)인지
+    pub fn is_link(&self) -> bool {
+        matches!(self, Self::NodeLinkDown { .. } | Self::BondDegraded)
+    }
+
     pub fn evaluator(&self) -> Evaluator {
         match self {
             Self::NodeOffline | Self::BackupJobFailed => Evaluator::Leader,
             Self::CertificateRenewFailed { .. } | Self::ApplySetDrift => Evaluator::Leader,
-            c if c.is_sdn() || c.is_backup_store() => Evaluator::Leader,
+            c if c.is_sdn() || c.is_backup_store() || c.is_link() => Evaluator::Leader,
             _ => Evaluator::Node,
         }
     }
@@ -431,7 +453,9 @@ impl AlertCondition {
             | Self::CertificateExpiring { .. }
             | Self::SdnCentralDown
             | Self::SdnChassisDown
-            | Self::SdnPhysnetNotReady => SubjectKind::Node,
+            | Self::SdnPhysnetNotReady
+            | Self::NodeLinkDown { .. }
+            | Self::BondDegraded => SubjectKind::Node,
             Self::SdnQuorumLost | Self::SdnSyncFailed => SubjectKind::Sdn,
             Self::SdnGatewayUnavailable | Self::SdnGatewayFailover => SubjectKind::Router,
             Self::SdnLbMemberDown => SubjectKind::LoadBalancer,
@@ -528,7 +552,14 @@ pub enum AlertRuleError {
     Op(String),
     #[error("{0} is out of range: {1}")]
     Range(&'static str, &'static str),
+    #[error(
+        "invalid ports pattern {0:?}: use 1-{MAX_PORTS_PATTERN} characters of an interface name with * and ?"
+    )]
+    Ports(String),
 }
+
+/// `NodeLinkDown.ports` 글롭의 길이 상한
+pub const MAX_PORTS_PATTERN: usize = 64;
 
 impl AlertRuleSpec {
     /// 형식만 본다(대상·노드·VM이 있는지는 API가 본다).
@@ -578,6 +609,11 @@ impl AlertRuleSpec {
                 if !(1..=100).contains(failures) =>
             {
                 return Err(AlertRuleError::Range("failures", "use 1-100"));
+            }
+            AlertCondition::NodeLinkDown {
+                ports: Some(ports), ..
+            } if !crate::physical::valid_port_glob(ports) => {
+                return Err(AlertRuleError::Ports(ports.clone()));
             }
             _ => {}
         }
@@ -1735,6 +1771,64 @@ mod tests {
         }
     }
 
+    /// 계획 75: 링크 조건 둘. 리더가 노드 상태로 평가하고(대상 노드 — 노드 거르기를 받음), 해제가 있는 지속 조건이다.
+    #[test]
+    fn link_conditions() {
+        let cases = [
+            (
+                json!({ "kind": "node_link_down" }),
+                AlertCondition::NodeLinkDown {
+                    ports: None,
+                    role: LinkRole::Uplink,
+                },
+                json!({ "kind": "node_link_down", "role": "uplink" }),
+            ),
+            (
+                json!({ "kind": "node_link_down", "ports": "eno*", "role": "any" }),
+                AlertCondition::NodeLinkDown {
+                    ports: Some("eno*".into()),
+                    role: LinkRole::Any,
+                },
+                json!({ "kind": "node_link_down", "ports": "eno*", "role": "any" }),
+            ),
+            (
+                json!({ "kind": "bond_degraded" }),
+                AlertCondition::BondDegraded,
+                json!({ "kind": "bond_degraded" }),
+            ),
+        ];
+        for (short, c, full) in cases {
+            assert_eq!(serde_json::from_value::<AlertCondition>(short).unwrap(), c);
+            assert_eq!(serde_json::to_value(&c).unwrap(), full);
+            assert_eq!(c.evaluator(), Evaluator::Leader);
+            assert_eq!(c.subject_kind(), SubjectKind::Node);
+            assert!(c.is_link());
+            assert!(!c.is_event() && !c.is_sdn() && !c.is_backup_store() && !c.is_acme());
+            let mut r = rule(c.clone());
+            r.for_secs = 30;
+            assert_eq!(r.validate(), Ok(()));
+            r.nodes = vec!["n1".into()];
+            assert_eq!(r.validate(), Ok(()));
+            r.vms = vec!["web".into()];
+            assert_eq!(r.validate(), Err(AlertRuleError::VmsFilter(c.kind())));
+        }
+        assert_eq!(AlertCondition::BondDegraded.kind(), "bond_degraded");
+        assert!(!AlertCondition::NodeOffline.is_link());
+        for bad in ["", "eno 1", "a/b", &"x".repeat(MAX_PORTS_PATTERN + 1)] {
+            let r = rule(AlertCondition::NodeLinkDown {
+                ports: Some(bad.to_string()),
+                role: LinkRole::Uplink,
+            });
+            assert_eq!(r.validate(), Err(AlertRuleError::Ports(bad.to_string())));
+        }
+        assert!(
+            serde_json::from_value::<AlertCondition>(
+                json!({ "kind": "node_link_down", "role": "trunk" })
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn condition_classes() {
         assert!(AlertCondition::HaRecovery.is_event());
@@ -1878,6 +1972,7 @@ mod tests {
             net_tx_bps: None,
             fs_used_mib: Some(1),
             fs_total_mib: Some(0),
+            interfaces: Vec::new(),
         }
     }
 
