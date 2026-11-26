@@ -224,10 +224,11 @@ impl Updates {
     async fn run_upgrade(&self, task: Uuid, resume: bool) -> Result<(), String> {
         let mut unit = upgrade_unit(task);
         // 이름 바꾸기(계획 74) 앞의 데몬이 띄운 유닛(`opl-upgrade-…`)을 이어 본다 — 업그레이드가 그 데몬을 이 판으로
-        // 바꾼다. 새 이름의 유닛이 없고 옛 이름의 유닛이 있으면 그것이다.
-        if resume && self.unit_state(&unit).await? == Some(UnitState::Gone) {
+        // 바꾼다. 새 이름의 유닛이 없고 옛 이름의 유닛이 있으면 그것이다. 상태를 읽지 못하면 읽을 때까지 다시 본다(한 번
+        // 못 읽었다고 옛 유닛을 놓치면 돌고 있는 apt를 끊긴 것으로 판정한다 — 리뷰 1).
+        if resume && self.known_state(&unit).await? == UnitState::Gone {
             let legacy = legacy_upgrade_unit(task);
-            if matches!(self.unit_state(&legacy).await?, Some(s) if s != UnitState::Gone) {
+            if self.known_state(&legacy).await? != UnitState::Gone {
                 unit = legacy;
             }
         }
@@ -300,6 +301,16 @@ impl Updates {
             ));
         }
         Ok(())
+    }
+
+    /// [`Self::unit_state`]를 읽을 때까지(`systemctl`이 실패하면 [`UpdatesConfig::poll`]마다 다시) 본다.
+    async fn known_state(&self, unit: &str) -> Result<UnitState, String> {
+        loop {
+            if let Some(state) = self.unit_state(unit).await? {
+                return Ok(state);
+            }
+            tokio::time::sleep(self.config.poll).await;
+        }
     }
 
     /// `systemctl show`로 읽은 유닛 상태. `systemctl`이 실패하면(systemd 자신을 올리는 중 등) `None`이다

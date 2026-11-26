@@ -889,6 +889,62 @@ async fn a_restarted_daemon_keeps_watching_the_old_named_upgrade_unit() {
     assert_eq!(done["status"]["state"], "succeeded", "{done}");
 }
 
+/// 새 이름 유닛의 상태를 잠깐 읽지 못해도(systemctl 실패) 옛 이름 유닛을 놓치지 않는다(리뷰 1).
+#[tokio::test]
+async fn an_unreadable_unit_state_does_not_skip_the_old_named_unit() {
+    let apt = FakeApt::new();
+    let new = std::cell::OnceCell::new();
+    let (env, task) = resume_upgrade(&apt, |id| {
+        let unit = format!("unit.state.orbivisor-upgrade-{}.service", id.simple());
+        apt.set(&unit, "error");
+        new.set(unit).unwrap();
+        apt.set(
+            &format!("unit.state.opl-upgrade-{}.service", id.simple()),
+            "active",
+        );
+        write_log(&apt, id, "opl-upgrade: start\n");
+    })
+    .await;
+    let admin = env.admin().await;
+    let id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+    let probe = format!(
+        "show -p ActiveState -p Result -p LoadState orbivisor-upgrade-{}.service",
+        id.simple()
+    );
+    eventually("the new unit to be read again", || {
+        (apt.lines("systemctl.calls")
+            .iter()
+            .filter(|c| **c == probe)
+            .count()
+            >= 2)
+            .then_some(())
+    })
+    .await;
+    // 이제 읽히고 새 이름 유닛은 없다 → 옛 이름 유닛을 지켜본다.
+    apt.set(new.get().unwrap(), "gone");
+    let old = format!(
+        "show -p ActiveState -p Result -p LoadState opl-upgrade-{}.service",
+        id.simple()
+    );
+    eventually("the old unit to be polled", || {
+        (apt.lines("systemctl.calls")
+            .iter()
+            .filter(|c| **c == old)
+            .count()
+            >= 2)
+            .then_some(())
+    })
+    .await;
+    let (_, now) = admin.get(&format!("/tasks/{id}")).await;
+    assert_eq!(now["status"]["state"], "running", "{now}");
+    apt.set(
+        &format!("unit.state.opl-upgrade-{}.service", id.simple()),
+        "success",
+    );
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "succeeded", "{done}");
+}
+
 /// 셸이 시작했는데 종료 상태 줄 없이 사라졌으면(apt가 도중에 끊겼다) dpkg가 깨끗해도 실패다.
 #[tokio::test]
 async fn a_vanished_unit_without_an_exit_status_was_interrupted() {
