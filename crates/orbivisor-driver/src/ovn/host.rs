@@ -920,6 +920,11 @@ impl OvnHost {
                 continue;
             };
             let new = self.paths.unit_file(&unit);
+            // 옛 판으로 되돌린 노드(postrm이 새 이름을 옛 이름으로의 링크로 둠 — 리뷰 2 N1)에서는 새 이름이 링크다.
+            // 그대로 옛 이름을 새 이름으로의 링크로 바꾸면 두 링크가 서로를 가리키므로, 링크를 지우고 진짜 파일로 쓴다.
+            if std::fs::symlink_metadata(&new).is_ok_and(|m| m.file_type().is_symlink()) {
+                remove_file(&new)?;
+            }
             if read_optional(&new)?.is_none() {
                 write_file(&new, text.as_bytes(), 0o644)?;
             }

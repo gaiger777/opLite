@@ -747,6 +747,40 @@ async fn legacy_units_become_aliases() {
     );
 }
 
+/// 옛 판으로 되돌렸다가(postrm이 새 이름을 옛 이름으로의 링크로 둠 — 리뷰 2 N1) 다시 올린 노드: 새 이름 링크를 진짜
+/// 파일로 바꾸고 옛 이름을 그것으로의 링크로(서로 가리키는 링크가 되지 않게), enable 링크도 새 이름으로.
+#[tokio::test]
+async fn units_reverted_by_a_downgrade_are_adopted_again() {
+    let env = Env::new();
+    let text = db_unit(Db::Nb, ip("10.0.0.1"), false, env.host.paths());
+    env.write("etc/systemd/system/opl-ovn-nb.service", &text);
+    let etc = env.path("etc/systemd/system");
+    std::os::unix::fs::symlink("opl-ovn-nb.service", etc.join("orbivisor-ovn-nb.service")).unwrap();
+    let wants = etc.join("multi-user.target.wants");
+    std::fs::create_dir_all(&wants).unwrap();
+    std::os::unix::fs::symlink(
+        etc.join("opl-ovn-nb.service"),
+        wants.join("opl-ovn-nb.service"),
+    )
+    .unwrap();
+
+    let adopted = env.host.adopt_legacy_units().await.unwrap();
+    assert_eq!(adopted, ["orbivisor-ovn-nb.service"]);
+    let new = etc.join("orbivisor-ovn-nb.service");
+    assert!(std::fs::symlink_metadata(&new).unwrap().is_file());
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), text);
+    assert_eq!(
+        std::fs::read_link(etc.join("opl-ovn-nb.service")).unwrap(),
+        Path::new("orbivisor-ovn-nb.service")
+    );
+    assert_eq!(
+        std::fs::read_link(wants.join("orbivisor-ovn-nb.service")).unwrap(),
+        new
+    );
+    assert!(std::fs::symlink_metadata(wants.join("opl-ovn-nb.service")).is_err());
+    assert_eq!(env.calls_of("systemctl daemon-reload").len(), 1);
+}
+
 /// 옛 판(계획 74 앞)의 단위 글: 새 글과 디렉터리 이름(`/etc/opl` 등)·단위 이름(`opl-ovn-`)만 다르다.
 fn legacy_text(text: &str) -> String {
     let mut text = text.replace(UNIT_PREFIX, LEGACY_UNIT_PREFIX);
