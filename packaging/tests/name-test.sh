@@ -21,6 +21,8 @@ EXCLUDE=(
 	# 전환 패키지 oplite의 control과 이름 바꾸기 전 패키지(V0)를 흉내 내는 픽스처
 	':!packaging/deb/oplite.control.in'
 	':!packaging/tests/fixtures/oplite-v0'
+	# 계획 43~73의 orbivisor 패키지(계획 74 앞)를 흉내 내는 픽스처(옛 판 그대로의 파일)
+	':!packaging/tests/fixtures/orbivisor-v1'
 )
 
 # 허용 규칙 "<파일 glob>|<ERE>": 파일이 glob에 맞으면 줄에서 ERE에 맞는 부분을 지운다(대소문자 구분).
@@ -238,8 +240,9 @@ OLD_EXCLUDE=(
 	':!crates/orbivisord/src/layout.rs'
 	# OVN 유닛 옛 이름을 별칭 링크로 바꾸기
 	':!crates/orbivisor-driver/src/ovn/units.rs'
-	# 옛 판(V0) 픽스처(옛 판 그대로의 파일)
+	# 옛 판(V0·계획 74 앞의 orbivisor V1) 픽스처(옛 판 그대로의 파일)
 	':!packaging/tests/fixtures/oplite-v0'
+	':!packaging/tests/fixtures/orbivisor-v1'
 )
 
 # 허용 규칙 "<파일 glob>|<ERE>"(위 RULES와 같은 모양): 옛 이름을 일부러 받는 줄의 모양
@@ -318,7 +321,9 @@ OLD_RULES=(
 	'packaging/tests/deb-test.sh|=/usr/lib/systemd/system/opld\.service|! -e /usr/share/orbivisor/opld\.toml\.example|ConditionPathExists=[|]/etc/opl/opld\.toml|! -e /etc/systemd/system/multi-user\.target\.wants/opld\.service'
 	'packaging/tests/maint-test.sh|/opld\.service(\.d)?|\(opld\.service\)|진짜 opld\.service|opld\.service는 그 링크|opld\.service가 (아직 있으면|진짜 파일|링크)|ln -s opld\.service '
 	'packaging/tests/maint-test.sh|"?opl-ovn-(\$db|nb|sb|northd)\.service"?'
-	'packaging/tests/repo-test.sh|/(etc|var/lib)/opl(/[A-Za-z0-9._-]*)?|/opld\.(service|toml|sock)(\.example)?|옛 이름 opld\.service는 별칭|/etc/orbivisor/opld\.toml|/run/orbivisor/opld\.sock|"opld\.toml이 링크가 아님"'
+	'packaging/tests/repo-test.sh|/(etc|var/lib|run|var/log)/opl(/[A-Za-z0-9._-]*)?|/opld\.(service|toml|sock)(\.example)?|옛 이름 opld\.service는 별칭|/etc/orbivisor/opld\.toml|/run/orbivisor/opld\.sock|opld\.toml이 링크가 아님'
+	# 계획 74 앞의 orbivisor(V1) 고정물을 만들고 옛 유닛 이름으로 enable됐는지 보는 줄(리뷰 2)
+	'packaging/tests/repo-test.sh|진짜 (유닛이 )?opld\.service|ln -s opld\.service |is-enabled opld(\.service)?'
 )
 
 # 시작하기의 두 "이름 바꾸기" 절(계획 43·74)은 옛 이름을 설명한다: 첫 절 머리부터 둘째 절 다음 머리 앞까지

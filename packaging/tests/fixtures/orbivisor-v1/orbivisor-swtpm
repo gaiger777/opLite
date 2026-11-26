@@ -1,0 +1,11 @@
+# Orbivisor vTPM: swtpm state and runtime files, included from /etc/apparmor.d/local/usr.bin.swtpm
+# (the Ubuntu/Debian swtpm profile). The paths are opld's defaults: data_dir=/var/lib/opl, run_dir=/run/opl.
+# With another data_dir or run_dir, add the same rules for those paths to /etc/apparmor.d/local/usr.bin.swtpm
+# and reload the profile: apparmor_parser -r /etc/apparmor.d/usr.bin.swtpm
+
+  /var/lib/opl/vm/*/tpm/ rw,
+  /var/lib/opl/vm/*/tpm/** rwk,
+  /run/opl/vm/*/ r,
+  /run/opl/vm/*/tpm.sock rw,
+  /run/opl/vm/*/swtpm.pid rw,
+  /run/opl/vm/*/swtpm.log rw,

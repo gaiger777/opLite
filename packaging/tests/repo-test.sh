@@ -12,6 +12,9 @@
 # 셋째 인자(파일 복원 도우미 이미지 꾸러미 orbivisor-restore-image, 계획 69)가 있으면 testing에 함께 올려 저장소에서
 # 설치하고, 다음 판(받은 둘을 판만 바꿔 다시 묶음)을 둘 다 올리면 dist-upgrade가 둘을 함께 올리는지 본다 —
 # 이미지는 Depends: orbivisor (= 판)이라 판마다 함께 내야 한다.
+# 끝으로 지금(계획 43~73) 노드에 깔린 orbivisor의 모양(fixtures/orbivisor-v1 — 진짜 opld.service와 별칭 링크
+# orbivisord.service, 옛 유지 스크립트)을 설치·enable하고 덮어쓰기를 둔 뒤 받은 판으로 올려, enable 링크·덮어쓰기·유닛
+# 파일·디렉터리가 새 이름으로 옮겨지는지 본다(계획 74 리뷰 2 — 가장 흔한 업그레이드 길).
 # 쓰는 법(CI): docker run --rm -v "$PWD:/work" debian:13 bash /work/packaging/tests/repo-test.sh /work/<orbivisor deb> /work/<oplite deb> [/work/<orbivisor-restore-image deb>]
 set -eu
 
@@ -26,6 +29,7 @@ TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_SCRIPT="$TESTS_DIR/../repo/build-repo.sh"
 DEB_DIR="$TESTS_DIR/../deb"
 V0_DIR="$TESTS_DIR/fixtures/oplite-v0"
+V1_DIR="$TESTS_DIR/fixtures/orbivisor-v1"
 
 fail() {
 	echo "repo-test: FAIL: $*" >&2
@@ -173,26 +177,30 @@ check_moved() {
 	dpkg -S "$APT_KEYRING" | grep -qxE "orbivisor(:amd64)?: $APT_KEYRING" || fail "$1: 키: $(dpkg -S "$APT_KEYRING" 2>&1)"
 }
 check_moved "dist-upgrade 뒤"
-# 새 데몬의 배치 맞추기(계획 74 설계 §3.4): 옛 설정 경로로 뜨고, 시작하면서 /etc/opl·/var/lib/opl을 새 이름으로 옮기고
-# 옛 이름을 링크로 남긴다. systemd가 돌지 않으므로 직접 띄워 제어 소켓이 열리면 멈춘다(클러스터 밖 노드는 소켓만 연다).
-orbivisord >"$WORK/daemon.log" 2>&1 &
-DAEMON=$!
-for _ in $(seq 1 60); do
-	[ -S /run/orbivisor/orbivisord.sock ] && break
-	sleep 0.5
-done
-[ -S /run/orbivisor/orbivisord.sock ] || fail "새 데몬의 제어 소켓 없음: $(cat "$WORK/daemon.log")"
-for d in /etc /var/lib /run; do
-	[ -d "$d/orbivisor" ] && [ ! -L "$d/orbivisor" ] || fail "$d/orbivisor가 진짜 디렉터리가 아님: $(ls -la "$d")"
-	[ "$(readlink "$d/opl")" = orbivisor ] || fail "$d/opl이 링크가 아님: $(ls -la "$d")"
-done
-[ -f /etc/orbivisor/orbivisord.toml ] && [ ! -L /etc/orbivisor/orbivisord.toml ] || fail "orbivisord.toml이 진짜 파일이 아님"
-[ "$(readlink /etc/orbivisor/opld.toml)" = orbivisord.toml ] || fail "opld.toml이 링크가 아님"
-[ "$(cat /var/lib/opl/repo-test.marker)" = keep ] || fail "옛 경로로 데이터를 읽지 못함"
-[ "$(readlink /run/orbivisor/opld.sock)" = orbivisord.sock ] || fail "옛 이름 소켓 링크 없음"
-grep -q "moved /var/lib/opl to /var/lib/orbivisor" "$WORK/daemon.log" || fail "시작 로그에 옮긴 것이 없음: $(cat "$WORK/daemon.log")"
-kill "$DAEMON"
-wait "$DAEMON" || true
+# check_layout <단계>: 새 데몬의 배치 맞추기(계획 74 설계 §3.4). 옛 설정 경로로 뜨고, 시작하면서 /etc/opl·/var/lib/opl을
+# 새 이름으로 옮기고 옛 이름을 링크로 남긴다. systemd가 돌지 않으므로 직접 띄워 제어 소켓이 열리면 멈춘다(클러스터 밖
+# 노드는 소켓만 연다).
+check_layout() {
+	orbivisord >"$WORK/daemon.log" 2>&1 &
+	DAEMON=$!
+	for _ in $(seq 1 60); do
+		[ -S /run/orbivisor/orbivisord.sock ] && break
+		sleep 0.5
+	done
+	[ -S /run/orbivisor/orbivisord.sock ] || fail "$1: 새 데몬의 제어 소켓 없음: $(cat "$WORK/daemon.log")"
+	for d in /etc /var/lib /run; do
+		[ -d "$d/orbivisor" ] && [ ! -L "$d/orbivisor" ] || fail "$1: $d/orbivisor가 진짜 디렉터리가 아님: $(ls -la "$d")"
+		[ "$(readlink "$d/opl")" = orbivisor ] || fail "$1: $d/opl이 링크가 아님: $(ls -la "$d")"
+	done
+	[ -f /etc/orbivisor/orbivisord.toml ] && [ ! -L /etc/orbivisor/orbivisord.toml ] || fail "$1: orbivisord.toml이 진짜 파일이 아님"
+	[ "$(readlink /etc/orbivisor/opld.toml)" = orbivisord.toml ] || fail "$1: opld.toml이 링크가 아님"
+	[ "$(cat /var/lib/opl/repo-test.marker)" = keep ] || fail "$1: 옛 경로로 데이터를 읽지 못함"
+	[ "$(readlink /run/orbivisor/opld.sock)" = orbivisord.sock ] || fail "$1: 옛 이름 소켓 링크 없음"
+	grep -q "moved /var/lib/opl to /var/lib/orbivisor" "$WORK/daemon.log" || fail "$1: 시작 로그에 옮긴 것이 없음: $(cat "$WORK/daemon.log")"
+	kill "$DAEMON"
+	wait "$DAEMON" || true
+}
+check_layout "dist-upgrade 뒤"
 [ ! -e /usr/share/oplite ] || fail "옛 /usr/share/oplite가 남음"
 # 수동으로 설치한 oplite가 oldlibs 전환 패키지가 되면 apt가 수동 표시를 새 의존 orbivisor로 옮긴다
 # (APT::Move-Autobit-Sections). 자동 설치 표시로 남으면 oplite를 지운 뒤 autoremove가 orbivisor를 지운다.
@@ -232,5 +240,59 @@ if [ -n "$IMAGE_DEB" ]; then
 	grep -qF "Inst orbivisor-restore-image [$VERSION] ($V2 " "$WORK/simulate2.txt" || fail "V2 dist-upgrade에 이미지 없음"
 	if grep -q "^Remv " "$WORK/simulate2.txt"; then fail "V2 dist-upgrade가 꾸러미를 지우려 함"; fi
 fi
+
+# 지금 노드에 깔린 판(계획 43~73의 orbivisor) → 받은 판(리뷰 2): 받은 판을 지우고 옛 배치로 되돌린 뒤 V1 고정물을 설치한다.
+apt-get purge -y orbivisor ${IMAGE_DEB:+orbivisor-restore-image}
+rm -rf /etc/orbivisor /etc/opl /var/lib/orbivisor /var/lib/opl /run/orbivisor /run/opl /var/log/orbivisor /var/log/opl
+V1="$VERSION~p43"
+P="$WORK/orbivisor-v1"
+mkdir -p "$P/usr/bin" "$P/usr/lib/systemd/system" "$P/usr/share/orbivisor" "$P/usr/share/doc/orbivisor" \
+	"$P/etc/apparmor.d/abstractions"
+for bin in orbivisord orbivisorctl; do
+	printf '#!/bin/sh\necho "%s %s"\n' "$bin" "$V1" >"$P/usr/bin/$bin"
+	chmod 0755 "$P/usr/bin/$bin"
+done
+ln -s orbivisord "$P/usr/bin/opld"
+ln -s orbivisorctl "$P/usr/bin/oplctl"
+install -m 0644 "$V1_DIR/opld.service" "$P/usr/lib/systemd/system/opld.service"
+ln -s opld.service "$P/usr/lib/systemd/system/orbivisord.service"
+install -m 0644 "$DEB_DIR/orbivisord.toml.example" "$P/usr/share/orbivisor/opld.toml.example"
+install -m 0644 "$DEB_DIR/copyright" "$P/usr/share/doc/orbivisor/copyright"
+install -m 0644 "$V1_DIR/orbivisor-swtpm" "$P/etc/apparmor.d/abstractions/orbivisor-swtpm"
+SIZE=$(du -sk "$P" | cut -f1)
+mkdir -p "$P/DEBIAN"
+sed -e "s/@VERSION@/$V1/g" -e "s/@INSTALLED_SIZE@/$SIZE/" "$V1_DIR/control.in" >"$P/DEBIAN/control"
+(cd "$P" && find usr -type f | LC_ALL=C sort | xargs md5sum) >"$P/DEBIAN/md5sums"
+echo /etc/apparmor.d/abstractions/orbivisor-swtpm >"$P/DEBIAN/conffiles"
+for script in postinst prerm postrm; do
+	install -m 0755 "$V1_DIR/$script" "$P/DEBIAN/$script"
+done
+V1_DEB="$WORK/orbivisor_${V1}_amd64.deb"
+dpkg-deb --build --root-owner-group "$P" "$V1_DEB"
+apt-get install -y --no-install-recommends "$V1_DEB"
+[ "$(dpkg-query -W -f '${Version}' orbivisor)" = "$V1" ] || fail "V1 버전: $(dpkg-query -W -f '${Version}' orbivisor)"
+# V1의 postinst가 옛 이름 enable 링크를 만든다(진짜 유닛이 opld.service).
+[ "$(readlink "$OLD_LINK")" = /usr/lib/systemd/system/opld.service ] || fail "V1 enable 링크: $(ls -l "$OLD_LINK" 2>&1)"
+[ "$(systemctl is-enabled opld.service)" = enabled ] || fail "V1 is-enabled opld: $(systemctl is-enabled opld.service 2>&1)"
+# 운영자의 덮어쓰기(`systemctl edit opld`)와 옛 배치의 설정·데이터
+DROPIN=/etc/systemd/system/opld.service.d
+mkdir -p "$DROPIN"
+printf '[Service]\nEnvironment=REPO_TEST=1\n' >"$DROPIN/override.conf"
+mkdir -p /etc/opl /var/lib/opl
+printf 'name = "repo-test"\naddress = "127.0.0.1"\n' >/etc/opl/opld.toml
+echo keep >/var/lib/opl/repo-test.marker
+apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold "$DEB"
+[ "$(dpkg-query -W -f '${Version}' orbivisor)" = "$VERSION" ] || fail "V1에서 올린 버전: $(dpkg-query -W -f '${Version}' orbivisor)"
+[ -f "$UNIT" ] && [ ! -L "$UNIT" ] || fail "V1에서 올린 뒤: 유닛 파일이 진짜 파일이 아님: $(ls -l "$UNIT")"
+[ "$(readlink /usr/lib/systemd/system/opld.service)" = orbivisord.service ] || fail "V1에서 올린 뒤: 옛 이름 opld.service는 별칭 링크가 아님"
+[ "$(readlink "$LINK")" = "$UNIT" ] || fail "V1에서 올린 뒤: enable 링크: $(ls -l "$LINK" 2>&1)"
+if [ -e "$OLD_LINK" ] || [ -L "$OLD_LINK" ]; then fail "V1에서 올린 뒤: 옛 이름 enable 링크가 남음"; fi
+[ "$(systemctl is-enabled orbivisord.service)" = enabled ] || fail "V1에서 올린 뒤: is-enabled orbivisord: $(systemctl is-enabled orbivisord.service 2>&1)"
+[ -f /etc/systemd/system/orbivisord.service.d/override.conf ] && [ ! -L /etc/systemd/system/orbivisord.service.d ] ||
+	fail "V1에서 올린 뒤: 덮어쓰기가 새 이름 디렉터리에 없음: $(ls -la /etc/systemd/system)"
+[ "$(readlink "$DROPIN")" = orbivisord.service.d ] || fail "V1에서 올린 뒤: 옛 이름 덮어쓰기가 링크가 아님"
+[ ! -e /usr/share/orbivisor/opld.toml.example ] || fail "V1에서 올린 뒤: 옛 예시 설정이 남음"
+dpkg --verify orbivisor || fail "V1에서 올린 뒤: dpkg --verify orbivisor"
+check_layout "V1에서 올린 뒤"
 
 echo "repo-test: 모두 통과"
