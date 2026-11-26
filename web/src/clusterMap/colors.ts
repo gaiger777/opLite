@@ -80,3 +80,9 @@ export const LINK_COLOR = {
   migration: "var(--info)",
   recommendation: "var(--muted-foreground)",
 } as const;
+
+/** 네트워크 층(계획 75): 포트·본딩 테두리·레일 선의 상태 색(업링크 띠와 같은 뜻). 저하는 빗금·점선, 끊김은 ×가 함께다. */
+export const PORT_COLOR = UPLINK_COLOR;
+
+/** 레일 띠 */
+export const RAIL_COLOR = "var(--chart-1)";

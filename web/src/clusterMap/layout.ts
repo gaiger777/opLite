@@ -4,7 +4,13 @@
 //
 // 그리기 차례(§6.3): 판(바닥) 모두 → 노드 "띠"(band) 차례 → 화살표. 띠는 한 판 안에서 `col + row`가 같은 노드다 — 이런
 // 노드끼리는 화면에서 겹치지 않으므로(가로로 노드 하나 반 넘게 떨어짐) 띠 하나의 타일을 경로 하나로 합칠 수 있다(`paths.ts`).
+//
+// 네트워크 층(계획 75 §4.2): 포트 줄은 블록 앞 바닥(노드 사이 간격 안 — 배치를 바꾸지 않음), 레일은 판 앞쪽에 가로 띠로
+// 깔고(`rails`를 켜면 판 깊이에 레일 띠를 더함 — 존·랙 격자와 겹치지 않음) 노드의 포트에서 레일로 바닥 위 선을 긋는다.
+// 모두 바닥 높이의 낮은 것이라 판 바로 뒤에 그리면 앞의 블록·타일이 바르게 가린다.
 import { type Box, boxBounds, iso, type Point, topCenter } from "@/components/iso/iso";
+import type { Lod } from "@/clusterMap/lod";
+import type { LinkTone, MapRail, RailTone } from "@/clusterMap/network";
 import {
   type ClusterModel,
   heatTone,
@@ -60,12 +66,34 @@ const TAG_RISE = 30;
 const MAX_COLS = 8;
 /** 판을 가로로 늘어놓는 한도(노드 24개 폭) */
 const ROW_LIMIT = 24 * PITCH;
+/**
+ * 포트 줄(블록 앞 바닥): 많아야 8개(넘으면 "+n"), 포트 10 × 8 × 높이 4, 간격 4. 블록 앞면에서 26 떨어져 스토리지 받침
+ * (앞 6~16) 뒤에 온다. 높이가 앞 거리보다 낮아 자기 블록과 화면에서 겹치지 않는다.
+ */
+export const PORT_MAX = 8;
+export const PORT_W = 10;
+export const PORT_D = 8;
+export const PORT_H = 4;
+export const PORT_STEP = 14;
+export const PORT_Y = 26;
+const PORT_X = 4;
+/**
+ * 레일(판 앞쪽 가로 띠): 판마다 많아야 8개(넘으면 "+n"), 마지막 줄 블록 앞면에서 64 뒤부터 24마다, 두께 8. 판 좌우
+ * 가장자리에서 16 안쪽.
+ */
+export const RAIL_MAX = 8;
+export const RAIL_TOP = 64;
+export const RAIL_STEP = 24;
+export const RAIL_D = 8;
+const RAIL_INSET = 16;
 
 export type GroupBy =
   { kind: "zone" } | { kind: "rack" } | { kind: "label"; key: string } | { kind: "none" };
 
 export interface LayoutOptions {
   group?: GroupBy;
+  /** 판 앞쪽에 네트워크 레일을 깐다(네트워크 레이어를 켰고 모델에 레일이 있을 때) */
+  rails?: boolean;
 }
 
 export type TileTone =
@@ -123,8 +151,72 @@ export interface Counts {
 /** 레이어가 그리는 노드 자료(§7.3 — 모델의 노드에서 그대로) */
 export type NodeLayers = Pick<
   MapNode,
-  "pools" | "sharedDown" | "uplink" | "gateway" | "fencing" | "fenceError"
+  "pools" | "sharedDown" | "uplink" | "gateway" | "fencing" | "fenceError" | "net"
 >;
+
+/** 포트 줄의 포트 하나(계획 75) */
+export interface PortItem {
+  /** `port:<노드 id>/<포트 이름>` */
+  key: string;
+  name: string;
+  /** 노드 열쇠 */
+  node: string;
+  index: number;
+  box: Box;
+  tone: LinkTone;
+  bond: string | null;
+  /** 이 포트의 장애 무게(위에 작은 표시) */
+  fault: "down" | "degraded" | null;
+}
+
+/** 본딩 묶음 테두리(구성 포트를 두름) */
+export interface BondFrame {
+  name: string;
+  /** 바닥 높이의 납작한 상자(윗면 = 테두리) */
+  box: Box;
+  tone: LinkTone;
+  fault: "down" | "degraded" | null;
+}
+
+export interface NodePorts {
+  /** 그리는 포트(많아야 `PORT_MAX`) */
+  ports: PortItem[];
+  bonds: BondFrame[];
+  /** 줄에 못 그린 포트 수("+n") */
+  more: number;
+}
+
+/** 판 앞쪽의 레일 하나 */
+export interface RailItem {
+  /** `rail:<판 열쇠>|<carrier>` */
+  key: string;
+  carrier: string;
+  kind: MapRail["kind"];
+  /** 이 레일 위 네트워크 수 */
+  networks: number;
+  slab: string;
+  index: number;
+  box: Box;
+  /** 이 판에서 이 레일을 쓰는 노드 수와 그중 끊김·저하 */
+  nodes: number;
+  down: number;
+  degraded: number;
+}
+
+/** 노드 포트 → 레일의 바닥 선(세계 y를 따라) */
+export interface RailWire {
+  rail: string;
+  node: string;
+  /** 출발 포트 열쇠(줄에 없으면 `null` — 블록 앞 가운데에서) */
+  port: string | null;
+  tone: Exclude<RailTone, "absent">;
+  /** 출발점(포트 앞 가장자리)과 꺾어 들어가는 x(포트 사이 틈 — 앞 줄 포트 아래를 지나지 않게), 끝 y(레일 뒤 가장자리) */
+  x: number;
+  y: number;
+  lane: number;
+  to: number;
+  z: number;
+}
 
 export interface NodeItem {
   /** `node:<id>`, "배치 안 됨" 판은 `unplaced` */
@@ -151,6 +243,8 @@ export interface NodeItem {
   stack: number;
   /** 스토리지·네트워크·HA 레이어의 자료(배치 안 됨 판은 `null`) */
   layers: NodeLayers | null;
+  /** 네트워크 층의 포트 줄(물리 관계를 읽은 노드만) */
+  net: NodePorts | null;
 }
 
 export interface SlabItem {
@@ -161,6 +255,9 @@ export interface SlabItem {
   box: Box;
   /** 판 위 노드 수(증인 포함, 배치 안 됨은 VM 수) */
   count: number;
+  /** 판 앞쪽 레일(`rails`를 켰을 때)과 못 그린 레일 수 */
+  rails: RailItem[];
+  railMore: number;
 }
 
 export interface MapLink {
@@ -192,6 +289,10 @@ export interface MapScene {
   tiles: Map<string, { node: NodeItem; cell: TileCell }>;
   /** 공유 풀 이름(스토리지 레이어 — 판마다 앞 가장자리의 띠) */
   shared: string[];
+  /** 포트 열쇠 → 포트, 레일 열쇠 → 레일, 포트 → 레일 선(계획 75) */
+  ports: Map<string, PortItem>;
+  rails: Map<string, RailItem>;
+  wires: RailWire[];
 }
 
 /** VM 상태 → 타일 색 */
@@ -433,6 +534,73 @@ function bars(box: Box, c: Counts): Bar[] {
   return out;
 }
 
+/** 포트 줄: 블록 앞 바닥에 왼쪽부터, 본딩은 구성 포트를 두르는 테두리 */
+function portRow(n: MapNode, key: string, b: Box): NodePorts | null {
+  const net = n.net;
+  if (!net) {
+    return null;
+  }
+  const ports = net.ports.slice(0, PORT_MAX).map((p, i): PortItem => ({
+    key: `port:${n.id}/${p.name}`,
+    name: p.name,
+    node: key,
+    index: i,
+    box: {
+      x: b.x + PORT_X + i * PORT_STEP,
+      y: b.y + b.d + PORT_Y,
+      z: b.z,
+      w: PORT_W,
+      d: PORT_D,
+      h: PORT_H,
+    },
+    tone: p.health,
+    bond: p.bond,
+    fault: p.fault?.severity ?? null,
+  }));
+  const bonds: BondFrame[] = [];
+  for (const bond of net.bonds) {
+    const members = ports.filter((p) => p.bond === bond.name);
+    if (members.length === 0) {
+      continue;
+    }
+    const first = members[0]!.box;
+    const last = members[members.length - 1]!.box;
+    bonds.push({
+      name: bond.name,
+      box: {
+        x: first.x - 2,
+        y: first.y - 2,
+        z: b.z,
+        w: last.x + PORT_W - first.x + 4,
+        d: PORT_D + 4,
+        h: 0,
+      },
+      tone: bond.health,
+      fault: bond.fault?.severity ?? null,
+    });
+  }
+  return { ports, bonds, more: Math.max(0, net.ports.length - PORT_MAX) };
+}
+
+/** 이 판 노드들이 쓰는 레일(모델 차례 — 어느 노드도 `absent`가 아닌 것) */
+function slabRails(rails: readonly MapRail[], members: readonly MapNode[]): MapRail[] {
+  const hosts = members.filter((m) => !m.witness);
+  return rails.filter((r) => hosts.some((m) => (r.states.get(m.name) ?? "absent") !== "absent"));
+}
+
+/**
+ * 네트워크 층의 포트 줄을 그리는가: 네트워크 레이어, 물리 관계를 읽은 노드, 요약 단계가 아님. 그리면 업링크 띠 대신이고,
+ * 요약 단계에서는 지금 업링크 띠 하나로 접힌다(설계 §4.2).
+ */
+export function portRowShown(node: NodeItem, network: boolean, lod: Lod): boolean {
+  return network && lod !== "summary" && (node.net?.ports.length ?? 0) > 0;
+}
+
+/** 레일 띠가 판 깊이에 더하는 양 */
+export function railBand(count: number): number {
+  return count > 0 ? RAIL_TOP + (count - 1) * RAIL_STEP + RAIL_D : 0;
+}
+
 function nodeTags(n: MapNode): NodeTag[] {
   const tags: NodeTag[] = [];
   if (!n.online) {
@@ -496,8 +664,10 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
     x: number;
     y: number;
   }
+  const allRails = opts.rails ? (model.rails ?? []) : [];
   const laid = buckets(model.nodes, by, model.name).map((b) => {
     const { rows, cols } = gridRows(b.members, by);
+    const used = rows.length > 0 ? slabRails(allRails, b.members) : [];
     const witnesses = b.members.filter((n) => n.witness);
     const placed: Placed[] = [];
     let y = SLAB_PAD;
@@ -514,8 +684,18 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       SLAB_PAD * 2 + cols * NODE + (cols - 1) * GAP,
       SLAB_PAD * 2 + witnesses.length * WITNESS_STEP - (WITNESS_STEP - WITNESS),
     );
-    const d = rows.length > 0 ? y + NODE + SLAB_PAD : SLAB_PAD + WITNESS;
-    return { bucket: b, placed, w, d };
+    const shownRails = used.slice(0, RAIL_MAX);
+    const d =
+      rows.length > 0 ? y + NODE + railBand(shownRails.length) + SLAB_PAD : SLAB_PAD + WITNESS;
+    return {
+      bucket: b,
+      placed,
+      w,
+      d,
+      grid: y + NODE,
+      rails: shownRails,
+      railMore: used.length - shownRails.length,
+    };
   });
 
   // 판 늘어놓기: 가로로, 한도(판 셋 또는 노드 24개 폭 중 작은 것, 가장 넓은 판보다는 크게)를 넘으면 다음 줄
@@ -539,15 +719,37 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
 
   const slabs: SlabItem[] = [];
   const nodes: NodeItem[] = [];
+  const wires: RailWire[] = [];
   let band = 0;
   laid.forEach((l, i) => {
     const o = origins[i]!;
+    const rails = l.rails.map((r, index): RailItem => ({
+      key: `rail:${l.bucket.key}|${r.carrier}`,
+      carrier: r.carrier,
+      kind: r.kind,
+      networks: r.networks.length,
+      slab: l.bucket.key,
+      index,
+      box: {
+        x: o.x + RAIL_INSET,
+        y: o.y + l.grid + RAIL_TOP + index * RAIL_STEP,
+        z: SLAB_H,
+        w: l.w - 2 * RAIL_INSET,
+        d: RAIL_D,
+        h: 0,
+      },
+      nodes: 0,
+      down: 0,
+      degraded: 0,
+    }));
     slabs.push({
       key: l.bucket.key,
       kind: l.bucket.kind,
       name: l.bucket.name,
       box: { x: o.x, y: o.y, z: 0, w: l.w, d: l.d, h: SLAB_H },
       count: l.bucket.members.length,
+      rails,
+      railMore: l.railMore,
     });
     // 띠: 증인 기둥(x로 늘어서 화면에서 이웃끼리 겹치므로 하나씩, 왼쪽부터) → col + row 차례
     const diag = (p: Placed) => (p.row < 0 ? p.col - WITNESS_BANDS : p.row + p.col);
@@ -574,6 +776,32 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
             !n.online,
           );
       const c = counts(onNode.get(n.id) ?? []);
+      const net = n.witness ? null : portRow(n, key, box);
+      l.rails.forEach((r, ri) => {
+        const tone = r.states.get(n.name) ?? "absent";
+        if (n.witness || tone === "absent") {
+          return;
+        }
+        const rail = rails[ri]!;
+        rail.nodes += 1;
+        rail.down += tone === "down" ? 1 : 0;
+        rail.degraded += tone === "degraded" ? 1 : 0;
+        const leaves = n.net?.carriers[r.carrier] ?? [];
+        const port = net?.ports.find((p) => leaves.includes(p.name)) ?? null;
+        const x = port ? port.box.x + PORT_W / 2 : box.x + box.w / 2;
+        wires.push({
+          rail: rail.key,
+          node: key,
+          port: port?.key ?? null,
+          tone,
+          x,
+          y: box.y + box.d + PORT_Y + PORT_D,
+          // 포트 사이 틈(앞 줄 같은 자리 포트 아래를 지나지 않게)
+          lane: port ? port.box.x + PORT_W + (PORT_STEP - PORT_W) / 2 : x,
+          to: rail.box.y,
+          z: SLAB_H,
+        });
+      });
       nodes.push({
         key,
         kind: n.witness ? "witness" : "node",
@@ -597,7 +825,9 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
           gateway: n.gateway,
           fencing: n.fencing,
           fenceError: n.fenceError,
+          net: n.net,
         },
+        net,
       });
     }
     if (order.length > 0) {
@@ -623,6 +853,8 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       name: null,
       box,
       count: unplaced.length,
+      rails: [],
+      railMore: 0,
     });
     // 한 층(칸 수 = 층 하나의 칸 수), 열 `cols`
     const grid = makeGrid(
@@ -650,6 +882,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       bars: [],
       stack: TILE_H,
       layers: null,
+      net: null,
     });
     band += 1;
   }
@@ -663,6 +896,12 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
   }
 
   const links = migrationLinks(model, byKey);
+  const ports = new Map<string, PortItem>();
+  for (const n of nodes) {
+    for (const p of n.net?.ports ?? []) {
+      ports.set(p.key, p);
+    }
+  }
   return {
     slabs,
     nodes,
@@ -672,6 +911,9 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
     byKey,
     tiles,
     shared: model.shared ?? [],
+    ports,
+    rails: new Map(slabs.flatMap((s) => s.rails.map((r) => [r.key, r] as const))),
+    wires,
   };
 }
 

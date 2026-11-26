@@ -1,10 +1,10 @@
 import type { AlertView } from "@/alerts/alerts";
 import { layoutCluster } from "@/clusterMap/layout";
-import { linkText, mapLabels } from "@/clusterMap/labels";
+import { linkText, mapLabels, speedText } from "@/clusterMap/labels";
 import { toModel } from "@/clusterMap/model";
 import i18n from "@/i18n";
 import { countReads } from "@/test/topology";
-import { load, mapNode, mapVm, nodeId, placement, vmId } from "@/test/clusterMap";
+import { load, mapNode, mapVm, nodeId, physicalTopology, placement, vmId } from "@/test/clusterMap";
 
 const n3 = mapNode(3, "n3", { labels: { zone: "rack-a" }, spec: { maintenance: true } });
 const n5 = mapNode(5, "n5", { labels: { zone: "rack-a" } });
@@ -146,4 +146,34 @@ it("reads the VM list once per picture, not once per tile", () => {
   const counted = countReads(model.vms);
   mapLabels(i18n.getFixedT("en"), { ...model, vms: counted.items }, scene);
   expect(counted.reads()).toBeLessThanOrEqual(2 * 2000);
+});
+
+it("names ports and rails in both languages", async () => {
+  const nodes = [n3, n5];
+  const model = toModel({
+    nodes,
+    vms: [],
+    physical: physicalTopology(nodes, { n3: ["eno1", "eno2"], n5: ["eno3"] }),
+  });
+  const scene = layoutCluster(model, { rails: true });
+  const rail = (carrier: string) =>
+    [...scene.rails.values()].find((r) => r.carrier === carrier)!.key;
+  const en = mapLabels(i18n.t, model, scene);
+  expect(en.get(`port:${n3.id}/eno1`)).toBe(
+    "Port eno1 on n3, down, bond bond0, 10 Gb/s, switch sw1 port Gi1/0/1, " +
+      "cuts off networks 2, VMs 3",
+  );
+  expect(en.get(`port:${n5.id}/eno3`)).toBe(
+    "Port eno3 on n5, down, 10 Gb/s, cuts off networks 1, VMs 2",
+  );
+  expect(en.get(rail("vmbr0"))).toBe("Rail vmbr0, 2 networks, 2 nodes, 1 down");
+  expect(en.get(`node:${n3.id}`)).toMatch(/, 2 link faults$/);
+  await i18n.changeLanguage("ko");
+  const ko = mapLabels(i18n.t, model, scene);
+  expect(ko.get(`port:${n3.id}/eno2`)).toBe(
+    "노드 n3의 포트 eno2, 끊김, 본딩 bond0, 10 Gb/s, 네트워크 2개·VM 3개 끊김",
+  );
+  expect(ko.get(rail("underlay"))).toBe("레일 underlay(VXLAN), 네트워크 1개, 노드 2개, 끊김 1");
+  expect(ko.get(`node:${n3.id}`)).toMatch(/, 링크 장애 2$/);
+  expect([speedText(25000), speedText(100), speedText(0)]).toEqual(["25 Gb/s", "100 Mb/s", null]);
 });

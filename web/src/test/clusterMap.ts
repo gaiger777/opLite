@@ -1,5 +1,7 @@
 // 클러스터 지도 시험의 자료(계획 70) — 순수 시험과 성능 시험이 함께 쓴다.
 import type { Node, NodeLoadView, PlacementStatus, StoragePool, Vm } from "@/api/types";
+import type { Impact, NodePhysical, PhysicalPort, PhysicalTopology } from "@/physical/api";
+import type { components } from "@/api/schema";
 import { NODE, vm as baseVm } from "@/test/fixtures";
 
 export const nodeId = (n: number) => `019a0f3c-0000-7000-8a00-${String(n).padStart(12, "0")}`;
@@ -219,5 +221,126 @@ export function stubSvgMatrix(): () => void {
   return () => {
     delete proto.getScreenCTM;
     delete proto.createSVGPoint;
+  };
+}
+
+type RailState = components["schemas"]["RailState"];
+
+/** 레일이 될 네트워크 id(계획 75) */
+export const netId = (n: number) => `019a0f3c-0000-7000-8f10-${String(n).padStart(12, "0")}`;
+
+/**
+ * 물리 관계(`GET /topology/physical`, 계획 75): 노드마다 eno1·eno2(본딩 bond0의 구성 포트) → bond0 → 브리지 vmbr0, underlay
+ * 포트 eno3, 남는 eno4. 네트워크: lan(브리지 vmbr0)·v100(VLAN, vmbr0)·overlay(VXLAN, underlay). `down`에 적은 노드 이름의
+ * 포트는 끊김 — eno1·eno2 하나면 bond0 저하(이중화 잃음), 둘이면 bond0 끊김, eno3면 underlay 끊김. `extra`는 노드마다 더할
+ * 업링크 이더넷 수(줄 넘침 시험).
+ */
+export function physicalTopology(
+  nodes: readonly Node[],
+  down: Record<string, string[]> = {},
+  extra = 0,
+): PhysicalTopology {
+  const hosts = nodes.filter((n) => !n.spec.witness);
+  const nets = [
+    { id: netId(1), name: "lan", kind: "bridge", carrier: "vmbr0" },
+    { id: netId(2), name: "v100", kind: "vlan", carrier: "vmbr0", vlan: 100 },
+    { id: netId(3), name: "overlay", kind: "vxlan", carrier: "underlay" },
+  ] as const;
+  const rails: Record<string, RailState[]> = {};
+  const out: NodePhysical[] = hosts.map((n) => {
+    const off = new Set(down[n.name] ?? []);
+    const h = (name: string): PhysicalPort["health"] => (off.has(name) ? "down" : "up");
+    const bondDown = off.has("eno1") && off.has("eno2");
+    const bond: PhysicalPort["health"] = bondDown
+      ? "down"
+      : off.has("eno1") || off.has("eno2")
+        ? "degraded"
+        : "up";
+    const eth = (name: string, extra: Partial<PhysicalPort> = {}): PhysicalPort => ({
+      name,
+      kind: "ethernet",
+      state: off.has(name) ? "down" : "up",
+      carrier: !off.has(name),
+      health: h(name),
+      role: "uplink",
+      speed_mbps: 10000,
+      ...extra,
+    });
+    const ports: PhysicalPort[] = [
+      eth("eno1", { master: "bond0", lldp: { chassis_name: "sw1", port_id: "Gi1/0/1" } }),
+      eth("eno2", { master: "bond0" }),
+      {
+        name: "bond0",
+        kind: "bond",
+        state: bondDown ? "down" : "up",
+        health: bond,
+        role: "uplink",
+        master: "vmbr0",
+        bond: {
+          mode: "802.3ad",
+          state: bond,
+          members: [
+            { name: "eno1", state: off.has("eno1") ? "down" : "up" },
+            { name: "eno2", state: off.has("eno2") ? "down" : "up" },
+          ],
+        },
+      },
+      { name: "vmbr0", kind: "bridge", state: "up", health: bond, role: "other" },
+      eth("eno3", { role: "underlay" }),
+      eth("eno4", { role: "unused", health: "down", state: "down", carrier: false }),
+      ...Array.from({ length: extra }, (_, i) => eth(`ens${i}`)),
+    ];
+    const impact: Impact[] = [];
+    for (const p of ["eno1", "eno2"].filter((p) => off.has(p))) {
+      impact.push({
+        port: p,
+        bond: "bond0",
+        severity: bondDown ? "down" : "degraded",
+        bridges: ["vmbr0"],
+        networks: [netId(1), netId(2)],
+        vms: 3,
+        vm_ids: [],
+      });
+    }
+    if (off.has("eno3")) {
+      impact.push({
+        port: "eno3",
+        severity: "down",
+        bridges: [],
+        networks: [netId(3)],
+        underlay: true,
+        vms: 2,
+        vm_ids: [],
+      });
+    }
+    const lanState: RailState = bond;
+    (rails.lan ??= []).push(lanState);
+    (rails.v100 ??= []).push(lanState);
+    (rails.overlay ??= []).push(off.has("eno3") ? "down" : "up");
+    return {
+      id: n.id,
+      node: n.name,
+      online: n.status.online,
+      ports,
+      bridges: [
+        {
+          name: "vmbr0",
+          health: bond,
+          uplinks: ["bond0"],
+          vlan_filtering: true,
+          networks: [netId(1), netId(2)],
+          vm_nics: 3,
+        },
+      ],
+      underlay: { address: "10.9.0.1", port: "eno3" },
+      impact,
+    };
+  });
+  return {
+    nodes: out,
+    networks: nets.map((net) => ({
+      ...net,
+      nodes: hosts.map((n, i) => ({ node: n.name, state: rails[net.name]![i]! })),
+    })),
   };
 }

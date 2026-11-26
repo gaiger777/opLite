@@ -7,7 +7,17 @@ import type { Lod } from "@/clusterMap/lod";
 export type Hit =
   | { kind: "node"; key: string }
   /** 타일(`vm:`·`more:`·`hidden:`·`ghost:` 열쇠)과 그 노드 열쇠 */
-  | { kind: "tile"; key: string; node: string };
+  | { kind: "tile"; key: string; node: string }
+  /** 포트 줄의 포트(계획 75)와 그 노드 열쇠 */
+  | { kind: "port"; key: string; node: string }
+  /** 판 앞쪽 레일 */
+  | { kind: "rail"; key: string };
+
+/** 적중 셈의 네트워크 층: 포트 줄을 그리는가(네트워크 레이어 + 요약 아님), 레일을 그리는가 */
+export interface HitNet {
+  ports: boolean;
+  rails: boolean;
+}
 
 /**
  * 화면 점 `p`가 상자의 보이는 윤곽 안인가. 화면의 한 점은 세계의 선 (A + z, B + z, z)이므로 그 선이 상자를 지나는 z 구간이
@@ -38,11 +48,18 @@ function hitTile(cells: readonly TileCell[], p: Point): TileCell | null {
   return best;
 }
 
-function hitNode(node: NodeItem, lod: Lod, p: Point): Hit | null {
+function hitNode(node: NodeItem, lod: Lod, p: Point, ports: boolean): Hit | null {
   if (lod !== "summary" && node.grid) {
     const cell = hitTile(node.grid.cells, p);
     if (cell) {
       return { kind: "tile", key: cell.key, node: node.key };
+    }
+  }
+  // 포트는 블록 앞 바닥이라 자기 블록과 화면에서 겹치지 않는다 — 앞 줄 블록이 먼저 맞으면 그것이 이긴다.
+  if (ports && lod !== "summary") {
+    const port = node.net?.ports.find((x) => hitsBox(p, x.box));
+    if (port) {
+      return { kind: "port", key: port.key, node: node.key };
     }
   }
   if (lod === "summary" && node.bars.some((bar) => hitsBox(p, bar.box))) {
@@ -51,12 +68,27 @@ function hitNode(node: NodeItem, lod: Lod, p: Point): Hit | null {
   return hitsBox(p, node.box) ? { kind: "node", key: node.key } : null;
 }
 
-/** 화면(SVG 사용자 좌표) 점 → 맞힌 노드·타일, 빈 곳(판 바닥 포함)이면 `null` */
-export function hitTest(scene: MapScene, lod: Lod, p: Point): Hit | null {
+/**
+ * 화면(SVG 사용자 좌표) 점 → 맞힌 노드·타일·포트·레일, 빈 곳(판 바닥 포함)이면 `null`. 레일은 바닥 위라 노드를 모두 본
+ * 뒤에 본다.
+ */
+export function hitTest(
+  scene: MapScene,
+  lod: Lod,
+  p: Point,
+  net: HitNet = { ports: false, rails: false },
+): Hit | null {
   for (let i = scene.nodes.length - 1; i >= 0; i--) {
-    const hit = hitNode(scene.nodes[i]!, lod, p);
+    const hit = hitNode(scene.nodes[i]!, lod, p, net.ports);
     if (hit) {
       return hit;
+    }
+  }
+  if (net.rails) {
+    for (const rail of scene.rails.values()) {
+      if (hitsBox(p, rail.box)) {
+        return { kind: "rail", key: rail.key };
+      }
     }
   }
   return null;

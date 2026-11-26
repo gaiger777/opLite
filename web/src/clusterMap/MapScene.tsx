@@ -1,6 +1,7 @@
 import { Maximize2, Minus, Plus } from "lucide-react";
 import {
   Fragment,
+  lazy,
   memo,
   type ReactNode,
   useCallback,
@@ -10,6 +11,7 @@ import {
   useMemo,
   useRef,
   useState,
+  Suspense,
 } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -55,6 +57,7 @@ import {
   type MapLink,
   type MapScene as Scene,
   nodeTop,
+  portRowShown,
   type NodeItem,
   type SlabItem,
   type TileCell,
@@ -74,6 +77,9 @@ import { scrollStep } from "@/dnd/autoscroll";
 import { useDndMaybe } from "@/dnd/DndProvider";
 import type { Item, Point as DndPoint, Verdict } from "@/dnd/types";
 
+/** 네트워크 층(계획 75)의 그림: 네트워크 레이어를 켤 때 받는 늦은 조각(포트·레일 카드와 함께) */
+const NetLayer = lazy(() => import("@/clusterMap/netUi").then((m) => ({ default: m.NetLayer })));
+
 /** 그림 상자의 크기를 모를 때(첫 그리기·jsdom) 쓰는 크기 */
 const DEFAULT_SIZE = { width: 960, height: 560 };
 /** 끌기로 본 움직임(px) — 이보다 많이 움직였으면 누르기가 아니다 */
@@ -81,7 +87,7 @@ const CLICK_SLOP = 4;
 /** 동작 줄이기에서 끌기 가장자리 보기 옮기기의 뛰기 사이(ms) — 미끄러지지 않고 한 번에 뛴다 */
 const JUMP_MS = 600;
 
-/** 그림이 연 것(열쇠: `node:`·`unplaced`·`vm:`·`more:`·`hidden:`·`ghost:`·화살표) */
+/** 그림이 연 것(열쇠: `node:`·`unplaced`·`vm:`·`more:`·`hidden:`·`ghost:`·화살표·`port:`·`rail:`) */
 export interface MapOpen {
   key: string;
   /** 서랍을 닫으면 초점을 돌려줄 그림의 원소(노드 `<g>`) */
@@ -167,6 +173,15 @@ function anchorOf(scene: Scene, key: string): Point | null {
   if (tile) {
     return topCenter(tile.cell.box);
   }
+  const port = scene.ports.get(key);
+  if (port) {
+    return topCenter(port.box);
+  }
+  const rail = scene.rails.get(key);
+  if (rail) {
+    // 레일 띠의 왼쪽 끝(이름 글 자리) — 띠는 판 너비만큼 길다
+    return iso(rail.box.x + 40, rail.box.y + rail.box.d / 2, rail.box.z);
+  }
   const link = scene.links.find((l) => l.key === key);
   return link
     ? { x: (link.from.x + link.to.x) / 2, y: (link.from.y + link.to.y) / 2 - link.lift / 2 }
@@ -182,6 +197,10 @@ function ownerOf(scene: Scene, key: string): string | null {
   if (tile) {
     return tile.node.key;
   }
+  const port = scene.ports.get(key);
+  if (port) {
+    return port.node;
+  }
   const link = scene.links.find((l) => l.key === key);
   return link ? link.ends[0] : null;
 }
@@ -194,6 +213,13 @@ function glowStyle(svg: string, scene: Scene, lit: string | null, problems: bool
   }
   const owner = ownerOf(scene, lit);
   const keys = new Set<string>(owner ? [owner] : []);
+  // 레일: 그 레일(모든 판의 같은 `carrier`)을 쓰는 노드(선이 있는 노드)를 남긴다
+  const carrier = scene.rails.get(lit)?.carrier;
+  for (const w of carrier !== undefined ? scene.wires : []) {
+    if (scene.rails.get(w.rail)?.carrier === carrier) {
+      keys.add(w.node);
+    }
+  }
   const links = scene.links.filter(
     (l) => l.key === lit || (owner !== null && l.ends.includes(owner)),
   );
@@ -293,7 +319,7 @@ function Text({
   );
 }
 
-const TAG_TONE: Record<Exclude<MarkTag, "alerts">, TagTone> = {
+const TAG_TONE: Record<Exclude<MarkTag, "alerts" | "fault">, TagTone> = {
   offline: "danger",
   frozen: "info",
   maintenance: "warning",
@@ -431,7 +457,7 @@ const NodeShape = memo(function NodeShape({
   if (item.kind === "unplaced") {
     return null;
   }
-  const marks = nodeMarks(item, layers);
+  const marks = nodeMarks(item, layers, lod);
   const b = item.box;
   const top = b.z + b.h;
   const offline = item.tags.includes("offline");
@@ -452,7 +478,14 @@ const NodeShape = memo(function NodeShape({
   const tagItems = marks.tags.map((tag) => ({
     key: tag,
     text: tagLabel(t, tag, info),
-    tone: tag === "alerts" ? SEVERITY_TONE[info?.severity ?? "warning"] : TAG_TONE[tag],
+    tone:
+      tag === "alerts"
+        ? SEVERITY_TONE[info?.severity ?? "warning"]
+        : tag === "fault"
+          ? info?.net?.severity === "down"
+            ? "danger"
+            : "warning"
+          : TAG_TONE[tag],
   }));
   // 이름·부하 글·꼬리표는 블록의 왼쪽(앞) 면 위에 — 블록 아래 바닥에 두면 앞 줄 블록의 이름과 헷갈린다. 증인은 기둥 아래.
   const face = item.kind === "witness" ? front : iso(b.x + b.w / 2, b.y + b.d, b.z + b.h);
@@ -640,6 +673,8 @@ function tagLabel(t: Translate, tag: MarkTag, info: MapNode | undefined): string
       return "GW";
     case "fence":
       return t("clusterMap.tagFence");
+    case "fault":
+      return t("clusterMap.tagFault", { count: info?.net?.faults ?? 0 });
     default:
       return t(`clusterMap.label.${tag}`);
   }
@@ -844,6 +879,14 @@ export interface MapSceneProps {
   renderCard(key: string): ReactNode;
   /** 끌어 옮기기(계획 71 §10) — 쪽이 그림을 `DndProvider` 안에 두고 준다. 없으면 끌기가 없다. */
   drag?: MapDrag;
+  /** 고른 것(열쇠) — 가리키거나 초점이 없을 때 밝히고 테두리(홈의 자세히 판과 짝) */
+  selected?: string | null;
+  /** 빈 곳을 누름(홈: 고른 것 풀기) */
+  onBlank?(): void;
+  /** 레일 이름 글(번역한 것) */
+  railName?(rail: { carrier: string; kind: string; networks: number }): string;
+  /** 그림 높이(Tailwind 칸) — 홈은 고정 높이 */
+  heightClass?: string;
 }
 
 /** 지도 끌어 옮기기에서 쪽이 주는 것 */
@@ -903,7 +946,14 @@ export function MapScene(props: MapSceneProps) {
         : focus.node
       : (order[0]?.key ?? null);
   const focusKey =
-    focus && focus.kind === "tile" && scene.tiles.has(focus.key) ? focus.key : focusNode;
+    focus &&
+    ((focus.kind === "tile" && scene.tiles.has(focus.key)) ||
+      (focus.kind === "port" && scene.ports.has(focus.key)) ||
+      (focus.kind === "rail" && scene.rails.has(focus.key)))
+      ? focus.key
+      : focusNode;
+  const netOn = layers.includes("network");
+  const hitNet = { ports: netOn, rails: netOn };
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const press = useRef<{ x: number; y: number } | null>(null);
@@ -971,15 +1021,15 @@ export function MapScene(props: MapSceneProps) {
     }
     const svg = svgRef.current;
     const p = svg ? toScene(svg, e.clientX, e.clientY) : null;
-    const hit = p ? hitTest(scene, lod, p) : null;
+    const hit = p ? hitTest(scene, lod, p, hitNet) : null;
     if (hit) {
       return hit.key;
     }
     return target.closest?.("g[data-key]")?.getAttribute("data-key") ?? null;
   };
 
-  const open = (key: string, detail: boolean) => {
-    const owner = ownerOf(scene, key);
+  const open = (key: string, detail: boolean, by?: string) => {
+    const owner = ownerOf(scene, key) ?? by ?? null;
     const at = { key, owner: owner ? nodeEl(owner) : null };
     if (detail) {
       latest.current.onDetail(at);
@@ -1013,7 +1063,13 @@ export function MapScene(props: MapSceneProps) {
     const svg = svgRef.current;
     const at = svg ? toScene(svg, p.x, p.y) : null;
     const hit = at ? hitTest(latest.current.scene, now.current.lod, at) : null;
-    const key = hit ? (hit.kind === "node" ? hit.key : hit.node) : null;
+    const key = hit
+      ? hit.kind === "node"
+        ? hit.key
+        : hit.kind === "rail"
+          ? null
+          : hit.node
+      : null;
     return key === "unplaced" ? null : key;
   }, []);
   const hasDrag = drag !== null;
@@ -1180,7 +1236,7 @@ export function MapScene(props: MapSceneProps) {
     }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      open(key, e.key === "Enter" && e.shiftKey);
+      open(key, e.key === "Enter" && e.shiftKey, nodeKey);
       return;
     }
     // Ctrl/⌘/Alt와 함께면 브라우저의 것(Ctrl+`-`·`+`·`0` 쪽 확대는 저시력 사용자가 쓴다 — WCAG 1.4.4)
@@ -1205,6 +1261,11 @@ export function MapScene(props: MapSceneProps) {
     if (!isNavKey(e.key)) {
       return;
     }
+    // `p`(포트 줄로)는 포트 줄을 그린 노드에서만 — 아니면 그림 밖 단축키 그대로
+    const node = scene.byKey.get(nodeKey);
+    if (e.key === "p" && (current.kind !== "node" || !node || !portRowShown(node, netOn, lod))) {
+      return;
+    }
     // Esc는 타일 단계에서만 그림이 받는다(노드 단계면 쪽의 Esc 그대로)
     if (e.key === "Escape" && current.kind === "node") {
       return;
@@ -1223,7 +1284,9 @@ export function MapScene(props: MapSceneProps) {
   };
 
   // 들고 있는 동안은 포인터 아래(키보드면 고른) 노드를 둘레로, 가리키기 밝히기 대신 놓을 수 있음 밝히기
-  const lit = held ? (over ?? origin?.node ?? null) : (hover ?? (focused ? focusKey : null));
+  const lit = held
+    ? (over ?? origin?.node ?? null)
+    : (hover ?? (focused ? focusKey : null) ?? props.selected ?? null);
   const levels =
     held && dnd
       ? scene.nodes
@@ -1241,6 +1304,14 @@ export function MapScene(props: MapSceneProps) {
     const tile = scene.tiles.get(lit);
     if (tile) {
       return tile.cell.box;
+    }
+    const port = scene.ports.get(lit);
+    if (port) {
+      return port.box;
+    }
+    const rail = scene.rails.get(lit);
+    if (rail) {
+      return rail.box;
     }
     // 배치 안 됨 판(납작한 상자)도 — 초점이 보이게(WCAG 2.4.7)
     return scene.byKey.get(lit)?.box ?? null;
@@ -1282,6 +1353,27 @@ export function MapScene(props: MapSceneProps) {
       ),
     [paths, defs, haLayer, lod, props.vmNames],
   );
+  const railName = props.railName;
+  // 밝힌 레일·포트의 선(원소 하나 — 가리키기마다 블록·경로를 다시 그리지 않음)
+  const litCarrier = lit !== null ? scene.rails.get(lit)?.carrier : undefined;
+  const litWires =
+    netOn && scene.rails.size > 0
+      ? scene.wires
+          .filter(
+            (w) =>
+              lit !== null &&
+              (w.port === lit ||
+                (litCarrier !== undefined && scene.rails.get(w.rail)?.carrier === litCarrier)),
+          )
+          .map((w) => {
+            const a = iso(w.x, w.y, w.z);
+            const b = iso(w.lane, Math.min(w.to, w.y + 4), w.z);
+            const c = iso(w.lane, w.to, w.z);
+            return `M${round(a.x)},${round(a.y)}L${round(b.x)},${round(b.y)}L${round(c.x)},${round(c.y)}`;
+          })
+          .join("")
+      : null;
+
   const linkEls = useMemo(
     () =>
       scene.links
@@ -1310,7 +1402,7 @@ export function MapScene(props: MapSceneProps) {
         aria-label={t("clusterMap.pictureLabel")}
         aria-describedby={props.describedBy}
         viewBox={viewBoxAttr(view)}
-        className="block h-[min(70vh,560px)] min-h-72 w-full touch-none rounded-lg border bg-gradient-to-b from-surface-1 to-background select-none"
+        className={`block ${props.heightClass ?? "h-[min(70vh,560px)] min-h-72"} w-full touch-none rounded-lg border bg-gradient-to-b from-surface-1 to-background select-none`}
         {...handlers}
         onPointerDown={(e) => {
           press.current = { x: e.clientX, y: e.clientY };
@@ -1379,6 +1471,8 @@ export function MapScene(props: MapSceneProps) {
           const key = hitAt(e);
           if (key) {
             open(key, e.ctrlKey || e.metaKey);
+          } else {
+            latest.current.onBlank?.();
           }
         }}
         onDoubleClick={(e) => {
@@ -1423,7 +1517,23 @@ export function MapScene(props: MapSceneProps) {
             <path d="M0,0 L10,5 L0,10 z" style={{ fill: LINK_COLOR.migration }} />
           </marker>
         </defs>
-        <g aria-hidden>{floor}</g>
+        <g aria-hidden>
+          {floor}
+          {netOn && (
+            <Suspense fallback={null}>
+              <NetLayer scene={scene} lod={lod} defs={defs} railName={railName} />
+            </Suspense>
+          )}
+          {litWires !== null && (
+            <path
+              d={litWires}
+              fill="none"
+              stroke="var(--foreground)"
+              strokeWidth={2.4}
+              pointerEvents="none"
+            />
+          )}
+        </g>
         <g>
           {paths.map((band) => (
             <Fragment key={band.band}>
@@ -1523,6 +1633,7 @@ function problem(n: NodeItem): boolean {
     n.tags.includes("maintenance") ||
     n.tags.includes("alerts") ||
     n.heat === "hot" ||
-    n.counts.failed > 0
+    n.counts.failed > 0 ||
+    (n.layers?.net?.faults ?? 0) > 0
   );
 }

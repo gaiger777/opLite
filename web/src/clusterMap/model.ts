@@ -3,6 +3,8 @@
 import type { AlertView } from "@/alerts/alerts";
 import type { Node, PlacementMode, PlacementStatus, StoragePool, Vm } from "@/api/types";
 import type { components } from "@/api/schema";
+import { type MapRail, type NodeNet, physicalLayer } from "@/clusterMap/network";
+import type { PhysicalTopology } from "@/physical/api";
 import { migrationPercent } from "@/tasks/tasks";
 
 export type TaskProgress = components["schemas"]["TaskProgress"];
@@ -73,6 +75,8 @@ export interface MapNode {
   fencing: boolean | null;
   /** HA 레이어: 이웃이 이 노드의 전원을 읽지 못한 이유(펜스 확인 실패) */
   fenceError: string | null;
+  /** 네트워크 레이어의 포트 줄·장애(계획 75 — `/topology/physical`을 읽었을 때만, 아니면 `null`) */
+  net: NodeNet | null;
 }
 
 export interface MapVm {
@@ -120,6 +124,8 @@ export interface ClusterModel {
   balancer: PlacementMode | null;
   /** 공유 풀 이름(스토리지 레이어 — 판 앞의 띠) */
   shared: string[];
+  /** 네트워크 레일(계획 75 — `/topology/physical`을 읽었을 때만, 아니면 `null`) */
+  rails: MapRail[] | null;
 }
 
 export interface MapInput {
@@ -139,6 +145,8 @@ export interface MapInput {
    * 모두 보는 사용자에게 `/placement`(15초 주기)와 실시간 VM 목록의 시차가 가짜 "+N 볼 수 없음"이 되지 않게.
    */
   vmsLimited?: boolean;
+  /** `GET /topology/physical`(계획 75). 없거나 403·409면 `null` — 네트워크 레이어는 업링크 띠 하나 그대로. */
+  physical?: PhysicalTopology | null;
 }
 
 /** 이름 차례: 숫자를 숫자로(`n2` < `n10`), 브라우저 언어와 상관없이 같은 차례 */
@@ -389,6 +397,7 @@ export function toModel(input: MapInput): ClusterModel {
     });
   }
 
+  const physical = input.physical ? physicalLayer(input.physical) : null;
   const leader = input.cluster?.leader ?? null;
   const poolMap = input.pools ? new Map(input.pools.map((p) => [p.name, p])) : null;
   const nodes: MapNode[] = input.nodes.map((n) => {
@@ -423,6 +432,7 @@ export function toModel(input: MapInput): ClusterModel {
       // 펜싱(`status.ha`)을 모르는 옛 노드(버전도 알리지 않음)는 그리지 않는다(빈 칸을 "없음"으로 보이지 않음).
       fencing: witness ? null : n.status.ha ? true : n.status.version === undefined ? null : false,
       fenceError: n.status.fence_check?.error ?? null,
+      net: witness ? null : (physical?.nodes.get(n.id) ?? null),
     };
   });
   nodes.sort(byName);
@@ -439,5 +449,6 @@ export function toModel(input: MapInput): ClusterModel {
     placement: placement !== null,
     balancer: placement ? (placement.settings?.mode ?? "recommend") : null,
     shared,
+    rails: physical?.rails ?? null,
   };
 }

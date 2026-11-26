@@ -46,7 +46,28 @@
       "migration": "{{vm}} → {{to}}",
       "migrationPct": "{{vm}} → {{to}} · {{progress}}%",
       "migrationStage": "{{vm}} → {{to}} · {{stage}}",
-      "recommendation": "Recommended: {{vm}} {{from}} → {{to}}"
+      "recommendation": "Recommended: {{vm}} {{from}} → {{to}}",
+      "faults_one": "{{count}} link fault",
+      "faults_other": "{{count}} link faults",
+      "port": "Port {{name}} on {{node}}",
+      "link": {
+        "up": "up",
+        "degraded": "degraded",
+        "down": "down"
+      },
+      "bond": "bond {{name}}",
+      "lldp": "switch {{switch}} port {{port}}",
+      "impact": {
+        "down": "cuts off networks {{networks}}, VMs {{vms}}",
+        "degraded": "no redundancy for networks {{networks}}, VMs {{vms}}"
+      },
+      "rail": "Rail {{name}}",
+      "networks_one": "{{count}} network",
+      "networks_other": "{{count}} networks",
+      "railNodes_one": "{{count}} node",
+      "railNodes_other": "{{count}} nodes",
+      "railDown": "{{count}} down",
+      "railDegraded": "{{count}} degraded"
     },
     "pictureLabel": "Cluster map",
     "listLabel": "Cluster map as a list",
@@ -79,7 +100,7 @@
     },
     "big": "Many nodes: show one group to read the map more easily.",
     "loadUnknownNote": "Load unknown: the leader's placement summary can't be read.",
-    "keys": "Arrows move between nodes, ] enters a node's VMs and [ or Esc leaves. Enter opens, Shift+Enter opens the page. Drag to pan; Ctrl + wheel, pinch or + − 0 to zoom. Drag a running VM's tile onto a node, or press m on it, to migrate it.",
+    "keys": "Arrows move between nodes, ] enters a node's VMs and [ or Esc leaves; with the Network layer, p enters a node's ports and ↓ goes from a port to its rail. Enter opens, Shift+Enter opens the page. Drag to pan; Ctrl + wheel, pinch or + − 0 to zoom. Drag a running VM's tile onto a node, or press m on it, to migrate it.",
     "cluster": "Cluster",
     "noGroup": "No zone",
     "unplaced": "Not placed",
@@ -104,7 +125,14 @@
       "uplinkDown": "No uplink",
       "noFencing": "No fencing (runs no HA VMs)",
       "haVm": "HA VM",
-      "recommendation": "Recommended move"
+      "recommendation": "Recommended move",
+      "portUp": "Port up",
+      "portDegraded": "Port degraded (hatched)",
+      "portDown": "Port down (×)",
+      "bond": "Bond (frame around its ports)",
+      "rail": "Network rail",
+      "wireDown": "Cut off from the rail (×)",
+      "fault": "Link fault"
     },
     "card": {
       "cpu": "CPU",
@@ -160,6 +188,34 @@
       "start_one": "Moving {{vm}}. Arrows choose a node, Enter drops, Escape cancels. {{count}} node can take it.",
       "start_other": "Moving {{vm}}. Arrows choose a node, Enter drops, Escape cancels. {{count}} nodes can take it.",
       "none": "Moving {{vm}}: no node can take it. Escape cancels."
-    }
+    },
+    "net": {
+      "underlay": "Underlay (VXLAN)",
+      "railTag_one": "{{name}} · {{count}} network",
+      "railTag_other": "{{name}} · {{count}} networks",
+      "moreRails_one": "+{{count}} rail",
+      "moreRails_other": "+{{count}} rails",
+      "legacy": "Old version — some details missing",
+      "kind": "Kind",
+      "speed": "Speed",
+      "mtu": "MTU",
+      "switch": "Switch",
+      "noLldp": "Install lldpd to see the switch port.",
+      "bond": "Bond {{name}} ({{mode}})",
+      "impact": "Affected",
+      "bridges": "Bridges: {{names}}",
+      "nodes": "Nodes",
+      "networksOn": "Networks",
+      "portTitle": "Port {{name}} on {{node}}",
+      "railTitle": "Rail {{name}}",
+      "health": {
+        "up": "Up",
+        "degraded": "Degraded",
+        "down": "Down",
+        "absent": "Not used"
+      }
+    },
+    "tagFault": "link ✕ {{count}}",
+    "legendShow": "Legend"
   }
 }

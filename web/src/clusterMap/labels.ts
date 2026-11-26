@@ -1,6 +1,13 @@
 // 화면 읽기 이름(계획 70 §10.3): 장면의 노드·타일·화살표마다 한 번 셈한다. 가리키기 카드와 `aria-live` 줄이 같은 글을
 // 쓴다. 모델의 VM·노드를 한 번씩만 훑는다(원소마다 목록을 훑지 않음).
-import type { MapLink, MapScene, NodeItem, SlabItem } from "@/clusterMap/layout";
+import type {
+  MapLink,
+  MapScene,
+  NodeItem,
+  PortItem,
+  RailItem,
+  SlabItem,
+} from "@/clusterMap/layout";
 import type { ClusterModel, MapNode, MapVm } from "@/clusterMap/model";
 import { migrationStageText } from "@/tasks/tasks";
 
@@ -59,6 +66,70 @@ function nodeText(t: Translate, item: NodeItem, n: MapNode, slab: SlabItem | und
   }
   if (n.alerts > 0) {
     parts.push(t(`${L}.alerts`, { count: n.alerts }));
+  }
+  if (n.net && n.net.faults > 0) {
+    parts.push(t(`${L}.faults`, { count: n.net.faults }));
+  }
+  return parts.join(", ");
+}
+
+/** 레일 이름: 브리지·physnet 이름, VXLAN·오버레이는 "underlay" */
+export function railName(t: Translate, rail: { carrier: string; kind: string }): string {
+  return rail.carrier === "underlay" && (rail.kind === "vxlan" || rail.kind === "sdn-overlay")
+    ? t("clusterMap.net.underlay")
+    : rail.carrier;
+}
+
+/** 속도(Mb/s) → "10 Gb/s"·"100 Mb/s" */
+export function speedText(mbps: number | undefined | null): string | null {
+  if (!mbps || mbps <= 0) {
+    return null;
+  }
+  return mbps >= 1000 ? `${Math.round(mbps / 100) / 10} Gb/s` : `${mbps} Mb/s`;
+}
+
+/** "포트 eno1, 노드 n1, 끊김, 본딩 bond0, 10 Gb/s, 영향: 네트워크 2개, VM 12개" */
+function portText(t: Translate, item: PortItem, n: MapNode): string {
+  const raw = n.net?.raw.ports.find((p) => p.name === item.name);
+  const parts = [t(`${L}.port`, { name: item.name, node: n.name }), t(`${L}.link.${item.tone}`)];
+  if (item.bond) {
+    parts.push(t(`${L}.bond`, { name: item.bond }));
+  }
+  const speed = speedText(raw?.speed_mbps);
+  if (speed) {
+    parts.push(speed);
+  }
+  if (raw?.lldp?.chassis_name || raw?.lldp?.port_id) {
+    parts.push(
+      t(`${L}.lldp`, {
+        switch: raw.lldp.chassis_name ?? raw.lldp.chassis_id ?? "?",
+        port: raw.lldp.port_id ?? "?",
+      }),
+    );
+  }
+  const impact =
+    n.net?.raw.impact?.find((i) => i.port === item.name) ??
+    (item.bond ? n.net?.raw.impact?.find((i) => i.port === item.bond) : undefined);
+  if (impact) {
+    parts.push(
+      t(`${L}.impact.${impact.severity}`, { networks: impact.networks.length, vms: impact.vms }),
+    );
+  }
+  return parts.join(", ");
+}
+
+/** "레일 vmbr0, 네트워크 3개, 노드 4개, 끊김 1" */
+function railText(t: Translate, rail: RailItem): string {
+  const parts = [
+    t(`${L}.rail`, { name: railName(t, rail) }),
+    t(`${L}.networks`, { count: rail.networks }),
+    t(`${L}.railNodes`, { count: rail.nodes }),
+  ];
+  if (rail.down > 0) {
+    parts.push(t(`${L}.railDown`, { count: rail.down }));
+  }
+  if (rail.degraded > 0) {
+    parts.push(t(`${L}.railDegraded`, { count: rail.degraded }));
   }
   return parts.join(", ");
 }
@@ -173,6 +244,15 @@ export function mapLabels(t: Translate, model: ClusterModel, scene: MapScene): M
   const nodeName = (key: string) => scene.byKey.get(key)?.name ?? key;
   for (const link of scene.links) {
     out.set(link.key, linkText(t, link, nodeName));
+  }
+  for (const port of scene.ports.values()) {
+    const n = nodes.get(scene.byKey.get(port.node)?.id ?? "");
+    if (n) {
+      out.set(port.key, portText(t, port, n));
+    }
+  }
+  for (const rail of scene.rails.values()) {
+    out.set(rail.key, railText(t, rail));
   }
   return out;
 }

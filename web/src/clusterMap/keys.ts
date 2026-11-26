@@ -1,11 +1,28 @@
 // 키보드 이웃(계획 70 §10.3): 초점은 두 단계다 — 노드 단계(화살표가 판 안 격자의 이웃, 판 끝에서는 옆 판의 가장 가까운
 // 노드)와 타일 단계(한 노드 위 타일 사이). `]`가 노드의 첫 타일로 들어가고 `[`·`Esc`가 노드로 나온다.
+// 네트워크 층(계획 75): `p`가 노드의 포트 줄로 들어가고(←·→ 포트 사이), 포트에서 `↓`가 그 포트의 레일로(←·→ 판의 레일
+// 사이, `↑`는 다시 포트), `[`·`Esc`가 노드로 나온다. 화면 초점은 늘 노드 `<g>` 하나다(한 탭 정지).
 import { nodeTop, type MapScene, type NodeItem, type TileCell } from "@/clusterMap/layout";
 
-export type Focus = { kind: "node"; key: string } | { kind: "tile"; node: string; key: string };
+export type Focus =
+  | { kind: "node"; key: string }
+  | { kind: "tile"; node: string; key: string }
+  /** 포트 줄의 포트(`port:` 열쇠)와 그 노드 열쇠 */
+  | { kind: "port"; node: string; key: string }
+  /** 레일(`rail:` 열쇠) — 들어온 노드 열쇠를 지닌다(화면 초점은 그 노드에) */
+  | { kind: "rail"; node: string; key: string };
 
 export type NavKey =
-  "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" | "Home" | "End" | "[" | "]" | "Escape";
+  | "ArrowLeft"
+  | "ArrowRight"
+  | "ArrowUp"
+  | "ArrowDown"
+  | "Home"
+  | "End"
+  | "["
+  | "]"
+  | "Escape"
+  | "p";
 
 const NAV_KEYS: readonly string[] = [
   "ArrowLeft",
@@ -17,6 +34,7 @@ const NAV_KEYS: readonly string[] = [
   "[",
   "]",
   "Escape",
+  "p",
 ];
 
 export function isNavKey(key: string): key is NavKey {
@@ -154,6 +172,59 @@ function tileNeighbor(
   }
 }
 
+/** 포트 단계: ←·→ 줄의 앞뒤 포트, Home·End 첫·끝, `↓` 그 포트의 레일(없으면 노드의 첫 레일) */
+function portNeighbor(scene: MapScene, node: NodeItem, key: string, nav: NavKey): Focus | null {
+  const ports = node.net?.ports ?? [];
+  const i = ports.findIndex((p) => p.key === key);
+  const to = (j: number) => {
+    const p = ports[j];
+    return p && j !== i ? ({ kind: "port", node: node.key, key: p.key } as const) : null;
+  };
+  switch (nav) {
+    case "ArrowLeft":
+      return to(i - 1);
+    case "ArrowRight":
+      return to(i + 1);
+    case "Home":
+      return to(0);
+    case "End":
+      return to(ports.length - 1);
+    case "ArrowDown": {
+      // 이 포트로 가는 레일(같은 본딩의 다른 포트에서 선이 나가도), 없으면 노드의 첫 레일
+      const name = ports[i]?.name ?? "";
+      const carriers = node.layers?.net?.carriers ?? {};
+      const mine = scene.wires.filter((w) => w.node === node.key);
+      const wire =
+        mine.find((w) => carriers[scene.rails.get(w.rail)?.carrier ?? ""]?.includes(name)) ??
+        mine[0];
+      return wire ? { kind: "rail", node: node.key, key: wire.rail } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** 레일 단계: ←·→ 같은 판의 앞뒤 레일, `↑` 그 노드에서 이 레일로 오는 포트(없으면 노드) */
+function railNeighbor(scene: MapScene, node: NodeItem, key: string, nav: NavKey): Focus | null {
+  const rail = scene.rails.get(key);
+  if (!rail) {
+    return { kind: "node", key: node.key };
+  }
+  const slab = scene.slabs.find((s) => s.key === rail.slab)?.rails ?? [];
+  const step = nav === "ArrowRight" ? 1 : nav === "ArrowLeft" ? -1 : 0;
+  if (step !== 0) {
+    const next = slab[rail.index + step];
+    return next ? { kind: "rail", node: node.key, key: next.key } : null;
+  }
+  if (nav === "ArrowUp") {
+    const wire = scene.wires.find((w) => w.rail === key && w.node === node.key && w.port);
+    return wire
+      ? { kind: "port", node: node.key, key: wire.port! }
+      : { kind: "node", key: node.key };
+  }
+  return null;
+}
+
 /**
  * 키 하나 → 다음 초점. 움직일 곳이 없으면 `null`(초점 그대로). 초점이 없거나 장면에서 사라졌으면 첫 노드.
  * 노드 단계: ←·→ 같은 줄의 열, ↑·↓ 줄(판 끝에서는 옆·앞뒤 판), Home·End 첫·끝 노드, `]` 첫 타일.
@@ -179,6 +250,10 @@ export function neighbor(scene: MapScene, focus: Focus | null, key: NavKey): Foc
         const first = focusableCells(nodeAt)[0];
         return first ? { kind: "tile", node: nodeAt.key, key: first.key } : null;
       }
+      case "p": {
+        const first = nodeAt.net?.ports[0];
+        return first ? { kind: "port", node: nodeAt.key, key: first.key } : null;
+      }
       case "[":
       case "Escape":
         return null;
@@ -190,6 +265,12 @@ export function neighbor(scene: MapScene, focus: Focus | null, key: NavKey): Foc
   }
   if (key === "[" || key === "Escape") {
     return { kind: "node", key: nodeAt.key };
+  }
+  if (focus!.kind === "port") {
+    return portNeighbor(scene, nodeAt, focus!.key, key);
+  }
+  if (focus!.kind === "rail") {
+    return railNeighbor(scene, nodeAt, focus!.key, key);
   }
   const cells = focusableCells(nodeAt);
   const at = cells.find((c) => c.key === focus!.key);

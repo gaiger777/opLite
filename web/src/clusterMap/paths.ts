@@ -4,9 +4,18 @@
 // 타일끼리는 화면에서 겹치지 않으므로(`layout.ts`의 타일 높이 ≤ 간격) 옆면 둘을 색마다 한 경로(왼쪽 면 밝기)로 칠하고, 오른쪽
 // 면은 층마다 색과 상관없는 검은 반투명 경로 하나로 어둡게 한다(`shade()`의 오른쪽 면과 같은 72%). 위 층 타일이 덮는 윗면은
 // 그리지 않는다.
-import { boxesPath, boxFace, type Face, facesPath, type Point, round } from "@/components/iso/iso";
+import { boxesPath, boxFace, crossPath, type Face, facesPath } from "@/components/iso/iso";
 import type { Lod } from "@/clusterMap/lod";
-import type { BarTone, MapScene, NodeItem, NodeTag, TileCell, TileTone } from "@/clusterMap/layout";
+import {
+  type BarTone,
+  type MapScene,
+  type NodeItem,
+  type NodeTag,
+  portRowShown,
+  type TileCell,
+  type TileTone,
+} from "@/clusterMap/layout";
+import { netElements } from "@/clusterMap/netPaths";
 
 export interface PathPiece {
   /** 그림 안에서 하나뿐인 열쇠(React key) */
@@ -41,21 +50,6 @@ function coveredTop(cells: readonly TileCell[], cell: TileCell, perLayer: number
   return (
     cell.index + perLayer < cells.length && cells[cell.index + perLayer]!.layer === cell.layer + 1
   );
-}
-
-/** 윗면 × 표시: 두 대각선을 가운데로 25% 줄인 선 둘 */
-function crossPath(top: readonly Point[]): string {
-  const [a, b, c, d] = top as [Point, Point, Point, Point];
-  const shrink = (p: Point, q: Point) => {
-    const k = 0.25;
-    return [
-      `${round(p.x + (q.x - p.x) * k)},${round(p.y + (q.y - p.y) * k)}`,
-      `${round(q.x + (p.x - q.x) * k)},${round(q.y + (p.y - q.y) * k)}`,
-    ];
-  };
-  const [p1, p2] = shrink(a, c);
-  const [p3, p4] = shrink(b, d);
-  return `M${p1}L${p2}M${p3}L${p4}`;
 }
 
 /** 무리 짓기(삽입 차례를 지키는 Map) */
@@ -231,8 +225,8 @@ export const MAP_LAYERS: readonly MapLayer[] = [
   "recommendations",
 ];
 
-/** 노드 꼬리표(알약)의 열쇠: 상태 꼬리표와 레이어가 더하는 게이트웨이·펜스 확인 실패 */
-export type MarkTag = NodeTag | "gateway" | "fence";
+/** 노드 꼬리표(알약)의 열쇠: 상태 꼬리표와 레이어가 더하는 게이트웨이·펜스 확인 실패·링크 장애(계획 75) */
+export type MarkTag = NodeTag | "gateway" | "fence" | "fault";
 
 /**
  * 노드 하나에 그릴 덧표시(상태 꼬리표·레이어). 그리는 쪽(`MapScene`)과 원소 셈(`elementCount`)이 같은 것을 쓴다. 레이어마다
@@ -255,7 +249,11 @@ export interface NodeMarks {
   ring: boolean;
 }
 
-export function nodeMarks(node: NodeItem, layers: ReadonlySet<MapLayer>): NodeMarks {
+export function nodeMarks(
+  node: NodeItem,
+  layers: ReadonlySet<MapLayer>,
+  lod: Lod = "tiles",
+): NodeMarks {
   const l = node.layers;
   const storage = layers.has("storage") && node.kind === "node" && l !== null;
   const network = layers.has("network") && l !== null;
@@ -267,6 +265,9 @@ export function nodeMarks(node: NodeItem, layers: ReadonlySet<MapLayer>): NodeMa
   if (ha && l.fenceError !== null) {
     tags.push("fence");
   }
+  if (network && node.kind === "node" && (l.net?.faults ?? 0) > 0) {
+    tags.push("fault");
+  }
   return {
     tags,
     stripe: node.tags.includes("maintenance"),
@@ -274,7 +275,11 @@ export function nodeMarks(node: NodeItem, layers: ReadonlySet<MapLayer>): NodeMa
     pedestal: storage && l.pools.length > 0,
     poolBad: storage && l.pools.some((p) => p.tone === "bad"),
     sharedTick: storage && l.sharedDown.length > 0,
-    uplink: network && node.kind === "node" && l.uplink !== null,
+    uplink:
+      network &&
+      node.kind === "node" &&
+      l.uplink !== null &&
+      !portRowShown(node, layers.has("network"), lod),
     ring: ha && l.fencing === false,
   };
 }
@@ -343,7 +348,7 @@ export function elementCount(
     n += scene.slabs.filter((s) => s.kind !== "unplaced").length * 2;
   }
   for (const node of scene.nodes) {
-    n += nodeElements(node, lod, nodeMarks(node, on));
+    n += nodeElements(node, lod, nodeMarks(node, on, lod));
     for (const cell of node.grid?.cells ?? []) {
       if (cellText(node, cell, lod)) {
         n += 1 + (lod === "detail" && cell.warn ? 1 : 0);
@@ -354,5 +359,8 @@ export function elementCount(
     n += band.pieces.length;
   }
   n += scene.links.filter((l) => l.kind === "migration" || on.has("recommendations")).length * 2;
+  if (on.has("network")) {
+    n += netElements(scene, lod);
+  }
   return n;
 }

@@ -209,3 +209,18 @@ export function gaugeFaces(
     rest: boxFace({ ...b, z: b.z + filled, h: b.h - filled }, face),
   };
 }
+
+/** 윗면 × 표시: 사각형 윗면(꼭짓점 넷)의 두 대각선을 가운데로 25% 줄인 선 둘(실패 타일·끊긴 포트) */
+export function crossPath(top: readonly Point[]): string {
+  const [a, b, c, d] = top as [Point, Point, Point, Point];
+  const shrink = (p: Point, q: Point) => {
+    const k = 0.25;
+    return [
+      `${round(p.x + (q.x - p.x) * k)},${round(p.y + (q.y - p.y) * k)}`,
+      `${round(q.x + (p.x - q.x) * k)},${round(q.y + (p.y - q.y) * k)}`,
+    ];
+  };
+  const [p1, p2] = shrink(a, c);
+  const [p3, p4] = shrink(b, d);
+  return `M${p1}L${p2}M${p3}L${p4}`;
+}

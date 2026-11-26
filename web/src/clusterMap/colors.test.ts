@@ -4,10 +4,14 @@ import {
   HEAT_COLOR,
   LINK_COLOR,
   POOL_COLOR,
+  PORT_COLOR,
+  RAIL_COLOR,
   TILE_COLOR,
   TILE_STROKE,
   UPLINK_COLOR,
 } from "@/clusterMap/colors";
+import { shade } from "@/components/iso/iso";
+import { NET_COLOR, NET_RAIL } from "@/clusterMap/netPaths";
 import { contrast, parseOklch, readBlock, type Rgba } from "@/test/contrast";
 
 // 지도 색의 대비(계획 70 §7.4): 상태 색은 그림 원소라 `--card`·`--background` 위에서 3:1 이상(두 테마). 색은 토큰과
@@ -85,6 +89,11 @@ const GRAPHIC: [string, string][] = [
   ["no uplink", UPLINK_COLOR.down],
   ["migration arrow", LINK_COLOR.migration],
   ["recommendation arrow", LINK_COLOR.recommendation],
+  // 네트워크 층(계획 75): 포트·본딩 테두리·레일 선, 레일 띠(윗면 밝기 그대로)
+  ["port up", PORT_COLOR.up],
+  ["port degraded", PORT_COLOR.degraded],
+  ["port down", PORT_COLOR.down],
+  ["network rail", shade(RAIL_COLOR, "top")],
 ];
 
 describe.each(Object.entries(THEMES))("%s theme map colors", (_theme, vars) => {
@@ -103,4 +112,10 @@ describe.each(Object.entries(THEMES))("%s theme map colors", (_theme, vars) => {
       1.1,
     );
   });
+});
+
+it("draws the network layer with the same colours as the legend", () => {
+  // 늦게 받는 네트워크 층 조각은 지도 조각의 `colors.ts`를 읽지 않고 같은 값을 따로 둔다(`netPaths.ts` 머리 설명)
+  expect(NET_COLOR).toEqual(PORT_COLOR);
+  expect(NET_RAIL).toBe(RAIL_COLOR);
 });

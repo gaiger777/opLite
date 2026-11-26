@@ -11,7 +11,14 @@ import { elementCount, type MapLayer, scenePaths } from "@/clusterMap/paths";
 import { topCenter } from "@/components/iso";
 import { DndProvider } from "@/dnd/DndProvider";
 import i18n from "@/i18n";
-import { bigCluster, layerStatus, mapNode, mapVm, stubSvgMatrix } from "@/test/clusterMap";
+import {
+  bigCluster,
+  layerStatus,
+  mapNode,
+  mapVm,
+  physicalTopology,
+  stubSvgMatrix,
+} from "@/test/clusterMap";
 
 // 노드 블록(`NodeShape`)을 몇 번 그렸는지: 그릴 때마다 덧표시를 한 번 셈한다.
 const drawn = vi.hoisted(() => ({ blocks: 0 }));
@@ -32,8 +39,9 @@ function draw(
   model: ClusterModel,
   layers: MapLayer[] = ALL,
   onSummaryEnter: (key: string) => void = () => {},
+  onOpen: (key: string) => void = () => {},
 ) {
-  const scene = layoutCluster(model);
+  const scene = layoutCluster(model, { rails: layers.includes("network") });
   const labels = mapLabels(i18n.t, model, scene);
   const lod = { current: null as Lod | null };
   const view = render(
@@ -44,7 +52,7 @@ function draw(
       vmNames={new Map(model.vms.map((v) => [v.id, v.name]))}
       layers={layers}
       slabName={(s) => s.name ?? "—"}
-      onOpen={() => {}}
+      onOpen={(o) => onOpen(o.key)}
       onDetail={() => {}}
       onSummaryEnter={onSummaryEnter}
       onLod={(l) => {
@@ -201,6 +209,135 @@ it("does not redraw node blocks while a VM tile is dragged across nodes", () => 
     expect(css).toContain("stroke:var(--brand)");
     expect(css).toContain("opacity:.45");
     fireEvent.pointerUp(svg, pointer(nodeTop(nodes[0]!)));
+    expect(drawn.blocks).toBe(0);
+  } finally {
+    restore();
+  }
+});
+
+/** 네트워크 층(계획 75)이 있는 작은 클러스터: n1은 bond0의 eno1과 underlay eno3이 끊김 */
+function netModel() {
+  const nodes = [
+    mapNode(1, "n1", { labels: { zone: "z" }, status: layerStatus(40) }),
+    mapNode(2, "n2", { labels: { zone: "z" }, status: layerStatus(40) }),
+    mapNode(3, "w", { labels: { zone: "z" }, spec: { witness: true } }),
+  ];
+  const vms = [mapVm(1, "web", nodes[0]!.id), mapVm(2, "db", nodes[1]!.id)];
+  return {
+    nodes,
+    model: toModel({ nodes, vms, physical: physicalTopology(nodes, { n1: ["eno1", "eno3"] }, 7) }),
+  };
+}
+
+it("draws exactly the counted elements with the network layer's ports, rails and faults", async () => {
+  const { model } = netModel();
+  const { svg, lod, count, expected, scene, unmount } = draw(model);
+  expect(lod.current).toBe("detail");
+  // 네트워크 층은 늦게 받는 조각 — 오면 셈과 꼭 같다
+  await within(svg).findByText("vmbr0");
+  expect(count()).toBe(expected());
+  // 포트 줄(8개 + "+2"), 레일 이름, 장애 꼬리표, 업링크 띠 대신 포트
+  expect(scene.byKey.get(`node:${model.nodes[0]!.id}`)!.net!.more).toBe(2);
+  expect(within(svg).getAllByText("+2")).toHaveLength(2);
+  expect(within(svg).getAllByText("vmbr0")).toHaveLength(1);
+  expect(within(svg).getAllByText("underlay")).toHaveLength(1);
+  expect(within(svg).getByText("link ✕ 2")).toBeInTheDocument();
+  unmount();
+  // 네트워크 레이어를 끄면 포트·레일이 없다
+  const off = draw(model, ["load"]);
+  expect(off.count()).toBe(off.expected());
+  expect(within(off.svg).queryByText("vmbr0")).toBeNull();
+  expect(within(off.svg).queryByText("link ✕ 2")).toBeNull();
+});
+
+it("counts the network layer exactly in the summary and tile views of a big cluster", async () => {
+  const input = bigCluster(100, 50, 10);
+  const model = toModel({ ...input, physical: physicalTopology(input.nodes, { n3: ["eno1"] }) });
+  const big = draw(model);
+  expect(big.lod.current).toBe("summary");
+  await within(big.svg).findAllByText("vmbr0");
+  expect(big.count()).toBe(big.expected());
+  expect(big.count()).toBeLessThan(4500);
+  big.unmount();
+  const mid = toModel({
+    ...bigCluster(40, 50, 4),
+    physical: physicalTopology(bigCluster(40, 50, 4).nodes, { n3: ["eno1", "eno2"] }),
+  });
+  const { lod, count, expected, svg } = draw(mid);
+  await within(svg).findAllByText("vmbr0");
+  for (let i = 0; i < 12 && lod.current !== "tiles"; i++) {
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+  }
+  expect(lod.current).toBe("tiles");
+  expect(count()).toBe(expected());
+});
+
+it("walks into a node's ports with p, to the port's rail with ↓ and back out", () => {
+  const { model } = netModel();
+  const { svg, scene, unmount } = draw(model);
+  const n1 = within(svg).getByRole("button", { name: /^Node n1,/ });
+  expect(n1.getAttribute("aria-label")).toContain("2 link faults");
+  act(() => n1.focus());
+  const live = () => svg.parentElement!.querySelector("[aria-live]")!.textContent;
+  drawn.blocks = 0;
+  expect(fireEvent.keyDown(n1, { key: "p" })).toBe(false);
+  expect(live()).toBe(
+    "Port eno1 on n1, down, bond bond0, 10 Gb/s, switch sw1 port Gi1/0/1, " +
+      "no redundancy for networks 2, VMs 3",
+  );
+  fireEvent.keyDown(n1, { key: "ArrowRight" });
+  expect(live()).toMatch(/^Port eno2 on n1, up, bond bond0/);
+  fireEvent.keyDown(n1, { key: "ArrowDown" });
+  const vmbr0 = [...scene.rails.values()].find((r) => r.carrier === "vmbr0")!;
+  expect(live()).toBe("Rail vmbr0, 2 networks, 2 nodes, 1 degraded");
+  fireEvent.keyDown(n1, { key: "ArrowLeft" });
+  expect(live()).toBe("Rail Underlay (VXLAN), 1 network, 2 nodes, 1 down");
+  fireEvent.keyDown(n1, { key: "ArrowRight" });
+  expect(live()).toContain("Rail vmbr0");
+  fireEvent.keyDown(n1, { key: "ArrowUp" });
+  expect(live()).toMatch(/^Port eno1 on n1/);
+  fireEvent.keyDown(n1, { key: "Escape" });
+  expect(live()).toMatch(/^Node n1,/);
+  // 화면 초점은 늘 노드 하나(한 탭 정지), 블록은 다시 그리지 않음
+  expect(document.activeElement).toBe(n1);
+  expect(drawn.blocks).toBe(0);
+  expect(vmbr0.nodes).toBe(2);
+  // 포트 줄을 그리지 않은(레이어 끔) 그림에서는 `p`를 받지 않는다
+  unmount();
+  const off = draw(model, ["load"]);
+  const m1 = within(off.svg).getByRole("button", { name: /^Node n1,/ });
+  act(() => m1.focus());
+  expect(fireEvent.keyDown(m1, { key: "p" })).toBe(true);
+});
+
+it("hits ports and rails under the pointer and lights the rail's nodes", () => {
+  const restore = stubSvgMatrix();
+  try {
+    const { model } = netModel();
+    const opened: string[] = [];
+    const { svg, scene } = draw(model, ALL, undefined, (key) => opened.push(key));
+    const port = scene.ports.get(`port:${model.nodes[0]!.id}/eno3`)!;
+    const at = (p: { x: number; y: number }) => ({
+      pointerType: "mouse",
+      clientX: p.x,
+      clientY: p.y,
+    });
+    drawn.blocks = 0;
+    fireEvent.pointerMove(svg, at(topCenter(port.box)));
+    expect(svg.parentElement!.querySelector("[data-map-card]")!.textContent).toContain(
+      "Port eno3 on n1",
+    );
+    fireEvent.click(svg, at(topCenter(port.box)));
+    const rail = [...scene.rails.values()].find((r) => r.carrier === "underlay")!;
+    const mid = topCenter({ ...rail.box, x: rail.box.x + rail.box.w / 2, w: 1 });
+    fireEvent.pointerMove(svg, at(mid));
+    const css = svg.querySelector("style")!.textContent!;
+    // 그 레일을 쓰는 노드 둘은 밝고 나머지(증인)는 흐림
+    for (const n of model.nodes.filter((x) => !x.witness)) {
+      expect(css).toContain(`g[data-key="node:${n.id}"]`);
+    }
+    fireEvent.click(svg, at(mid));
+    expect(opened).toEqual([port.key, rail.key]);
     expect(drawn.blocks).toBe(0);
   } finally {
     restore();
