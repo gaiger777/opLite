@@ -12,10 +12,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/bin" "$WORK/systemd-running"
-# is-enabled는 ORBIVISOR_FAKE_ENABLED(기본 yes)가 no면 실패한다.
+# is-enabled는 ORBIVISOR_FAKE_ENABLED(기본 yes)가 no면 실패한다. daemon-reload 때 옛 이름의 enable 링크나 /etc의 진짜
+# opld.service가 아직 있으면 "daemon-reload (old names)"로 기록한다 — postinst는 파일을 옮긴 뒤에 reload한다(리뷰 2 N3).
 cat >"$WORK/bin/systemctl" <<'EOF'
 #!/bin/sh
-echo "$*" >>"$ORBIVISOR_FAKE_LOG"
+etc="$ORBIVISOR_SYSTEMD_ETC"
+if [ "$1" = daemon-reload ] && { [ -L "$etc/multi-user.target.wants/opld.service" ] ||
+	{ [ -f "$etc/opld.service" ] && [ ! -L "$etc/opld.service" ]; }; }; then
+	echo "daemon-reload (old names)" >>"$ORBIVISOR_FAKE_LOG"
+else
+	echo "$*" >>"$ORBIVISOR_FAKE_LOG"
+fi
 [ "$1" != is-enabled ] || [ "${ORBIVISOR_FAKE_ENABLED:-yes}" = yes ]
 EOF
 chmod 0755 "$WORK/bin/systemctl"
@@ -46,7 +53,7 @@ check() {
 	# ORBIVISOR_SYSTEMD_ETC·ORBIVISOR_APT_SOURCES: postrm이 지우는 enable 링크와 소스 파일이 시험 디렉터리 안에 있게 한다.
 	if ! PATH="$WORK/bin:$PATH" ORBIVISOR_FAKE_LOG="$log" ORBIVISOR_SYSTEMD_DIR="$systemd_dir" \
 		ORBIVISOR_SYSTEMD_ETC="$WORK/etc-systemd" ORBIVISOR_APT_SOURCES="$WORK/oplite.sources" \
-		ORBIVISOR_APPARMOR_DIR="$WORK/apparmor" "$DEB_DIR/$1" "${@:2}"; then
+		ORBIVISOR_APPARMOR_DIR="$WORK/apparmor" ORBIVISOR_SYSTEMD_LIB="$WORK/lib-systemd" "$DEB_DIR/$1" "${@:2}"; then
 		echo "FAIL $name: 스크립트가 0이 아닌 코드로 끝났다"
 		FAILED=1
 		return
@@ -89,14 +96,13 @@ mkdir -p "$WORK/etc-systemd/multi-user.target.wants"
 ln -sf /usr/lib/systemd/system/orbivisord.service "$WORK/etc-systemd/multi-user.target.wants/orbivisord.service"
 check "처음 설치(systemd 없음, 링크 있음)" no "" postinst configure
 rm -f "$WORK/etc-systemd/multi-user.target.wants/orbivisord.service"
-# 이름 바꾸기(계획 74): 옛 이름의 enable 링크·덮어쓰기를 새 이름으로 옮기고 daemon-reload를 한 번 더 한다.
+# 이름 바꾸기(계획 74): 옛 이름의 enable 링크·덮어쓰기를 새 이름으로 옮긴 뒤 daemon-reload를 한 번 한다.
 ETC="$WORK/etc-systemd"
 WANTS="$ETC/multi-user.target.wants"
 mkdir -p "$WANTS" "$ETC/opld.service.d"
 ln -sf /usr/lib/systemd/system/opld.service "$WANTS/opld.service"
 echo '[Service]' >"$ETC/opld.service.d/override.conf"
-check "업그레이드: enable 링크·덮어쓰기 옮기기" yes "daemon-reload
-daemon-reload
+check "업그레이드: enable 링크·덮어쓰기 옮기기(옮긴 뒤 reload 한 번)" yes "daemon-reload
 is-enabled --quiet orbivisord.service
 restart orbivisord.service" postinst configure 0.1.0
 if [ ! -e "$WANTS/opld.service" ] && [ ! -L "$WANTS/opld.service" ] &&
@@ -108,7 +114,7 @@ else
 	echo "FAIL 옮긴 뒤: $(ls -la "$WANTS" "$ETC")"
 	FAILED=1
 fi
-check "업그레이드: 이미 옮김(한 번 더 reload하지 않음)" yes "daemon-reload
+check "업그레이드: 이미 옮김" yes "daemon-reload
 is-enabled --quiet orbivisord.service
 restart orbivisord.service" postinst configure 0.1.0
 # 덮어쓰기가 두 이름 다 진짜면 손대지 않는다.
@@ -135,8 +141,7 @@ rm -rf "$ETC"
 mkdir -p "$WANTS"
 printf '[Service]\nExecStart=/usr/bin/orbivisord --config /srv/node.toml\n' >"$ETC/opld.service"
 ln -sf "$ETC/opld.service" "$WANTS/opld.service"
-check "업그레이드: /etc의 진짜 opld.service를 새 이름으로" yes "daemon-reload
-daemon-reload
+check "업그레이드: /etc의 진짜 opld.service를 새 이름으로(옮긴 뒤 reload 한 번)" yes "daemon-reload
 is-enabled --quiet orbivisord.service
 restart orbivisord.service" postinst configure 0.1.0
 if [ -f "$ETC/orbivisord.service" ] && [ ! -L "$ETC/orbivisord.service" ] &&
@@ -155,8 +160,7 @@ rm -rf "$ETC"
 # mask한 opld(/dev/null 링크): orbivisord.service도 mask하고 다시 시작·enable하지 않는다.
 mkdir -p "$ETC"
 ln -s /dev/null "$ETC/opld.service"
-check "업그레이드: mask한 opld는 orbivisord도 mask" yes "daemon-reload
-daemon-reload" postinst configure 0.1.0
+check "업그레이드: mask한 opld는 orbivisord도 mask" yes "daemon-reload" postinst configure 0.1.0
 if [ "$(readlink "$ETC/orbivisord.service")" = /dev/null ]; then echo "ok   orbivisord.service도 mask"; else
 	echo "FAIL orbivisord.service를 mask하지 않았다"
 	FAILED=1
@@ -188,7 +192,6 @@ fi
 mkdir -p "$WANTS"
 ln -sf /lib/systemd/system/opld.service "$WANTS/opld.service"
 ORBIVISOR_FAKE_OPLITE_CONFIG=0.1.0 check "oplite V0에서 바로: 링크 옮기고 restart" yes "daemon-reload
-daemon-reload
 is-enabled --quiet orbivisord.service
 restart orbivisord.service" postinst configure
 if [ -L "$WANTS/orbivisord.service" ] && [ ! -L "$WANTS/opld.service" ]; then echo "ok   V0의 enable 링크 옮김"; else
@@ -255,6 +258,78 @@ if [ ! -L "$WANTS/opld.service" ]; then echo "ok   purge 뒤 옛 이름 enable �
 	FAILED=1
 fi
 
+# 옛 판(계획 74 앞)으로 되돌림(리뷰 2 N1): 새 postrm upgrade가 OVN 중앙 단위 이름을 되돌린다 — 새 이름 파일은 옛 이름으로,
+# 새 이름은 옛 이름으로의 링크로, enable 링크도 옛 이름으로, daemon-reload 한 번(멈추지 않음).
+ETC="$WORK/etc-systemd"
+WANTS="$ETC/multi-user.target.wants"
+LIB="$WORK/lib-systemd"
+MARK='# Managed by Orbivisor (orbivisord); changes are overwritten.'
+ovn_after_upgrade() {
+	rm -rf "$ETC" "$LIB"
+	mkdir -p "$WANTS" "$LIB"
+	for db in nb sb northd; do
+		printf '%s\n[Service]\nExecStart=/x %s\n' "$MARK" "$db" >"$ETC/orbivisor-ovn-$db.service"
+		ln -s "orbivisor-ovn-$db.service" "$ETC/opl-ovn-$db.service"
+		ln -s "$ETC/orbivisor-ovn-$db.service" "$WANTS/orbivisor-ovn-$db.service"
+	done
+}
+# 옛 판의 유닛: opld.service가 진짜 파일, orbivisord.service는 그 별칭
+old_package_unpacked() {
+	echo '[Unit]' >"$LIB/opld.service"
+	ln -s opld.service "$LIB/orbivisord.service"
+}
+ovn_after_upgrade
+old_package_unpacked
+check "postrm upgrade <옛 판>: OVN 단위 되돌림" yes "daemon-reload" postrm upgrade 0.0.9
+reverted=yes
+for db in nb sb northd; do
+	if ! { [ -f "$ETC/opl-ovn-$db.service" ] && [ ! -L "$ETC/opl-ovn-$db.service" ] &&
+		grep -qx "ExecStart=/x $db" "$ETC/opl-ovn-$db.service" &&
+		[ "$(readlink "$ETC/orbivisor-ovn-$db.service")" = "opl-ovn-$db.service" ] &&
+		[ "$(readlink "$WANTS/opl-ovn-$db.service")" = "$ETC/opl-ovn-$db.service" ] &&
+		[ ! -L "$WANTS/orbivisor-ovn-$db.service" ]; }; then
+		reverted=no
+	fi
+done
+if [ "$reverted" = yes ]; then echo "ok   옛 이름이 진짜 파일, 새 이름은 그 링크, enable 링크는 옛 이름"; else
+	echo "FAIL 되돌린 뒤: $(ls -la "$ETC" "$WANTS")"
+	FAILED=1
+fi
+check "postrm upgrade <옛 판>: 이미 되돌림(reload 없음)" yes "" postrm upgrade 0.0.9
+ovn_after_upgrade
+old_package_unpacked
+check "postrm failed-upgrade <옛 판>(systemd 없음): 파일만" no "" postrm failed-upgrade 0.0.9
+if [ "$(readlink "$ETC/orbivisor-ovn-nb.service")" = opl-ovn-nb.service ]; then echo "ok   systemd 없이도 되돌림"; else
+	echo "FAIL systemd 없이 되돌리지 않았다"
+	FAILED=1
+fi
+# 새 판으로 올림(풀린 판의 opld.service가 링크): 되돌리지 않는다.
+ovn_after_upgrade
+echo '[Unit]' >"$LIB/orbivisord.service"
+ln -s orbivisord.service "$LIB/opld.service"
+check "postrm upgrade <새 판>: 그대로" yes "" postrm upgrade 0.2.0
+if [ -f "$ETC/orbivisor-ovn-nb.service" ] && [ ! -L "$ETC/orbivisor-ovn-nb.service" ] &&
+	[ -L "$ETC/opl-ovn-nb.service" ]; then echo "ok   새 판으로 올릴 때 OVN 단위 그대로"; else
+	echo "FAIL 새 판으로 올릴 때 OVN 단위를 바꿨다"
+	FAILED=1
+fi
+# 표시 없는 새 이름 파일, 옛 이름이 진짜 파일(이미 갈라짐)은 손대지 않는다.
+ovn_after_upgrade
+old_package_unpacked
+echo '[Unit]' >"$ETC/orbivisor-ovn-nb.service"
+rm -f "$ETC/opl-ovn-sb.service"
+printf '%s\n' "$MARK" >"$ETC/opl-ovn-sb.service"
+check "postrm upgrade <옛 판>: 남의 파일·갈라진 단위는 그대로" yes "daemon-reload" postrm upgrade 0.0.9
+if [ -L "$ETC/opl-ovn-nb.service" ] && [ ! -L "$ETC/orbivisor-ovn-nb.service" ] &&
+	[ ! -L "$ETC/orbivisor-ovn-sb.service" ] && [ ! -L "$ETC/opl-ovn-sb.service" ] &&
+	[ "$(readlink "$ETC/orbivisor-ovn-northd.service")" = opl-ovn-northd.service ]; then
+	echo "ok   northd만 되돌림"
+else
+	echo "FAIL 남의 파일·갈라진 단위를 바꿨다: $(ls -la "$ETC")"
+	FAILED=1
+fi
+rm -rf "$ETC" "$LIB"
+
 # remove·purge는 opld가 쓴 소스 파일(관리 표시)을 지우고, 관리자가 쓴 파일과 업그레이드 때는 남긴다.
 SOURCES="$WORK/oplite.sources"
 managed() { printf '# managed by opld; edits are overwritten\nTypes: deb\n' >"$SOURCES"; }
@@ -293,6 +368,28 @@ if [ "$(grep -cxF "$INCLUDE" "$LOCAL")" = 1 ]; then echo "ok   local 파일에 i
 	echo "FAIL local 파일: $(cat "$LOCAL")"
 	FAILED=1
 fi
+# 새 경로 규칙도 local 파일에 한 번씩(리뷰 2 N2 — 옛 판 conffile·고친 conffile에도 남게)
+RULES='/var/lib/orbivisor/vm/*/tpm/ rw,
+/var/lib/orbivisor/vm/*/tpm/** rwk,
+/run/orbivisor/vm/*/ r,
+/run/orbivisor/vm/*/tpm.sock rw,
+/run/orbivisor/vm/*/swtpm.pid rw,
+/run/orbivisor/vm/*/swtpm.log rw,'
+rules_once=yes
+while IFS= read -r rule; do
+	[ "$(grep -cxF "$rule" "$LOCAL")" = 1 ] || rules_once=no
+done <<<"$RULES"
+if [ "$rules_once" = yes ] && [ "$(wc -l <"$LOCAL" | tr -d ' ')" = 7 ]; then echo "ok   local 파일에 새 경로 규칙 한 번씩"; else
+	echo "FAIL local 파일의 규칙: $(cat "$LOCAL")"
+	FAILED=1
+fi
+# 규칙 목록이 conffile의 새 경로 규칙과 같다.
+if [ "$(grep -E '^ +/(var/lib|run)/orbivisor/' "$DEB_DIR/apparmor/orbivisor-swtpm" | sed 's/^ *//')" = "$RULES" ]; then
+	echo "ok   local 규칙이 conffile의 새 경로 규칙과 같음"
+else
+	echo "FAIL local 규칙과 conffile이 다르다"
+	FAILED=1
+fi
 printf '#include <tunables/global>\n' >"$AA/usr.bin.swtpm"
 # 가짜 명령의 본문이라 $는 가짜 명령이 돌 때 풀린다(작은따옴표 그대로).
 # shellcheck disable=SC2016
@@ -306,8 +403,9 @@ echo '/srv/tpm/** rwk,' >>"$LOCAL"
 check "postrm remove(include 둠)" no "" postrm remove
 check "postrm purge(include 뺌)" no "disable orbivisord.service
 apparmor_parser -r -T -W $AA/usr.bin.swtpm" postrm purge
-if ! grep -qxF "$INCLUDE" "$LOCAL" && grep -qxF '/srv/tpm/** rwk,' "$LOCAL"; then
-	echo "ok   purge가 include 줄만 뺐다"
+if ! grep -qxF "$INCLUDE" "$LOCAL" && grep -qxF '/srv/tpm/** rwk,' "$LOCAL" &&
+	! grep -qF /orbivisor/ "$LOCAL" && [ "$(wc -l <"$LOCAL" | tr -d ' ')" = 1 ]; then
+	echo "ok   purge가 include 줄과 새 경로 규칙만 뺐다"
 else
 	echo "FAIL purge 뒤 local 파일: $(cat "$LOCAL")"
 	FAILED=1

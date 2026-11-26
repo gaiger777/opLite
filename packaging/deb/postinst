@@ -20,14 +20,27 @@ APPARMOR_DIR="${ORBIVISOR_APPARMOR_DIR:-/etc/apparmor.d}"
 UNIT=/usr/lib/systemd/system/orbivisord.service
 SWTPM_INCLUDE='include <abstractions/orbivisor-swtpm>'
 
-# swtpm AppArmor(계획 59): swtpm 프로필의 local 파일(swtpm 꾸러미가 만들고 소유하지 않는다)에 orbivisor 경로를 한 번만
-# 더하고, 프로필이 있고 AppArmor가 켜져 있으면 다시 읽힌다. swtpm을 나중에 설치하면 그 postinst가 이 줄과 함께 읽는다.
+# swtpm AppArmor(계획 59): swtpm 프로필의 local 파일(swtpm 꾸러미가 만들고 소유하지 않는다)에 orbivisor 경로(include
+# 줄과 새 경로 규칙)를 한 줄씩 한 번만 더하고, 프로필이 있고 AppArmor가 켜져 있으면 다시 읽힌다. swtpm을 나중에
+# 설치하면 그 postinst가 이 줄들과 함께 읽는다.
+# 새 경로(계획 74)의 규칙은 conffile(abstractions/orbivisor-swtpm) 밖, local 파일에도 둔다(리뷰 2 N2): 옛 판으로
+# 되돌리면 옛 conffile(옛 경로 규칙만)이 깔리고, 운영자가 conffile을 고쳐 둔 노드는 업그레이드(--force-confold) 뒤에도
+# 옛 파일이 남는다. AppArmor는 링크를 다 푼 경로(/var/lib/orbivisor/…)로 판단하므로 그 규칙이 없으면 돌고 있는
+# swtpm의 상태 쓰기가 거부된다. local 파일은 어느 꾸러미도 소유하지 않아 되돌려도 남는다.
+SWTPM_RULES='/var/lib/orbivisor/vm/*/tpm/ rw,
+/var/lib/orbivisor/vm/*/tpm/** rwk,
+/run/orbivisor/vm/*/ r,
+/run/orbivisor/vm/*/tpm.sock rw,
+/run/orbivisor/vm/*/swtpm.pid rw,
+/run/orbivisor/vm/*/swtpm.log rw,'
 swtpm_apparmor() {
 	local_file="$APPARMOR_DIR/local/usr.bin.swtpm"
 	mkdir -p "$APPARMOR_DIR/local"
-	if ! grep -qxF "$SWTPM_INCLUDE" "$local_file" 2>/dev/null; then
-		echo "$SWTPM_INCLUDE" >>"$local_file"
-	fi
+	printf '%s\n%s\n' "$SWTPM_INCLUDE" "$SWTPM_RULES" | while IFS= read -r line; do
+		if ! grep -qxF "$line" "$local_file" 2>/dev/null; then
+			echo "$line" >>"$local_file"
+		fi
+	done
 	if [ -f "$APPARMOR_DIR/usr.bin.swtpm" ] && command -v aa-enabled >/dev/null 2>&1 &&
 		aa-enabled --quiet 2>/dev/null; then
 		apparmor_parser -r -T -W "$APPARMOR_DIR/usr.bin.swtpm" || true
@@ -98,11 +111,12 @@ configure | abort-remove | abort-deconfigure)
 		fi
 	fi
 	if [ -d "$SYSTEMD_DIR" ]; then
-		# 돌고 있는 opld.service가 새 실제 파일의 별칭으로 orbivisord.service에 합쳐진다(MainPID 그대로).
+		# 파일을 먼저 옮기고 daemon-reload는 한 번만 한다(리뷰 2 N3): 옮기기 앞에 reload하면 /etc의 진짜 opld.service와
+		# 이제 진짜인 /usr/lib의 orbivisord.service가 잠시 서로 다른 두 단위가 되고, 둘 다 읽힌 단위는 다음 reload에서
+		# 합쳐지지 않을 수 있다. 한 번이면 돌고 있는 opld.service가 새 실제 파일의 별칭으로 orbivisord.service에
+		# 합쳐진다(MainPID 그대로 — 설계 §2의 실험과 같은 전이).
+		move_units || true
 		systemctl daemon-reload || true
-		if move_units; then
-			systemctl daemon-reload || true
-		fi
 		if [ "$masked" = yes ]; then
 			echo "orbivisor: opld.service is masked; orbivisord.service is masked too and not started" >&2
 		elif systemctl is-enabled --quiet orbivisord.service; then

@@ -304,11 +304,14 @@ OLD_RULES=(
 	# 유지 스크립트(postinst·postrm): 옛 이름 유닛 파일·enable 링크·덮어쓰기의 경로와 그 안내(옛 이름을 systemctl에
 	# 넘기는 줄은 걸린다)
 	'packaging/deb/postinst|/opld\.service(\.d)?|\(opld\.service\.d\)|opld\.service는 그 별칭|/etc의 (진짜 )?opld\.service|돌고 있는 opld\.service가|the old opld\.service unit|opld\.service is masked|옛 /etc/opl/opld\.toml'
-	'packaging/deb/postrm|/opld\.service"|\(옛 이름 링크 /var/lib/opl·/etc/opl\)'
+	'packaging/deb/postrm|/opld\.service"|\(옛 이름 링크 /var/lib/opl·/etc/opl\)|opld\.service가 진짜 파일'
+	# 옛 판으로 되돌릴 때 OVN 중앙 단위 이름 되돌리기(리뷰 2 N1)
+	'packaging/deb/postrm|old_name="opl-ovn-\$db\.service"|(/etc/systemd/system/|back to )opl-ovn-\*\.service'
 	# 패키징 시험: 옛 판 배치·옛 유닛 경로를 만들거나 없음을 확인하는 줄
 	'packaging/tests/build-deb-test.sh|OPL_(LICENSE_KEYS|APT_KEY|BIN_DIR)|"\$UNIT_DIR/opld\.service"|ConditionPathExists=[|]/etc/opl/opld\.toml|별칭 링크 opld\.service|! -e "\$T/usr/share/orbivisor/opld\.toml\.example"|옛 이름\(/var/lib/opl,|^# /run/opl — '
 	'packaging/tests/deb-test.sh|=/usr/lib/systemd/system/opld\.service|! -e /usr/share/orbivisor/opld\.toml\.example|ConditionPathExists=[|]/etc/opl/opld\.toml|! -e /etc/systemd/system/multi-user\.target\.wants/opld\.service'
-	'packaging/tests/maint-test.sh|/opld\.service(\.d)?|\(opld\.service\)|진짜 opld\.service|opld\.service는 그 링크'
+	'packaging/tests/maint-test.sh|/opld\.service(\.d)?|\(opld\.service\)|진짜 opld\.service|opld\.service는 그 링크|opld\.service가 (아직 있으면|진짜 파일|링크)|ln -s opld\.service '
+	'packaging/tests/maint-test.sh|"?opl-ovn-(\$db|nb|sb|northd)\.service"?'
 	'packaging/tests/repo-test.sh|/(etc|var/lib)/opl(/[A-Za-z0-9._-]*)?|/opld\.(service|toml|sock)(\.example)?|옛 이름 opld\.service는 별칭|/etc/orbivisor/opld\.toml|/run/orbivisor/opld\.sock|"opld\.toml이 링크가 아님"'
 )
 

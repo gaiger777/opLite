@@ -3,21 +3,34 @@
 # purge여도 지우지 않는다.
 # opld가 쓴 APT 소스 파일(첫 줄이 관리 표시)은 지운다: 함께 지워진 저장소 공개 키를 가리켜 apt-get
 # update가 실패한다. 관리자가 직접 쓴 파일은 남긴다.
+# 이름 바꾸기(계획 74) 앞의 판으로 되돌릴 때(dpkg가 옛 판을 푼 뒤 이 postrm을 `upgrade <옛 판>`으로 부른다)는 데몬이
+# 옮긴 OVN 중앙 단위 이름을 되돌린다(revert_ovn_units).
 set -eu
 
 SYSTEMD_DIR="${ORBIVISOR_SYSTEMD_DIR:-/run/systemd/system}"
 SYSTEMD_ETC="${ORBIVISOR_SYSTEMD_ETC:-/etc/systemd/system}"
 APT_SOURCES="${ORBIVISOR_APT_SOURCES:-/etc/apt/sources.list.d/oplite.sources}"
 APPARMOR_DIR="${ORBIVISOR_APPARMOR_DIR:-/etc/apparmor.d}"
+SYSTEMD_LIB="${ORBIVISOR_SYSTEMD_LIB:-/usr/lib/systemd/system}"
 SWTPM_INCLUDE='include <abstractions/orbivisor-swtpm>'
+# postinst가 local 파일에 더하는 새 경로 규칙(postinst의 SWTPM_RULES와 같아야 한다)
+SWTPM_RULES='/var/lib/orbivisor/vm/*/tpm/ rw,
+/var/lib/orbivisor/vm/*/tpm/** rwk,
+/run/orbivisor/vm/*/ r,
+/run/orbivisor/vm/*/tpm.sock rw,
+/run/orbivisor/vm/*/swtpm.pid rw,
+/run/orbivisor/vm/*/swtpm.log rw,'
+# OVN 중앙 단위 파일의 첫 줄(crates/orbivisor-driver/src/ovn/units.rs UNIT_MARK)
+OVN_MARK='# Managed by Orbivisor (orbivisord); changes are overwritten.'
 
 # purge는 conffile(abstractions/orbivisor-swtpm)을 지우므로 swtpm 프로필의 local 파일에서 include 줄을 뺀다(남으면
-# 프로필을 읽지 못한다). 다른 줄은 그대로 둔다.
+# 프로필을 읽지 못한다). postinst가 더한 새 경로 규칙도 뺀다. 다른 줄은 그대로 둔다.
 swtpm_apparmor_purge() {
 	local_file="$APPARMOR_DIR/local/usr.bin.swtpm"
-	[ -f "$local_file" ] && grep -qxF "$SWTPM_INCLUDE" "$local_file" || return 0
+	ours="$(printf '%s\n%s' "$SWTPM_INCLUDE" "$SWTPM_RULES")"
+	[ -f "$local_file" ] && printf '%s\n' "$ours" | grep -qxFf - "$local_file" || return 0
 	tmp="$local_file.orbivisor-tmp"
-	grep -vxF "$SWTPM_INCLUDE" "$local_file" >"$tmp" || true
+	printf '%s\n' "$ours" | grep -vxFf - "$local_file" >"$tmp" || true
 	cat "$tmp" >"$local_file"
 	rm -f "$tmp"
 	if [ -f "$APPARMOR_DIR/usr.bin.swtpm" ] && command -v aa-enabled >/dev/null 2>&1 &&
@@ -26,7 +39,56 @@ swtpm_apparmor_purge() {
 	fi
 }
 
+# 옛 판으로 되돌림(리뷰 2 N1): 새 데몬은 옛 이름 OVN 중앙 단위(/etc/systemd/system/opl-ovn-*.service)를 새 이름
+# (orbivisor-ovn-*.service)으로 옮기고 옛 이름을 그것으로의 링크로 두었다. 옛 데몬은 새 이름을 모르고 옛 이름 링크
+# 자리에 진짜 파일을 써서, 같은 DB를 쥔 단위가 둘이 된다(다시 시작 실패, 부팅 때 경쟁). 그래서 되돌릴 때 거꾸로
+# 한다: 새 이름 파일(Orbivisor 표시)을 옛 이름으로 옮기고 새 이름은 옛 이름으로의 링크로, enable 링크도 옛 이름으로.
+# 다음 daemon-reload에서 systemd가 두 이름을 한 단위로 합치므로 돌고 있는 ovsdb·northd는 멈추지 않는다(옮길 때와 같은
+# 전이). 옛 이름이 링크가 아닌 진짜 파일이면(이미 둘로 갈라짐) 손대지 않고 알린다. 0: 되돌린 것이 있음, 1: 없음,
+# 2: 실패.
+revert_ovn_units() {
+	wants="$SYSTEMD_ETC/multi-user.target.wants"
+	reverted=1
+	for db in nb sb northd; do
+		new_name="orbivisor-ovn-$db.service"
+		old_name="opl-ovn-$db.service"
+		new="$SYSTEMD_ETC/$new_name"
+		old="$SYSTEMD_ETC/$old_name"
+		[ -f "$new" ] && [ ! -L "$new" ] && [ "$(head -n 1 "$new")" = "$OVN_MARK" ] || continue
+		if [ -L "$old" ]; then
+			[ "$(readlink "$old")" = "$new_name" ] || continue
+		elif [ -e "$old" ]; then
+			echo "orbivisor: both $old and $new are files; left them as they are (keep one and make the other a link)" >&2
+			continue
+		fi
+		# mv는 대상이 원본으로의 링크면 같은 파일로 보고 멈추므로 링크를 먼저 지운다(그 사이 daemon-reload는 없다).
+		rm -f "$old" || return 2
+		mv "$new" "$old" || return 2
+		ln -s "$old_name" "$new" || return 2
+		if [ -L "$wants/$new_name" ]; then
+			if [ ! -e "$wants/$old_name" ] && [ ! -L "$wants/$old_name" ]; then
+				ln -s "$old" "$wants/$old_name" || return 2
+			fi
+			rm -f "$wants/$new_name" || return 2
+		fi
+		reverted=0
+	done
+	return $reverted
+}
+
 case "$1" in
+upgrade | failed-upgrade)
+	# 풀린 판이 이름 바꾸기 앞의 것인지는 그 판의 유닛 파일로 본다(그 판은 opld.service가 진짜 파일이다).
+	if [ -f "$SYSTEMD_LIB/opld.service" ] && [ ! -L "$SYSTEMD_LIB/opld.service" ]; then
+		rc=0
+		revert_ovn_units || rc=$?
+		if [ "$rc" = 2 ]; then
+			echo "orbivisor: cannot rename the OVN central units in $SYSTEMD_ETC back to opl-ovn-*.service; rename them by hand (docs/guide/getting-started.md)" >&2
+		elif [ "$rc" = 0 ] && [ -d "$SYSTEMD_DIR" ]; then
+			systemctl daemon-reload || true
+		fi
+	fi
+	;;
 remove | purge)
 	if [ "$1" = purge ]; then
 		# enable이 만든 링크를 정리한다(systemd가 돌지 않아도 된다).
