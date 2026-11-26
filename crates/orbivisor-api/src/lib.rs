@@ -623,7 +623,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             revision::layer,
-        ));
+        ))
+        // 두 이름의 세션 쿠키 값이 다르면 고른 쪽으로 새 이름을 맞춘다(계획 74 리뷰 2, 다음 판에서 뺌).
+        .layer(axum::middleware::from_fn(auth::resync_session_cookie));
     // 믿는 프록시의 헤더와 허용 출처(CORS)는 라우트를 찾기 전에 본다(preflight는 라우트가 없다).
     Router::new()
         .nest("/api/v1", api)

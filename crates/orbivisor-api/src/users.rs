@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::audit::AuditNote;
 use crate::auth::{
-    Action, LEGACY_SESSION_COOKIE, Principal, SESSION_COOKIE, SESSION_TTL, cookie_value,
-    dummy_hash, hash_password, new_token, session_cookie, verify_password,
+    Action, LEGACY_SESSION_COOKIE, Principal, SESSION_COOKIE, SESSION_TTL, dummy_hash,
+    hash_password, new_token, session_cookies, verify_password,
 };
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
@@ -198,7 +198,7 @@ pub(crate) async fn new_session(
 /// 세션 쿠키(Set-Cookie 값). 허용 출처(다른 사이트일 수 있는 웹 포털)의 요청이면 그 출처가 보내는 요청에도
 /// 붙도록 `SameSite=None; Secure`, 아니면 `SameSite=Strict`다. 새 이름과 옛 이름을 같은 값·속성으로 둘 다
 /// 쓴다(계획 74: 한 릴리스 동안 옛 판 노드와 세션을 나눈다, 다음 판에서 뺌).
-fn session_set_cookie(
+pub(crate) fn session_set_cookie(
     state: &AppState,
     value: &str,
     max_age: u64,
@@ -442,26 +442,24 @@ pub async fn logout(
     audit: AuditNote,
     parts: Parts,
 ) -> Response {
-    if let Some(id) = session_cookie(&parts.headers) {
+    // 두 이름의 값이 다르면 둘 다 끝낸다(옛 판 노드에서 따로 로그인한 것 — 계획 74, 다음 판에서 뺌).
+    let cookies = session_cookies(&parts.headers);
+    if cookies[0].is_some() {
         // 다른 사이트의 페이지가 로그아웃시키지 못하게 쿠키 요청과 같은 출처 검사를 한다.
         if let Err(e) = state.check_cookie_origin(&parts) {
             return e.into_response();
         }
-        // 지우기 전에 세션의 사용자를 감사 로그에 남긴다.
-        if let Some(user) = state.session_user(id)
+        // 지우기 전에 세션의 사용자를 감사 로그에 남긴다. 인증과 같은 차례로 고른다(두 값이 다르면 옛 이름 쪽 —
+        // 로그인해 쓰던 사용자, 리뷰 2).
+        if let Some(user) = cookies.iter().flatten().find_map(|c| state.session_user(c))
             && let Ok(Some(principal)) = state.principal_for(user)
         {
             audit.principal(principal, AuditAuth::Session);
         }
-        if let Err(e) = state.end_session(id, ip).await {
-            return e.into_response();
-        }
-        // 옛 이름 쿠키가 다른 세션(옛 판 노드에서 따로 로그인한 것)이면 그것도 끝낸다(계획 74, 다음 판에서 뺌).
-        if let Some(legacy) = cookie_value(&parts.headers, LEGACY_SESSION_COOKIE)
-            && legacy != id
-            && let Err(e) = state.end_session(legacy, ip).await
-        {
-            return e.into_response();
+        for id in cookies.into_iter().flatten() {
+            if let Err(e) = state.end_session(id, ip).await {
+                return e.into_response();
+            }
         }
     }
     match session_set_cookie(&state, "", 0, web_origin) {

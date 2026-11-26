@@ -230,6 +230,46 @@ async fn session_requests_and_logout_name_the_user() {
     assert_eq!((&anon.user, anon.auth), (&None, AuditAuth::None));
 }
 
+/// 계획 74 리뷰 2: 두 이름의 세션 쿠키가 다르면(옛 판 노드에서 다른 사용자로 로그인) 로그아웃의 감사 주체는 인증과
+/// 같이 옛 이름 쪽 — 로그인해 쓰던 사용자다.
+#[tokio::test]
+async fn logout_with_two_different_session_cookies_names_the_later_login() {
+    let env = Env::start().await;
+    env.user("viewer", "viewer").await;
+    let http = reqwest::Client::new();
+    let url = |p: &str| format!("{}/api/v1{p}", env.base);
+    let login = async |user: &str, password: &str| {
+        let resp = http
+            .post(url("/auth/login"))
+            .json(&json!({ "username": user, "password": password }))
+            .send()
+            .await
+            .unwrap();
+        let cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
+        cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("orbivisor_session=")
+            .unwrap()
+            .to_string()
+    };
+    let admin = login("admin", ADMIN_PASSWORD).await;
+    let viewer = login("viewer", "password-1").await;
+    let resp = http
+        .post(url("/auth/logout"))
+        .header(
+            "cookie",
+            format!("orbivisor_session={admin}; opl_session={viewer}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let out = entry(&env, "POST /auth/logout", 204).await;
+    assert_eq!(out.user.as_deref(), Some("viewer"));
+}
+
 #[tokio::test]
 async fn reads_are_not_recorded_but_opening_a_console_is() {
     let env = Env::start().await;

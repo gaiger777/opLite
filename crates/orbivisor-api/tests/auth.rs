@@ -191,6 +191,72 @@ async fn legacy_session_cookie_name_is_accepted() {
     );
 }
 
+/// 계획 74 리뷰 2: 두 이름의 값이 달라 옛 이름 쪽 세션을 고르면 응답이 새 이름 쿠키를 그 값으로 다시 쓴다(로그인과
+/// 같은 속성) — 뒤에 옛 판 노드에서만 로그아웃해도 새 이름 쿠키에 앞 사용자의 세션이 남지 않게. 값이 같거나 새 이름
+/// 쪽을 고르면 쓰지 않는다. 고른 옛 이름 세션을 쓸 수 없으면(비밀번호가 바뀐 세대) 새 이름 쪽을 본다.
+#[tokio::test]
+async fn a_different_old_name_session_rewrites_the_new_name_cookie() {
+    let env = Env::start().await;
+    env.user("viewer", "viewer").await;
+    let base = format!("{}/api/v1", env.base);
+    let admin = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let viewer = cookie_login(&env.base, "viewer", "password-1").await;
+    let whoami = async |cookie: &str| {
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/auth/whoami"))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap();
+        let set = set_cookies(&resp);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        (body["name"].clone(), set)
+    };
+    let mixed = format!("{admin}; opl_session={}", cookie_value(&viewer));
+    let (name, set) = whoami(&mixed).await;
+    assert_eq!(name, "viewer");
+    assert_eq!(
+        set,
+        [format!(
+            "orbivisor_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200",
+            cookie_value(&viewer)
+        )]
+    );
+    // 같은 값(새 판 노드의 로그인), 새 이름만, 옛 이름이 끝난 세션: 쓰지 않는다.
+    let same = format!("{admin}; opl_session={}", cookie_value(&admin));
+    assert_eq!(whoami(&same).await, (json!("admin"), vec![]));
+    assert_eq!(whoami(&admin).await, (json!("admin"), vec![]));
+    let ended = format!("{admin}; opl_session={:064x}", 1);
+    assert_eq!(whoami(&ended).await, (json!("admin"), vec![]));
+
+    // 옛 이름 쪽 세션이 지난 세대(그 뒤 비밀번호가 바뀜)면 새 이름 쪽(admin)으로 들어간다.
+    let viewer_user = env
+        .cluster
+        .get_by_name::<UserSpec>("viewer")
+        .unwrap()
+        .unwrap();
+    let stale = "e".repeat(64);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    env.cluster
+        .create(&Session::new(
+            hex::encode(Sha256::digest(stale.as_bytes())),
+            SessionSpec {
+                user: viewer_user.id,
+                epoch: viewer_user.spec.session_epoch + 1,
+                expires_at: now + 3600,
+                pending: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let (name, set) = whoami(&format!("{admin}; opl_session={stale}")).await;
+    assert_eq!(name, "admin");
+    assert!(set.is_empty(), "{set:?}");
+}
+
 #[tokio::test]
 async fn roles_limit_what_users_can_do() {
     let env = Env::start().await;

@@ -320,9 +320,47 @@ fn deleted(result: Result<u64, ClusterError>) -> Result<(), ApiError> {
     }
 }
 
-/// 세션 쿠키의 값. 새 이름 먼저, 없으면 옛 이름(둘 다 있으면 새 것).
-pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<&str> {
-    cookie_value(headers, SESSION_COOKIE).or_else(|| cookie_value(headers, LEGACY_SESSION_COOKIE))
+/// 세션 쿠키 값을 볼 차례(계획 74). 두 이름의 값이 같거나 하나만 있으면 그 값 하나다. 다르면 옛 이름이 먼저다: 새 판
+/// 노드는 두 이름에 같은 값을 쓰므로, 다른 값은 그 뒤 옛 판 노드에서 한 로그인(옛 이름만 씀) — 더 나중의 로그인이다
+/// (리뷰 1 M2). 인증([`AppState::session_login`])과 로그아웃의 감사 주체가 같은 차례를 쓴다.
+pub(crate) fn session_cookies(headers: &HeaderMap) -> [Option<&str>; 2] {
+    let new = cookie_value(headers, SESSION_COOKIE);
+    let legacy = cookie_value(headers, LEGACY_SESSION_COOKIE);
+    match (new, legacy) {
+        (Some(n), Some(l)) if n != l => [Some(l), Some(n)],
+        (n, l) => [n.or(l), None],
+    }
+}
+
+/// 새 판 노드가 두 이름의 값이 다른 쿠키에서 옛 이름 쪽 세션을 골랐을 때, 응답에서 새 이름 쿠키를 그 값으로 다시
+/// 쓰게 하는 자리(리뷰 2). 그러면 뒤에 옛 판 노드에서만 로그아웃해도(옛 이름만 지움) 새 이름 쿠키에 앞 사용자의
+/// 세션이 남지 않는다. [`resync_session_cookie`] 미들웨어가 요청마다 둔다.
+#[derive(Clone, Default)]
+pub(crate) struct SessionCookieResync(Arc<Mutex<Option<axum::http::HeaderValue>>>);
+
+/// [`SessionCookieResync`]를 요청에 두고, 채워졌으면 응답에 새 이름 세션 쿠키를 더한다. 응답이 이미 새 이름 쿠키를
+/// 쓰면(로그인·로그아웃) 그대로 둔다.
+pub(crate) async fn resync_session_cookie(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let slot = SessionCookieResync::default();
+    req.extensions_mut().insert(slot.clone());
+    let mut res = next.run(req).await;
+    let value = slot.0.lock().unwrap().take();
+    if let Some(value) = value {
+        let prefix = format!("{SESSION_COOKIE}=");
+        let sets = res
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .any(|v| v.as_bytes().starts_with(prefix.as_bytes()));
+        if !sets {
+            res.headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    res
 }
 
 /// `Cookie` 헤더들에서 `name` 쿠키의 값
@@ -633,37 +671,41 @@ impl AppState {
 
     /// 쿠키 세션과 그 사용자. 대기 세션도 돌려준다(부르는 쪽이 `pending`을 본다).
     fn session_login(&self, parts: &Parts) -> Result<(User, FoundSession, String), ApiError> {
-        // 계획 74: 두 이름의 값이 다르면 옛 이름을 먼저 본다. 새 판 노드는 두 이름에 같은 값을 쓰므로, 다른 값은 그 뒤
-        // 옛 판 노드에서 한 로그인(옛 이름만 씀)이다 — 더 나중의 로그인이다(리뷰 1 M2: 같은 브라우저에서 다른 사용자로
-        // 로그인하면 노드마다 다른 사용자가 되지 않게). 옛 이름의 세션이 끝났으면 새 이름을 본다. 옛 판 노드에서
-        // 로그아웃(옛 이름만 지움)하고 다시 로그인한 브라우저에는 끝난 `orbivisor_session`이 남는다(1e760031, 다음 판에서 뺌).
-        let new = cookie_value(&parts.headers, SESSION_COOKIE);
-        let legacy = cookie_value(&parts.headers, LEGACY_SESSION_COOKIE);
-        let order = match (new, legacy) {
-            (Some(n), Some(l)) if n != l => [Some(l), Some(n)],
-            (n, l) => [n.or(l), None],
-        };
+        // 계획 74: 두 이름의 값이 다르면 옛 이름을 먼저 본다([`session_cookies`]). 고른 세션이 끝났거나 쓸 수 없으면
+        // (비밀번호 바뀜, 영역 없음 — 리뷰 2) 다른 이름을 본다. 옛 판 노드에서 로그아웃(옛 이름만 지움)하고 다시 로그인한
+        // 브라우저에는 끝난 `orbivisor_session`이 남는다(1e760031, 다음 판에서 뺌).
+        let order = session_cookies(&parts.headers);
         let mut chosen = None;
         for cookie in order.into_iter().flatten() {
-            if let Some(found) = self.find_session(cookie)? {
-                chosen = Some((cookie, found));
-                break;
+            let Some(found) = self.find_session(cookie)? else {
+                continue;
+            };
+            let Some(user) = self.cluster.get::<UserSpec>(found.user)? else {
+                continue;
+            };
+            // 세션을 만든 뒤 비밀번호가 바뀌었다(다른 노드에서 바뀌었을 수도 있다). Raft 세션은 리더의
+            // 정리 작업이 지운다.
+            if user.spec.session_epoch != found.epoch {
+                self.sessions.remove(cookie);
+                continue;
             }
+            if !self.realm_exists(&user)? {
+                continue;
+            }
+            chosen = Some((cookie, user, found));
+            break;
         }
-        let (session, found) = chosen.ok_or_else(ApiError::unauthorized)?;
+        let (session, user, found) = chosen.ok_or_else(ApiError::unauthorized)?;
         self.check_cookie_origin(parts)?;
-        let user = self
-            .cluster
-            .get::<UserSpec>(found.user)?
-            .ok_or_else(ApiError::unauthorized)?;
-        // 세션을 만든 뒤 비밀번호가 바뀌었다(다른 노드에서 바뀌었을 수도 있다). Raft 세션은 리더의
-        // 정리 작업이 지운다.
-        if user.spec.session_epoch != found.epoch {
-            self.sessions.remove(session);
-            return Err(ApiError::unauthorized());
-        }
-        if !self.realm_exists(&user)? {
-            return Err(ApiError::unauthorized());
+        // 두 이름의 값이 달라 옛 이름 쪽을 골랐으면 응답에서 새 이름 쿠키를 같은 값·속성으로 다시 쓴다(리뷰 2).
+        if order[1].is_some()
+            && order[0] == Some(session)
+            && let Some(slot) = parts.extensions.get::<SessionCookieResync>()
+        {
+            let web_origin = crate::proxy::from_web_origin(parts);
+            let value =
+                crate::users::session_set_cookie(self, session, SESSION_TTL.as_secs(), web_origin)?;
+            *slot.0.lock().unwrap() = Some(value[0].clone());
         }
         Ok((user, found, session.to_string()))
     }
@@ -1076,20 +1118,32 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_prefers_the_new_name() {
+    fn session_cookies_put_a_different_old_name_first() {
         let cookies = |v: &str| {
             let mut h = HeaderMap::new();
             h.insert(COOKIE, v.parse().unwrap());
             h
         };
-        assert_eq!(session_cookie(&cookies("orbivisor_session=n")), Some("n"));
-        // 옛 판 노드가 만든 세션
-        assert_eq!(session_cookie(&cookies("a=1; opl_session=o")), Some("o"));
         assert_eq!(
-            session_cookie(&cookies("opl_session=o; orbivisor_session=n")),
-            Some("n")
+            session_cookies(&cookies("orbivisor_session=n")),
+            [Some("n"), None]
         );
-        assert_eq!(session_cookie(&cookies("x_opl_session=o")), None);
-        assert_eq!(session_cookie(&HeaderMap::new()), None);
+        // 옛 판 노드가 만든 세션
+        assert_eq!(
+            session_cookies(&cookies("a=1; opl_session=o")),
+            [Some("o"), None]
+        );
+        // 새 판 노드의 로그인(같은 값)
+        assert_eq!(
+            session_cookies(&cookies("opl_session=s; orbivisor_session=s")),
+            [Some("s"), None]
+        );
+        // 그 뒤 옛 판 노드에서 한 로그인(다른 값): 옛 이름 먼저
+        assert_eq!(
+            session_cookies(&cookies("opl_session=o; orbivisor_session=n")),
+            [Some("o"), Some("n")]
+        );
+        assert_eq!(session_cookies(&cookies("x_opl_session=o")), [None, None]);
+        assert_eq!(session_cookies(&HeaderMap::new()), [None, None]);
     }
 }
