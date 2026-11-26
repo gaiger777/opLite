@@ -4340,8 +4340,9 @@ fn placement_node_row(n: &Value) -> Vec<String> {
 const CAPACITY_NODE_HEADERS: &[&str] = &[
     "NODE",
     "ONLINE",
-    "VCPUS",
+    "SHARED",
     "OVERCOMMIT",
+    "DEDICATED",
     "CPU",
     "MEMORY",
     "MEM USED",
@@ -4352,8 +4353,8 @@ const CAPACITY_NODE_HEADERS: &[&str] = &[
 const CAPACITY_POOL_HEADERS: &[&str] =
     &["POOL", "PROVISIONED", "USED", "TOTAL", "VOLUMES", "NODES"];
 
-/// `capacity`의 노드 행: VCPUS는 공유 정책 VM의 vCPU/공유 스레드(`threads − reserved − dedicated_total` — 오버커밋과 같은
-/// 셈, 웹 표의 CPU 막대와 같음), MEMORY는 할당/전체,
+/// `capacity`의 노드 행: SHARED는 공유 정책 VM의 vCPU/공유 스레드(`threads − reserved − dedicated_total` — 오버커밋과 같은
+/// 셈, 웹 표의 CPU 막대와 같음), DEDICATED는 잡힌 전용 CPU/전용 CPU(리뷰 1), CPU는 노드 전체 사용률, MEMORY는 할당/전체,
 /// STORAGE는 로컬 풀 프로비전 합/전체 합
 fn capacity_node_row(n: &Value) -> Vec<String> {
     let cpu = &n["cpu"];
@@ -4386,6 +4387,11 @@ fn capacity_node_row(n: &Value) -> Vec<String> {
         .into(),
         format!("{}/{shared}", cell(&cpu["vcpus_shared"])),
         ratio(&cpu["overcommit"]),
+        format!(
+            "{}/{}",
+            cell(&cpu["dedicated_used"]),
+            cell(&cpu["dedicated_total"])
+        ),
         percent_cell(&cpu["use_pct"]),
         mib_pair_cell(&mem["allocated_mib"], &mem["total_mib"]),
         mib_cell(&mem["used_mib"]),
@@ -16123,7 +16129,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         assert!(Cli::try_parse_from(["oplctl", "placement", "status"]).is_ok());
     }
 
-    /// `capacity` 행: vCPU는 공유 vCPU/공유 스레드, 오버커밋·사용률·사용 메모리가 없으면 `-`, 로컬 풀은 합
+    /// `capacity` 행: 공유 vCPU/공유 스레드와 전용 잡힘/전용을 따로, 오버커밋·사용률·사용 메모리가 없으면 `-`, 로컬 풀은 합
     #[test]
     fn capacity_rows() {
         let node = json!({
@@ -16146,6 +16152,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "yes",
                 "18/10",
                 "x1.80",
+                "2/4",
                 "37.2%",
                 "32.0GiB/64.0GiB",
                 "16.0GiB",
@@ -16161,7 +16168,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         });
         assert_eq!(
             capacity_node_row(&bare),
-            ["svc02", "no", "0/0", "-", "-", "0B/0B", "-", "-"]
+            ["svc02", "no", "0/0", "-", "0/0", "-", "0B/0B", "-", "-"]
         );
         let pool = json!({ "pool": "ceph", "total_bytes": 1024, "used_bytes": 0,
                            "provisioned_bytes": 2048, "volumes": 2, "nodes_ready": 1, "nodes": 2 });

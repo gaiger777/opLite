@@ -92,8 +92,12 @@ pub struct MemoryCapacity {
     pub total_mib: u64,
     /// hugepages 풀로 떼어 둔 메모리(보통 VM은 쓰지 못함)
     pub reserved_mib: u64,
-    /// 자리 잡은 VM에 할당한 메모리(`memory_mib` 합)
+    /// 자리 잡은 VM에 할당한 메모리(`memory_mib` 합, hugepages VM 포함)
     pub allocated_mib: u64,
+    /// 그 가운데 hugepages 풀에서 받는 VM의 몫(계획 75 리뷰 1)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub allocated_hugepages_mib: u64,
     /// 실제 사용(배치 부하 요약, 없으면 없음)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
@@ -102,10 +106,23 @@ pub struct MemoryCapacity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub hugepages: Vec<HugepageCapacity>,
-    /// 할당 ÷ 노드 메모리. 노드 메모리를 모르면 없다.
+    /// 보통 메모리의 오버커밋: hugepages 아닌 VM의 할당 ÷ (노드 메모리 − hugepages 풀). 보통 VM은 그 풀을 쓰지 못한다.
+    /// 노드 메모리를 모르면 없다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub overcommit: Option<f64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// VM 메모리가 hugepages에서 오는지: 켤 때 정한 NUMA 모양의 페이지, 기록이 없으면 스펙
+fn on_hugepages(vm: &Vm) -> bool {
+    match vm.status.hardware.as_ref().and_then(numa::now) {
+        Some(n) => n.page.is_some(),
+        None => vm.spec.hugepages.is_some(),
+    }
 }
 
 /// 크기 하나의 hugepages(페이지 수)
@@ -202,6 +219,14 @@ fn ratio(a: u64, b: u64) -> Option<f64> {
     (b > 0).then(|| a as f64 / b as f64)
 }
 
+/// 보통 메모리의 오버커밋(노드 메모리를 모르면 없음, 풀이 노드 메모리를 다 가져가면 보통 VM이 있을 때 무한이 아니라
+/// 할당 그대로 ÷ 1MiB로 크게 보인다)
+fn normal_overcommit(allocated: u64, on_pages: u64, total: u64, reserved: u64) -> Option<f64> {
+    (total > 0).then(|| {
+        allocated.saturating_sub(on_pages) as f64 / total.saturating_sub(reserved).max(1) as f64
+    })
+}
+
 /// 크기 순(2M, 1G) hugepages 목록: 풀이 있거나 쓰는 크기만
 fn hugepages(
     total: impl Fn(PageKind) -> u64,
@@ -292,13 +317,24 @@ fn node_capacity(
         .map(|k| total_pages(k) * u64::from(k.size_mib()))
         .sum();
     let allocated_mib: u64 = here.iter().map(|v| u64::from(v.spec.memory_mib)).sum();
+    let allocated_hugepages_mib: u64 = here
+        .iter()
+        .filter(|v| on_hugepages(v))
+        .map(|v| u64::from(v.spec.memory_mib))
+        .sum();
     let memory = MemoryCapacity {
         total_mib: node.status.memory_mib,
         reserved_mib,
         allocated_mib,
+        allocated_hugepages_mib,
         used_mib: load.and_then(|l| l.mem_used_mib),
         hugepages: hugepages(total_pages, |k| used_pages.get(&k).copied().unwrap_or(0)),
-        overcommit: ratio(allocated_mib, node.status.memory_mib),
+        overcommit: normal_overcommit(
+            allocated_mib,
+            allocated_hugepages_mib,
+            node.status.memory_mib,
+            reserved_mib,
+        ),
     };
 
     let numa = match (topology, &sets) {
@@ -452,11 +488,17 @@ fn totals(nodes: &[NodeCapacity], shared: &[SharedPoolCapacity]) -> CapacityTota
     }
     let total_mib = online.iter().map(|n| n.memory.total_mib).sum();
     let allocated_mib = online.iter().map(|n| n.memory.allocated_mib).sum();
+    let allocated_hugepages_mib = online
+        .iter()
+        .map(|n| n.memory.allocated_hugepages_mib)
+        .sum();
+    let reserved_mib = online.iter().map(|n| n.memory.reserved_mib).sum();
     let used: Vec<u64> = online.iter().filter_map(|n| n.memory.used_mib).collect();
     let memory = MemoryCapacity {
         total_mib,
-        reserved_mib: online.iter().map(|n| n.memory.reserved_mib).sum(),
+        reserved_mib,
         allocated_mib,
+        allocated_hugepages_mib,
         used_mib: (!used.is_empty()).then(|| used.iter().sum()),
         hugepages: pages
             .into_iter()
@@ -466,7 +508,12 @@ fn totals(nodes: &[NodeCapacity], shared: &[SharedPoolCapacity]) -> CapacityTota
                 used,
             })
             .collect(),
-        overcommit: ratio(allocated_mib, total_mib),
+        overcommit: normal_overcommit(
+            allocated_mib,
+            allocated_hugepages_mib,
+            total_mib,
+            reserved_mib,
+        ),
     };
 
     let mut storage = StorageTotals::default();
@@ -697,6 +744,10 @@ mod tests {
         // 공유 스레드 8 − 1 − 4 = 3에 공유 vCPU 6
         assert_eq!(c.cpu.overcommit, Some(2.0));
         assert_eq!(c.memory.reserved_mib, 1024);
+        // 보통 메모리 오버커밋은 hugepages VM(db 512)과 풀(1024)을 뺀다: 2048 ÷ (16384 − 1024)
+        assert_eq!(c.memory.allocated_hugepages_mib, 512);
+        assert_eq!(c.memory.overcommit, Some(2048.0 / 15360.0));
+        assert_eq!(cap.totals.memory.overcommit, c.memory.overcommit);
         assert_eq!(
             c.memory.hugepages,
             [HugepageCapacity {
@@ -718,6 +769,34 @@ mod tests {
         let json =
             serde_json::to_value(build(&[node("b", 2, 1024, true)], &[], &[], &[], &[])).unwrap();
         assert!(json["nodes"][0].get("numa").is_none(), "{json}");
+    }
+
+    /// hugepages를 크게 떼어 둔 노드(64G 가운데 32G)에 보통 VM 40G: 보통 메모리는 넘쳤다(×1.25, ×0.63이 아님).
+    #[test]
+    fn memory_overcommit_leaves_out_the_hugepage_pool() {
+        let mut n = node("a", 8, 65536, true);
+        n.status.topology = Some(
+            serde_json::from_value(json!({
+                "sockets": 1, "threads_per_core": 1, "cpus": "0-7",
+                "nodes": [{ "id": 0, "cpus": "0-7", "memory_mib": 65536,
+                            "hugepages": [{ "size_kib": 1048576, "total": 32 }] }],
+                "pinning": true, "cpuset": true, "probed_at": 1
+            }))
+            .unwrap(),
+        );
+        let v = vm(
+            "big",
+            json!({ "cores": 2 }),
+            40960,
+            Some(&n),
+            VmPhase::Running,
+        );
+        let cap = build(std::slice::from_ref(&n), &[v], &[], &[], &[]);
+        let m = &cap.nodes[0].memory;
+        assert_eq!((m.reserved_mib, m.allocated_hugepages_mib), (32768, 0));
+        assert_eq!(m.overcommit, Some(1.25));
+        let json = serde_json::to_value(m).unwrap();
+        assert!(json.get("allocated_hugepages_mib").is_none(), "{json}");
     }
 
     fn pool(name: &str, backend: serde_json::Value) -> StoragePool {
