@@ -7,7 +7,8 @@
 # 넘어간 뒤에도 켜지 않는다.
 # 이름 바꾸기(계획 74): 유닛의 실제 파일은 orbivisord.service, opld.service는 그 별칭 링크다. 옛 이름의 enable 링크
 # (multi-user.target.wants/opld.service)와 덮어쓰기(opld.service.d)를 새 이름으로 옮긴다 — 옛 enable 링크만 있으면
-# is-enabled orbivisord가 disabled다. 덮어쓰기 디렉터리는 옮긴 뒤 옛 이름을 링크로 남긴다.
+# is-enabled orbivisord가 disabled다. 덮어쓰기 디렉터리는 옮긴 뒤 옛 이름을 링크로 남긴다. /etc의 진짜 opld.service는
+# orbivisord.service로 옮기고, mask한 opld는 orbivisord도 mask한 채 둔다(move_unit_links).
 # systemd가 돌지 않으면(컨테이너, 설치 프로그램의 chroot) 링크만 옮기고, 처음 설치이고 enable 링크가 없을 때
 # enable(링크 만들기)만 한다.
 set -eu
@@ -33,22 +34,55 @@ swtpm_apparmor() {
 	fi
 }
 
-# 옛 이름의 enable 링크·덮어쓰기를 새 이름으로 옮긴다. 옮긴 것이 있으면 0으로 끝난다.
+# 옛 이름의 유닛 파일·enable 링크·덮어쓰기를 새 이름으로 옮긴다. 0: 옮긴 것이 있음, 1: 없음, 2: 실패(어디서 멈췄는지 알림).
+# `if`·`||` 안에서 부르므로 set -e가 꺼진다 — 명령마다 실패를 돌려준다(리뷰 1 M3).
+# /etc의 opld.service(리뷰 1 I2): `systemctl edit --full opld`로 만든 진짜 파일이면 /usr/lib의 별칭을 가려 두 이름이 다른
+# 유닛이 된다 — orbivisord.service로 옮기고(내용은 운영자 것 그대로) 옛 이름은 그것으로의 링크로 남긴다. mask(/dev/null
+# 링크)면 orbivisord.service도 mask하고 시작하지 않는다.
+masked=no
 move_unit_links() {
 	moved=1
 	wants="$SYSTEMD_ETC/multi-user.target.wants"
+	old_unit="$SYSTEMD_ETC/opld.service"
+	new_unit="$SYSTEMD_ETC/orbivisord.service"
+	if [ -L "$old_unit" ] && [ "$(readlink "$old_unit")" = /dev/null ]; then
+		masked=yes
+		if [ ! -e "$new_unit" ] && [ ! -L "$new_unit" ]; then
+			ln -s /dev/null "$new_unit" || return 2
+			moved=0
+		fi
+	elif [ -f "$old_unit" ] && [ ! -L "$old_unit" ]; then
+		if [ -e "$new_unit" ] || [ -L "$new_unit" ]; then
+			echo "orbivisor: both $old_unit and $new_unit exist; left them as they are (merge them by hand and make $old_unit a link to orbivisord.service)" >&2
+		else
+			mv "$old_unit" "$new_unit" || return 2
+			ln -s orbivisord.service "$old_unit" || return 2
+			moved=0
+		fi
+	fi
 	if [ -L "$wants/opld.service" ]; then
-		rm -f "$wants/opld.service"
-		ln -sf "$UNIT" "$wants/orbivisord.service"
+		rm -f "$wants/opld.service" || return 2
+		ln -sf "$UNIT" "$wants/orbivisord.service" || return 2
 		moved=0
 	fi
 	if [ -d "$SYSTEMD_ETC/opld.service.d" ] && [ ! -L "$SYSTEMD_ETC/opld.service.d" ] &&
 		[ ! -e "$SYSTEMD_ETC/orbivisord.service.d" ]; then
-		mv "$SYSTEMD_ETC/opld.service.d" "$SYSTEMD_ETC/orbivisord.service.d"
-		ln -s orbivisord.service.d "$SYSTEMD_ETC/opld.service.d"
+		mv "$SYSTEMD_ETC/opld.service.d" "$SYSTEMD_ETC/orbivisord.service.d" || return 2
+		ln -s orbivisord.service.d "$SYSTEMD_ETC/opld.service.d" || return 2
 		moved=0
 	fi
 	return $moved
+}
+
+# move_unit_links를 부르고 실패면 알리고 끝낸다(옛 데몬은 그대로 돈다 — 고친 뒤 `dpkg --configure -a`).
+move_units() {
+	rc=0
+	move_unit_links || rc=$?
+	if [ "$rc" = 2 ]; then
+		echo "orbivisor: cannot move the old opld.service unit files in $SYSTEMD_ETC to orbivisord.service; fix it and run dpkg --configure -a" >&2
+		exit 1
+	fi
+	return "$rc"
 }
 
 case "$1" in
@@ -66,10 +100,12 @@ configure | abort-remove | abort-deconfigure)
 	if [ -d "$SYSTEMD_DIR" ]; then
 		# 돌고 있는 opld.service가 새 실제 파일의 별칭으로 orbivisord.service에 합쳐진다(MainPID 그대로).
 		systemctl daemon-reload || true
-		if move_unit_links; then
+		if move_units; then
 			systemctl daemon-reload || true
 		fi
-		if systemctl is-enabled --quiet orbivisord.service; then
+		if [ "$masked" = yes ]; then
+			echo "orbivisor: opld.service is masked; orbivisord.service is masked too and not started" >&2
+		elif systemctl is-enabled --quiet orbivisord.service; then
 			# VM의 QEMU는 자기 scope에 있어 데몬을 다시 시작해도 계속 돈다.
 			systemctl restart orbivisord.service || true
 		elif [ "$first" = yes ]; then
@@ -78,8 +114,9 @@ configure | abort-remove | abort-deconfigure)
 			systemctl start orbivisord.service || true
 		fi
 	else
-		move_unit_links || true
-		if [ "$first" = yes ] && [ ! -L "$SYSTEMD_ETC/multi-user.target.wants/orbivisord.service" ]; then
+		move_units || true
+		if [ "$first" = yes ] && [ "$masked" = no ] &&
+			[ ! -L "$SYSTEMD_ETC/multi-user.target.wants/orbivisord.service" ]; then
 			systemctl enable orbivisord.service || true
 		fi
 	fi

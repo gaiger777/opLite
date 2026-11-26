@@ -30,7 +30,8 @@ VERSION=$1
 OUT_DIR=$2
 [ -n "$VERSION" ] || usage
 
-# 옛 이름 OPL_LICENSE_KEYS로 빌드하는 릴리스 파이프라인도 한 릴리스 동안 받는다(계획 74).
+# 옛 이름 OPL_LICENSE_KEYS·OPL_APT_KEY·OPL_BIN_DIR로 빌드하는 릴리스 파이프라인도 한 릴리스 동안 받는다(계획 74 — 빠지면
+# 말없이 키링 없는 패키지가 나오거나 다른 바이너리를 담는다).
 ORBIVISOR_LICENSE_KEYS=${ORBIVISOR_LICENSE_KEYS:-${OPL_LICENSE_KEYS:-}}
 
 if [ -z "${ORBIVISOR_LICENSE_KEYS:-}" ] && [ "${ORBIVISOR_DEV_LICENSE:-}" != 1 ]; then
@@ -40,7 +41,7 @@ fi
 
 DEB_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$DEB_DIR/../.." && pwd)
-BIN_DIR=${ORBIVISOR_BIN_DIR:-$ROOT/target/release}
+BIN_DIR=${ORBIVISOR_BIN_DIR:-${OPL_BIN_DIR:-$ROOT/target/release}}
 
 if [ -n "${ORBIVISOR_LICENSE_KEYS:-}" ]; then
 	DEV_KEY=$(cat "$ROOT/crates/orbivisor-types/keys/dev-license.pub")
@@ -119,7 +120,7 @@ if [ -n "$IMAGE_SRC" ]; then
 	fi
 fi
 
-APT_KEY=${ORBIVISOR_APT_KEY:-}
+APT_KEY=${ORBIVISOR_APT_KEY:-${OPL_APT_KEY:-}}
 if [ -n "$APT_KEY" ] && [ ! -f "$APT_KEY" ]; then
 	echo "build-deb: ORBIVISOR_APT_KEY의 $APT_KEY 이 없다" >&2
 	exit 1

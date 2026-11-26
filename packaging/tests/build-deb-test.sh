@@ -8,7 +8,7 @@
 set -eu
 
 # 사용자 셸의 값에 결과가 흔들리지 않게 한다(아래 run이 ORBIVISOR_DEV_LICENSE 기본 1을 준다).
-unset ORBIVISOR_DEV_LICENSE ORBIVISOR_LICENSE_KEYS
+unset ORBIVISOR_DEV_LICENSE ORBIVISOR_LICENSE_KEYS OPL_LICENSE_KEYS OPL_APT_KEY OPL_BIN_DIR
 
 DEB_DIR="$(cd "$(dirname "$0")/../deb" && pwd)"
 WORK="$(mktemp -d)"
@@ -220,6 +220,17 @@ if [ "$code" -eq 0 ] && cmp -s "$WORK/archive.gpg" "$WORK/tree-orbivisor/$KEYRIN
 	ok "ORBIVISOR_APT_KEY의 키링을 싣는다"
 else
 	fail "키링: 종료 코드 $code"
+	cat "$WORK/stderr"
+fi
+# 옛 이름 OPL_APT_KEY·OPL_BIN_DIR로 빌드하는 파이프라인(계획 74 리뷰 1): 키링을 빠뜨리지 않는다.
+rm -rf "$WORK/out"
+code=0
+PATH="$WORK/fakebin:$PATH" OPL_BIN_DIR="$WORK/bin" OPL_APT_KEY="$WORK/archive.gpg" ORBIVISOR_DEV_LICENSE=1 \
+	sh "$DEB_DIR/build-deb.sh" 0.1.0 "$WORK/out" >"$WORK/stdout" 2>"$WORK/stderr" || code=$?
+if [ "$code" -eq 0 ] && cmp -s "$WORK/archive.gpg" "$WORK/tree-orbivisor/$KEYRING"; then
+	ok "옛 이름 OPL_APT_KEY·OPL_BIN_DIR도 받는다"
+else
+	fail "옛 이름 OPL_APT_KEY·OPL_BIN_DIR: 종료 코드 $code"
 	cat "$WORK/stderr"
 fi
 ORBIVISOR_APT_KEY="$WORK/missing.gpg" run 0.1.0

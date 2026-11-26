@@ -131,6 +131,59 @@ if [ -L "$WANTS/orbivisord.service" ] && [ ! -L "$WANTS/opld.service" ]; then ec
 	FAILED=1
 fi
 rm -rf "$ETC"
+# /etc의 진짜 opld.service(`systemctl edit --full opld`, 리뷰 1 I2): orbivisord.service로 옮기고(내용 그대로) 옛 이름은 링크.
+mkdir -p "$WANTS"
+printf '[Service]\nExecStart=/usr/bin/orbivisord --config /srv/node.toml\n' >"$ETC/opld.service"
+ln -sf "$ETC/opld.service" "$WANTS/opld.service"
+check "업그레이드: /etc의 진짜 opld.service를 새 이름으로" yes "daemon-reload
+daemon-reload
+is-enabled --quiet orbivisord.service
+restart orbivisord.service" postinst configure 0.1.0
+if [ -f "$ETC/orbivisord.service" ] && [ ! -L "$ETC/orbivisord.service" ] &&
+	grep -qF -- '--config /srv/node.toml' "$ETC/orbivisord.service" &&
+	[ "$(readlink "$ETC/opld.service")" = orbivisord.service ] &&
+	[ -L "$WANTS/orbivisord.service" ] && [ ! -L "$WANTS/opld.service" ]; then
+	echo "ok   운영자의 유닛 파일은 orbivisord.service, opld.service는 그 링크"
+else
+	echo "FAIL /etc 유닛 옮긴 뒤: $(ls -la "$ETC")"
+	FAILED=1
+fi
+check "업그레이드: /etc 유닛 이미 옮김" yes "daemon-reload
+is-enabled --quiet orbivisord.service
+restart orbivisord.service" postinst configure 0.1.0
+rm -rf "$ETC"
+# mask한 opld(/dev/null 링크): orbivisord.service도 mask하고 다시 시작·enable하지 않는다.
+mkdir -p "$ETC"
+ln -s /dev/null "$ETC/opld.service"
+check "업그레이드: mask한 opld는 orbivisord도 mask" yes "daemon-reload
+daemon-reload" postinst configure 0.1.0
+if [ "$(readlink "$ETC/orbivisord.service")" = /dev/null ]; then echo "ok   orbivisord.service도 mask"; else
+	echo "FAIL orbivisord.service를 mask하지 않았다"
+	FAILED=1
+fi
+ORBIVISOR_FAKE_ENABLED=no check "처음 설치: mask한 opld는 enable하지 않음" yes "daemon-reload" postinst configure
+check "처음 설치(systemd 없음): mask한 opld는 enable하지 않음" no "" postinst configure
+rm -rf "$ETC"
+# 옮기기가 실패하면(읽기 전용 등) 성공으로 끝내지 않는다(리뷰 1 M3) — 다시 시작하지 않고 0이 아닌 코드.
+if [ "$(id -u)" != 0 ]; then
+	mkdir -p "$WANTS" "$ETC/opld.service.d"
+	ln -sf /usr/lib/systemd/system/opld.service "$WANTS/opld.service"
+	chmod 0555 "$ETC"
+	: >"$WORK/log"
+	if PATH="$WORK/bin:$PATH" ORBIVISOR_FAKE_LOG="$WORK/log" ORBIVISOR_SYSTEMD_DIR="$WORK/systemd-running" \
+		ORBIVISOR_SYSTEMD_ETC="$ETC" ORBIVISOR_APPARMOR_DIR="$WORK/apparmor" \
+		"$DEB_DIR/postinst" configure 0.1.0 2>"$WORK/err"; then
+		echo "FAIL 옮기기 실패가 성공으로 끝났다"
+		FAILED=1
+	elif grep -q restart "$WORK/log" || ! grep -q 'cannot move' "$WORK/err"; then
+		echo "FAIL 옮기기 실패 뒤: $(cat "$WORK/log" "$WORK/err")"
+		FAILED=1
+	else
+		echo "ok   옮기기 실패는 알리고 0이 아닌 코드(다시 시작 없음)"
+	fi
+	chmod 0755 "$ETC"
+	rm -rf "$ETC"
+fi
 # 옛 oplite V0에서 바로 넘어옴: V0의 enable 링크(opld.service)를 옮기고 다시 시작한다.
 mkdir -p "$WANTS"
 ln -sf /lib/systemd/system/opld.service "$WANTS/opld.service"
