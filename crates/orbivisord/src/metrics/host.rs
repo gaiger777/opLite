@@ -23,6 +23,17 @@ pub struct ProcStat {
     pub rss_mib: u64,
 }
 
+/// 인터페이스 하나의 누적 카운터(`/sys/class/net/<if>/statistics`, 계획 75)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IfaceCounters {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_errors: u64,
+    pub tx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_dropped: u64,
+}
+
 /// 호스트 값을 읽는다. 읽지 못하면 `None`이다.
 pub trait HostProbe: Send + Sync {
     /// 모든 코어를 합한 CPU 시간
@@ -38,6 +49,11 @@ pub trait HostProbe: Send + Sync {
     fn tap_bytes(&self, name: &str) -> Option<(u64, u64)>;
     /// `path`가 있는 파일 시스템의 (쓰는 MiB, 전체 MiB)
     fn fs(&self, path: &Path) -> Option<(u64, u64)>;
+    /// 인터페이스 `name`의 누적 카운터(계획 75). Linux만 읽는다(그 밖은 없음).
+    fn iface_counters(&self, name: &str) -> Option<IfaceCounters> {
+        let _ = name;
+        None
+    }
 }
 
 /// 이 OS의 [`HostProbe`]
@@ -245,6 +261,26 @@ impl HostProbe for LinuxProbe {
 
     fn fs(&self, path: &Path) -> Option<(u64, u64)> {
         statvfs_mib(path)
+    }
+
+    fn iface_counters(&self, name: &str) -> Option<IfaceCounters> {
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            return None;
+        }
+        let counter = |c: &str| -> Option<u64> {
+            self.read(&format!("sys/class/net/{name}/statistics/{c}"))?
+                .trim()
+                .parse()
+                .ok()
+        };
+        Some(IfaceCounters {
+            rx_bytes: counter("rx_bytes")?,
+            tx_bytes: counter("tx_bytes")?,
+            rx_errors: counter("rx_errors")?,
+            tx_errors: counter("tx_errors")?,
+            rx_dropped: counter("rx_dropped")?,
+            tx_dropped: counter("tx_dropped")?,
+        })
     }
 }
 
@@ -611,6 +647,32 @@ intr 12345
         assert_eq!(probe.tap_bytes("opabcn0"), Some((30, 40)));
         assert_eq!(probe.tap_bytes("../../proc"), None);
         assert_eq!(probe.tap_bytes("nope"), None);
+        // 계획 75: 인터페이스 카운터 여섯(하나라도 없으면 없음)
+        assert_eq!(probe.iface_counters("eth0"), None);
+        for (c, v) in [
+            ("rx_errors", 1),
+            ("tx_errors", 2),
+            ("rx_dropped", 3),
+            ("tx_dropped", 4),
+        ] {
+            write(
+                root,
+                &format!("sys/class/net/eth0/statistics/{c}"),
+                &format!("{v}\n"),
+            );
+        }
+        assert_eq!(
+            probe.iface_counters("eth0"),
+            Some(IfaceCounters {
+                rx_bytes: 1000,
+                tx_bytes: 2000,
+                rx_errors: 1,
+                tx_errors: 2,
+                rx_dropped: 3,
+                tx_dropped: 4,
+            })
+        );
+        assert_eq!(probe.iface_counters("../eth0"), None);
         let (used, total) = probe.fs(root).unwrap();
         assert!(total > 0 && used <= total);
     }

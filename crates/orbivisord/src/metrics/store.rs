@@ -83,8 +83,13 @@ fn push<T>(series: &mut VecDeque<T>, sample: T) {
 }
 
 impl MetricsStore {
+    /// 인터페이스별 값(계획 75)은 실시간 표본이라 마지막 점에만 남긴다(1시간 시리즈의 점마다 64개까지 달면 메모리와
+    /// `/metrics/nodes` 응답이 커진다). 앞 점의 것은 새 점이 들어올 때 지운다.
     pub fn push_node(&self, sample: NodeSample) {
         let mut inner = self.inner.lock().unwrap();
+        if let Some(last) = inner.node.back_mut() {
+            last.interfaces = Vec::new();
+        }
         push(&mut inner.node, sample);
         inner.node_pushed += 1;
         inner.total += 1;
@@ -574,5 +579,36 @@ mod tests {
         // 이 노드에서 잰 적이 없는 VM은 시리즈가 없다.
         let other = source.read(&query(MetricsScope::Vm { id: Uuid::now_v7() }, None));
         assert!(other.vms.is_empty());
+    }
+
+    /// 계획 75: 인터페이스별 값은 마지막 점에만 남고, 노드 사이 응답(JSON)에 그대로 실린다. 기록 쓰기의 값에는 들지 않는다.
+    #[test]
+    fn interface_samples_stay_only_on_the_last_point() {
+        let store = Arc::new(MetricsStore::default());
+        let with = |t: i64, name: &str| NodeSample {
+            interfaces: vec![orbivisor_types::metrics::IfaceSample {
+                name: name.into(),
+                rx_bps: Some(10.0),
+                tx_bps: Some(20.0),
+                rx_errors: Some(0),
+                tx_errors: Some(1),
+                rx_dropped: None,
+                tx_dropped: None,
+            }],
+            ..node(t)
+        };
+        store.push_node(with(1_000, "eno1"));
+        store.push_node(with(2_000, "eno2"));
+        let source = StoreSource::new(Uuid::now_v7(), store.clone());
+        let reply = source.read(&query(MetricsScope::Nodes, None));
+        let samples = &reply.node.as_ref().unwrap().samples;
+        assert!(samples[0].interfaces.is_empty());
+        assert_eq!(samples[1].interfaces[0].name, "eno2");
+        let json = serde_json::to_value(&reply).unwrap();
+        assert!(json["node"]["samples"][0].get("interfaces").is_none());
+        assert_eq!(json["node"]["samples"][1]["interfaces"][0]["tx_errors"], 1);
+        assert_eq!(serde_json::from_value::<MetricsReply>(json).unwrap(), reply);
+        let pending = store.take_pending(&mut Marks::default());
+        assert_eq!(pending.node[1].values(), node(2_000).values());
     }
 }

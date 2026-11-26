@@ -1,8 +1,8 @@
 //! HA 상태 검사의 노드 쪽 검사기(설계 §8.2). [`CHECK_INTERVAL`]마다 켜진 `HaCheck`와 클러스터 링크의 자동 검사
 //! (`cluster-link-<n>`)를 이 노드의 대상으로 동시에 돌려 결과를 리스 갱신에 싣고(`Cluster::set_lease_checks`),
-//! 저장된 것과 다르면 `NodeStatus.checks`에 쓴다(화면용). 인터페이스 목록(`NodeStatus.interfaces`)도 여기서
-//! 쓰고, 본딩 상태가 바뀌면 감사 항목과 기록 Task(`bond-degraded`)로 알린다. 노드 CPU 탐침(계획 63, [`CpuWatch`])도
-//! 회차마다 거두어 카탈로그를 올리고 `NodeStatus.cpu`를 쓴다. 노드 NUMA 토폴로지 탐침(계획 64, [`TopologyWatch`])도
+//! 저장된 것과 다르면 `NodeStatus.checks`에 쓴다(화면용). 인터페이스 목록(`NodeStatus.interfaces`, lldpd가 있으면
+//! LLDP 이웃도 — 계획 75)도 여기서 쓰고, 본딩 상태가 바뀌면 감사 항목과 기록 Task(`bond-degraded`)로 알린다. 노드
+//! CPU 탐침(계획 63, [`CpuWatch`])도 회차마다 거두어 카탈로그를 올리고 `NodeStatus.cpu`를 쓴다. 노드 NUMA 토폴로지 탐침(계획 64, [`TopologyWatch`])도
 //! 회차마다 노드 설정 `host_resources`를 적용하고 30초마다 다시 읽어 `NodeStatus.topology`를 쓴다. 노드 SDN 에이전트(계획 65,
 //! [`SdnReport`])가 읽은 `NodeStatus.sdn`도 여기서 쓴다. 위트니스는 띄우지 않는다.
 
@@ -177,6 +177,10 @@ pub struct State {
     interfaces_at: Option<Instant>,
     /// 마지막 `ip` 실패(같은 실패를 회차마다 적지 않는다)
     ip_error: Option<String>,
+    /// LLDP 이웃을 묻는 `lldpcli`(계획 75)
+    lldpcli: Lldpcli,
+    /// 마지막 `lldpcli` 실패(같은 실패를 회차마다 적지 않는다)
+    lldp_error: Option<String>,
     /// 검사 이름 → (실패·degraded 상태, 노드 시계로 시작된 유닉스 초)
     since: HashMap<String, (CheckState, u64)>,
     /// 시간 안에 끝나지 않은 디렉터리 probe(디렉터리별). 끝날 때까지 새로 띄우지 않는다.
@@ -191,6 +195,14 @@ pub struct State {
     topology: Option<TopologyWatch>,
     /// 도는 VM의 스레드 고정 맞추기(계획 64). 없으면 하지 않는다.
     pins: Option<PinWatch>,
+}
+
+/// `lldpcli`(계획 75): 처음 쓸 때 `PATH`에서 찾고, 없으면 다음 시작까지 다시 찾지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lldpcli {
+    Unsearched,
+    Missing,
+    At(PathBuf),
 }
 
 /// 도는 VM의 스레드 고정을 [`PROBE_EVERY`] 회차(30초)마다, 노드 설정 `host_resources`가 바뀌면 곧바로 맞춘다(§7·§10:
@@ -264,6 +276,8 @@ impl State {
             auto_ifaces: HashMap::new(),
             interfaces_at: None,
             ip_error: None,
+            lldpcli: Lldpcli::Unsearched,
+            lldp_error: None,
             since: HashMap::new(),
             stuck: HashMap::new(),
             pvs_cache: HashMap::new(),
@@ -304,7 +318,8 @@ impl State {
                 .await
                 .and_then(|json| orbivisor_driver::interfaces(&self.config.net, &json));
             match read {
-                Ok(list) => {
+                Ok(mut list) => {
+                    self.attach_lldp(&mut list).await;
                     self.seen.extend(list.iter().map(|i| i.name.clone()));
                     self.interfaces = Some(list);
                     self.ip_error = None;
@@ -320,6 +335,38 @@ impl State {
         }
         if let Some(list) = &mut self.interfaces {
             orbivisor_driver::refresh_interfaces(&self.config.net, list);
+        }
+    }
+
+    /// lldpd가 있으면 이웃을 물어 이름이 같은 인터페이스에 붙인다([`INTERFACES_EVERY`]마다, `ip`와 함께). 묻지 못하면
+    /// 이웃 없이 둔다.
+    async fn attach_lldp(&mut self, list: &mut [NodeInterface]) {
+        if self.lldpcli == Lldpcli::Unsearched {
+            self.lldpcli = match orbivisor_driver::find_in_path("lldpcli") {
+                Some(bin) => Lldpcli::At(bin),
+                None => {
+                    tracing::info!(
+                        "lldpcli not found: install lldpd to see the switch ports of the interfaces"
+                    );
+                    Lldpcli::Missing
+                }
+            };
+        }
+        let Lldpcli::At(bin) = &self.lldpcli else {
+            return;
+        };
+        match orbivisor_driver::lldp_neighbors(bin).await {
+            Ok(neighbors) => {
+                orbivisor_driver::attach_lldp(list, &neighbors);
+                self.lldp_error = None;
+            }
+            Err(e) => {
+                let e = e.to_string();
+                if self.lldp_error.as_ref() != Some(&e) {
+                    tracing::info!(error = %e, "cannot read the LLDP neighbors");
+                }
+                self.lldp_error = Some(e);
+            }
         }
     }
 
@@ -1179,6 +1226,7 @@ mod tests {
                 self.audit.clone(),
             );
             state.ip = "/nonexistent/ip".into();
+            state.lldpcli = Lldpcli::Missing;
             state
         }
 
@@ -2101,6 +2149,53 @@ mod tests {
         let mut fresh = s.state(&[]);
         run_once(&mut fresh).await;
         assert_eq!(s.node().status.interfaces, interfaces);
+    }
+
+    /// 계획 75: lldpcli가 있으면 `ip`와 함께 이웃을 물어 노드 상태의 인터페이스에 붙이고(짧은 회차에도 남음), 실패하면
+    /// 이웃 없이 쓴다. 없으면 묻지 않는다.
+    #[tokio::test]
+    async fn lldp_neighbors_are_attached_to_the_interfaces() {
+        let s = setup().await;
+        s.bond(1);
+        let mut state = s.state(&[]);
+        s.fake_ip(&mut state, IP_JSON);
+        let lldp = r#"{"lldp":{"interface":{"eno1":{"via":"LLDP","chassis":{"tor-a":{"id":{"type":"mac","value":"00:1c:73:aa:bb:cc"}}},"port":{"id":{"type":"ifname","value":"Gi1/0/12"}}}}}}"#;
+        state.lldpcli = Lldpcli::At(s.script(
+            "fake-lldpcli",
+            &format!("#!/bin/sh\ncat <<'EOF'\n{lldp}\nEOF\n"),
+        ));
+        run_once(&mut state).await;
+        let neighbor = |s: &Setup| {
+            s.node()
+                .status
+                .interfaces
+                .iter()
+                .map(|i| (i.name.clone(), i.lldp.clone()))
+                .collect::<Vec<_>>()
+        };
+        let want = orbivisor_types::node::LldpNeighbor {
+            chassis_name: Some("tor-a".into()),
+            chassis_id: Some("00:1c:73:aa:bb:cc".into()),
+            port_id: Some("Gi1/0/12".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            neighbor(&s),
+            [
+                ("eno1".to_string(), Some(want.clone())),
+                ("eno2".to_string(), None),
+                ("bond0".to_string(), None),
+            ]
+        );
+        // 짧은 회차(sysfs만)에도 남는다.
+        run_once(&mut state).await;
+        assert_eq!(neighbor(&s)[0].1, Some(want));
+        // lldpd가 멈추면 다음 `ip` 회차에 이웃이 빈다.
+        state.lldpcli = Lldpcli::At(s.script("bad-lldpcli", "#!/bin/sh\nexit 1\n"));
+        state.interfaces_at = None;
+        run_once(&mut state).await;
+        assert!(neighbor(&s).iter().all(|(_, n)| n.is_none()));
+        assert!(state.lldp_error.is_some());
     }
 
     /// 인터페이스가 64개를 넘어도 자동 검사는 모두에서 찾고, 노드 상태에는 주소가 있는 것을 남긴 64개를 쓴다.

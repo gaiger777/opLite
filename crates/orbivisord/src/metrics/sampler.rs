@@ -1,7 +1,7 @@
 //! 측정기. 5초마다 이 노드와 이 노드에서 도는 VM을 재어 [`MetricsStore`]에 넣는다.
 //!
 //! 비율은 직전 측정과의 차이를 걸린 시간(단조 시계)으로 나눈다. 첫 측정(시작, VM 시작·붙기, pid
-//! 바뀜, 카운터가 줄어듦)은 기준만 잡고 점을 만들지 않는다.
+//! 바뀜, 카운터가 줄어듦)은 기준만 잡고 점을 만들지 않는다. 노드 점에는 인터페이스별 값(계획 75)도 단다.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,15 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::future::join_all;
 use orbivisor_cluster::Cluster;
 use orbivisor_driver::{DiskCounters, Hypervisor, RuntimeStatus};
-use orbivisor_types::metrics::{NodeSample, VmSample};
+use orbivisor_types::metrics::{IfaceSample, MAX_IFACE_SAMPLES, NodeSample, VmSample};
 use orbivisor_types::network::{USER_NETWORK, tap_name};
+use orbivisor_types::node::{InterfaceKind, NodeInterface, NodeSpec};
 use orbivisor_types::vm::VmSpec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use uuid::Uuid;
 
-use super::host::{CpuTimes, HostProbe};
+use super::host::{CpuTimes, HostProbe, IfaceCounters};
 use super::store::MetricsStore;
 
 /// 측정 간격(고정)
@@ -81,6 +82,8 @@ struct NodeCounters {
     cpu: Option<CpuTimes>,
     disk: Option<(u64, u64)>,
     nic: Option<(u64, u64)>,
+    /// 표본 대상 인터페이스([`iface_targets`])마다 카운터(읽지 못했으면 없음)
+    ifaces: Vec<(String, Option<IfaceCounters>)>,
 }
 
 /// VM의 직전 누적 카운터. pid가 바뀌면 다시 기준을 잡는다.
@@ -119,6 +122,54 @@ fn rate(prev: Option<u64>, now: Option<u64>, secs: f64) -> Result<Option<f64>, D
     }
 }
 
+/// 인터페이스별 표본의 대상(계획 75): 노드 상태의 인터페이스(검사기가 `ip`·sysfs로 쓴 것 — lo·tap·Orbivisor 장치는 이미
+/// 빠짐) 가운데 이더넷·본딩·VLAN·브리지, [`MAX_IFACE_SAMPLES`]개까지. veth·dummy·그 밖은 뺀다.
+fn iface_targets(list: &[NodeInterface]) -> Vec<String> {
+    list.iter()
+        .filter(|i| {
+            matches!(
+                i.kind,
+                InterfaceKind::Ethernet
+                    | InterfaceKind::Bond
+                    | InterfaceKind::Vlan
+                    | InterfaceKind::Bridge
+            )
+        })
+        .take(MAX_IFACE_SAMPLES)
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// 직전·지금 카운터로 인터페이스별 표본: 바이트는 초당(노드 합계 `net_*_bps`처럼 바이트/초), 오류·버림은 늘어난 수.
+/// 처음 본(직전 카운터가 없는)·사라진(지금 읽지 못한) 인터페이스는 값이 없고, 줄어든 카운터(되감김)는 그 값만 없다.
+/// 두 번 다 읽지 못한 인터페이스(카운터를 읽지 못하는 OS)는 뺀다.
+fn iface_samples(
+    prev: &[(String, Option<IfaceCounters>)],
+    now: &[(String, Option<IfaceCounters>)],
+    secs: f64,
+) -> Vec<IfaceSample> {
+    now.iter()
+        .filter_map(|(name, now)| {
+            let prev = prev.iter().find(|(n, _)| n == name).and_then(|(_, c)| *c);
+            if prev.is_none() && now.is_none() {
+                return None;
+            }
+            let pair = prev.zip(*now).filter(|_| secs > 0.0);
+            let delta =
+                |f: fn(&IfaceCounters) -> u64| pair.and_then(|(p, n)| f(&n).checked_sub(f(&p)));
+            Some(IfaceSample {
+                name: name.clone(),
+                rx_bps: delta(|c| c.rx_bytes).map(|d| d as f64 / secs),
+                tx_bps: delta(|c| c.tx_bytes).map(|d| d as f64 / secs),
+                rx_errors: delta(|c| c.rx_errors),
+                tx_errors: delta(|c| c.tx_errors),
+                rx_dropped: delta(|c| c.rx_dropped),
+                tx_dropped: delta(|c| c.tx_dropped),
+            })
+        })
+        .collect()
+}
+
 fn node_sample(
     prev: &NodeCounters,
     now: &NodeCounters,
@@ -148,7 +199,7 @@ fn node_sample(
         net_tx_bps: rate(second(prev.nic), second(now.nic), secs)?,
         fs_used_mib: fs.map(|f| f.0),
         fs_total_mib: fs.map(|f| f.1),
-        interfaces: Vec::new(),
+        interfaces: iface_samples(&prev.ifaces, &now.ifaces, secs),
     })
 }
 
@@ -255,11 +306,23 @@ impl Sampler {
     }
 
     fn sample_node(&mut self, at: Instant, t: i64) {
+        // 대상 인터페이스는 이 노드의 상태에서 온다(읽지 못하면 이번에는 없다).
+        let targets = match self.cluster.get::<NodeSpec>(self.cluster.id().0) {
+            Ok(Some(me)) => iface_targets(&me.status.interfaces),
+            _ => Vec::new(),
+        };
         let now = NodeCounters {
             at,
             cpu: self.probe.cpu_times(),
             disk: self.probe.disk_bytes(),
             nic: self.probe.nic_bytes(),
+            ifaces: targets
+                .into_iter()
+                .map(|name| {
+                    let counters = self.probe.iface_counters(&name);
+                    (name, counters)
+                })
+                .collect(),
         };
         if let Some(prev) = &self.node
             && let Ok(sample) = node_sample(
@@ -414,6 +477,7 @@ mod tests {
         processes: HashMap<u32, ProcStat>,
         taps: HashMap<String, (u64, u64)>,
         fs: Option<(u64, u64)>,
+        ifaces: HashMap<String, IfaceCounters>,
         /// `process()`가 불린 시각들
         process_calls: Vec<Instant>,
     }
@@ -447,6 +511,9 @@ mod tests {
         }
         fn fs(&self, _path: &Path) -> Option<(u64, u64)> {
             self.0.lock().unwrap().fs
+        }
+        fn iface_counters(&self, name: &str) -> Option<IfaceCounters> {
+            self.0.lock().unwrap().ifaces.get(name).copied()
         }
     }
 
@@ -701,6 +768,166 @@ mod tests {
         tokio::time::advance(INTERVAL).await;
         f.sampler.tick().await;
         assert_eq!(node_samples(&f.store)[2].disk_read_bps, None);
+    }
+
+    fn counters(bytes: u64, errors: u64) -> IfaceCounters {
+        IfaceCounters {
+            rx_bytes: bytes,
+            tx_bytes: bytes * 2,
+            rx_errors: errors,
+            tx_errors: errors * 2,
+            rx_dropped: errors * 3,
+            tx_dropped: errors * 4,
+        }
+    }
+
+    fn iface(name: &str, kind: InterfaceKind) -> NodeInterface {
+        NodeInterface {
+            name: name.into(),
+            kind,
+            state: "up".into(),
+            carrier: Some(true),
+            speed_mbps: None,
+            mac: None,
+            master: None,
+            addresses: vec![],
+            bond: None,
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
+        }
+    }
+
+    /// 계획 75: 대상은 이더넷·본딩·VLAN·브리지(veth·dummy·그 밖 제외), 64개까지(순서 그대로).
+    #[test]
+    fn iface_targets_are_physical_bond_vlan_and_bridge() {
+        let list = [
+            iface("eno1", InterfaceKind::Ethernet),
+            iface("veth1", InterfaceKind::Veth),
+            iface("bond0", InterfaceKind::Bond),
+            iface("dummy0", InterfaceKind::Dummy),
+            iface("bond0.100", InterfaceKind::Vlan),
+            iface("vmbr0", InterfaceKind::Bridge),
+            iface("vxlan9", InterfaceKind::Other),
+        ];
+        assert_eq!(
+            iface_targets(&list),
+            ["eno1", "bond0", "bond0.100", "vmbr0"]
+        );
+        let many: Vec<_> = (0..MAX_IFACE_SAMPLES + 6)
+            .map(|i| iface(&format!("eth{i}"), InterfaceKind::Ethernet))
+            .collect();
+        let targets = iface_targets(&many);
+        assert_eq!(targets.len(), MAX_IFACE_SAMPLES);
+        assert_eq!(
+            targets.last().unwrap(),
+            &format!("eth{}", MAX_IFACE_SAMPLES - 1)
+        );
+    }
+
+    /// 계획 75: 바이트는 초당, 오류·버림은 늘어난 수. 처음 본·사라진 인터페이스는 값이 없고, 되감긴 카운터는 그 값만 없다.
+    /// 두 번 다 읽지 못한 인터페이스는 뺀다.
+    #[test]
+    fn iface_samples_are_deltas() {
+        let prev = vec![
+            ("eno1".to_string(), Some(counters(1_000, 1))),
+            ("eno2".to_string(), Some(counters(1_000, 1))),
+            ("bond0".to_string(), Some(counters(5_000, 0))),
+            ("gone".to_string(), Some(counters(0, 0))),
+            ("never".to_string(), None),
+        ];
+        let mut wrapped = counters(9_000, 0);
+        wrapped.rx_bytes = 10;
+        let now = vec![
+            ("eno1".to_string(), Some(counters(6_000, 4))),
+            ("eno2".to_string(), Some(counters(1_000, 1))),
+            ("bond0".to_string(), Some(wrapped)),
+            ("gone".to_string(), None),
+            ("never".to_string(), None),
+            ("new0".to_string(), Some(counters(1, 1))),
+        ];
+        let got = iface_samples(&prev, &now, 5.0);
+        let names: Vec<&str> = got.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["eno1", "eno2", "bond0", "gone", "new0"]);
+        assert_eq!(
+            got[0],
+            IfaceSample {
+                name: "eno1".into(),
+                rx_bps: Some(1_000.0),
+                tx_bps: Some(2_000.0),
+                rx_errors: Some(3),
+                tx_errors: Some(6),
+                rx_dropped: Some(9),
+                tx_dropped: Some(12),
+            }
+        );
+        assert_eq!(
+            (got[1].rx_bps, got[1].rx_errors, got[1].tx_dropped),
+            (Some(0.0), Some(0), Some(0))
+        );
+        // 받기 바이트만 되감겼다.
+        assert_eq!((got[2].rx_bps, got[2].tx_bps), (None, Some(1_600.0)));
+        assert_eq!(got[2].rx_errors, Some(0));
+        let empty = |s: &IfaceSample| {
+            [s.rx_bps, s.tx_bps].iter().all(Option::is_none)
+                && [s.rx_errors, s.tx_errors, s.rx_dropped, s.tx_dropped]
+                    .iter()
+                    .all(Option::is_none)
+        };
+        assert!(empty(&got[3]) && empty(&got[4]));
+        // 걸린 시간이 없으면 값이 없다.
+        assert!(iface_samples(&prev, &now, 0.0).iter().all(empty));
+    }
+
+    /// 계획 75: 노드 점에 이 노드 상태의 인터페이스별 값이 달리고, 저장소에는 마지막 점에만 남는다.
+    #[tokio::test]
+    async fn node_samples_carry_interface_rates() {
+        let mut f = fixture().await;
+        let mut me: orbivisor_types::node::Node = Resource::new(
+            "n1",
+            NodeSpec {
+                sdn: None,
+                host_resources: None,
+                address: "h:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        me.id = f.cluster.id().0;
+        me.status.interfaces = vec![
+            iface("eno1", InterfaceKind::Ethernet),
+            iface("veth1", InterfaceKind::Veth),
+        ];
+        f.cluster.create(&me).await.unwrap();
+        tokio::time::pause();
+        f.probe.set(|v| {
+            v.cpu = Some(CpuTimes { busy: 0, total: 0 });
+            v.ifaces.insert("eno1".into(), counters(0, 0));
+            v.ifaces.insert("veth1".into(), counters(0, 0));
+        });
+        f.sampler.tick().await;
+        tokio::time::advance(INTERVAL).await;
+        f.probe.set(|v| {
+            v.ifaces.insert("eno1".into(), counters(50_000, 2));
+            v.ifaces.insert("veth1".into(), counters(50_000, 2));
+        });
+        f.sampler.tick().await;
+        let samples = node_samples(&f.store);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].interfaces.len(), 1);
+        let eno1 = &samples[0].interfaces[0];
+        assert_eq!(eno1.name, "eno1");
+        assert_eq!((eno1.rx_bps, eno1.tx_bps), (Some(10_000.0), Some(20_000.0)));
+        assert_eq!((eno1.rx_errors, eno1.tx_dropped), (Some(2), Some(8)));
+
+        tokio::time::advance(INTERVAL).await;
+        f.sampler.tick().await;
+        let samples = node_samples(&f.store);
+        assert_eq!(samples.len(), 2);
+        assert!(samples[0].interfaces.is_empty());
+        assert_eq!(samples[1].interfaces[0].rx_bps, Some(0.0));
     }
 
     #[tokio::test]
