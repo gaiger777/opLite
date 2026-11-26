@@ -74,8 +74,11 @@ export function capacityRow(
     used: n.storage.reduce((s, p) => s + p.used_bytes, 0),
   };
   const poolErrors = n.storage.filter((p) => !p.ready).length;
-  const faults = physical?.impact?.length ?? 0;
-  const unreachable = physical?.unreachable?.length ?? 0;
+  // 본딩 구성 포트의 장애는 본딩 하나로 센다(배지·경보와 같은 수). 오프라인 노드의 마지막으로 본 장애는 세지 않는다
+  // (`offline`이 이미 있다 — 리뷰 2).
+  const live = n.online ? physical : undefined;
+  const faults = new Set((live?.impact ?? []).map((i) => i.bond ?? i.port)).size;
+  const unreachable = live?.unreachable?.length ?? 0;
   const problems: Problem[] = [];
   if (!n.online) problems.push("offline");
   if ((n.cpu.overcommit ?? 0) > CPU_OVERCOMMIT_LIMIT || (n.memory.overcommit ?? 0) > 1) {

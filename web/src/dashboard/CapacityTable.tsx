@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/table";
 import { StatusChip } from "@/components/StatusChip";
 import type { MapSelection } from "@/dashboard/selection";
-import { cpuText, memoryText, storageText } from "@/dashboard/texts";
+import { cpuText, cpuUseText, memoryText, storageText } from "@/dashboard/texts";
 import { UsageBar } from "@/dashboard/UsageBar";
 import { WidgetCard } from "@/dashboard/WidgetCard";
 import { formatBytes } from "@/lib/format";
@@ -31,7 +31,8 @@ function Bars({ row, compact }: { row: CapacityRow; compact: boolean }) {
         compact={compact}
         label={t("physical.table.cpuOf", { node: row.node })}
         m={row.cpu}
-        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
+        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuDedicated)}
+        note={cpuUseText(t, row.cpuUsePct)}
       />
       <UsageBar
         compact={compact}
@@ -55,11 +56,14 @@ const COUNT: Partial<Record<CapacityRow["problems"][number], keyof CapacityRow>>
   unreachable: "unreachable",
 };
 
-function Problems({ row }: { row: CapacityRow }) {
+function Problems({ row, pending }: { row: CapacityRow; pending: boolean }) {
   const { t } = useTranslation();
-  // 물리 관계를 받지 못했으면 "장애 없음"이 아니라 "모름"이다(리뷰 1).
+  // 물리 관계를 받지 못했으면 "장애 없음"이 아니라 "모름"이다(리뷰 1). 첫 답을 기다리는 동안은 "확인 중"(리뷰 2).
   const unknown = row.linkUnknown && (
-    <StatusChip tone="neutral">? {t("physical.problem.linkUnknown")}</StatusChip>
+    <StatusChip tone="neutral">
+      <span aria-hidden>? </span>
+      {t(pending ? "physical.problem.linkChecking" : "physical.problem.linkUnknown")}
+    </StatusChip>
   );
   if (row.problems.length === 0) {
     return (
@@ -87,12 +91,15 @@ function Problems({ row }: { row: CapacityRow }) {
 export function CapacityTable({
   capacity,
   physical,
+  linkPending = false,
   selected,
   onSelect,
   phone,
 }: {
   capacity: Capacity;
+  /** 없으면 링크 상태를 모른다(첫 답 전이면 `linkPending`) */
   physical?: readonly NodePhysical[];
+  linkPending?: boolean;
   selected: MapSelection | null;
   onSelect(s: MapSelection): void;
   phone: boolean;
@@ -168,7 +175,7 @@ export function CapacityTable({
                 >
                   {row.node}
                 </button>
-                <Problems row={row} />
+                <Problems row={row} pending={linkPending} />
               </div>
               <Bars row={row} compact={false} />
             </li>
@@ -215,7 +222,8 @@ export function CapacityTable({
                     compact
                     label={t("physical.table.cpuOf", { node: row.node })}
                     m={row.cpu}
-                    text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
+                    text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuDedicated)}
+                    note={cpuUseText(t, row.cpuUsePct)}
                   />
                 </TableCell>
                 <TableCell className="min-w-40">
@@ -235,7 +243,7 @@ export function CapacityTable({
                   />
                 </TableCell>
                 <TableCell>
-                  <Problems row={row} />
+                  <Problems row={row} pending={linkPending} />
                 </TableCell>
               </TableRow>
             ))}

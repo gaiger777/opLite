@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import { useAlertRules, useNotificationTargets } from "@/alerts/alerts";
 import { isLink, LINK_DEFAULTS } from "@/alerts/rules";
 import { api, call } from "@/api/client";
+import { useList } from "@/api/live";
 import { usePermissions } from "@/auth/usePermissions";
 import { FormDialog } from "@/components/FormDialog";
 import { Button } from "@/components/ui/button";
@@ -21,10 +22,15 @@ export function LinkAlertsCard() {
   const manage = usePermissions().can("write", "alert-rule");
   // 규칙을 바꿀 수 없는 사용자는 묻지도 않는다(홈마다 403을 받지 않게).
   const rules = useAlertRules(manage);
+  const nodes = useList("node");
   const [open, setOpen] = useState(false);
   if (!manage || !rules.data || rules.data.some((r) => isLink(r.spec.condition.kind))) {
     return null;
   }
+  // 링크 규칙은 모든 노드(꺼진 것 포함)가 `link-alerts`를 알아야 만든다 — 409를 받기 전에 까닭을 보인다(리뷰 2).
+  const old = (nodes.data ?? [])
+    .filter((n) => !(n.status.features ?? []).includes("link-alerts"))
+    .map((n) => n.name);
   return (
     <section
       aria-labelledby="link-alerts"
@@ -34,9 +40,13 @@ export function LinkAlertsCard() {
         <h2 id="link-alerts" className="text-sm font-medium">
           {t("physical.alerts.title")}
         </h2>
-        <p className="text-xs text-muted-foreground">{t("physical.alerts.none")}</p>
+        <p className="text-xs text-muted-foreground">
+          {old.length > 0
+            ? t("physical.alerts.oldNodes", { nodes: old.join(", ") })
+            : t("physical.alerts.none")}
+        </p>
       </div>
-      <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+      <Button variant="outline" size="sm" disabled={old.length > 0} onClick={() => setOpen(true)}>
         <BellPlus />
         {t("physical.alerts.enable")}
       </Button>

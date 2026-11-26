@@ -75,7 +75,11 @@ export function Legend({
         [{ background: PORT_COLOR.down }, k("portDown")],
         [{ borderColor: PORT_COLOR.up, borderWidth: 2 }, k("bond")],
         [{ background: RAIL_COLOR }, k("rail")],
-        [{ borderColor: PORT_COLOR.down, borderStyle: "dashed", borderWidth: 2 }, k("wireDown")],
+        [{ borderColor: PORT_COLOR.down, borderWidth: 2 }, k("wireDown")],
+        [
+          { borderColor: "var(--muted-foreground)", borderStyle: "dotted", borderWidth: 2 },
+          k("wireUnknown"),
+        ],
         [{ background: "var(--danger)", borderRadius: 0 }, k("fault")],
       );
     }

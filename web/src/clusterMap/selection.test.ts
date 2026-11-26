@@ -64,6 +64,12 @@ it("finds the focus by name or id", () => {
     node: `node:${n1}`,
     key: `port:${n1}/eno3`,
   });
+  // 본딩 이름(본딩 경보의 지도 링크) → 그 묶음의 구성 포트(리뷰 2)
+  expect(focusOf({ kind: "port", node: "n1", port: "bond0" }, model, scene)).toEqual({
+    kind: "port",
+    node: `node:${n1}`,
+    key: `port:${n1}/eno1`,
+  });
   // 줄에 없는 포트(남는 eno4) → 그 노드
   expect(focusOf({ kind: "port", node: "n1", port: "eno4" }, model, scene)).toEqual({
     kind: "node",

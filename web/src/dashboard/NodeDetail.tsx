@@ -8,7 +8,7 @@ import type { Vm } from "@/api/types";
 import { StatusChip } from "@/components/StatusChip";
 import { ChainDiagram } from "@/dashboard/ChainDiagram";
 import type { MapSelection } from "@/dashboard/selection";
-import { cpuText, memoryText, storageText } from "@/dashboard/texts";
+import { cpuText, cpuUseText, memoryText, storageText } from "@/dashboard/texts";
 import { UsageBar } from "@/dashboard/UsageBar";
 import { formatCapacity, formatMib } from "@/lib/format";
 import { useNodeTopology } from "@/numa/numa";
@@ -124,7 +124,8 @@ function CpuSection({ cap, vms, nodeName }: { cap: NodeCapacity; vms: Vm[]; node
       <UsageBar
         label={t("physical.table.cpu")}
         m={row.cpu}
-        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
+        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuDedicated)}
+        note={cpuUseText(t, row.cpuUsePct)}
       />
       {top.length > 0 && (
         <ul aria-label={t("physical.cpu.vms")} className="flex flex-col gap-0.5 text-xs">
@@ -314,7 +315,12 @@ export function NetworkSection({
           · {t("physical.chain.vms", { count: u.vms })}
         </p>
       ))}
-      <ChainDiagram chain={chain} highlight={highlight} samples={sample.data?.interfaces} />
+      <ChainDiagram
+        chain={chain}
+        highlight={highlight}
+        samples={sample.data?.interfaces}
+        node={node.node}
+      />
     </Section>
   );
 }

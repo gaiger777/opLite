@@ -43,14 +43,16 @@
       "link_other": "링크 장애 {{count}}",
       "linkUnknown": "링크 상태 모름",
       "unreachable_one": "네트워크 {{count}}개 없음",
-      "unreachable_other": "네트워크 {{count}}개 없음"
+      "unreachable_other": "네트워크 {{count}}개 없음",
+      "linkChecking": "링크 확인 중"
     },
     "health": {
       "up": "정상",
       "degraded": "저하",
       "down": "끊김",
       "absent": "없음",
-      "unknown": "모름"
+      "unknown": "모름",
+      "missing": "사라짐"
     },
     "chain": {
       "summaryOk_one": "네트워크 사슬, 원소 {{count}}개, 장애 없음",
@@ -131,7 +133,8 @@
       "retry": "다시 시도",
       "stale": "마지막으로 본 값",
       "unreachableAt": "{{node}}에 네트워크 {{network}}이(가) 없음",
-      "staleRefresh": "다시 읽지 못해 마지막 답을 보입니다."
+      "staleRefresh": "다시 읽지 못해 마지막 답을 보입니다.",
+      "maintenance": "유지보수"
     },
     "rail": {
       "bridge": "브리지",
@@ -153,11 +156,22 @@
     },
     "alerts": {
       "title": "링크 경보",
-      "none": "업링크 포트·본딩을 보는 규칙이 아직 없습니다.",
+      "none": "업링크·서비스 포트와 본딩을 보는 규칙이 아직 없습니다.",
       "enable": "링크 경보 켜기",
-      "dialogDescription": "권하는 링크 규칙(업링크 포트 끊김, 본딩 저하)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
+      "dialogDescription": "권하는 링크 규칙(업링크·서비스 포트 끊김, 본딩 저하)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
       "created_one": "링크 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개).",
-      "created_other": "링크 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개)."
-    }
+      "created_other": "링크 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개).",
+      "oldNodes": "옛 판 노드가 있습니다({{nodes}}). 업그레이드하거나, 없어진 노드는 지우면 링크 경보를 켤 수 있습니다."
+    },
+    "forget": {
+      "action": "잊기",
+      "title": "{{node}}의 {{port}}를 잊을까요?",
+      "description": "NIC를 빼거나 바꾼 뒤에 씁니다. 노드가 이 포트를 더는 기억하지 않고 그 링크 경보가 풀립니다. 아직 쓰는 포트는 다음 수집에서 다시 기억합니다."
+    },
+    "use": {
+      "cluster": "클러스터 링크",
+      "management": "관리"
+    },
+    "badgeMaintenance": "유지보수 {{count}}"
   }
 }

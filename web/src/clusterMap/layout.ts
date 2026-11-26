@@ -163,7 +163,8 @@ export interface PortItem {
   node: string;
   index: number;
   box: Box;
-  tone: LinkTone;
+  /** 오프라인 노드의 포트는 `unknown`(마지막 색을 지금처럼 보이지 않게) */
+  tone: LinkTone | "unknown";
   bond: string | null;
   /** 이 포트의 장애 무게(위에 작은 표시) */
   fault: "down" | "degraded" | null;
@@ -174,7 +175,7 @@ export interface BondFrame {
   name: string;
   /** 바닥 높이의 납작한 상자(윗면 = 테두리) */
   box: Box;
-  tone: LinkTone;
+  tone: LinkTone | "unknown";
   fault: "down" | "degraded" | null;
 }
 

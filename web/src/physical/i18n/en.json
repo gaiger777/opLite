@@ -43,14 +43,16 @@
       "link_other": "{{count}} link faults",
       "linkUnknown": "link state unknown",
       "unreachable_one": "{{count}} network missing",
-      "unreachable_other": "{{count}} networks missing"
+      "unreachable_other": "{{count}} networks missing",
+      "linkChecking": "checking links"
     },
     "health": {
       "up": "up",
       "degraded": "degraded",
       "down": "down",
       "absent": "not here",
-      "unknown": "unknown"
+      "unknown": "unknown",
+      "missing": "missing"
     },
     "chain": {
       "summaryOk_one": "Network chain, {{count}} element, no faults",
@@ -131,7 +133,8 @@
       "retry": "Try again",
       "stale": "last seen",
       "unreachableAt": "{{network}} is not on {{node}}",
-      "staleRefresh": "Could not refresh — showing the last answer."
+      "staleRefresh": "Could not refresh — showing the last answer.",
+      "maintenance": "maintenance"
     },
     "rail": {
       "bridge": "bridge",
@@ -153,11 +156,22 @@
     },
     "alerts": {
       "title": "Link alerts",
-      "none": "No rule watches uplink ports or bonds yet.",
+      "none": "No rule watches uplink or service ports or bonds yet.",
       "enable": "Turn on link alerts",
-      "dialogDescription": "Creates the recommended link rules (uplink port down, bond degraded). They are ordinary rules afterwards. Rules that already exist are skipped.",
+      "dialogDescription": "Creates the recommended link rules (uplink or service port down, bond degraded). They are ordinary rules afterwards. Rules that already exist are skipped.",
       "created_one": "Created {{count}} link alert rule; {{existing}} already existed.",
-      "created_other": "Created {{count}} link alert rules; {{existing}} already existed."
-    }
+      "created_other": "Created {{count}} link alert rules; {{existing}} already existed.",
+      "oldNodes": "Some nodes run an older Orbivisor ({{nodes}}). Upgrade them, or remove the ones that are gone, to turn on link alerts."
+    },
+    "forget": {
+      "action": "Forget",
+      "title": "Forget {{port}} on {{node}}?",
+      "description": "Use this after removing or replacing the NIC. The node stops remembering the port, and its link alert clears. A port still in use comes back on the next scan."
+    },
+    "use": {
+      "cluster": "cluster link",
+      "management": "management"
+    },
+    "badgeMaintenance": "{{count}} in maintenance"
   }
 }

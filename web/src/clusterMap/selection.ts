@@ -143,7 +143,10 @@ export function focusOf(target: FocusTarget, model: ClusterModel, scene: MapScen
       if (!n || !scene.byKey.has(`node:${n.id}`)) {
         return null;
       }
-      const key = `port:${n.id}/${target.port}`;
+      // 본딩 이름(본딩 경보의 지도 링크)이면 그 묶음의 끊긴(없으면 첫) 구성 포트로(리뷰 2)
+      const group = n.net?.ports.filter((p) => p.bond === target.port) ?? [];
+      const name = (group.find((p) => p.health === "down") ?? group[0])?.name ?? target.port;
+      const key = `port:${n.id}/${name}`;
       return scene.ports.has(key)
         ? { kind: "port", node: `node:${n.id}`, key }
         : { kind: "node", key: `node:${n.id}` };

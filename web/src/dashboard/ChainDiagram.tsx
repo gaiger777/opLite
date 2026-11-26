@@ -15,6 +15,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { type Chain, CHAIN_COLUMNS, type ChainItem } from "@/physical/chain";
+import { ForgetPort } from "@/physical/ForgetPort";
 import { HEALTH_TOKEN, tokenColor } from "@/physical/colors";
 
 type IfaceSample = components["schemas"]["IfaceSample"];
@@ -39,11 +40,14 @@ export function ChainDiagram({
   chain,
   highlight,
   samples,
+  node,
 }: {
   chain: Chain;
-  /** 강조할 포트 이름(포트를 골랐을 때) */
+  /** 강조할 포트 이름(포트를 골랐을 때 — 관리자가 내린 브리지면 브리지 칸) */
   highlight?: string;
   samples?: readonly IfaceSample[];
+  /** 노드 이름(사라진 포트 "잊기") */
+  node?: string;
 }) {
   const { t } = useTranslation();
   const hatch = useId().replace(/:/g, "");
@@ -119,7 +123,7 @@ export function ChainDiagram({
             })}
             {chain.items.map((item) => {
               const p = place.get(item.id)!;
-              const on = item.port?.name === highlight && highlight !== undefined;
+              const on = highlight !== undefined && (item.port?.name ?? item.label) === highlight;
               const mark = item.fault === "down" || item.health === "down" ? "× " : "";
               const sub = [
                 item.note,
@@ -204,6 +208,18 @@ export function ChainDiagram({
                     {p.speed_mbps ? ` · ${t("physical.chain.speed", { speed: p.speed_mbps })}` : ""}
                     {p.carrier === false ? ` · ${t("physical.chain.noCarrier")}` : ""}
                     {p.bond ? ` · ${p.bond.mode}` : ""}
+                    {/* 본딩의 이상한 구성 포트(사라짐·LACP 어긋남 — 리뷰 2: 왜 저하인지) */}
+                    {(p.bond?.members ?? [])
+                      .filter((m) => m.state !== "up")
+                      .map((m) => ` · ${m.name} ${t(`nodes.interfaces.portState.${m.state}`)}`)
+                      .join("")}
+                    {p.addresses?.length ? ` · ${p.addresses.join(", ")}` : ""}
+                    {p.state === "missing" && node && (
+                      <>
+                        {" "}
+                        <ForgetPort node={node} port={p.name} />
+                      </>
+                    )}
                   </TableCell>
                   <TableCell>
                     {p.lldp

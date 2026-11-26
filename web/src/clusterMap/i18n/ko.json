@@ -53,7 +53,8 @@
       "link": {
         "up": "연결됨",
         "degraded": "저하",
-        "down": "끊김"
+        "down": "끊김",
+        "unknown": "모름"
       },
       "bond": "본딩 {{name}}",
       "lldp": "스위치 {{switch}} 포트 {{port}}",
@@ -67,7 +68,8 @@
       "railNodes_one": "노드 {{count}}개",
       "railNodes_other": "노드 {{count}}개",
       "railDown": "끊김 {{count}}",
-      "railDegraded": "저하 {{count}}"
+      "railDegraded": "저하 {{count}}",
+      "railUnknown": "모름 {{count}}"
     },
     "pictureLabel": "클러스터 지도",
     "listLabel": "목록으로 본 클러스터 지도",
@@ -132,7 +134,8 @@
       "bond": "본딩(구성 포트 테두리)",
       "rail": "네트워크 레일",
       "wireDown": "레일에서 끊김(×)",
-      "fault": "링크 장애"
+      "fault": "링크 장애",
+      "wireUnknown": "모름(오프라인 노드)"
     },
     "card": {
       "cpu": "CPU",
@@ -212,8 +215,12 @@
         "up": "연결됨",
         "degraded": "저하",
         "down": "끊김",
-        "absent": "쓰지 않음"
-      }
+        "absent": "쓰지 않음",
+        "unknown": "모름",
+        "missing": "사라짐"
+      },
+      "stale": "링크를 다시 읽지 못해 마지막 답을 보입니다.",
+      "members": "구성 포트: {{list}}"
     },
     "tagFault": "링크 ✕ {{count}}",
     "legendShow": "범례"

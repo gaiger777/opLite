@@ -18,7 +18,8 @@ export type RailTone = LinkTone | "absent" | "unknown";
 /** 포트 줄의 포트 하나 */
 export interface MapPort {
   name: string;
-  health: LinkTone;
+  /** 오프라인 노드면 `unknown`(리뷰 2) */
+  health: LinkTone | "unknown";
   /** `service`는 주소를 가진 포트(스토리지·클러스터 링크·관리망, 리뷰 1) */
   role: "uplink" | "underlay" | "service";
   /** 이 포트를 묶은 본딩(줄에서 이웃으로 붙고 묶음 테두리를 같이 쓴다) */
@@ -30,7 +31,7 @@ export interface MapPort {
 /** 본딩 묶음(구성 포트를 두르는 테두리) */
 export interface MapBond {
   name: string;
-  health: LinkTone;
+  health: LinkTone | "unknown";
   mode: string;
   /** 본딩 자체의 장애(구성 포트에 링크 끊김이 없는 저하·끊김) */
   fault: Impact | null;
@@ -110,7 +111,8 @@ function carrierTop(np: NodePhysical, rail: Pick<NetRail, "kind" | "carrier">): 
 export function nodeNet(np: NodePhysical, rails: readonly MapRail[]): NodeNet {
   const impact = np.impact ?? [];
   const faultOf = (name: string) => impact.find((i) => i.port === name) ?? null;
-  const tone = (h: PhysicalPort["health"]): LinkTone => h;
+  // 오프라인 노드의 상태는 낡았다 — 마지막 색을 지금처럼 보이지 않는다(리뷰 2).
+  const tone = (h: PhysicalPort["health"]) => (np.online ? h : "unknown");
   const row = np.ports.filter(isRowPort);
   const ports: MapPort[] = [];
   const seen = new Set<string>();
@@ -147,12 +149,18 @@ export function nodeNet(np: NodePhysical, rails: readonly MapRail[]): NodeNet {
       carriers[rail.carrier] = leafPorts(np.ports, top).filter((n) => names.has(n));
     }
   }
+  // 없는 네트워크에 붙은 NIC도 장애다(배지·표와 같게 — 리뷰 2).
+  const lost = np.unreachable?.length ?? 0;
   return {
     ports,
     bonds,
-    faults: impact.length,
+    faults: impact.length + lost,
     severity:
-      impact.length === 0 ? null : impact.some((i) => i.severity === "down") ? "down" : "degraded",
+      impact.length + lost === 0
+        ? null
+        : lost || impact.some((i) => i.severity === "down")
+          ? "down"
+          : "degraded",
     legacy: np.legacy === true,
     carriers,
     raw: np,

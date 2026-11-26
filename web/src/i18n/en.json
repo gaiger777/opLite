@@ -3150,7 +3150,7 @@
       "sdn_lb_member_down": "Load balancer member down",
       "backup_verify_failed": "Backup verification failed",
       "backup_store_unavailable": "Backup store unreachable",
-      "node_link_down": "Uplink port link down",
+      "node_link_down": "Uplink or service port link down",
       "node_link_down_any": "LAN port link down",
       "bond_degraded": "Bond degraded"
     },

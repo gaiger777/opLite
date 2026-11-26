@@ -232,37 +232,73 @@ export function carrierOf(chain: Chain, networkId: string): ChainItem | undefine
 export interface FaultEntry {
   id: string;
   node: string;
-  /** 포트 장애면 포트 이름 */
+  /** 포트 장애면 보이는 이름: 포트, 본딩 구성 포트의 장애는 본딩 하나로 접는다(리뷰 2 — 경보와 같은 수) */
   port?: string;
+  /** 고를 포트(지도 포트 줄에 있는 것 — 본딩이면 끊긴 첫 구성 포트, 브리지면 없음 → 노드를 고름) */
+  focus?: string;
+  /** 본딩으로 접었으면 장애가 난 구성 포트(서버 순서) */
+  members: { port: string; missing: boolean }[];
+  /** 노드에서 사라진 포트(기억 포트) */
+  missing: boolean;
+  /** 주소를 가진 포트의 쓰임·주소(VM 수 대신 보인다 — 스토리지·클러스터 링크망) */
+  uses: string[];
+  addresses: string[];
   /** 노드에 없는 네트워크면 그 id */
   network?: string;
   severity: Fault;
   vms: number;
   /** 오프라인 노드의 마지막으로 본 값(배지 수에 넣지 않는다) */
   stale: boolean;
+  /** 유지보수 노드(경보는 조용하다 — 배지·목록에 표시) */
+  maintenance: boolean;
 }
 
 /**
  * 클러스터의 장애(노드 이름 순, 노드 안은 서버 순서 — 포트 장애 다음 없는 네트워크) — "물리 장애 n" 배지와 요약. 오프라인
- * 노드의 것은 `stale`(마지막으로 본 값)이다.
+ * 노드의 것은 `stale`(마지막으로 본 값)이다. 같은 본딩의 구성 포트 장애는 하나로 접는다. `maintenance`는 유지보수 노드 id.
  */
-export function faultList(nodes: readonly NodePhysical[]): FaultEntry[] {
-  return nodes.flatMap((n) => [
-    ...(n.impact ?? []).map((i) => ({
-      id: n.id,
-      node: n.node,
-      port: i.port,
-      severity: i.severity,
-      vms: i.vms,
-      stale: !n.online,
-    })),
-    ...(n.unreachable ?? []).map((u) => ({
-      id: n.id,
-      node: n.node,
-      network: u.network,
-      severity: "down" as const,
-      vms: u.vms,
-      stale: !n.online,
-    })),
-  ]);
+export function faultList(
+  nodes: readonly NodePhysical[],
+  maintenance: ReadonlySet<string> = new Set(),
+): FaultEntry[] {
+  return nodes.flatMap((n) => {
+    const base = { id: n.id, node: n.node, stale: !n.online, maintenance: maintenance.has(n.id) };
+    const ports = new Map(n.ports.map((p) => [p.name, p]));
+    const out: FaultEntry[] = [];
+    for (const i of n.impact ?? []) {
+      const p = ports.get(i.port);
+      const member = { port: i.port, missing: i.missing === true };
+      const folded = i.bond ? out.find((e) => e.port === i.bond) : undefined;
+      if (folded) {
+        folded.members.push(member);
+        folded.severity = worse(folded.severity, i.severity);
+        folded.missing ||= member.missing;
+        continue;
+      }
+      out.push({
+        ...base,
+        port: i.bond ?? i.port,
+        focus: p?.kind === "bridge" ? undefined : i.port,
+        members: i.bond ? [member] : [],
+        missing: member.missing,
+        uses: i.uses ?? [],
+        addresses: p?.addresses ?? [],
+        severity: i.severity,
+        vms: i.vms,
+      });
+    }
+    for (const u of n.unreachable ?? []) {
+      out.push({
+        ...base,
+        network: u.network,
+        members: [],
+        missing: false,
+        uses: [],
+        addresses: [],
+        severity: "down",
+        vms: u.vms,
+      });
+    }
+    return out;
+  });
 }

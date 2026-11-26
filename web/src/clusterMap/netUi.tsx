@@ -16,6 +16,7 @@ import {
   netPaths,
 } from "@/clusterMap/netPaths";
 import type { MapRail, RailTone } from "@/clusterMap/network";
+import { ForgetPort } from "@/physical/ForgetPort";
 
 /** 오른쪽 면 그늘(`paths.ts`의 `SHADE_OPACITY`와 같은 값) */
 const SHADE_OPACITY = 0.28;
@@ -216,7 +217,7 @@ export function PortCard({
       </p>
       <div className="flex flex-wrap gap-1">
         <StatusChip tone={LINK_CHIP[port.tone]}>
-          {t(`clusterMap.net.health.${port.tone}`)}
+          {t(`clusterMap.net.health.${raw?.state === "missing" ? "missing" : port.tone}`)}
         </StatusChip>
         {node.net?.legacy && <StatusChip tone="neutral">{t("clusterMap.net.legacy")}</StatusChip>}
       </div>
@@ -230,10 +231,23 @@ export function PortCard({
             .join(" · ")}
         </p>
       )}
+      {raw?.state === "missing" && <ForgetPort node={node.name} port={port.name} />}
+      {raw?.addresses?.length ? <p>{raw.addresses.join(", ")}</p> : null}
       {bond && (
         <p>
           {t("clusterMap.net.bond", { name: bond.name, mode: bond.bond?.mode ?? "—" })} ·{" "}
           {t(`clusterMap.net.health.${bond.health}`)}
+        </p>
+      )}
+      {/* 본딩의 이상한 구성 포트(사라짐·LACP 어긋남 — 리뷰 2: 왜 저하인지) */}
+      {bond?.bond?.members.some((m) => m.state !== "up") && (
+        <p>
+          {t("clusterMap.net.members", {
+            list: bond.bond.members
+              .filter((m) => m.state !== "up")
+              .map((m) => `${m.name} ${t(`nodes.interfaces.portState.${m.state}`)}`)
+              .join(", "),
+          })}
         </p>
       )}
       <p className={lldp ? undefined : "text-muted-foreground"}>

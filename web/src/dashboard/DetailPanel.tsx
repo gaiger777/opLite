@@ -9,8 +9,9 @@ import type { Vm } from "@/api/types";
 import { StatusChip } from "@/components/StatusChip";
 import { Sheet } from "@/components/ui/sheet";
 import { NodeDetail } from "@/dashboard/NodeDetail";
+import { pickFault } from "@/dashboard/pick";
 import type { MapSelection } from "@/dashboard/selection";
-import { cpuText, memoryText, storageText } from "@/dashboard/texts";
+import { cpuText, cpuUseText, memoryText, storageText } from "@/dashboard/texts";
 import { UsageBar } from "@/dashboard/UsageBar";
 import { errorMessage } from "@/i18n/errors";
 import { formatMib } from "@/lib/format";
@@ -18,6 +19,7 @@ import { useNodeTopology } from "@/numa/numa";
 import type { Capacity, NetRail, PhysicalTopology } from "@/physical/api";
 import { capacityRow } from "@/physical/capacity";
 import { faultList } from "@/physical/chain";
+import { ForgetPort } from "@/physical/ForgetPort";
 import { vmPath } from "@/physical/vmPath";
 import { VmPeek } from "@/vms/VmPeek";
 
@@ -33,12 +35,16 @@ function ClusterSummary({
   capacity,
   physical,
   physicalError,
+  physicalStale,
+  maintenance,
   onRetry,
   onSelect,
 }: {
   capacity: Capacity;
   physical?: PhysicalTopology;
   physicalError?: unknown;
+  physicalStale?: boolean;
+  maintenance?: ReadonlySet<string>;
   onRetry?(): void;
   onSelect(s: MapSelection): void;
 }) {
@@ -58,7 +64,7 @@ function ClusterSummary({
     allocated: totals.storage.provisioned_bytes,
     used: totals.storage.used_bytes,
   };
-  const faults = faultList(physical?.nodes ?? []);
+  const faults = faultList(physical?.nodes ?? [], maintenance);
   const rails = physical?.networks ?? [];
   const railName = new Map(rails.map((r) => [r.id, r.name]));
   const broken = rails.filter((r) =>
@@ -73,7 +79,8 @@ function ClusterSummary({
       <UsageBar
         label={t("physical.table.cpu")}
         m={row.cpu}
-        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
+        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuDedicated)}
+        note={cpuUseText(t, row.cpuUsePct)}
       />
       <UsageBar
         label={t("physical.table.memory")}
@@ -90,7 +97,8 @@ function ClusterSummary({
           ) : (
             <div className="flex flex-col items-start gap-1">
               <p className="text-sm text-muted-foreground">
-                ? {t("physical.panel.physicalUnknown")}
+                <span aria-hidden>? </span>
+                {t("physical.panel.physicalUnknown")}
               </p>
               <p className="text-xs text-muted-foreground">{errorMessage(t, physicalError)}</p>
               <button type="button" className="text-sm underline" onClick={onRetry}>
@@ -99,11 +107,22 @@ function ClusterSummary({
             </div>
           )
         ) : faults.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("physical.panel.noFaults")}</p>
+          // 다시 읽지 못했으면 "장애 없음"이라 말하지 않는다(리뷰 2).
+          <p className="text-sm text-muted-foreground">
+            {t(physicalStale ? "physical.panel.staleRefresh" : "physical.panel.noFaults")}
+          </p>
         ) : (
           <ul className="flex flex-col gap-1 text-sm">
+            {physicalStale && (
+              <li role="status" className="text-xs text-warning-fg">
+                {t("physical.panel.staleRefresh")}
+              </li>
+            )}
             {faults.map((f) => (
-              <li key={`${f.node}/${f.port ?? f.network}`} className="flex items-center gap-2">
+              <li
+                key={`${f.node}/${f.port ?? f.network}`}
+                className="flex flex-wrap items-center gap-x-2"
+              >
                 <StatusChip
                   tone={f.stale ? "neutral" : f.severity === "down" ? "danger" : "warning"}
                 >
@@ -113,13 +132,7 @@ function ClusterSummary({
                 <button
                   type="button"
                   className="underline-offset-4 hover:underline"
-                  onClick={() =>
-                    onSelect(
-                      f.port !== undefined
-                        ? { kind: "port", node: f.id, port: f.port }
-                        : { kind: "node", id: f.id },
-                    )
-                  }
+                  onClick={() => onSelect(pickFault(f))}
                 >
                   {f.port !== undefined
                     ? t("physical.panel.faultAt", { node: f.node, port: f.port })
@@ -129,9 +142,30 @@ function ClusterSummary({
                       })}
                 </button>
                 <span className="text-xs text-muted-foreground">
-                  {t("physical.chain.vms", { count: f.vms })}
-                  {f.stale && ` · ${t("physical.panel.stale")}`}
+                  {[
+                    // 본딩으로 접은 구성 포트, 사라진 포트
+                    ...f.members.map(
+                      (m) => `${m.port} ${t(`physical.health.${m.missing ? "missing" : "down"}`)}`,
+                    ),
+                    f.members.length === 0 && f.missing ? t("physical.health.missing") : undefined,
+                    // 주소를 가진 포트(스토리지·클러스터 링크망)는 VM 수 대신 쓰임·주소(리뷰 2)
+                    ...(f.vms === 0 && (f.uses.length > 0 || f.addresses.length > 0)
+                      ? [...f.uses.map((u) => t(`physical.use.${u}`)), ...f.addresses]
+                      : [t("physical.chain.vms", { count: f.vms })]),
+                    f.maintenance ? t("physical.panel.maintenance") : undefined,
+                    f.stale ? t("physical.panel.stale") : undefined,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </span>
+                {(f.members.length > 0
+                  ? f.members.filter((m) => m.missing).map((m) => m.port)
+                  : f.missing && f.port
+                    ? [f.port]
+                    : []
+                ).map((port) => (
+                  <ForgetPort key={port} node={f.node} port={port} />
+                ))}
               </li>
             ))}
           </ul>
@@ -294,7 +328,18 @@ function VmDetail({
                 ]
                   .filter(Boolean)
                   .join(" → ")}
-                {n.state && n.state !== "up" && ` · ${t(`physical.health.${n.state}`)}`}
+                {n.state && n.state !== "up" && (
+                  // 이 노드에 없는 네트워크·끊김은 노드 판과 같이 위험 표시(리뷰 2)
+                  <span
+                    className={
+                      n.state === "absent" || n.state === "down" ? "text-danger-fg" : undefined
+                    }
+                  >
+                    {" · "}
+                    {n.state === "absent" || n.state === "down" ? "× " : ""}
+                    {t(`physical.health.${n.state}`)}
+                  </span>
+                )}
               </dd>
             </div>
           ))}
@@ -309,6 +354,8 @@ export function DetailPanel({
   capacity,
   physical,
   physicalError,
+  physicalStale,
+  maintenance,
   onRetry,
   onSelect,
 }: {
@@ -317,6 +364,10 @@ export function DetailPanel({
   physical?: PhysicalTopology;
   /** 물리 관계를 받지 못한 까닭(받은 적이 있으면 없음) */
   physicalError?: unknown;
+  /** 다시 읽지 못해 마지막 답을 보이는 중 */
+  physicalStale?: boolean;
+  /** 유지보수 노드 id */
+  maintenance?: ReadonlySet<string>;
   onRetry?(): void;
   onSelect(s: MapSelection | null): void;
 }) {
@@ -354,6 +405,10 @@ export function DetailPanel({
     }
     case "vm": {
       const vm = vms.data?.find((v) => v.id === selection.id);
+      // 목록을 아직 받지 못했으면 "사라짐"이 아니라 기다림이다(리뷰 2).
+      if (!vm && !vms.data) {
+        return <p className="text-sm text-muted-foreground">{t("common.loading")}</p>;
+      }
       if (!vm) break;
       return <VmDetail vm={vm} capacity={capacity} physical={physical} nodeName={nodeName} />;
     }
@@ -369,6 +424,8 @@ export function DetailPanel({
           capacity={capacity}
           physical={physical}
           physicalError={physicalError}
+          physicalStale={physicalStale}
+          maintenance={maintenance}
           onRetry={onRetry}
           onSelect={onSelect}
         />

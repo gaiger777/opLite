@@ -1,12 +1,13 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http, HttpResponse } from "msw";
+import { delay, http, HttpResponse } from "msw";
 
 import type { MapSelection } from "@/dashboard/selection";
 import type { NodeTopologyInfo } from "@/numa/numa";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { expectNoAxeViolations } from "@/test/axe";
 import { NODE, vm, volume } from "@/test/fixtures";
+import { PHYSICAL_KEY } from "@/physical/api";
 import { CAPACITY, LAN, PHYSICAL } from "@/test/physical";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
@@ -50,7 +51,9 @@ const TOPO: NodeTopologyInfo = {
   warnings: [],
 };
 
-const NODE_B = { ...NODE, id: "n2", name: "node-b" };
+// 링크 경보를 아는 노드(옛 판 노드가 없으면 "링크 경보 켜기"가 열린다)
+const LINKED = { ...NODE, status: { ...NODE.status, features: ["link-alerts"] } };
+const NODE_B = { ...LINKED, id: "n2", name: "node-b" };
 const DB = vm("db", "running", {
   spec: {
     ...vm("db", "running").spec,
@@ -64,7 +67,7 @@ const WEB = vm("web", "running", {
 
 function dashboard({ rules = [] as unknown[] } = {}) {
   const volumes = [volume("db-root", "fast")];
-  mockLists({ node: [NODE, NODE_B], vm: [DB, WEB] });
+  mockLists({ node: [LINKED, NODE_B], vm: [DB, WEB] });
   server.use(
     // VM 판은 디스크의 볼륨만 하나씩 묻는다(목록 전체를 지켜보지 않음).
     http.get(apiUrl("/volumes/:key"), ({ params }) => {
@@ -135,7 +138,7 @@ it("lays out the map, the details panel and the allocation table on a wide scree
     "aria-valuetext",
     "allocated 60 GiB / 96 GiB · used 36 GiB · ×0.6",
   );
-  expect(await within(panel).findByRole("button", { name: "eno1 on node-a" })).toBeInTheDocument();
+  expect(await within(panel).findByRole("button", { name: "bond0 on node-a" })).toBeInTheDocument();
 
   // 행: 막대(넘침 꼬리), 오버커밋, 문제
   const a = within(table).getByRole("row", { name: /node-a/ });
@@ -146,6 +149,12 @@ it("lays out the map, the details panel and the allocation table on a wide scree
     "14 shared vCPU / 7 threads · ×2.0 · dedicated 2 / 8 · node use 40 %",
   );
   expect(cpu.querySelector("[data-part=overflow]")).not.toBeNull();
+  // 사용률은 줄이지 않는 둘째 줄(좁은 칸·en에서도 잘리지 않음), 줄이는 첫 줄은 title로 다 보인다(리뷰 2).
+  expect(within(a).getByText("node use 40 %")).not.toHaveClass("truncate");
+  expect(within(a).getByText(/^14 shared vCPU/)).toHaveAttribute(
+    "title",
+    "14 shared vCPU / 7 threads · ×2.0 · dedicated 2 / 8",
+  );
   expect(
     within(a)
       .getByRole("meter", { name: "Memory of node-a" })
@@ -192,8 +201,107 @@ it("says the physical state is unknown instead of 'no faults' when it cannot be 
   // 배지는 "?"이고 누르면 다시 묻는다.
   fail = false;
   await user.click(screen.getByRole("button", { name: /Physical state unknown/ }));
-  expect(await within(panel).findByRole("button", { name: "eno1 on node-a" })).toBeInTheDocument();
+  expect(await within(panel).findByRole("button", { name: "bond0 on node-a" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "1 physical fault" })).toBeInTheDocument();
+});
+
+it("says the answer is stale instead of 'no faults' when a refresh fails", async () => {
+  dashboard();
+  let fail = false;
+  server.use(
+    http.get(apiUrl("/topology/physical"), () =>
+      fail
+        ? HttpResponse.json({ code: "internal", message: "leader changed" }, { status: 500 })
+        : HttpResponse.json({
+            ...PHYSICAL,
+            nodes: PHYSICAL.nodes.map((n) => ({ ...n, impact: [] })),
+          }),
+    ),
+  );
+  const { queryClient } = renderPage(<DashboardPage />);
+  const panel = await screen.findByRole("complementary", { name: "Details" });
+  expect(await within(panel).findByText("No link or bond faults.")).toBeInTheDocument();
+  fail = true;
+  await queryClient.refetchQueries({ queryKey: PHYSICAL_KEY });
+  await waitFor(
+    () => expect(within(panel).queryByText("No link or bond faults.")).not.toBeInTheDocument(),
+    { timeout: 5000 },
+  );
+  expect(
+    within(panel).getByText("Could not refresh — showing the last answer."),
+  ).toBeInTheDocument();
+  // 배지 줄에도(판을 보지 않아도 알게)
+  expect(
+    screen
+      .getAllByRole("status")
+      .some((el) => el.textContent === "Could not refresh — showing the last answer."),
+  ).toBe(true);
+});
+
+it("says the links are being checked before the first physical answer", async () => {
+  dashboard();
+  server.use(
+    http.get(apiUrl("/topology/physical"), async () => {
+      await delay("infinite");
+      return HttpResponse.json(PHYSICAL);
+    }),
+  );
+  renderPage(<DashboardPage />);
+  const table = await screen.findByRole("table", { name: "Allocation and use by node" });
+  const a = within(table).getByRole("row", { name: /node-a/ });
+  expect(a).toHaveTextContent("checking links");
+  expect(a).not.toHaveTextContent("OK");
+});
+
+it("folds bond member faults, shows missing ports and forgets them", async () => {
+  dashboard();
+  const forgot: unknown[] = [];
+  const node = PHYSICAL.nodes[0]!;
+  const physical = {
+    ...PHYSICAL,
+    nodes: [
+      {
+        ...node,
+        ports: [
+          ...node.ports,
+          { name: "eno9", kind: "ethernet", state: "missing", role: "uplink", health: "down" },
+        ],
+        impact: [
+          ...(node.impact ?? []),
+          {
+            port: "eno9",
+            severity: "down",
+            missing: true,
+            bridges: [],
+            networks: [],
+            vms: 0,
+            vm_ids: [],
+          },
+        ],
+      },
+      ...PHYSICAL.nodes.slice(1),
+    ],
+  };
+  server.use(
+    http.get(apiUrl("/topology/physical"), () => HttpResponse.json(physical)),
+    http.post(apiUrl("/nodes/:key/forget-ports"), async ({ params, request }) => {
+      forgot.push([params.key, await request.json()]);
+      return HttpResponse.json(NODE);
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<DashboardPage />);
+  const panel = await screen.findByRole("complementary", { name: "Details" });
+  const bond = (await within(panel).findByRole("button", { name: "bond0 on node-a" })).closest(
+    "li",
+  )!;
+  expect(bond).toHaveTextContent("eno1 down");
+  const gone = within(panel).getByRole("button", { name: "eno9 on node-a" }).closest("li")!;
+  expect(gone).toHaveTextContent("missing");
+  await user.click(within(gone).getByRole("button", { name: "Forget" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Forget eno9 on node-a?" });
+  await user.click(within(dialog).getByRole("button", { name: "Forget" }));
+  await waitFor(() => expect(forgot).toEqual([["node-a", { ports: ["eno9"] }]]));
 });
 
 it("sorts the table and filters it to the nodes with problems", async () => {
@@ -342,7 +450,11 @@ it("shows a VM with its path and a network with its nodes", async () => {
   expect(within(path).getByText(/NUMA 1/)).toBeInTheDocument();
   expect(within(path).getByText("db-root → fast")).toBeInTheDocument();
   expect(
-    within(path).getByText(/^tenant → vmbr100 → × eno1 \(down\), eno2 \(up\) · degraded$/),
+    within(path).getByText(
+      (_, el) =>
+        el?.tagName === "DD" &&
+        el.textContent === "tenant → vmbr100 → × eno1 (down), eno2 (up) · degraded",
+    ),
   ).toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: "map rail lan" }));
@@ -464,6 +576,15 @@ it("offers to turn on link alerts until a link rule exists", async () => {
   renderPage(<DashboardPage />, { as: VIEWER });
   await screen.findByRole("table", { name: "Allocation and use by node" });
   expect(screen.queryByRole("region", { name: "Link alerts" })).not.toBeInTheDocument();
+});
+
+it("explains why link alerts cannot be turned on while an old node is left", async () => {
+  dashboard();
+  mockLists({ node: [LINKED, { ...NODE, id: "n3", name: "svc03" }], vm: [DB, WEB] });
+  renderPage(<DashboardPage />);
+  const card = await screen.findByRole("region", { name: "Link alerts" });
+  expect(card).toHaveTextContent("Some nodes run an older Orbivisor (svc03).");
+  expect(within(card).getByRole("button", { name: "Turn on link alerts" })).toBeDisabled();
 });
 
 it("does not ask for the dashboard without cluster read", async () => {

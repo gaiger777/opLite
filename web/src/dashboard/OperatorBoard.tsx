@@ -12,9 +12,11 @@ import { CapacityTable } from "@/dashboard/CapacityTable";
 import { DetailPanel } from "@/dashboard/DetailPanel";
 import { HomeMap } from "@/dashboard/HomeMap";
 import { LinkAlertsCard } from "@/dashboard/LinkAlertsCard";
+import { pickFault } from "@/dashboard/pick";
 import { focusOf, type MapSelection } from "@/dashboard/selection";
 import { WidgetCard } from "@/dashboard/WidgetCard";
 import { errorMessage } from "@/i18n/errors";
+import { useList } from "@/api/live";
 import { useCapacity, usePhysicalTopology } from "@/physical/api";
 import { faultList } from "@/physical/chain";
 
@@ -22,12 +24,25 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
   const { t } = useTranslation();
   const capacity = useCapacity();
   const physical = usePhysicalTopology();
+  const nodes = useList("node");
   const [selection, setSelection] = useState<MapSelection | null>(null);
+  // 배지·판·표에서 고를 때마다 올린다 — 같은 포트를 다시 골라도 지도가 그리로 옮긴다(리뷰 2). 지도에서 누른 것은 옮기지 않는다.
+  const [seq, setSeq] = useState(0);
+  // 유지보수 노드(경보는 조용하다 — 배지에 따로 적는다, 리뷰 2)
+  const maintenance = new Set(
+    (nodes.data ?? []).filter((n) => n.spec.maintenance).map((n) => n.id),
+  );
   // 배지는 지금 값만 센다(오프라인 노드의 마지막으로 본 장애는 판의 목록에만).
-  const faults = faultList(physical.data?.nodes ?? []).filter((f) => !f.stale);
-  // 물리 관계를 한 번도 받지 못하고 실패했으면 "장애 없음"이 아니라 "모름"이다(리뷰 1). 다시 읽다 실패하면 마지막 값을 쓴다.
+  const faults = faultList(physical.data?.nodes ?? [], maintenance).filter((f) => !f.stale);
+  const quiet = faults.filter((f) => f.maintenance).length;
+  // 물리 관계를 한 번도 받지 못하고 실패했으면 "장애 없음"이 아니라 "모름"이다(리뷰 1). 다시 읽다 실패하면 마지막 값을 쓰되
+  // 그렇다고 적는다(리뷰 2 — 그동안 생긴 장애를 "없음"으로 보이지 않게).
   const physicalUnknown = !physical.data && physical.isError;
-  const select = (s: MapSelection | null) => setSelection(s);
+  const physicalStale = !!physical.data && physical.isError;
+  const select = (s: MapSelection | null) => {
+    setSelection(s);
+    setSeq((n) => n + 1);
+  };
   const first = faults[0];
 
   const badge = physicalUnknown ? (
@@ -37,7 +52,8 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
       className="text-muted-foreground"
       onClick={() => void physical.refetch()}
     >
-      <TriangleAlert aria-hidden />? {t("physical.badgeUnknown")}
+      <TriangleAlert aria-hidden />
+      <span aria-hidden>?</span> {t("physical.badgeUnknown")}
     </Button>
   ) : (
     first && (
@@ -45,18 +61,18 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
         variant="outline"
         size="sm"
         className="border-danger text-danger-fg"
-        onClick={() =>
-          select(
-            first.port !== undefined
-              ? { kind: "port", node: first.id, port: first.port }
-              : { kind: "node", id: first.id },
-          )
-        }
+        onClick={() => select(pickFault(first))}
       >
         <TriangleAlert aria-hidden />
         {t("physical.badge", { count: faults.length })}
+        {quiet > 0 && ` · ${t("physical.badgeMaintenance", { count: quiet })}`}
       </Button>
     )
+  );
+  const stale = physicalStale && (
+    <p role="status" className="text-xs text-warning-fg">
+      {t("physical.panel.staleRefresh")}
+    </p>
   );
 
   const map = (
@@ -68,7 +84,12 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
         </Link>
       }
     >
-      <HomeMap selected={selection ?? undefined} onSelect={select} focus={focusOf(selection)} />
+      <HomeMap
+        selected={selection ?? undefined}
+        onSelect={setSelection}
+        focus={focusOf(selection)}
+        focusSeq={seq}
+      />
     </WidgetCard>
   );
 
@@ -81,7 +102,8 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
   const table = capacity.data ? (
     <CapacityTable
       capacity={capacity.data}
-      physical={physicalUnknown ? undefined : (physical.data?.nodes ?? [])}
+      physical={physical.data?.nodes}
+      linkPending={physical.isPending}
       selected={selection}
       onSelect={select}
       phone={phone}
@@ -96,6 +118,8 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
       capacity={capacity.data}
       physical={physical.data}
       physicalError={physicalUnknown ? physical.error : undefined}
+      physicalStale={physicalStale}
+      maintenance={maintenance}
       onRetry={() => void physical.refetch()}
       onSelect={select}
     />
@@ -107,6 +131,7 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
   const top = (
     <div className="flex flex-wrap items-center gap-(--gap) empty:hidden">
       {badge}
+      {stale}
       <LinkAlertsCard />
     </div>
   );

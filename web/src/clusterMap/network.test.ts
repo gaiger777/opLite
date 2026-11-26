@@ -140,3 +140,14 @@ it("puts address-only (service) ports in the row and keeps an unknown rail state
   expect(rail(["up", "unknown"])).toBe("unknown");
   expect(rail(["unknown", "degraded"])).toBe("degraded");
 });
+
+it("counts NICs on missing networks as faults and greys out the ports of an offline node", () => {
+  const np = physicalTopology([A]).nodes[0]!;
+  const clean = { ...np, impact: [] };
+  expect(nodeNet(clean, []).faults).toBe(0);
+  const lost = nodeNet({ ...clean, unreachable: [{ network: netId(1), vms: 1, vm_ids: [] }] }, []);
+  expect([lost.faults, lost.severity]).toEqual([1, "down"]);
+  // 오프라인: 마지막으로 본 색을 지금처럼 보이지 않는다(리뷰 2).
+  const off = nodeNet({ ...np, online: false }, []);
+  expect(new Set(off.ports.map((p) => p.health))).toEqual(new Set(["unknown"]));
+});

@@ -139,7 +139,7 @@ export function netPaths(scene: MapScene, lod: Lod): NetPiece[] {
       });
     }
   }
-  for (const tone of LINK_TONES) {
+  for (const tone of WIRE_TONES) {
     const list = ports.filter((p) => p.tone === tone);
     if (list.length > 0) {
       out.push({
@@ -161,7 +161,7 @@ export function netPaths(scene: MapScene, lod: Lod): NetPiece[] {
     ),
     parts: ports.length,
   });
-  for (const tone of LINK_TONES) {
+  for (const tone of WIRE_TONES) {
     const list = ports.filter((p) => p.tone === tone);
     if (list.length > 0) {
       out.push({

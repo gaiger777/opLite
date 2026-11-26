@@ -53,7 +53,8 @@
       "link": {
         "up": "up",
         "degraded": "degraded",
-        "down": "down"
+        "down": "down",
+        "unknown": "unknown"
       },
       "bond": "bond {{name}}",
       "lldp": "switch {{switch}} port {{port}}",
@@ -67,7 +68,8 @@
       "railNodes_one": "{{count}} node",
       "railNodes_other": "{{count}} nodes",
       "railDown": "{{count}} down",
-      "railDegraded": "{{count}} degraded"
+      "railDegraded": "{{count}} degraded",
+      "railUnknown": "{{count}} unknown"
     },
     "pictureLabel": "Cluster map",
     "listLabel": "Cluster map as a list",
@@ -132,7 +134,8 @@
       "bond": "Bond (frame around its ports)",
       "rail": "Network rail",
       "wireDown": "Cut off from the rail (×)",
-      "fault": "Link fault"
+      "fault": "Link fault",
+      "wireUnknown": "Unknown (offline node)"
     },
     "card": {
       "cpu": "CPU",
@@ -212,8 +215,12 @@
         "up": "Up",
         "degraded": "Degraded",
         "down": "Down",
-        "absent": "Not used"
-      }
+        "absent": "Not used",
+        "unknown": "Unknown",
+        "missing": "Missing"
+      },
+      "stale": "Could not refresh the links — showing the last answer.",
+      "members": "Bond ports: {{list}}"
     },
     "tagFault": "link ✕ {{count}}",
     "legendShow": "Legend"

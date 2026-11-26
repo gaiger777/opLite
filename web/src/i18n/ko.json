@@ -3150,7 +3150,7 @@
       "sdn_lb_member_down": "부하 분산기 멤버 죽음",
       "backup_verify_failed": "백업 검증 실패",
       "backup_store_unavailable": "백업 저장소에 닿지 않음",
-      "node_link_down": "업링크 포트 링크 끊김",
+      "node_link_down": "업링크·서비스 포트 링크 끊김",
       "node_link_down_any": "랜 포트 링크 끊김",
       "bond_degraded": "본딩 저하"
     },

@@ -177,3 +177,10 @@ it("names ports and rails in both languages", async () => {
   expect(ko.get(`node:${n3.id}`)).toMatch(/, 링크 장애 2$/);
   expect([speedText(25000), speedText(100), speedText(0)]).toEqual(["25 Gb/s", "100 Mb/s", null]);
 });
+
+it("has the unknown rail text in both languages (review 2)", async () => {
+  const en = (await import("@/clusterMap/i18n/en.json")).default;
+  const ko = (await import("@/clusterMap/i18n/ko.json")).default;
+  expect(en.clusterMap.label.railUnknown).toBe("{{count}} unknown");
+  expect(ko.clusterMap.label.railUnknown).toBe("모름 {{count}}");
+});

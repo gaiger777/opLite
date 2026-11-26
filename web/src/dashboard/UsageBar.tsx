@@ -10,12 +10,15 @@ export function UsageBar({
   label,
   m,
   text,
+  note,
   compact = false,
 }: {
   label: string;
   m: Measure;
-  /** 보이는 글이자 `aria-valuetext`(예: "12 / 16 vCPU · 사용 40 %") */
+  /** 보이는 글(좁으면 줄임표, 다 보려면 `title`)이자 `aria-valuetext`의 앞(예: "12 / 16 vCPU · ×2.0") */
   text: string;
+  /** 줄이지 않는 둘째 줄(CPU 사용률 — 리뷰 2: 좁은 칸에서 글 끝이 잘려 사용률이 사라지지 않게) */
+  note?: string;
   /** 표 칸처럼 좁은 곳: 글을 막대 아래 작게 */
   compact?: boolean;
 }) {
@@ -32,7 +35,7 @@ export function UsageBar({
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.min(100, percent)}
-        aria-valuetext={text}
+        aria-valuetext={note ? `${text} · ${note}` : text}
         className="relative h-3 w-full overflow-hidden rounded-sm"
       >
         {/* 총 */}
@@ -73,7 +76,10 @@ export function UsageBar({
           />
         )}
       </div>
-      <span className="truncate text-xs text-muted-foreground tabular-nums">{text}</span>
+      <span className="truncate text-xs text-muted-foreground tabular-nums" title={text}>
+        {text}
+      </span>
+      {note && <span className="text-xs font-medium tabular-nums">{note}</span>}
     </div>
   );
 }

@@ -154,6 +154,8 @@ export interface InfraMapProps {
   onSelect?(s: MapSelection | null): void;
   /** 이리로 옮기고 강조: `node:<이름|id>`·`vm:<이름|id>`·`port:<노드>/<포트>`·`rail:<carrier>`(없으면 `page`는 주소의 `?focus=`) */
   focus?: string;
+  /** 같은 `focus`로 다시 옮기기(홈 — 누를 때마다 올림, 리뷰 2) */
+  focusSeq?: number;
 }
 
 /**
@@ -166,7 +168,7 @@ export default function InfraMap(props: InfraMapProps) {
   return ready ? <InfraMapBody {...props} /> : <ListPending error={null} />;
 }
 
-function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMapProps) {
+function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq }: InfraMapProps) {
   const home = variant === "home";
   const { t } = useTranslation();
   const { user } = usePrincipal();
@@ -224,7 +226,10 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
   // `?focus=`(홈은 `focus`): 포트·레일이면 네트워크 레이어를 (기억하지 않고) 켠다
   const focusParam = focusProp ?? (home ? null : search.get("focus"));
   const focusTarget = useMemo(() => parseFocus(focusParam), [focusParam]);
-  const wantsNet = focusTarget?.kind === "port" || focusTarget?.kind === "rail";
+  // 사용자가 그 요청 뒤에 레이어를 끄면 따른다(리뷰 2)
+  const [netOff, setNetOff] = useState<string | null>(null);
+  const wantsNet =
+    (focusTarget?.kind === "port" || focusTarget?.kind === "rail") && netOff !== focusParam;
   const netShown = layers.includes("network") || wantsNet;
   // 물리 관계(계획 75): 네트워크 레이어를 켰고 루트 읽기가 있을 때만. 403·409(섞인 판)면 지금 업링크 띠 하나 그대로.
   const physical = usePhysicalTopology(netShown && perms.has("cluster.read"));
@@ -328,8 +333,9 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
     setApplied(null);
     setFocusLit(null);
   }
-  if (model && scene && focusTarget && focusParam && applied !== focusParam && !waitNet) {
-    setApplied(focusParam);
+  const focusKey = `${focusParam}#${focusSeq}`;
+  if (model && scene && focusTarget && focusParam && applied !== focusKey && !waitNet) {
+    setApplied(focusKey);
     const f = focusOf(focusTarget, model, scene);
     if (f) {
       setFocusRequest((r) => ({ focus: f, seq: (r?.seq ?? 0) + 1, dom: !home }));
@@ -591,13 +597,14 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
                   checked={shown.includes(layer)}
                   disabled={blocked !== null}
                   aria-describedby={blocked ? `${id}-why` : undefined}
-                  onCheckedChange={(on) =>
+                  onCheckedChange={(on) => {
+                    if (on !== true && layer === "network") setNetOff(focusParam);
                     setLayers(
                       on === true
                         ? MAP_LAYERS.filter((l) => l === layer || layers.includes(l))
                         : layers.filter((l) => l !== layer),
-                    )
-                  }
+                    );
+                  }}
                 />
                 <Label htmlFor={id}>{t(`clusterMap.layer.${layer}`)}</Label>
                 {blocked && (
@@ -686,6 +693,11 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
       {legacy && (
         <p role="status" className="text-sm text-muted-foreground">
           {t("clusterMap.net.legacy")}
+        </p>
+      )}
+      {physicalData && physical.isError && (
+        <p role="status" className="text-sm text-warning-fg">
+          {t("clusterMap.net.stale")}
         </p>
       )}
       <Body

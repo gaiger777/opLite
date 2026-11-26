@@ -108,18 +108,106 @@ describe("network chain", () => {
   });
 
   it("lists faults across the cluster", () => {
+    const entry = {
+      id: "n1",
+      node: "node-a",
+      focus: "eno1",
+      missing: false,
+      uses: [],
+      addresses: [],
+      maintenance: false,
+    };
+    // 본딩 구성 포트의 장애는 본딩 하나로 접고, 고를 포트는 끊긴 구성 포트다(리뷰 2).
     expect(faultList(PHYSICAL.nodes)).toEqual([
-      { id: "n1", node: "node-a", port: "eno1", severity: "degraded", vms: 2, stale: false },
+      {
+        ...entry,
+        port: "bond0",
+        members: [{ port: "eno1", missing: false }],
+        severity: "degraded",
+        vms: 2,
+        stale: false,
+      },
     ]);
-    // 오프라인 노드의 것은 마지막으로 본 값, 노드에 없는 네트워크의 NIC도 장애다(리뷰 1).
+    // 오프라인 노드의 것은 마지막으로 본 값, 노드에 없는 네트워크의 NIC도 장애다(리뷰 1). 유지보수 노드는 표시한다.
     const off = {
       ...NODE_A,
       online: false,
       unreachable: [{ network: LAN, vms: 1, vm_ids: ["v"] }],
     };
-    expect(faultList([off])).toEqual([
-      { id: "n1", node: "node-a", port: "eno1", severity: "degraded", vms: 2, stale: true },
-      { id: "n1", node: "node-a", network: LAN, severity: "down", vms: 1, stale: true },
+    expect(faultList([off], new Set(["n1"]))).toEqual([
+      {
+        ...entry,
+        port: "bond0",
+        members: [{ port: "eno1", missing: false }],
+        severity: "degraded",
+        vms: 2,
+        stale: true,
+        maintenance: true,
+      },
+      {
+        ...entry,
+        focus: undefined,
+        network: LAN,
+        members: [],
+        severity: "down",
+        vms: 1,
+        stale: true,
+        maintenance: true,
+      },
+    ]);
+    // 본딩이 통째로 끊김(eno1 down, eno2 사라짐): 하나로, 사라진 포트·더 나쁜 무게. 주소만 가진 포트는 쓰임·주소.
+    const whole: NodePhysical = {
+      ...NODE_A,
+      ports: [
+        ...NODE_A.ports,
+        {
+          name: "ens1f0",
+          kind: "ethernet",
+          state: "down",
+          role: "service",
+          uses: ["cluster"],
+          addresses: ["10.10.0.11"],
+          health: "down",
+        },
+      ],
+      impact: [
+        { ...NODE_A.impact![0]!, severity: "down" },
+        { ...NODE_A.impact![0]!, port: "eno2", severity: "down", missing: true },
+        {
+          port: "ens1f0",
+          severity: "down",
+          bridges: [],
+          uses: ["cluster"],
+          networks: [],
+          vms: 0,
+          vm_ids: [],
+        },
+      ],
+    };
+    expect(faultList([whole])).toEqual([
+      {
+        ...entry,
+        port: "bond0",
+        members: [
+          { port: "eno1", missing: false },
+          { port: "eno2", missing: true },
+        ],
+        missing: true,
+        severity: "down",
+        vms: 2,
+        stale: false,
+      },
+      {
+        ...entry,
+        port: "ens1f0",
+        focus: "ens1f0",
+        members: [],
+        uses: ["cluster"],
+        addresses: ["10.10.0.11"],
+        severity: "down",
+        vms: 0,
+        stale: false,
+      },
     ]);
   });
 
