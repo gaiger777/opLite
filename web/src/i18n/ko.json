@@ -4341,7 +4341,7 @@
       "rulesLink": "경보 규칙",
       "enable": "SDN 경보 켜기",
       "dialogTitle": "SDN 경보 켜기",
-      "dialogDescription": "권하는 SDN 규칙(정족수, 중앙, chassis, 게이트웨이, 동기화, 물리 네트워크, 부하 분산기 멤버)과 링크 규칙(업링크 포트 끊김, 본딩 저하)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
+      "dialogDescription": "권하는 SDN 규칙(정족수, 중앙, chassis, 게이트웨이, 동기화, 물리 네트워크, 부하 분산기 멤버)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
       "for": "{{secs}}초 동안",
       "exists": "있음",
       "create_one": "규칙 {{count}}개 만들기",

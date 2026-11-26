@@ -160,6 +160,7 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/alert-rules", Root(AlertRead)),
     ("POST", "/alert-rules", Root(AlertManage)),
     ("POST", "/alert-rules/sdn-defaults", Root(AlertManage)),
+    ("POST", "/alert-rules/link-defaults", Root(AlertManage)),
     ("GET", "/alert-rules/{key}", Root(AlertRead)),
     ("PUT", "/alert-rules/{key}", Root(AlertManage)),
     ("DELETE", "/alert-rules/{key}", Root(AlertManage)),

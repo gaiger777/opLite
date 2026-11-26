@@ -182,8 +182,7 @@ pub struct SdnDefaultsResponse {
 
 /// "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 한 번에 만든다 — `sdn-quorum-lost` critical 0초,
 /// `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info,
-/// `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 모든 노드가
-/// `link-alerts`를 알면 링크 규칙 둘(계획 75)도 — `node-link-down`(업링크 포트) critical 30초, `bond-degraded` warning 60초. 같은 이름의
+/// `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 같은 이름의
 /// 규칙이 있으면 건드리지 않는다. 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`sdn-services`를 알아야
 /// 한다.
 #[utoipa::path(post, path = "/alert-rules/sdn-defaults", tag = "alerts",
@@ -200,16 +199,38 @@ pub async fn create_sdn_default_rules(
         "alert-rule sdn-defaults -> {}",
         req.targets.join(",")
     ));
-    let mut rules = orbivisor_types::alert::sdn::default_rules(&req.targets);
-    // 대상·기능은 한 번 본다(모든 규칙이 같은 대상이다).
+    let rules = orbivisor_types::alert::sdn::default_rules(&req.targets);
+    create_default_rules(&state, rules).await.map(Json)
+}
+
+/// "링크 경보 켜기"(계획 75 §3.4): 권하는 링크 규칙 둘을 한 번에 만든다 — `node-link-down`(업링크 포트) critical 30초,
+/// `bond-degraded` warning 60초. SDN 묶음과 같은 방식이다: 같은 이름의 규칙이 있으면 건드리지 않고(다시 불러도 같다), 만든
+/// 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`link-alerts`를 알아야 한다(아니면 409 `cluster_upgrading`).
+#[utoipa::path(post, path = "/alert-rules/link-defaults", tag = "alerts",
+    request_body = SdnDefaultsRequest,
+    responses((status = 200, body = SdnDefaultsResponse), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_link_default_rules(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Json(req): Json<SdnDefaultsRequest>,
+) -> Result<Json<SdnDefaultsResponse>, ApiError> {
+    state.authorize(&principal, Action::Write, AlertRuleSpec::KIND)?;
+    audit.detail(format!(
+        "alert-rule link-defaults -> {}",
+        req.targets.join(",")
+    ));
+    let rules = orbivisor_types::alert::link_default_rules(&req.targets);
+    create_default_rules(&state, rules).await.map(Json)
+}
+
+/// 권하는 묶음 하나를 만든다. 대상·기능은 첫 규칙으로 한 번 본다(묶음 안의 규칙은 대상이 같고 같은 기능을 쓴다).
+async fn create_default_rules(
+    state: &AppState,
+    rules: Vec<(&'static str, AlertRuleSpec)>,
+) -> Result<SdnDefaultsResponse, ApiError> {
     if let Some((_, spec)) = rules.first() {
-        check_rule(&state, spec)?;
-    }
-    // 링크 규칙(계획 75)은 모든 노드가 `link-alerts`를 알 때만 만든다(섞인 판에서도 SDN 규칙은 만든다).
-    if !crate::cluster::missing_feature(&state.cluster, orbivisor_types::node::LINK_ALERTS)?
-        .is_empty()
-    {
-        rules.retain(|(_, spec)| !spec.condition.is_link());
+        check_rule(state, spec)?;
     }
     let mut out = SdnDefaultsResponse {
         created: Vec::new(),
@@ -233,7 +254,7 @@ pub async fn create_sdn_default_rules(
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(Json(out))
+    Ok(out)
 }
 
 // ---- 알림 대상 ----

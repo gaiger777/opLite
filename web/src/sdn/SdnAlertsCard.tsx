@@ -15,7 +15,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 
 /**
- * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟과 링크 규칙 둘(계획 75 — 모든 노드가 `link-alerts`를 알 때만)을 고른 알림 대상으로 한 번에 만든다(서버의
+ * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 고른 알림 대상으로 한 번에 만든다(서버의
  * `POST /alert-rules/sdn-defaults` — 이미 있는 이름은 서버가 건너뛴다). 만든 뒤는 보통 규칙이라 경보 화면에서 고친다. 경보 규칙을 바꿀 수 있는(`alert.manage`) 사용자에게만 보인다.
  */
 export function SdnAlertsCard() {

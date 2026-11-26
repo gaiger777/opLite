@@ -126,7 +126,10 @@ export const SDN_DEFAULTS: readonly {
     forSecs: 60,
   },
   { name: "sdn-lb-member-down", kind: "sdn_lb_member_down", severity: "warning", forSecs: 30 },
-  // 링크(계획 75) — 모든 노드가 `link-alerts`를 알 때만 서버가 만든다.
+];
+
+/** "링크 경보 켜기"(계획 75 §3.4, 서버 `link_default_rules`)가 만드는 권하는 규칙 */
+export const LINK_DEFAULTS: typeof SDN_DEFAULTS = [
   { name: "node-link-down", kind: "node_link_down", severity: "critical", forSecs: 30 },
   { name: "bond-degraded", kind: "bond_degraded", severity: "warning", forSecs: 60 },
 ];

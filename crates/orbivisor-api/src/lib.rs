@@ -251,6 +251,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(prometheus::get_prometheus))
         .routes(routes!(r::list_alert_rules, alerts::create_alert_rule))
         .routes(routes!(alerts::create_sdn_default_rules))
+        .routes(routes!(alerts::create_link_default_rules))
         .routes(routes!(
             r::get_alert_rule,
             alerts::update_alert_rule,

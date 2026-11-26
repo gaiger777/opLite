@@ -4341,7 +4341,7 @@
       "rulesLink": "Alert rules",
       "enable": "Turn on SDN alerts",
       "dialogTitle": "Turn on SDN alerts",
-      "dialogDescription": "Creates the recommended SDN rules (quorum, centrals, chassis, gateways, sync, physical networks, load balancer members) and link rules (uplink port down, bond degraded). They are ordinary rules afterwards. Rules that already exist are skipped.",
+      "dialogDescription": "Creates the recommended SDN rules (quorum, centrals, chassis, gateways, sync, physical networks, load balancer members). They are ordinary rules afterwards. Rules that already exist are skipped.",
       "for": "for {{secs}} s",
       "exists": "exists",
       "create_one": "Create {{count}} rule",

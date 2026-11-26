@@ -194,11 +194,10 @@ it("turns on the recommended SDN alert rules with the server's sdn-defaults", as
   expect(await screen.findByText(/1 SDN alert rule\./)).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Turn on SDN alerts" }));
   const dialog = await screen.findByRole("dialog", { name: "Turn on SDN alerts" });
-  // SDN 여덟과 링크 둘(계획 75) 가운데 하나가 이미 있다.
-  await user.click(within(dialog).getByRole("button", { name: "Create 9 rules" }));
+  await user.click(within(dialog).getByRole("button", { name: "Create 7 rules" }));
   expect(await within(dialog).findByText("Choose 1 to 16 notification targets.")).toBeVisible();
   await user.click(within(dialog).getByLabelText("ops"));
-  await user.click(within(dialog).getByRole("button", { name: "Create 9 rules" }));
+  await user.click(within(dialog).getByRole("button", { name: "Create 7 rules" }));
   await waitFor(() => expect(sent).toHaveLength(1));
   expect(sent[0]).toEqual({ targets: ["ops"] });
   expect(await screen.findByText("Created 6 SDN alert rules; 2 already existed.")).toBeVisible();

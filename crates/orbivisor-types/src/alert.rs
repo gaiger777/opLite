@@ -1470,6 +1470,39 @@ fn is_default_repeat(n: &u32) -> bool {
     *n == DEFAULT_REPEAT_SECS
 }
 
+/// "링크 경보 켜기"(계획 75 §3.4)의 권하는 규칙: 업링크 포트 끊김 critical 30초, 본딩 저하 warning 60초. 대상은
+/// `targets`다. SDN 묶음(`sdn::default_rules`)과 따로 둔다 — SDN을 쓰지 않는 클러스터에도 링크는 있다.
+pub fn link_default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpec)> {
+    let rule = |condition, severity, for_secs| AlertRuleSpec {
+        enabled: true,
+        condition,
+        for_secs,
+        severity,
+        targets: targets.to_vec(),
+        repeat_secs: DEFAULT_REPEAT_SECS,
+        send_resolved: true,
+        nodes: Vec::new(),
+        vms: Vec::new(),
+    };
+    vec![
+        (
+            "node-link-down",
+            rule(
+                AlertCondition::NodeLinkDown {
+                    ports: None,
+                    role: LinkRole::Uplink,
+                },
+                Severity::Critical,
+                30,
+            ),
+        ),
+        (
+            "bond-degraded",
+            rule(AlertCondition::BondDegraded, Severity::Warning, 60),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,6 +1520,35 @@ mod tests {
             nodes: vec![],
             vms: vec![],
         }
+    }
+
+    /// 링크 묶음(계획 75): 두 조건, 이름·심각도·지속 시간, 모두 검증을 지난다.
+    #[test]
+    fn link_default_rules_are_the_two_link_conditions() {
+        let rules = link_default_rules(&["ops".into()]);
+        let got: Vec<_> = rules
+            .iter()
+            .map(|(name, spec)| {
+                spec.validate().unwrap();
+                assert!(spec.condition.is_link() && !spec.condition.is_sdn());
+                assert_eq!(*name, spec.condition.kind().replace('_', "-"));
+                (*name, spec.severity, spec.for_secs)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("node-link-down", Severity::Critical, 30),
+                ("bond-degraded", Severity::Warning, 60)
+            ]
+        );
+        assert_eq!(
+            rules[0].1.condition,
+            AlertCondition::NodeLinkDown {
+                ports: None,
+                role: LinkRole::Uplink
+            }
+        );
     }
 
     fn cpu_rule() -> AlertRuleSpec {

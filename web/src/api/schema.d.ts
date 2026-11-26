@@ -147,6 +147,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/alert-rules/link-defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * "링크 경보 켜기"(계획 75 §3.4): 권하는 링크 규칙 둘을 한 번에 만든다 — `node-link-down`(업링크 포트) critical 30초,
+         *     `bond-degraded` warning 60초. SDN 묶음과 같은 방식이다: 같은 이름의 규칙이 있으면 건드리지 않고(다시 불러도 같다), 만든
+         *     뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`link-alerts`를 알아야 한다(아니면 409 `cluster_upgrading`).
+         */
+        post: operations["create_link_default_rules"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/alert-rules/sdn-defaults": {
         parameters: {
             query?: never;
@@ -159,8 +180,7 @@ export interface paths {
         /**
          * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 한 번에 만든다 — `sdn-quorum-lost` critical 0초,
          *     `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info,
-         *     `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 모든 노드가
-         *     `link-alerts`를 알면 링크 규칙 둘(계획 75)도 — `node-link-down`(업링크 포트) critical 30초, `bond-degraded` warning 60초. 같은 이름의
+         *     `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 같은 이름의
          *     규칙이 있으면 건드리지 않는다. 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`sdn-services`를 알아야
          *     한다.
          */
@@ -20207,6 +20227,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_link_default_rules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnDefaultsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SdnDefaultsResponse"];
                 };
             };
             "4XX": {

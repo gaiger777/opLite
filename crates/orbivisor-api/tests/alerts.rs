@@ -1211,13 +1211,12 @@ async fn sdn_alerts_fire_from_node_state_and_observations() {
         .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // SDN 여덟과 링크 둘(계획 75)
-    assert_eq!(body["created"].as_array().unwrap().len(), 10, "{body}");
+    assert_eq!(body["created"].as_array().unwrap().len(), 8, "{body}");
     let (_, again) = admin
         .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
         .await;
     assert_eq!(again["created"], json!([]), "{again}");
-    assert_eq!(again["existing"].as_array().unwrap().len(), 10, "{again}");
+    assert_eq!(again["existing"].as_array().unwrap().len(), 8, "{again}");
     let missing = admin
         .post("/alert-rules/sdn-defaults", json!({"targets": ["nobody"]}))
         .await;
@@ -1779,8 +1778,8 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     engine.shutdown().await;
 }
 
-/// 링크 조건은 모든 노드가 `link-alerts`를 알 때만 받는다(409 `cluster_upgrading`). "SDN 경보 켜기"는 그동안 링크 규칙을
-/// 빼고 만든다.
+/// 링크 조건은 모든 노드가 `link-alerts`를 알 때만 받는다(409 `cluster_upgrading`). "링크 경보 켜기"(`link-defaults`)도
+/// 그동안 409이고, SDN 묶음은 링크 규칙 없이 여덟 그대로다. 모두 알면 묶음이 둘을 만들고 다시 부르면 그대로 둔다.
 #[tokio::test]
 async fn link_rules_wait_for_every_node_to_know_link_alerts() {
     use orbivisor_types::node::{FEATURES, LINK_ALERTS};
@@ -1814,27 +1813,31 @@ async fn link_rules_wait_for_every_node_to_know_link_alerts() {
             .await;
         assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
     }
+    let got = admin
+        .post("/alert-rules/link-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
     // 다른 조건은 된다.
     rig.rule(
         "off",
         json!({"condition": {"kind": "node_offline"}, "severity": "critical", "targets": ["ops"]}),
     )
     .await;
+    let names = |body: &serde_json::Value, key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().or(r["name"].as_str()).unwrap().to_string())
+            .collect()
+    };
     let (status, body) = admin
         .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let created: Vec<&str> = body["created"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["name"].as_str().unwrap())
-        .collect();
+    let created = names(&body, "created");
     assert_eq!(created.len(), 8, "{body}");
-    assert!(
-        !created.contains(&"node-link-down") && !created.contains(&"bond-degraded"),
-        "{body}"
-    );
+    assert!(created.iter().all(|n| n.starts_with("sdn-")), "{body}");
     // 나쁜 글롭은 400
     let mut n = rig
         .env
@@ -1856,15 +1859,43 @@ async fn link_rules_wait_for_every_node_to_know_link_alerts() {
         )
         .await;
     assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
-    let (status, body) = admin
+    // SDN 묶음은 여전히 링크 규칙을 만들지 않는다.
+    let (_, again) = admin
         .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
         .await;
+    assert_eq!(again["created"], json!([]), "{again}");
+    let (status, body) = admin
+        .post("/alert-rules/link-defaults", json!({"targets": ["ops"]}))
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let created: Vec<&str> = body["created"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(created, ["node-link-down", "bond-degraded"], "{body}");
+    assert_eq!(
+        names(&body, "created"),
+        ["node-link-down", "bond-degraded"],
+        "{body}"
+    );
+    let rule = &body["created"][0]["spec"];
+    assert_eq!(rule["severity"], "critical", "{body}");
+    assert_eq!(rule["for_secs"], 30, "{body}");
+    assert_eq!(rule["condition"]["role"], "uplink", "{body}");
+    // 멱등: 다시 부르면 만들지 않고 있던 것을 알린다.
+    let (status, again) = admin
+        .post("/alert-rules/link-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["created"], json!([]), "{again}");
+    assert_eq!(
+        names(&again, "existing"),
+        ["node-link-down", "bond-degraded"],
+        "{again}"
+    );
+    let missing = admin
+        .post("/alert-rules/link-defaults", json!({"targets": ["nobody"]}))
+        .await;
+    assert_error(&missing, StatusCode::BAD_REQUEST, "invalid_request");
+    // admin만 쓴다(SDN 묶음과 같은 권한).
+    let operator = rig.env.user("u-operator", "operator").await;
+    let got = operator
+        .post("/alert-rules/link-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(got.0, StatusCode::FORBIDDEN);
 }

@@ -6,6 +6,7 @@ import {
   isEvent,
   isLink,
   isSdn,
+  LINK_DEFAULTS,
   ruleFormOf,
   ruleSpecOf,
   SDN_DEFAULTS,
@@ -116,14 +117,14 @@ it("offers SDN conditions and filters nodes only on node subjects (plan 67)", ()
   expect(isEvent("sdn_gateway_failover")).toBe(true);
   expect(ruleSpecOf({ ...form, kind: "sdn_gateway_failover", forSecs: "60" }).for_secs).toBe(0);
   expect(CONDITION_KINDS.filter(isSdn)).toHaveLength(8);
-  expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(
-    CONDITION_KINDS.filter((k) => isSdn(k) || isLink(k)).sort(),
-  );
+  expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(CONDITION_KINDS.filter(isSdn).sort());
 });
 
 it("edits the link conditions with a port pattern and a role (plan 75)", () => {
   const form = { ...emptyRuleForm(), name: "links", targets: ["ops"], nodes: "svc01" };
   expect(CONDITION_KINDS.filter(isLink)).toEqual(["node_link_down", "bond_degraded"]);
+  // "링크 경보 켜기" 묶음은 SDN 묶음과 따로다.
+  expect(LINK_DEFAULTS.map((r) => r.kind)).toEqual(CONDITION_KINDS.filter(isLink));
   expect(takesNodes("node_link_down")).toBe(true);
   expect(isEvent("bond_degraded")).toBe(false);
   const down = { ...form, kind: "node_link_down" as const };
