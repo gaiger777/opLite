@@ -6354,8 +6354,11 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             config.token = None;
             config.save(&config_path)?;
             // 기본 위치면 옛 로그인 파일의 토큰도 지운다(새 파일만 비우면 옛 파일에 평문으로 남는다 — 리뷰 1 M3).
-            if cli.config.is_none() {
-                clear_legacy_token()?;
+            // 서버 토큰과 새 파일은 이미 지웠으므로 실패는 login처럼 경고다(리뷰 2).
+            if cli.config.is_none()
+                && let Err(e) = clear_legacy_token()
+            {
+                eprintln!("warning: cannot clear the token in the old login file: {e:#}");
             }
             writeln!(out, "logged out")?;
             if kept {
