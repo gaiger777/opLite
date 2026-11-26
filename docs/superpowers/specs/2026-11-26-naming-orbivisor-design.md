@@ -177,7 +177,10 @@ swtpm AppArmor의 새 경로 규칙은 conffile 밖 `local/usr.bin.swtpm`에도 
 ### 4.3 옛 판으로 되돌리기(리뷰 2 N1)
 
 dpkg는 옛 판을 푼 뒤 새 판의 `postrm upgrade <옛 판>`을 부른다. 풀린 판의 `/usr/lib/systemd/system/opld.service`가 진짜 파일(이름
-바꾸기 앞)이면 OVN 중앙 단위를 거꾸로 옮긴다: `orbivisor-ovn-*.service`(Orbivisor 표시, 옛 이름이 그것으로의 링크이거나 없음)를
+바꾸기 앞)이면 postinst가 옮긴 데몬 enable 링크를 `wants/opld.service`로, `/etc`의 진짜 `orbivisord.service`를 `opld.service`로
+되돌린다 — 옛 postinst는 `is-enabled opld.service`로 다시 시작을 정하는데 systemd 257은 enable 링크가 `wants/orbivisord.service`
+(옛 판에서는 별칭)뿐이면 disabled로 본다(debian:13 컨테이너에서 확인). 그러면 지워진 새 바이너리가 재부팅까지 돌며 OVN 단위를 다시
+새 이름으로 옮긴다. 그리고 OVN 중앙 단위를 거꾸로 옮긴다: `orbivisor-ovn-*.service`(Orbivisor 표시, 옛 이름이 그것으로의 링크이거나 없음)를
 옛 이름으로, 새 이름은 옛 이름으로의 링크로, enable 링크도 옛 이름으로, `daemon-reload` 한 번 — 옮길 때와 같은 합치기 전이라 도는
 ovsdb·northd가 멈추지 않는다. 그러지 않으면 옛 데몬이 옛 이름 링크 자리에 진짜 파일을 써서 같은 DB를 쥔 단위가 둘이 된다. 옛
 데몬은 단위 글을 옛 경로로 다시 쓰고 중앙을 한 번 다시 시작한다(받아들임). 다시 올리면 새 데몬의 adopt가 새 이름 링크를 진짜

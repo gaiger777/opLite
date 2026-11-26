@@ -446,8 +446,10 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
     노드만 거친 경우다: 옛 노드는 옛 이름 쿠키만 지우므로 새 이름 쿠키의 앞 사용자 세션이 남는다. 그래서 버전이 섞인 동안 한
     브라우저에서 사용자를 바꿀 때는 먼저 로그아웃한다.
 - **옛 판으로 되돌리기.** 이름 바꾸기 앞의 판을 다시 깔아도(`apt install orbivisor=<옛 판>`) 노드는 돈다: 디렉터리·설정·잠금·
-  소켓은 옛 이름 링크로 풀리고, `opld.service`는 옛 판의 진짜 유닛이 된다(enable 링크 `orbivisord.service`는 같은 파일을 가리킨다).
-  새 판의 postrm이 OVN 중앙 단위를 되돌린다: `orbivisor-ovn-*.service`(Orbivisor 표시)를 `opl-ovn-*.service`로 옮기고 새 이름은
+  소켓은 옛 이름 링크로 풀리고, `opld.service`는 옛 판의 진짜 유닛이 된다. 새 판의 postrm이 enable 링크를
+  `multi-user.target.wants/opld.service`로, `/etc/systemd/system/orbivisord.service`(옮긴 `systemctl edit --full` 파일)를
+  `opld.service`로 되돌린다 — 옛 판의 postinst가 `is-enabled opld`를 보고 옛 데몬을 다시 시작한다(systemd 257은 enable 링크가
+  새 이름뿐이면 opld를 disabled로 본다). postrm은 OVN 중앙 단위도 되돌린다: `orbivisor-ovn-*.service`(Orbivisor 표시)를 `opl-ovn-*.service`로 옮기고 새 이름은
   그것으로의 링크, enable 링크도 옛 이름으로 바꾼 뒤 `daemon-reload`(도는 ovsdb·northd는 멈추지 않는다). 옛 데몬은 단위 글을 옛
   경로로 다시 쓰고 OVN 중앙을 한 번 다시 시작한다. postrm이 되돌리지 못했다고 알리면 중앙 노드에서 손으로 한다(단위마다,
   `db`는 `nb`·`sb`·`northd`): `cd /etc/systemd/system && rm opl-ovn-<db>.service && mv orbivisor-ovn-<db>.service
