@@ -113,7 +113,15 @@ fn main() -> anyhow::Result<()> {
     let migrate =
         layout::should_migrate(rustix::process::geteuid().is_root(), args.config.as_deref());
     if migrate {
-        log_layout(layout::migrate(root));
+        let notes = layout::migrate(root);
+        if let Some(stop) = layout::fatal(&notes).cloned() {
+            log_layout(notes);
+            anyhow::bail!(
+                "{stop}; not starting, so that this node does not come up with an empty data directory \
+                 (fix the cause and restart orbivisord)"
+            );
+        }
+        log_layout(notes);
     }
     let (config_path, warning) = layout::config_path(args.config.as_deref(), root);
     if let Some(warning) = warning {

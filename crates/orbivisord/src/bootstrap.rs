@@ -323,9 +323,18 @@ pub async fn mark_shutdown(cluster: &Cluster, shutdown: NodeShutdown) -> anyhow:
     .await
 }
 
-/// 이 빌드가 아는 기능([`FEATURES`]). 위트니스도 적는다(새 기능의 API는 모든 노드를 본다).
+/// 이 빌드가 아는 기능([`FEATURES`]). 위트니스도 적는다(새 기능의 API는 모든 노드를 본다). `orbivisor-layout`은 이
+/// 노드의 배치가 맞을 때만이다([`crate::layout::aligned`] — 다른 노드가 새 이름으로 적은 경로를 이 노드가 열 수 있음).
 fn features() -> Vec<String> {
-    FEATURES.iter().map(|f| f.to_string()).collect()
+    feature_list(crate::layout::aligned(Path::new("/")))
+}
+
+fn feature_list(layout_aligned: bool) -> Vec<String> {
+    FEATURES
+        .iter()
+        .filter(|f| layout_aligned || **f != orbivisor_types::node::ORBIVISOR_LAYOUT)
+        .map(|f| f.to_string())
+        .collect()
 }
 
 /// 이 노드가 알릴 기능: 빌드의 기능과, 포트 80 HTTP-01 리스너를 켰으면 `http01`(계획 73 §11.3 — 노드 설정이다)
@@ -475,6 +484,22 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// 기능 목록의 기대값: `orbivisor-layout`은 시험 호스트의 배치가 맞을 때만이다([`crate::layout::aligned`]).
+    fn on_this_host(list: &[&str]) -> Vec<String> {
+        let aligned = crate::layout::aligned(Path::new("/"));
+        list.iter()
+            .filter(|f| aligned || **f != "orbivisor-layout")
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_layout_feature_follows_the_node_layout() {
+        assert!(feature_list(true).iter().any(|f| f == "orbivisor-layout"));
+        assert!(!feature_list(false).iter().any(|f| f == "orbivisor-layout"));
+        assert_eq!(feature_list(false).len() + 1, FEATURES.len());
+    }
     use async_trait::async_trait;
     use openraft::ServerState;
     use orbivisor_cluster::ClusterConfig;
@@ -913,7 +938,7 @@ pub(crate) mod tests {
         assert_eq!(version().as_deref(), Some(BUILD));
         assert_eq!(
             features(),
-            [
+            on_this_host(&[
                 "node-drain",
                 "incremental-backup",
                 "incremental-replication",
@@ -955,7 +980,7 @@ pub(crate) mod tests {
                 "config-history",
                 "acme",
                 "orbivisor-layout"
-            ]
+            ])
         );
         update_node_status(&cluster, |status| {
             status.version = Some("0.0.1".into());
@@ -968,7 +993,7 @@ pub(crate) mod tests {
         assert_eq!(version().as_deref(), Some(BUILD));
         assert_eq!(
             features(),
-            [
+            on_this_host(&[
                 "node-drain",
                 "incremental-backup",
                 "incremental-replication",
@@ -1010,7 +1035,7 @@ pub(crate) mod tests {
                 "config-history",
                 "acme",
                 "orbivisor-layout"
-            ]
+            ])
         );
         cluster.shutdown().await.unwrap();
     }
@@ -1042,7 +1067,7 @@ pub(crate) mod tests {
         assert!(!node().status.cluster_addresses.is_empty());
         assert_eq!(
             node().status.features,
-            [
+            on_this_host(&[
                 "node-drain",
                 "incremental-backup",
                 "incremental-replication",
@@ -1084,7 +1109,7 @@ pub(crate) mod tests {
                 "config-history",
                 "acme",
                 "orbivisor-layout"
-            ]
+            ])
         );
         cluster.shutdown().await.unwrap();
     }
@@ -1290,49 +1315,49 @@ pub(crate) mod tests {
                 online: true,
                 arch: Some(Arch::native()),
                 version: Some(BUILD.to_string()),
-                features: vec![
-                    "node-drain".into(),
-                    "incremental-backup".into(),
-                    "incremental-replication".into(),
-                    "storage-migration".into(),
-                    "metrics".into(),
-                    "node-roles".into(),
-                    "shared-sessions".into(),
-                    "vip".into(),
-                    "lease-liveness".into(),
-                    "voter-limit".into(),
-                    "observer".into(),
-                    "multi-link".into(),
-                    "ha-placement".into(),
-                    "fast-ha".into(),
-                    "ha-checks".into(),
-                    "placement".into(),
-                    "hotplug".into(),
-                    "node-replication".into(),
-                    "ceph-setup".into(),
-                    "install-media".into(),
-                    "templates".into(),
-                    "vtpm".into(),
-                    "guest-agent".into(),
-                    "metrics-history".into(),
-                    "notifications".into(),
-                    "folders".into(),
-                    "two-factor".into(),
-                    "cpu-models".into(),
-                    "numa".into(),
-                    "sdn".into(),
-                    "sdn-routing".into(),
-                    "sdn-services".into(),
-                    "backup-store".into(),
-                    "file-restore".into(),
-                    "vm-check".into(),
-                    "vmware-migrate".into(),
-                    "vm-export".into(),
-                    "declarative".into(),
-                    "config-history".into(),
-                    "acme".into(),
-                    "orbivisor-layout".into(),
-                ],
+                features: on_this_host(&[
+                    "node-drain",
+                    "incremental-backup",
+                    "incremental-replication",
+                    "storage-migration",
+                    "metrics",
+                    "node-roles",
+                    "shared-sessions",
+                    "vip",
+                    "lease-liveness",
+                    "voter-limit",
+                    "observer",
+                    "multi-link",
+                    "ha-placement",
+                    "fast-ha",
+                    "ha-checks",
+                    "placement",
+                    "hotplug",
+                    "node-replication",
+                    "ceph-setup",
+                    "install-media",
+                    "templates",
+                    "vtpm",
+                    "guest-agent",
+                    "metrics-history",
+                    "notifications",
+                    "folders",
+                    "two-factor",
+                    "cpu-models",
+                    "numa",
+                    "sdn",
+                    "sdn-routing",
+                    "sdn-services",
+                    "backup-store",
+                    "file-restore",
+                    "vm-check",
+                    "vmware-migrate",
+                    "vm-export",
+                    "declarative",
+                    "config-history",
+                    "acme",
+                    "orbivisor-layout",
+                ]),
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()
             }

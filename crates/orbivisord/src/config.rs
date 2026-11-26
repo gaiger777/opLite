@@ -1214,7 +1214,7 @@ impl CephSection {
 }
 
 fn default_ceph_client_dir() -> PathBuf {
-    "/etc/orbivisor/ceph".into()
+    crate::layout::existing(Path::new("/etc/orbivisor/ceph"))
 }
 fn default_ceph_packages() -> Vec<String> {
     DAEMON_PACKAGES.iter().map(|p| p.to_string()).collect()
@@ -1263,9 +1263,15 @@ impl SdnSection {
     /// 이 노드에서 OVN을 세우는 단계들(실제 명령). 노드 TLS 원본은 `{data_dir}/pki`, `tag`는 클러스터 태그다. Linux가
     /// 아닌 노드도 만들고 Task가 거절한다.
     pub fn host(&self, data_dir: &Path, tag: &str) -> OvnHost {
+        // 기본 자리는 배치를 맞추지 않은(못한) 노드에서 옛 자리다(`layout::existing`).
+        let base = OvnPaths::default();
         let paths = OvnPaths {
+            etc: crate::layout::existing(&base.etc),
+            var_lib: crate::layout::existing(&base.var_lib),
+            run: crate::layout::existing(&base.run),
+            log: crate::layout::existing(&base.log),
             pki: data_dir.join(orbivisor_peer::pki::PKI_DIR),
-            ..OvnPaths::default()
+            ..base
         };
         let options = OvnOptions {
             central_packages: self.central_packages.clone(),
@@ -1468,7 +1474,7 @@ fn default_dpkg() -> PathBuf {
     "/usr/bin/dpkg".into()
 }
 fn default_log_dir() -> PathBuf {
-    "/var/log/orbivisor".into()
+    crate::layout::existing(Path::new("/var/log/orbivisor"))
 }
 fn default_upgrade_poll() -> Duration {
     Duration::from_secs(2)
@@ -1589,11 +1595,12 @@ fn default_listen() -> SocketAddr {
 fn default_cluster_listen() -> SocketAddr {
     "0.0.0.0:8007".parse().unwrap()
 }
+// 경로 기본값은 새 이름이되, 배치를 맞추지 않은(못한) 노드에서는 옛 자리다(`layout::existing`, 리뷰 1 S1).
 fn default_data_dir() -> PathBuf {
-    "/var/lib/orbivisor".into()
+    crate::layout::existing(Path::new("/var/lib/orbivisor"))
 }
 fn default_run_dir() -> PathBuf {
-    "/run/orbivisor".into()
+    crate::layout::existing(Path::new("/run/orbivisor"))
 }
 fn default_qemu_share_dir() -> PathBuf {
     "/opt/homebrew/share/qemu".into()
@@ -2162,10 +2169,14 @@ mod tests {
         assert_eq!(c.listen, "0.0.0.0:8006".parse().unwrap());
         assert_eq!(c.api_address(), "10.0.0.5:8006");
         assert_eq!(c.cluster_address(), "10.0.0.5:8007");
-        assert_eq!(c.data_dir, Path::new("/var/lib/orbivisor"));
+        // 기본 경로는 이 호스트의 배치를 따른다(옛 배치의 시험 호스트에서는 옛 자리).
+        assert_eq!(
+            c.data_dir,
+            crate::layout::existing(Path::new("/var/lib/orbivisor"))
+        );
         assert_eq!(
             c.control_socket(),
-            Path::new("/run/orbivisor/orbivisord.sock")
+            crate::layout::existing(Path::new("/run/orbivisor")).join("orbivisord.sock")
         );
         assert_eq!(c.reconciler.acpi_timeout(), Duration::from_secs(60));
         let schedule = c.schedule.scheduler_config();
@@ -2490,8 +2501,14 @@ mod tests {
         c.validate().unwrap();
         let host = c.sdn.host(Path::new("/var/lib/orbivisor"), "abc");
         assert_eq!(host.paths().pki, Path::new("/var/lib/orbivisor/pki"));
-        assert_eq!(host.paths().etc, Path::new("/etc/orbivisor/ovn"));
-        assert_eq!(host.paths().var_lib, Path::new("/var/lib/orbivisor/ovn"));
+        assert_eq!(
+            host.paths().etc,
+            crate::layout::existing(Path::new("/etc/orbivisor/ovn"))
+        );
+        assert_eq!(
+            host.paths().var_lib,
+            crate::layout::existing(Path::new("/var/lib/orbivisor/ovn"))
+        );
         assert_eq!(host.options().central_packages, CENTRAL_PACKAGES);
         assert_eq!(host.options().host_packages, HOST_PACKAGES);
         assert_eq!(host.options().install_timeout, Duration::from_secs(1800));
@@ -2520,7 +2537,10 @@ mod tests {
         let c = parse("name = \"n\"\naddress = \"h\"");
         c.validate().unwrap();
         let host = c.ceph.host();
-        assert_eq!(host.paths().client_dir, Path::new("/etc/orbivisor/ceph"));
+        assert_eq!(
+            host.paths().client_dir,
+            crate::layout::existing(Path::new("/etc/orbivisor/ceph"))
+        );
         assert_eq!(host.paths().etc_ceph, Path::new("/etc/ceph"));
         assert_eq!(host.options().packages, DAEMON_PACKAGES);
         assert_eq!(host.options().client_packages, CLIENT_PACKAGES);
@@ -2586,7 +2606,10 @@ mod tests {
         assert_eq!(u.systemd_run, Path::new("/usr/bin/systemd-run"));
         assert_eq!(u.systemctl, Path::new("/usr/bin/systemctl"));
         assert_eq!(u.dpkg, Path::new("/usr/bin/dpkg"));
-        assert_eq!(u.log_dir, Path::new("/var/log/orbivisor"));
+        assert_eq!(
+            u.log_dir,
+            crate::layout::existing(Path::new("/var/log/orbivisor"))
+        );
         assert_eq!(u.poll, Duration::from_secs(2));
 
         let c = parse(
@@ -2767,7 +2790,7 @@ mod tests {
         std::fs::write(&path, "name = \"n\"").unwrap();
         assert_eq!(
             Config::data_dir_of(&path).unwrap(),
-            Path::new("/var/lib/orbivisor")
+            crate::layout::existing(Path::new("/var/lib/orbivisor"))
         );
         std::fs::write(&path, "data_dir = 5").unwrap();
         assert!(Config::data_dir_of(&path).is_err());

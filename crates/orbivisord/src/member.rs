@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -993,6 +993,8 @@ impl Member {
             dns_resolver: config.acme.dns_resolver,
             api_cert: Some(api_cert.clone()),
             node_cert_pem: Some(tls.cert_pem.clone()),
+            // 배치를 맞추지 않은(못한) 노드에서는 옛 자리(`layout::existing`)
+            hook_root: crate::layout::existing(Path::new(orbivisor_types::acme::HOOK_DIR)),
             ..Default::default()
         };
         // 네트워크 주소 목록이 논리 포트 상태를 OvnSync와 같은 TLS로 읽는다(계획 65).
