@@ -22,6 +22,7 @@ pub mod cluster;
 mod console;
 mod cpu;
 mod cpu_baseline;
+mod dashboard;
 mod declarative;
 mod drain;
 mod drift;
@@ -231,6 +232,9 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(cpu::refresh_node_cpu))
         .routes(routes!(numa::get_node_topology))
         .routes(routes!(numa::topology_usage))
+        // 운영자 대시보드(계획 75)
+        .routes(routes!(dashboard::physical_topology))
+        .routes(routes!(dashboard::get_capacity))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
         .routes(routes!(drain::unfreeze_node))

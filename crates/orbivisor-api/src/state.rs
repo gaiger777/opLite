@@ -103,6 +103,8 @@ pub struct AppState {
     pub(crate) plans: crate::declarative::Plans,
     /// 이 노드의 ACME 설정(계획 73 — 키 디렉터리·DNS 확인 서버·만료 경보가 볼 인증서)
     pub acme: crate::acme::AcmeNodeConfig,
+    /// 운영자 대시보드 두 읽기(`/topology/physical`·`/capacity`, 계획 75)의 마지막 결과
+    pub(crate) dashboard: crate::dashboard::DashboardCache,
 }
 
 impl AppState {
@@ -152,6 +154,7 @@ impl AppState {
             vmware_cache: Default::default(),
             plans: Default::default(),
             acme: Default::default(),
+            dashboard: Default::default(),
         }
     }
 }

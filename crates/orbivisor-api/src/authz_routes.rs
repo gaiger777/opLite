@@ -133,6 +133,9 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     // NUMA 토폴로지(계획 64): 노드 번호·pCPU를 보이므로 루트 `cluster.read`
     ("GET", "/nodes/{key}/topology", Root(ClusterRead)),
     ("GET", "/topology/usage", Root(ClusterRead)),
+    // 운영자 대시보드(계획 75): 모든 노드의 포트·용량을 보이므로 루트 `cluster.read`
+    ("GET", "/topology/physical", Root(ClusterRead)),
+    ("GET", "/capacity", Root(ClusterRead)),
     ("POST", "/nodes/{key}/upgrade", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/drain", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/unfreeze", Root(ClusterAdmin)),

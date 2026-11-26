@@ -92,6 +92,8 @@ async fn openapi_document_is_served_without_login() {
         "/placement-rules",
         "/placement-rules/{key}",
         "/placement",
+        "/topology/physical",
+        "/capacity",
         "/placement/recommendations",
         "/placement/recommendations/{id}/apply",
         "/vm-imports",
