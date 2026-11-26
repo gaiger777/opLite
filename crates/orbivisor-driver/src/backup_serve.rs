@@ -36,8 +36,11 @@ pub fn backup_serve_unit(id: Uuid) -> String {
 
 /// 이름 바꾸기(계획 74) 앞의 데몬이 쓰던 scope 이름. 같은 세션의 남은 scope를 치울 때 함께 본다.
 fn legacy_backup_serve_unit(id: Uuid) -> String {
-    format!("opl-bkserve-{id}")
+    format!("{LEGACY_BACKUP_SERVE_PREFIX}{id}")
 }
+
+/// 이름 바꾸기 앞의 scope 이름 앞
+const LEGACY_BACKUP_SERVE_PREFIX: &str = "opl-bkserve-";
 
 /// `exe`(`orbivisord`)의 헬퍼를 `cfg`로 띄우고 소켓이 답하기를 기다린다. `cfg.pid_file`은 있어야 한다(헬퍼가 pid를
 /// 적는다 — 다시 뜬 opld가 그것으로 찾는다). 표준 오류는 `log`에 덧붙인다. `scope`면 systemd scope(`id`)로 감싼다.
@@ -161,5 +164,24 @@ pub async fn stop_backup_serve(pid_file: &Path, socket: &Path) {
         {
             tracing::warn!(file = %f.display(), error = %e, "cannot remove");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 새로 띄우는 scope는 새 이름이고, 치울 때 함께 보는 옛 이름은 계획 74 앞의 이름이다.
+    #[test]
+    fn scope_names_use_the_new_prefix_and_remember_the_old_one() {
+        let id = Uuid::nil();
+        assert_eq!(
+            backup_serve_unit(id),
+            "orbivisor-bkserve-00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            legacy_backup_serve_unit(id),
+            "opl-bkserve-00000000-0000-0000-0000-000000000000"
+        );
     }
 }

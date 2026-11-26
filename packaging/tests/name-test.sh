@@ -245,7 +245,7 @@ OLD_EXCLUDE=(
 # 허용 규칙 "<파일 glob>|<ERE>"(위 RULES와 같은 모양): 옛 이름을 일부러 받는 줄의 모양
 OLD_RULES=(
 	# 이름 바꾸기 앞에 저장된 ACME 훅 경로(spec에 들어 있다)
-	'crates/orbivisor-types/src/acme.rs|"/etc/opl/[^"]*"'
+	'crates/orbivisor-types/src/acme.rs|LEGACY_HOOK_DIR: &str = "/etc/opl/acme-hooks/"|hook_(path_ok|rest)\("/etc/opl/[^"]*"\)'
 	'crates/orbivisor-api/src/acme/dns/hook.rs|/etc/opl/acme-hooks/'
 	'crates/orbivisor-api/src/acme/api.rs|옛 판은 `/etc/opl/acme-hooks/`만'
 	'web/src/certs/dialogs.tsx|/etc/opl/acme-hooks/'
@@ -280,25 +280,31 @@ OLD_RULES=(
 	'docs/architecture.md|옛 (이름 )?(링크 )?(디렉터리\()?`[^`]*`(·`[^`]*`)*|별칭 링크 `opld\.service`|`[|]/etc/opl/opld\.toml`|덮어쓰기\(`opld\.service\.d`\)'
 	# 시작하기의 설치 안내: 패키지가 까는 별칭
 	'docs/guide/getting-started.md|별칭 `opld\.service`'
-	# 쿠키·잠금·일시 유닛의 옛 이름을 받는 코드(리뷰 1 — 새 이름을 쓰는 줄은 그대로 걸린다)
-	'crates/orbivisor-api/src/auth.rs|"opl_session"|cookies\("[^"]*"\)'
-	'crates/orbivisor-api/src/oidc.rs|"opl_oidc"'
+	# 쿠키·잠금·일시 유닛의 옛 이름을 받는 코드(리뷰 1 — 새 이름을 쓰는 줄은 그대로 걸린다). 옛 문자열은 LEGACY_ 상수의
+	# 정의 줄에만 허용한다(리뷰 2 — 새 이름의 상수·함수가 옛 문자열로 되돌아가면 걸린다).
+	'crates/orbivisor-api/src/auth.rs|LEGACY_SESSION_COOKIE: &str = "opl_session"|cookies\("[^"]*"\)'
+	'crates/orbivisor-api/src/oidc.rs|LEGACY_STATE_COOKIE: &str = "opl_oidc"'
 	'crates/orbivisor-api/src/oidc_login.rs|옛 이름 `opl_oidc`도'
 	'web/src/api/schema.d.ts|옛 이름 `opl_oidc`도'
 	'crates/orbivisor-api/tests/auth.rs|opl_session'
+	'crates/orbivisor-api/tests/audit.rs|opl_session=\{viewer\}'
 	'crates/orbivisor-api/tests/oidc_login.rs|opl_(session|oidc)'
-	'crates/orbivisor-api/src/updates.rs|`opl-upgrade-…`|format!\("opl-upgrade-\{\}", task\.simple\(\)\)|"opl-upgrade-[0-9a-f]{32}"'
+	'crates/orbivisor-api/src/updates.rs|`opl-upgrade-…`|LEGACY_UPGRADE_PREFIX: &str = "opl-upgrade-"|"opl-upgrade-[0-9a-f]{32}"'
 	'crates/orbivisor-api/tests/updates.rs|opl-upgrade-'
-	'crates/orbivisor-driver/src/backup_serve.rs|format!\("opl-bkserve-\{id\}"\)'
-	'crates/orbivisor-driver/src/file_restore.rs|"opl-fr-"|옛 `opl-fr-<id>(\.scope)?`'
+	'crates/orbivisor-driver/src/backup_serve.rs|LEGACY_BACKUP_SERVE_PREFIX: &str = "opl-bkserve-"|"opl-bkserve-0{8}-0{4}-0{4}-0{4}-0{12}"'
+	'crates/orbivisor-driver/src/file_restore.rs|LEGACY_UNIT_PREFIX: &str = "opl-fr-"|옛 `opl-fr-<id>(\.scope)?`'
 	'crates/orbivisor-driver/src/file_restore/tests.rs|opl-fr-'
 	'crates/orbivisor-driver/src/ovn/host.rs|옛 디렉터리 이름\(`/etc/opl` 등\)·옛 단위 이름\(`opl-ovn-`\)'
 	'crates/orbivisor-driver/src/ovn/host/tests.rs|디렉터리 이름\(`/etc/opl` 등\)'
 	'crates/orbivisord/src/*|옛 이름 (링크 ?)?\(?`opld\.(sock|lock)`|\(`opld\.lock`만 잠금\)'
+	'crates/orbivisord/src/main.rs|LEGACY_LOCK: &str = "opld\.lock"'
 	# 옛 로그인 파일 받기와 그 시험
 	'crates/orbivisorctl/src/*|~/\.config/opl/oplctl\.json|"\.config/opl/oplctl\.json"'
-	# 시험이 임시 디렉터리에 두는 파일 이름(그 자리의 설정·소켓·로그인 파일)과 옛 잠금 파일
-	'crates/*|\.(path|join)\("(sub/)?(opld\.(toml|sock|lock)|oplctl\.json)"\)'
+	'crates/orbivisorctl/tests/legacy_env.rs|~/\.config/opl/oplctl\.json|"\.config/opl/oplctl\.json"'
+	# 시험이 임시 디렉터리에 두는 파일 이름(그 자리의 설정·소켓·로그인 파일)과 옛 잠금 파일. src의 시험은 임시
+	# 디렉터리(`dir.path()`) 아래만 — 데몬의 `self.run_dir.join("opld.sock")` 같은 줄은 걸린다(리뷰 2).
+	'crates/*/tests/*|\.(path|join)\("(sub/)?(opld\.(toml|sock|lock)|oplctl\.json)"\)'
+	'crates/*/src/*|dir\.path\(\)\.join\("(sub/)?(opld\.(toml|sock)|oplctl\.json)"\)'
 	# 구조·안내 문서의 옛 이름 쿠키·잠금
 	'docs/*|옛 이름 `opl_(session|oidc)`도|같은 값의 `opl_session`도|, `opld\.lock`'
 	# 유지 스크립트(postinst·postrm): 옛 이름 유닛 파일·enable 링크·덮어쓰기의 경로와 그 안내(옛 이름을 systemctl에
@@ -381,7 +387,23 @@ expect_old clean packaging/deb/postinst '		ln -s orbivisord.service.d "$SYSTEMD_
 expect_old left packaging/tests/maint-test.sh 'restart opld.service" postinst configure 0.1.0'
 expect_old clean packaging/tests/maint-test.sh 'ln -sf /usr/lib/systemd/system/opld.service "$WANTS/opld.service"'
 expect_old clean crates/orbivisord/tests/smoke.rs '        .arg(d.path("opld.toml"))'
-expect_old clean crates/orbivisor-api/src/updates.rs '    format!("opl-upgrade-{}", task.simple())'
+# 계획 74 리뷰 2: 옛 문자열은 LEGACY_ 상수 정의에만 — 새 이름 쪽이 옛 문자열로 되돌아가면 걸린다.
+expect_old left crates/orbivisor-api/src/updates.rs '    format!("opl-upgrade-{}", task.simple())'
+expect_old clean crates/orbivisor-api/src/updates.rs 'const LEGACY_UPGRADE_PREFIX: &str = "opl-upgrade-";'
+expect_old left crates/orbivisor-api/src/auth.rs 'pub const SESSION_COOKIE: &str = "opl_session";'
+expect_old clean crates/orbivisor-api/src/auth.rs 'pub const LEGACY_SESSION_COOKIE: &str = "opl_session";'
+expect_old left crates/orbivisor-api/src/oidc.rs 'pub const STATE_COOKIE: &str = "opl_oidc";'
+expect_old clean crates/orbivisor-api/src/oidc.rs 'pub const LEGACY_STATE_COOKIE: &str = "opl_oidc";'
+expect_old left crates/orbivisor-types/src/acme.rs 'pub const HOOK_DIR: &str = "/etc/opl/acme-hooks/";'
+expect_old clean crates/orbivisor-types/src/acme.rs 'pub const LEGACY_HOOK_DIR: &str = "/etc/opl/acme-hooks/";'
+expect_old left crates/orbivisord/src/config.rs '            .unwrap_or_else(|| self.run_dir.join("opld.sock"))'
+expect_old left crates/orbivisord/src/main.rs '        lock_file(&dir.join("opld.lock"))?,'
+expect_old clean crates/orbivisord/src/main.rs 'const LEGACY_LOCK: &str = "opld.lock";'
+expect_old clean crates/orbivisorctl/src/cli.rs '        let old = dir.path().join("opld.sock");'
+expect_old clean crates/orbivisord/tests/release_vips.rs '    let lock = std::fs::File::create(data.join("opld.lock")).unwrap();'
+expect_old left crates/orbivisor-driver/src/backup_serve.rs '    format!("opl-bkserve-{id}")'
+expect_old clean crates/orbivisor-driver/src/backup_serve.rs 'const LEGACY_BACKUP_SERVE_PREFIX: &str = "opl-bkserve-";'
+expect_old left crates/orbivisor-driver/src/file_restore.rs 'pub const UNIT_PREFIX: &str = "opl-fr-";'
 
 range=$(rename_range)
 if [ -n "$range" ]; then ok "시작하기의 이름 바꾸기 절: 줄 $range"; else fail "시작하기에서 두 이름 바꾸기 절을 찾지 못함"; fi

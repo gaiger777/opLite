@@ -475,8 +475,11 @@ fn upgrade_unit(task: Uuid) -> String {
 
 /// 이름 바꾸기(계획 74) 앞의 데몬이 쓰던 업그레이드 유닛 이름
 fn legacy_upgrade_unit(task: Uuid) -> String {
-    format!("opl-upgrade-{}", task.simple())
+    format!("{LEGACY_UPGRADE_PREFIX}{}", task.simple())
 }
+
+/// 이름 바꾸기 앞의 업그레이드 유닛 이름 앞
+const LEGACY_UPGRADE_PREFIX: &str = "opl-upgrade-";
 
 /// 업그레이드 유닛이 돌리는 셸 명령. 처음에 시작 줄([`START_MARK`]), 끝에 종료 상태 줄([`EXIT_MARK`])을
 /// 로그에 남긴다. apt는 다른 apt의 잠금을 [`LOCK_TIMEOUT`]초까지 기다린다.

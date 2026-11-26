@@ -482,9 +482,12 @@ fn prepare_data_dir(dir: &Path) -> anyhow::Result<()> {
 fn lock_data_dir(dir: &Path) -> anyhow::Result<[File; 2]> {
     Ok([
         lock_file(&dir.join("orbivisord.lock"))?,
-        lock_file(&dir.join("opld.lock"))?,
+        lock_file(&dir.join(LEGACY_LOCK))?,
     ])
 }
+
+/// 이름 바꾸기(계획 74) 앞의 잠금 파일 이름
+const LEGACY_LOCK: &str = "opld.lock";
 
 fn lock_file(path: &Path) -> anyhow::Result<File> {
     let file = std::fs::OpenOptions::new()
