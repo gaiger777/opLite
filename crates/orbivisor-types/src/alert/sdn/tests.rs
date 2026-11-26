@@ -571,19 +571,23 @@ fn lb_member_down_per_load_balancer() {
     assert_eq!(run(Some(&obs("error")))[0].holds, Some(true));
 }
 
-/// 권하는 묶음(§11): 여덟 조건, 이름·심각도·지속 시간, 모두 검증을 지난다.
+/// 권하는 묶음(§11): SDN 여덟 조건과 링크 조건 둘(계획 75), 이름·심각도·지속 시간, 모두 검증을 지난다.
 #[test]
 fn default_rules_cover_every_condition() {
     let rules = default_rules(&["ops".into()]);
-    assert_eq!(rules.len(), 8);
+    assert_eq!(rules.len(), 10);
     let mut kinds = BTreeSet::new();
     for (name, spec) in &rules {
         spec.validate().unwrap();
-        assert!(spec.condition.is_sdn());
+        assert!(spec.condition.is_sdn() || spec.condition.is_link());
         assert_eq!(*name, spec.condition.kind().replace('_', "-"));
         kinds.insert(spec.condition.kind());
     }
-    assert_eq!(kinds.len(), 8);
+    assert_eq!(kinds.len(), 10);
+    assert_eq!(
+        rules.iter().filter(|(_, s)| s.condition.is_link()).count(),
+        2
+    );
     let find = |n: &str| rules.iter().find(|(name, _)| *name == n).unwrap().1.clone();
     assert_eq!(
         (
@@ -596,4 +600,20 @@ fn default_rules_cover_every_condition() {
     assert_eq!(find("sdn-gateway-failover").severity, Severity::Info);
     assert_eq!(find("sdn-sync-failed").for_secs, 120);
     assert_eq!(find("sdn-lb-member-down").for_secs, 30);
+    let link = find("node-link-down");
+    assert_eq!((link.severity, link.for_secs), (Severity::Critical, 30));
+    assert_eq!(
+        link.condition,
+        AlertCondition::NodeLinkDown {
+            ports: None,
+            role: crate::alert::LinkRole::Uplink
+        }
+    );
+    assert_eq!(
+        (
+            find("bond-degraded").severity,
+            find("bond-degraded").for_secs
+        ),
+        (Severity::Warning, 60)
+    );
 }

@@ -296,6 +296,7 @@ mod tests {
                 id: Uuid::nil(),
                 name: "node1".into(),
                 node: Some("node1".into()),
+                port: None,
             },
             state: AlertState::Firing,
             since: 1,

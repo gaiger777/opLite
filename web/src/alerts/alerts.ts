@@ -66,10 +66,10 @@ export function useAlertHistory(period: HistoryPeriod) {
   });
 }
 
-/** 경보 대상 표시: 노드 경보는 노드 이름, 나머지는 `kind/name@node`(CLI와 같음) */
+/** 경보 대상 표시: 노드 경보는 노드 이름(링크 경보는 `노드/포트`), 나머지는 `kind/name@node`(CLI와 같음) */
 export function subjectText(subject: AlertSubject): string {
   if (subject.kind === "node") {
-    return subject.name;
+    return subject.port ? `${subject.name}/${subject.port}` : subject.name;
   }
   return `${subject.kind}/${subject.name}${subject.node ? `@${subject.node}` : ""}`;
 }

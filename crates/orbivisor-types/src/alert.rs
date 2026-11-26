@@ -717,12 +717,27 @@ pub struct AlertSubject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub node: Option<String>,
+    /// 링크 경보(`node_link_down`·`bond_degraded`, 계획 75)의 포트·본딩 이름. 한 노드에서 포트마다 경보가 따로다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub port: Option<String>,
 }
 
 impl AlertSubject {
-    /// 경보 키: 규칙 id + 대상 종류·id
+    /// 경보 키: 규칙 id + 대상 종류·id(+ 포트)
     pub fn key(&self, rule: Uuid) -> String {
-        format!("{rule}/{}/{}", self.kind.as_str(), self.id)
+        match &self.port {
+            Some(port) => format!("{rule}/{}/{}/{port}", self.kind.as_str(), self.id),
+            None => format!("{rule}/{}/{}", self.kind.as_str(), self.id),
+        }
+    }
+
+    /// 알림에 쓰는 이름: 대상 이름, 포트가 있으면 `노드/포트`
+    pub fn label(&self) -> String {
+        match &self.port {
+            Some(port) => format!("{}/{port}", self.name),
+            None => self.name.clone(),
+        }
     }
 }
 
@@ -2043,6 +2058,7 @@ mod tests {
             id: Uuid::from_u128(7),
             name: "n1".into(),
             node: Some("n1".into()),
+            port: None,
         }
     }
 

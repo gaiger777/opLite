@@ -63,7 +63,7 @@ impl Notification {
     pub fn title(&self) -> String {
         let head = format!("[Orbivisor {}] {}", self.cluster, self.word());
         match (&self.rule, &self.subject) {
-            (Some(rule), Some(s)) => format!("{head} {}: {rule} on {}", self.severity, s.name),
+            (Some(rule), Some(s)) => format!("{head} {}: {rule} on {}", self.severity, s.label()),
             (Some(rule), None) => format!("{head} {}: {rule}", self.severity),
             _ => match &self.detail {
                 Some(d) => format!("{head}: {d}"),
@@ -88,6 +88,9 @@ impl Notification {
                 && *node != s.name
             {
                 line.push_str(&format!(" on node {node}"));
+            }
+            if let Some(port) = &s.port {
+                line.push_str(&format!(" port {port}"));
             }
             lines.push(line);
         }
@@ -170,9 +173,15 @@ pub(crate) fn webhook_request(w: &WebhookTarget, n: &Notification) -> WebhookReq
     let mut headers: Vec<(String, String)> = Vec::new();
     let (content_type, body) = match w.format {
         WebhookFormat::Json => {
-            let subject = n.subject.as_ref().map(
-                |s| json!({ "kind": s.kind.as_str(), "id": s.id, "name": s.name, "node": s.node }),
-            );
+            let subject = n.subject.as_ref().map(|s| {
+                let mut v =
+                    json!({ "kind": s.kind.as_str(), "id": s.id, "name": s.name, "node": s.node });
+                // 링크 경보(계획 75)만 포트를 단다(다른 경보의 본문은 그대로).
+                if let Some(port) = &s.port {
+                    v["port"] = json!(port);
+                }
+                v
+            });
             let body = json!({
                 "version": 1,
                 "cluster": n.cluster,
@@ -370,7 +379,7 @@ pub(crate) fn record_of(
         // 장부가 이 노드 이름으로 채운다.
         node: String::new(),
         rule: n.rule.clone(),
-        subject: n.subject.as_ref().map(|s| s.name.clone()),
+        subject: n.subject.as_ref().map(|s| s.label()),
         state: n.state,
         target: target.into(),
         ok: result.is_ok(),
@@ -443,10 +452,15 @@ impl Job {
         }
     }
 
-    /// 같은 경보의 같은 대상 알림을 가리는 열쇠: (대상, 규칙, 경보 대상 id). 규칙 경보가 아니면 None이다.
+    /// 같은 경보의 같은 대상 알림을 가리는 열쇠: (대상, 규칙, 경보 대상 id, 포트). 규칙 경보가 아니면 None이다.
     fn alert(&self) -> Option<AlertKey> {
         let (rule, subject) = (self.n.rule.as_ref()?, self.n.subject.as_ref()?);
-        Some((self.target.clone(), rule.clone(), subject.id))
+        Some((
+            self.target.clone(),
+            rule.clone(),
+            subject.id,
+            subject.port.clone(),
+        ))
     }
 
     /// 다시 하기를 기다리는 `FIRING`인데 그 뒤에 같은 경보의 `RESOLVED`를 받았다(리뷰 2 #5).
@@ -457,8 +471,8 @@ impl Job {
     }
 }
 
-/// (대상, 규칙 이름, 경보 대상 id)
-type AlertKey = (String, String, uuid::Uuid);
+/// (대상, 규칙 이름, 경보 대상 id, 링크 경보의 포트)
+type AlertKey = (String, String, uuid::Uuid, Option<String>);
 
 /// 대상 하나의 분당 창
 struct Window {
@@ -939,6 +953,7 @@ mod tests {
                 id: Uuid::from_u128(7),
                 name: "web1".into(),
                 node: Some("node1".into()),
+                port: None,
             }),
             value: Some(97.456),
             threshold: Some(90.0),

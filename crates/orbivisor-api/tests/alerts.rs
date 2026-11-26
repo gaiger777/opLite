@@ -1211,12 +1211,13 @@ async fn sdn_alerts_fire_from_node_state_and_observations() {
         .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["created"].as_array().unwrap().len(), 8, "{body}");
+    // SDN 여덟과 링크 둘(계획 75)
+    assert_eq!(body["created"].as_array().unwrap().len(), 10, "{body}");
     let (_, again) = admin
         .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
         .await;
     assert_eq!(again["created"], json!([]), "{again}");
-    assert_eq!(again["existing"].as_array().unwrap().len(), 8, "{again}");
+    assert_eq!(again["existing"].as_array().unwrap().len(), 10, "{again}");
     let missing = admin
         .post("/alert-rules/sdn-defaults", json!({"targets": ["nobody"]}))
         .await;
@@ -1632,4 +1633,238 @@ async fn apply_set_drift_alerts_name_the_set() {
     let text = hits[0].json().to_string();
     assert!(text.contains("\"rule\":\"drift\""), "{text}");
     assert!(text.contains("Apply set web drifted: 1 object"), "{text}");
+}
+
+/// 링크 경보(계획 75 §3.4): 노드 상태의 끊긴 업링크 포트(`node_link_down`)·저하된 본딩(`bond_degraded`)마다 하나, 문구는
+/// 영향(위 브리지·네트워크·VM). 역할 거르기(`uplink`는 쓰지 않는 포트를 보지 않음)와 포트 글롭, 포트가 돌아오면 해제.
+#[tokio::test]
+async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
+    use orbivisor_types::network::Network;
+    use orbivisor_types::node::{FEATURES, NodeInterface};
+    use orbivisor_types::vm::{Vm, VmPhase};
+
+    let interfaces = |eno2_up: bool| -> Vec<NodeInterface> {
+        let eno2 = if eno2_up { "up" } else { "down" };
+        serde_json::from_value(json!([
+            { "name": "eno1", "kind": "ethernet", "state": "up", "carrier": true, "master": "bond0" },
+            { "name": "eno2", "kind": "ethernet", "state": eno2, "carrier": eno2_up, "master": "bond0" },
+            { "name": "bond0", "kind": "bond", "state": "up", "carrier": true, "master": "vmbr0",
+              "bond": { "mode": "active-backup", "state": if eno2_up { "up" } else { "degraded" },
+                        "ports": [ { "name": "eno1", "state": "up" }, { "name": "eno2", "state": eno2 } ] } },
+            { "name": "vmbr0", "kind": "bridge", "state": "up", "carrier": true },
+            { "name": "eno3", "kind": "ethernet", "state": "down", "carrier": false }
+        ]))
+        .unwrap()
+    };
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    let svc01 = add_node(
+        &rig.env,
+        "svc01",
+        NodeStatus {
+            online: true,
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+            interfaces: interfaces(false),
+            ..NodeStatus::default()
+        },
+    )
+    .await;
+    let lan: Network = Resource::new(
+        "lan",
+        serde_json::from_value(json!({ "bridge": "vmbr0" })).unwrap(),
+    );
+    rig.env.cluster.create(&lan).await.unwrap();
+    let mut spec = common::vm_request("web")["spec"].clone();
+    spec["nics"] = json!([{ "network": "lan", "model": "virtio" }]);
+    let mut vm: Vm = Resource::new("web", serde_json::from_value(spec).unwrap());
+    vm.status.phase = VmPhase::Running;
+    vm.status.node = Some(svc01);
+    rig.env.cluster.create(&vm).await.unwrap();
+
+    rig.rule(
+        "uplinks",
+        json!({"condition": {"kind": "node_link_down"}, "severity": "critical", "for_secs": 0, "targets": ["ops"]}),
+    )
+    .await;
+    rig.rule(
+        "bonds",
+        json!({"condition": {"kind": "bond_degraded"}, "severity": "warning", "for_secs": 0, "targets": ["ops"]}),
+    )
+    .await;
+    rig.rule(
+        "spare",
+        json!({"condition": {"kind": "node_link_down", "ports": "eno3", "role": "any"}, "severity": "info",
+               "for_secs": 0, "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    let hits = rig.hook.wait(3).await;
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 3, "{:?}", rig.hook.hits());
+    let by_rule = |hits: &[Hit], rule: &str, state: &str| -> Value {
+        hits.iter()
+            .map(Hit::json)
+            .find(|h| h["rule"] == rule && h["state"] == state)
+            .unwrap_or_else(|| panic!("no {state} {rule} in {hits:?}"))
+    };
+    let up = by_rule(&hits, "uplinks", "firing");
+    assert_eq!(
+        up["subject"],
+        json!({ "kind": "node", "id": svc01, "name": "svc01", "node": "svc01", "port": "eno2" }),
+        "{up}"
+    );
+    assert_eq!(
+        up["detail"], "eno2 down on svc01: bond0 degraded — vmbr0, 1 network, 1 VM",
+        "{up}"
+    );
+    assert!(
+        up["title"]
+            .as_str()
+            .unwrap()
+            .ends_with("uplinks on svc01/eno2"),
+        "{up}"
+    );
+    let bond = by_rule(&hits, "bonds", "firing");
+    assert_eq!(bond["subject"]["port"], "bond0", "{bond}");
+    assert_eq!(
+        bond["detail"], "eno2 down on svc01: bond0 degraded — vmbr0, 1 network, 1 VM",
+        "{bond}"
+    );
+    // 쓰지 않는 포트는 `role: any`와 글롭으로만 본다(영향 없음).
+    let spare = by_rule(&hits, "spare", "firing");
+    assert_eq!(spare["subject"]["port"], "eno3", "{spare}");
+    assert_eq!(spare["detail"], "eno3 down on svc01", "{spare}");
+    // 경보 목록도 포트마다
+    let a = rig.alerts().await;
+    let ports: Vec<&str> = a["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["subject"]["port"].as_str().unwrap())
+        .collect();
+    assert_eq!(ports.len(), 3, "{a}");
+    assert!(
+        ports.contains(&"eno2") && ports.contains(&"bond0") && ports.contains(&"eno3"),
+        "{a}"
+    );
+
+    // eno2가 돌아오면 60초 뒤 두 경보가 풀린다(eno3는 그대로).
+    let mut n = rig.env.cluster.get::<NodeSpec>(svc01).unwrap().unwrap();
+    n.status.interfaces = interfaces(true);
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(svc01, &n.status)
+        .await
+        .unwrap();
+    rig.wait_alerts(|a| {
+        a["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["clear_since"].is_i64())
+            .count()
+            == 2
+    })
+    .await;
+    rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
+    let hits = rig.hook.wait(5).await;
+    for rule in ["uplinks", "bonds"] {
+        by_rule(&hits, rule, "resolved");
+    }
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 5, "{:?}", rig.hook.hits());
+    let a = rig.alerts().await;
+    assert_eq!(a["alerts"].as_array().unwrap().len(), 1, "{a}");
+    assert_eq!(a["alerts"][0]["subject"]["port"], "eno3", "{a}");
+    engine.shutdown().await;
+}
+
+/// 링크 조건은 모든 노드가 `link-alerts`를 알 때만 받는다(409 `cluster_upgrading`). "SDN 경보 켜기"는 그동안 링크 규칙을
+/// 빼고 만든다.
+#[tokio::test]
+async fn link_rules_wait_for_every_node_to_know_link_alerts() {
+    use orbivisor_types::node::{FEATURES, LINK_ALERTS};
+
+    let rig = Rig::start().await;
+    let admin = rig.env.admin().await;
+    rig.target("ops", "json").await;
+    add_node(
+        &rig.env,
+        "old",
+        NodeStatus {
+            online: true,
+            features: FEATURES
+                .iter()
+                .filter(|f| **f != LINK_ALERTS)
+                .map(|f| f.to_string())
+                .collect(),
+            ..NodeStatus::default()
+        },
+    )
+    .await;
+    for condition in [
+        json!({"kind": "node_link_down"}),
+        json!({"kind": "bond_degraded"}),
+    ] {
+        let got = admin
+            .post(
+                "/alert-rules",
+                json!({"name": "link", "spec": {"condition": condition, "severity": "warning", "targets": ["ops"]}}),
+            )
+            .await;
+        assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    }
+    // 다른 조건은 된다.
+    rig.rule(
+        "off",
+        json!({"condition": {"kind": "node_offline"}, "severity": "critical", "targets": ["ops"]}),
+    )
+    .await;
+    let (status, body) = admin
+        .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created: Vec<&str> = body["created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(created.len(), 8, "{body}");
+    assert!(
+        !created.contains(&"node-link-down") && !created.contains(&"bond-degraded"),
+        "{body}"
+    );
+    // 나쁜 글롭은 400
+    let mut n = rig
+        .env
+        .cluster
+        .get_by_name::<NodeSpec>("old")
+        .unwrap()
+        .unwrap();
+    n.status.features = FEATURES.iter().map(|f| f.to_string()).collect();
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(n.id, &n.status)
+        .await
+        .unwrap();
+    let got = admin
+        .post(
+            "/alert-rules",
+            json!({"name": "link", "spec": {"condition": {"kind": "node_link_down", "ports": "eno 1"},
+                   "severity": "warning", "targets": ["ops"]}}),
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    let (status, body) = admin
+        .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created: Vec<&str> = body["created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(created, ["node-link-down", "bond-degraded"], "{body}");
 }

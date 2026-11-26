@@ -119,6 +119,7 @@ fn node_subject(n: &Node) -> AlertSubject {
         id: n.id,
         name: n.name.clone(),
         node: Some(n.name.clone()),
+        port: None,
     }
 }
 
@@ -128,6 +129,7 @@ fn sdn_subject(sdn: &Sdn) -> AlertSubject {
         id: sdn.id,
         name: sdn.name.clone(),
         node: None,
+        port: None,
     }
 }
 
@@ -259,6 +261,7 @@ fn router_subject(r: &Router) -> AlertSubject {
         id: r.id,
         name: r.name.clone(),
         node: None,
+        port: None,
     }
 }
 
@@ -459,6 +462,7 @@ fn lb_member_down(inputs: &SdnInputs, observed: Option<&SdnObservations>) -> Vec
                 id: lb.id,
                 name: lb.name.clone(),
                 node: None,
+                port: None,
             };
             let Some(obs) = observed else {
                 return Some(SdnFinding::new(subject, None, None));
@@ -489,7 +493,8 @@ fn lb_member_down(inputs: &SdnInputs, observed: Option<&SdnObservations>) -> Vec
         .collect()
 }
 
-/// "SDN 경보 켜기"(§11)의 권하는 규칙: (이름, 스펙). 대상은 `targets`다.
+/// "SDN 경보 켜기"(§11)의 권하는 규칙: (이름, 스펙). 대상은 `targets`다. 끝의 둘은 링크 조건(계획 75 §3.4 — 업링크 포트
+/// 끊김 critical 30초, 본딩 저하 warning 60초)이고 기능 `link-alerts`가 클러스터 전체일 때만 만든다(API).
 pub fn default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpec)> {
     let rule = |condition, severity, for_secs| AlertRuleSpec {
         enabled: true,
@@ -538,6 +543,21 @@ pub fn default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpec)> {
         (
             "sdn-lb-member-down",
             rule(AlertCondition::SdnLbMemberDown, Severity::Warning, 30),
+        ),
+        (
+            "node-link-down",
+            rule(
+                AlertCondition::NodeLinkDown {
+                    ports: None,
+                    role: super::LinkRole::Uplink,
+                },
+                Severity::Critical,
+                30,
+            ),
+        ),
+        (
+            "bond-degraded",
+            rule(AlertCondition::BondDegraded, Severity::Warning, 60),
         ),
     ]
 }

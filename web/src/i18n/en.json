@@ -3147,7 +3147,10 @@
       "sdn_physnet_not_ready": "Physical network not ready",
       "sdn_lb_member_down": "Load balancer member down",
       "backup_verify_failed": "Backup verification failed",
-      "backup_store_unavailable": "Backup store unreachable"
+      "backup_store_unavailable": "Backup store unreachable",
+      "node_link_down": "Uplink port link down",
+      "node_link_down_any": "LAN port link down",
+      "bond_degraded": "Bond degraded"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3179,7 +3182,9 @@
       "sdn_physnet_not_ready": "Physical network not ready",
       "sdn_lb_member_down": "Load balancer member down",
       "backup_verify_failed": "Backup verification failed",
-      "backup_store_unavailable": "Backup store unreachable"
+      "backup_store_unavailable": "Backup store unreachable",
+      "node_link_down": "LAN port link down",
+      "bond_degraded": "Bond degraded"
     },
     "rules": {
       "create": "Create rule",
@@ -3207,6 +3212,13 @@
       "percent": "Used above (%)",
       "ops": "Task kinds",
       "opsHint": "For example vm-start, vm-migrate. Leave empty for every task.",
+      "role": "Ports to watch",
+      "roles": {
+        "uplink": "Uplink and underlay ports only",
+        "any": "Every LAN port"
+      },
+      "ports": "Port names",
+      "portsHint": "A pattern with * and ? (for example eno*). Leave empty for every port.",
       "forSecs": "For (seconds)",
       "forSecsHint": "The condition must hold this long before it notifies (0 to 86400).",
       "noTargets": "There are no notification targets. Create one first.",
@@ -3222,6 +3234,7 @@
         "taken": "That name is already in use.",
         "value": "Enter a number.",
         "percent": "Enter a percentage from 0 to 100.",
+        "ports": "Use 1-64 characters without spaces, '/' or ':' (* and ? are allowed).",
         "forSecs": "Enter whole seconds from 0 to 86400.",
         "repeatSecs": "Enter 0, or whole seconds from 60 to 604800.",
         "targets": "Choose 1 to 16 notification targets."
@@ -4328,7 +4341,7 @@
       "rulesLink": "Alert rules",
       "enable": "Turn on SDN alerts",
       "dialogTitle": "Turn on SDN alerts",
-      "dialogDescription": "Creates the recommended SDN rules (quorum, centrals, chassis, gateways, sync, physical networks, load balancer members). They are ordinary rules afterwards. Rules that already exist are skipped.",
+      "dialogDescription": "Creates the recommended SDN rules (quorum, centrals, chassis, gateways, sync, physical networks, load balancer members) and link rules (uplink port down, bond degraded). They are ordinary rules afterwards. Rules that already exist are skipped.",
       "for": "for {{secs}} s",
       "exists": "exists",
       "create_one": "Create {{count}} rule",

@@ -159,7 +159,8 @@ export interface paths {
         /**
          * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 한 번에 만든다 — `sdn-quorum-lost` critical 0초,
          *     `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info,
-         *     `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 같은 이름의
+         *     `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 모든 노드가
+         *     `link-alerts`를 알면 링크 규칙 둘(계획 75)도 — `node-link-down`(업링크 포트) critical 30초, `bond-degraded` warning 60초. 같은 이름의
          *     규칙이 있으면 건드리지 않는다. 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`sdn-services`를 알아야
          *     한다.
          */
@@ -1150,6 +1151,28 @@ export interface paths {
          *     새 폴더의 `vm.dedicated`가 든다(403, 계획 64).
          */
         post: operations["restore_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/capacity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드별 용량: CPU(스레드·예약·전용·vCPU 할당·실행·오버커밋·사용률), 메모리(총·예약·할당·사용·hugepages·오버커밋),
+         *     NUMA 노드별, 로컬 풀(총·사용·프로비전 = 볼륨 크기 합·볼륨 수), 공유 풀, 온라인 노드의 합. 사용률·사용 메모리는
+         *     `GET /placement`의 노드 부하이고, 리더에 묻지 못하면 빈다(나머지는 그대로). 루트 `cluster.read`, 모든 노드가
+         *     `operator-dashboard`를 알아야 한다.
+         */
+        get: operations["get_capacity"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3652,6 +3675,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/topology/physical": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 물리 ↔ 가상 네트워크 관계: 노드마다 포트(본딩·VLAN·LLDP 이웃·역할)·브리지(업링크·네트워크·VM NIC 수)·underlay·
+         *     physnet과 포트·본딩 장애의 영향(위 브리지·네트워크·VM), 네트워크마다 노드별 레일 상태(up/degraded/down/absent).
+         *     옛 노드(`legacy`)는 VLAN 아래 장치를 이름(`eno1.100`)으로 추정하고 MTU·LLDP가 빈다. 루트 `cluster.read`, 모든
+         *     노드가 `operator-dashboard`를 알아야 한다.
+         */
+        get: operations["physical_topology"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/topology/usage": {
         parameters: {
             query?: never;
@@ -5359,6 +5404,14 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "apply_set_drift";
+        } | {
+            /** @enum {string} */
+            kind: "node_link_down";
+            ports?: string;
+            role?: components["schemas"]["LinkRole"];
+        } | {
+            /** @enum {string} */
+            kind: "bond_degraded";
         };
         /**
          * @description 비교
@@ -5423,6 +5476,8 @@ export interface components {
             name: string;
             /** @description 그 일이 일어난 노드 이름(노드·풀 경보는 평가한 노드) */
             node?: string;
+            /** @description 링크 경보(`node_link_down`·`bond_degraded`, 계획 75)의 포트·본딩 이름. 한 노드에서 포트마다 경보가 따로다. */
+            port?: string;
         };
         /** @description `GET /alerts`의 경보 하나(규칙 이름·심각도를 붙인 [`ActiveAlert`]) */
         AlertView: {
@@ -6044,6 +6099,21 @@ export interface components {
             ports: components["schemas"]["BondPort"][];
             state: components["schemas"]["BondState"];
         };
+        /** @description 노드의 Linux 브리지 하나 */
+        Bridge: {
+            health: components["schemas"]["LinkHealth"];
+            name: string;
+            /** @description 이 노드에서 이 브리지에 붙는 네트워크 id(브리지·VLAN·공급자 네트워크, 이름 순) */
+            networks: string[];
+            /** @description `master`가 이 브리지인 인터페이스(tap 빼고) */
+            uplinks: string[];
+            vlan_filtering: boolean;
+            /**
+             * Format: int32
+             * @description 이 노드에서 도는 VM의 NIC 가운데 그 네트워크들에 붙은 수
+             */
+            vm_nics: number;
+        };
         BridgeInfo: {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
@@ -6053,6 +6123,28 @@ export interface components {
         CancelLiveRestoreRequest: {
             /** @description 게스트가 라이브 복원 뒤 쓴 것을 버린다는 확인(참이어야 한다) */
             discard?: boolean;
+        };
+        /** @description `GET /capacity`의 응답 */
+        Capacity: {
+            /** @description 위트니스가 아닌 노드(이름 순, 오프라인 포함) */
+            nodes: components["schemas"]["NodeCapacity"][];
+            /** @description 공유 풀(이름 순) */
+            shared_pools: components["schemas"]["SharedPoolCapacity"][];
+            /** @description 온라인 노드의 합과 공유 풀 */
+            totals: components["schemas"]["CapacityTotals"];
+        };
+        /** @description 합(온라인 노드와 공유 풀) */
+        CapacityTotals: {
+            /** @description 노드 값의 합(오버커밋은 합으로 다시 나눔, 사용률은 스레드 수로 가중 평균) */
+            cpu: components["schemas"]["CpuCapacity"];
+            memory: components["schemas"]["MemoryCapacity"];
+            /**
+             * Format: int32
+             * @description 합에 든 온라인 노드 수
+             */
+            nodes: number;
+            /** @description 온라인 노드의 로컬 풀과 공유 풀의 합 */
+            storage: components["schemas"]["StorageTotals"];
         };
         /** @description `POST /image-catalog/{id}/download` */
         CatalogDownloadRequest: {
@@ -6789,6 +6881,54 @@ export interface components {
             /** @description 모든 VM에서 숨기는 플래그 */
             mask?: string[];
             mode: components["schemas"]["BaselineMode"];
+        };
+        /** @description CPU */
+        CpuCapacity: {
+            /**
+             * Format: int32
+             * @description 전용 CPU(`host_resources.dedicated_cpus`)
+             */
+            dedicated_total: number;
+            /**
+             * Format: int32
+             * @description 그 가운데 도는 전용 VM이 잡은 것
+             */
+            dedicated_used: number;
+            /**
+             * Format: double
+             * @description 공유 vCPU ÷ 공유 스레드(`threads − reserved − dedicated_total`). 공유 스레드가 없으면 없다.
+             */
+            overcommit?: number;
+            /**
+             * Format: int32
+             * @description 예약 CPU(호스트·Orbivisor, `host_resources.reserved_cpus`)
+             */
+            reserved: number;
+            /**
+             * Format: int32
+             * @description 노드의 CPU 스레드(`NodeStatus.cpus`)
+             */
+            threads: number;
+            /**
+             * Format: double
+             * @description 지난 1분 노드 CPU 사용률 %(배치 부하 요약, 없으면 없음)
+             */
+            use_pct?: number;
+            /**
+             * Format: int32
+             * @description 자리 잡은 VM의 vCPU 합(시작·실행·정지 중·옮기는 중)
+             */
+            vcpus_allocated: number;
+            /**
+             * Format: int32
+             * @description 그 가운데 실행 중인 VM
+             */
+            vcpus_running: number;
+            /**
+             * Format: int32
+             * @description 그 가운데 공유 정책 VM(공유 스레드 위에서 돎)
+             */
+            vcpus_shared: number;
         };
         /**
          * @description '+name' turns a CPU flag on, '-name' hides it
@@ -7827,6 +7967,11 @@ export interface components {
             group: string;
             realm: string;
         };
+        /**
+         * @description 장애의 무게
+         * @enum {string}
+         */
+        FaultSeverity: "down" | "degraded";
         /** @description 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`). */
         FenceCheck: {
             /**
@@ -8827,6 +8972,21 @@ export interface components {
              */
             until: number;
         };
+        /** @description 크기 하나의 hugepages(페이지 수) */
+        HugepageCapacity: {
+            /** Format: int32 */
+            size_kib: number;
+            /**
+             * Format: int64
+             * @description 풀의 페이지 수(노드가 알린 예약)
+             */
+            total: number;
+            /**
+             * Format: int64
+             * @description Orbivisor VM이 잡은 페이지 수(도는 VM의 기록)
+             */
+            used: number;
+        };
         /** @description 호스트 노드의 hugepages 풀 하나 */
         HugepagePool: {
             /** Format: int32 */
@@ -8852,6 +9012,37 @@ export interface components {
             size: components["schemas"]["PageKind"];
         };
         /**
+         * @description 인터페이스 하나의 표본(계획 75, `/sys/class/net/<if>/statistics`의 직전 표본과의 차). 첫 표본·카운터가 되감긴
+         *     표본은 값이 없다.
+         */
+        IfaceSample: {
+            name: string;
+            /**
+             * Format: double
+             * @description 받기 바이트/초
+             */
+            rx_bps?: number | null;
+            /**
+             * Format: int64
+             * @description 직전 표본 뒤 늘어난 버린 패킷 수
+             */
+            rx_dropped?: number | null;
+            /**
+             * Format: int64
+             * @description 직전 표본 뒤 늘어난 받기 오류 수
+             */
+            rx_errors?: number | null;
+            /**
+             * Format: double
+             * @description 보내기 바이트/초
+             */
+            tx_bps?: number | null;
+            /** Format: int64 */
+            tx_dropped?: number | null;
+            /** Format: int64 */
+            tx_errors?: number | null;
+        };
+        /**
          * Format: binary
          * @description 업로드 본문의 문서용 스키마: 바이너리 파일
          */
@@ -8866,6 +9057,27 @@ export interface components {
             mem_pct: number;
             /** Format: int32 */
             total_pct: number;
+        };
+        /** @description 장애 하나와 그 영향 */
+        Impact: {
+            /** @description 끊긴 포트가 든 본딩 */
+            bond?: string;
+            /** @description 위에 있는 브리지(이름 순) */
+            bridges: string[];
+            /** @description 영향받는 네트워크 id(이름 순) */
+            networks: string[];
+            /** @description 장애가 난 포트(이더넷·VLAN의 링크 끊김) 또는 본딩(구성 포트에 링크 끊김이 없는 저하·끊김) */
+            port: string;
+            severity: components["schemas"]["FaultSeverity"];
+            /** @description underlay 주소를 가진 인터페이스가 위에 있다(VXLAN·SDN 오버레이가 영향받음). */
+            underlay?: boolean;
+            /** @description 그 VM의 id([`MAX_IMPACT_VM_IDS`]개까지, 이름 순) */
+            vm_ids: string[];
+            /**
+             * Format: int32
+             * @description 이 노드에서 그 네트워크에 NIC가 있는 VM 수
+             */
+            vms: number;
         };
         /** @enum {string} */
         ImportPhase: "ready" | "importing" | "done" | "failed";
@@ -9487,6 +9699,16 @@ export interface components {
          * @enum {string}
          */
         Level: "standard" | "premium";
+        /**
+         * @description 링크 상태
+         * @enum {string}
+         */
+        LinkHealth: "up" | "degraded" | "down";
+        /**
+         * @description 링크 경보(`NodeLinkDown`)가 보는 포트
+         * @enum {string}
+         */
+        LinkRole: "uplink" | "any";
         /** @description 디렉터리 나열 한 쪽 */
         ListPage: {
             entries: components["schemas"]["EntryView"][];
@@ -11357,6 +11579,19 @@ export interface components {
         };
         /** @enum {string} */
         LiveRestorePhase: "starting" | "copying" | "pivoting" | "paused" | "stopped" | "failed";
+        /** @description LLDP 이웃(스위치) 하나(`lldpcli -f json show neighbors`, 계획 75). 모르는 칸은 없다. */
+        LldpNeighbor: {
+            /** @description 섀시 id(보통 MAC) */
+            chassis_id?: string;
+            /** @description 스위치 이름(sysName) */
+            chassis_name?: string;
+            /** @description 스위치 관리 주소 */
+            mgmt_ip?: string;
+            /** @description 스위치 포트 설명 */
+            port_descr?: string;
+            /** @description 스위치 포트 id(예: `Gi1/0/12`) */
+            port_id?: string;
+        };
         /** @description `GET /load-balancers` */
         LoadBalancerList: {
             items: components["schemas"]["LoadBalancerView"][];
@@ -11798,6 +12033,36 @@ export interface components {
             /** @description 위트니스 노드인지(VM을 돌리지 않는 투표 멤버) */
             witness: boolean;
         };
+        /** @description 메모리 */
+        MemoryCapacity: {
+            /**
+             * Format: int64
+             * @description 자리 잡은 VM에 할당한 메모리(`memory_mib` 합)
+             */
+            allocated_mib: number;
+            /** @description 크기마다 hugepages(풀이 있거나 쓰는 크기만) */
+            hugepages?: components["schemas"]["HugepageCapacity"][];
+            /**
+             * Format: double
+             * @description 할당 ÷ 노드 메모리. 노드 메모리를 모르면 없다.
+             */
+            overcommit?: number;
+            /**
+             * Format: int64
+             * @description hugepages 풀로 떼어 둔 메모리(보통 VM은 쓰지 못함)
+             */
+            reserved_mib: number;
+            /**
+             * Format: int64
+             * @description 노드 메모리(`NodeStatus.memory_mib`)
+             */
+            total_mib: number;
+            /**
+             * Format: int64
+             * @description 실제 사용(배치 부하 요약, 없으면 없음)
+             */
+            used_mib?: number;
+        };
         /**
          * @description 게스트 노드 메모리를 호스트 NUMA 노드에 묶는 방법
          * @enum {string}
@@ -11971,6 +12236,22 @@ export interface components {
             /** @description 루트에 있는 객체(폴더 없음)의 권한 */
             root_contents: string[];
         };
+        /** @description 네트워크 하나의 레일(지도 바닥 판의 가로 띠) */
+        NetRail: {
+            /** @description 실어 나르는 것: 브리지 이름, physnet 이름, VXLAN·오버레이는 `underlay` */
+            carrier: string;
+            /**
+             * Format: uuid
+             * @description 네트워크 id
+             */
+            id: string;
+            kind: components["schemas"]["RailKind"];
+            name: string;
+            /** @description 위트니스가 아닌 노드마다(이름 순) */
+            nodes: components["schemas"]["RailNode"][];
+            /** Format: int32 */
+            vlan?: number;
+        };
         /** @description `GET /networks/{key}/ips` */
         NetworkIps: {
             /** @description 템플릿이 아닌 VM의 이 네트워크 NIC마다(VM 이름, NIC 순). 부른 사용자가 읽을 수 있는 VM의 것만 있다. */
@@ -12138,6 +12419,20 @@ export interface components {
          * @enum {string}
          */
         NodeAlertMetric: "cpu" | "mem_percent" | "fs_percent" | "disk_read" | "disk_write" | "net_rx" | "net_tx";
+        /** @description 노드 하나의 용량 */
+        NodeCapacity: {
+            cpu: components["schemas"]["CpuCapacity"];
+            /** Format: uuid */
+            id: string;
+            memory: components["schemas"]["MemoryCapacity"];
+            /** @description 노드 이름 */
+            node: string;
+            /** @description 호스트 NUMA 노드마다(id 순). 토폴로지를 모르면(옛 노드·macOS) 빈다. */
+            numa?: components["schemas"]["NumaCapacity"][];
+            online: boolean;
+            /** @description 이 노드의 로컬 풀(이름 순) */
+            storage: components["schemas"]["PoolCapacity"][];
+        };
         NodeCounts: {
             /** Format: int64 */
             total: number;
@@ -12277,10 +12572,22 @@ export interface components {
             /** @description 링크가 있는지(sysfs `carrier`). 읽지 못했으면 없다. */
             carrier?: boolean;
             kind: components["schemas"]["InterfaceKind"];
+            /** @description 이 포트 건너편 스위치(lldpd가 있을 때 `lldpcli`로 읽음, 계획 75). 없으면 쓰지 않는다. */
+            lldp?: components["schemas"]["LldpNeighbor"];
             mac?: string;
             /** @description 이 인터페이스를 묶은 본딩·브리지 */
             master?: string;
+            /**
+             * Format: int32
+             * @description MTU(계획 75). 모르면(옛 노드) 없다.
+             */
+            mtu?: number;
             name: string;
+            /**
+             * @description VLAN·macvlan의 아래 장치(`ip -j -d`의 `link`, 계획 75). 없으면(옛 노드·아래 장치 없음) 쓰지 않는다 — 물리
+             *     관계는 VLAN 이름 규칙(`eno1.100`)으로 추정한다.
+             */
+            parent?: string;
             /**
              * Format: int32
              * @description 링크 속도(Mbps). 모르면 없다.
@@ -12288,6 +12595,11 @@ export interface components {
             speed_mbps?: number;
             /** @description operstate(`up`, `down`, `unknown`, `lowerlayerdown` …) */
             state: string;
+            /**
+             * Format: int32
+             * @description VLAN 인터페이스의 VLAN id(계획 75)
+             */
+            vlan_id?: number;
         };
         /** @description 노드 하나의 부하. 백분율은 0.1% 단위다. */
         NodeLoadView: {
@@ -12340,6 +12652,29 @@ export interface components {
             /** @description 지표를 모르는 옛 노드의 이름(정렬) */
             unsupported: string[];
         };
+        /** @description 노드 하나의 물리 네트워크 */
+        NodePhysical: {
+            /** @description Linux 브리지(이름 순, opld가 만든 장치 뺌) */
+            bridges: components["schemas"]["Bridge"][];
+            /** Format: uuid */
+            id: string;
+            /** @description 지금 장애가 난 포트·본딩마다 영향(포트 순서) */
+            impact?: components["schemas"]["Impact"][];
+            /**
+             * @description 옛 노드(기능 `operator-dashboard`를 알리지 않음): `mtu`·`parent`·`lldp`가 없고 VLAN 아래 장치는 이름 규칙
+             *     (`eno1.100`)으로 추정했다. 화면은 "옛 판 — 일부 정보 없음"을 보인다.
+             */
+            legacy?: boolean;
+            /** @description 노드 이름 */
+            node: string;
+            online: boolean;
+            /** @description SDN physnet 연결(`NodeStatus.sdn.physnets`) */
+            physnets?: components["schemas"]["PhysnetState"][];
+            /** @description 포트(노드가 알린 인터페이스 순서, veth 뺌) */
+            ports: components["schemas"]["Port"][];
+            /** @description VXLAN·Geneve 패킷이 오가는 주소와 그 주소를 가진 인터페이스 */
+            underlay?: components["schemas"]["UnderlayLink"];
+        };
         /** @description 노드를 뺐지만 손으로 할 일이 남았을 때의 `DELETE /nodes/{key}` 응답 */
         NodeRemoved: {
             warnings: string[];
@@ -12370,6 +12705,11 @@ export interface components {
              * @description 데이터 디렉터리가 있는 파일 시스템
              */
             fs_used_mib?: number | null;
+            /**
+             * @description 인터페이스별 트래픽·오류(계획 75 — 물리·본딩·VLAN·브리지만, 노드당 [`MAX_IFACE_SAMPLES`]개까지). 실시간 표본에만
+             *     있고 기록(RRD)에는 두지 않는다. 비면(옛 노드·macOS) 쓰지 않는다.
+             */
+            interfaces?: components["schemas"]["IfaceSample"][];
             /** Format: int64 */
             mem_total_mib?: number | null;
             /** Format: int64 */
@@ -12783,6 +13123,35 @@ export interface components {
             error?: string;
             ok: boolean;
         };
+        /** @description 호스트 NUMA 노드 하나 */
+        NumaCapacity: {
+            /**
+             * Format: int64
+             * @description hugepages 없이 이 노드에 묶인 보통 메모리(MiB)
+             */
+            bound_mib: number;
+            /** @description 이 NUMA 노드의 온라인 CPU */
+            cpus: components["schemas"]["CpuSet"];
+            /** @description 그 가운데 전용 */
+            dedicated: components["schemas"]["CpuSet"];
+            /** @description 전용 가운데 잡힌 것 */
+            dedicated_used: components["schemas"]["CpuSet"];
+            hugepages?: components["schemas"]["HugepageCapacity"][];
+            /** Format: int32 */
+            id: number;
+            /**
+             * Format: int64
+             * @description 노드 메모리 전체(hugepages 풀 포함)
+             */
+            memory_mib: number;
+            /**
+             * Format: int32
+             * @description 이 노드의 CPU에 고정된 vCPU 수
+             */
+            pinned_vcpus: number;
+            /** @description 그 가운데 예약 */
+            reserved: components["schemas"]["CpuSet"];
+        };
         /** @description 노드 하나가 VM을 받거나 켤 수 있는지 */
         NumaNodeFit: {
             fits: boolean;
@@ -13019,6 +13388,13 @@ export interface components {
              * @default 0
              */
             total: number;
+        };
+        /** @description `GET /topology/physical`의 응답 */
+        PhysicalTopology: {
+            /** @description 네트워크마다 레일 하나(이름 순) */
+            networks: components["schemas"]["NetRail"][];
+            /** @description 노드마다 하나(이름 순, 위트니스 포함) */
+            nodes: components["schemas"]["NodePhysical"][];
         };
         /** @description 노드의 physnet 연결 상태(`NodeSdn.physnets`, 계획 66 §7) */
         PhysnetState: {
@@ -13274,6 +13650,26 @@ export interface components {
             /** @description 공유 볼륨 그룹 이름 */
             vg: string;
         };
+        /** @description 노드 로컬 풀 하나 */
+        PoolCapacity: {
+            pool: string;
+            /**
+             * Format: int64
+             * @description 이 노드에 있는 그 풀 볼륨의 `size_bytes` 합(씬 할당)
+             */
+            provisioned_bytes: number;
+            /** @description 이 노드에서 쓸 수 있다. */
+            ready: boolean;
+            /** Format: int64 */
+            total_bytes: number;
+            /**
+             * Format: int64
+             * @description `total − available`
+             */
+            used_bytes: number;
+            /** Format: int32 */
+            volumes: number;
+        };
         /** @description 풀에서 바꿀 수 있는 값: 디렉터리 풀의 `shared`, dir·NFS 풀의 `backups`. 적지 않은 값은 그대로 둔다. */
         PoolPatch: {
             backups?: boolean;
@@ -13341,6 +13737,42 @@ export interface components {
              */
             total_bytes: number;
         };
+        /** @description 포트(인터페이스) 하나 */
+        Port: {
+            /** @description 본딩이면 모드·상태·구성 포트 */
+            bond?: components["schemas"]["PortBond"];
+            carrier?: boolean;
+            /** @description 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들 */
+            health: components["schemas"]["LinkHealth"];
+            kind: components["schemas"]["PortKind"];
+            lldp?: components["schemas"]["LldpNeighbor"];
+            mac?: string;
+            /** @description 이 포트를 묶은 본딩·브리지 */
+            master?: string;
+            /** Format: int32 */
+            mtu?: number;
+            name: string;
+            /** @description VLAN의 아래 장치(노드가 알리지 않았으면 이름 규칙으로 추정) */
+            parent?: string;
+            role: components["schemas"]["PortRole"];
+            /** Format: int32 */
+            speed_mbps?: number;
+            /** @description operstate(`up`, `down`, `unknown`, `lowerlayerdown` …) */
+            state: string;
+            /** Format: int32 */
+            vlan_id?: number;
+        };
+        /** @description 본딩 포트의 본딩 정보 */
+        PortBond: {
+            members: components["schemas"]["BondPort"][];
+            mode: string;
+            state: components["schemas"]["BondState"];
+        };
+        /**
+         * @description 포트 종류(`dummy` 등 그 밖은 `other`)
+         * @enum {string}
+         */
+        PortKind: "ethernet" | "bond" | "vlan" | "bridge" | "other";
         /** @description OVN의 논리 포트 상태 */
         PortLive: {
             /** @description 바인딩한 노드(이름, 모르는 chassis면 그 이름). 바인딩 전이거나 SB를 읽지 못했으면 없다. */
@@ -13348,6 +13780,11 @@ export interface components {
             /** @description 포트가 바인딩되어 흐름이 깔렸다(NB `up`). */
             up: boolean;
         };
+        /**
+         * @description 포트가 쓰이는 곳
+         * @enum {string}
+         */
+        PortRole: "uplink" | "underlay" | "unused" | "other";
         /**
          * @description 본딩 포트의 상태
          * @enum {string}
@@ -13482,6 +13919,22 @@ export interface components {
          * @enum {string}
          */
         RaftRole: "leader" | "follower" | "candidate" | "joining" | "down" | "unknown";
+        /**
+         * @description 레일 종류
+         * @enum {string}
+         */
+        RailKind: "bridge" | "vlan" | "vxlan" | "sdn-overlay" | "sdn-provider";
+        /** @description 레일 위 노드 하나 */
+        RailNode: {
+            /** @description 노드 이름 */
+            node: string;
+            state: components["schemas"]["RailState"];
+        };
+        /**
+         * @description 한 노드에서 본 레일 상태
+         * @enum {string}
+         */
+        RailState: "up" | "degraded" | "down" | "absent";
         /** @description 영역이 사용자를 확인하는 방법 */
         RealmBackend: (components["schemas"]["LdapRealm"] & {
             /** @enum {string} */
@@ -16399,6 +16852,34 @@ export interface components {
          * @enum {string}
          */
         Severity: "info" | "warning" | "critical";
+        /** @description 공유 풀 하나 */
+        SharedPoolCapacity: {
+            /**
+             * Format: int32
+             * @description 이 풀을 허용하는 노드 수(위트니스 빼고)
+             */
+            nodes: number;
+            /**
+             * Format: int32
+             * @description 이 풀을 쓸 수 있는 노드 수
+             */
+            nodes_ready: number;
+            pool: string;
+            /**
+             * Format: int64
+             * @description 그 풀 볼륨의 `size_bytes` 합
+             */
+            provisioned_bytes: number;
+            /**
+             * Format: int64
+             * @description 풀 상태의 값(없으면 준비된 노드가 알린 값, 그것도 없으면 0)
+             */
+            total_bytes: number;
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int32 */
+            volumes: number;
+        };
         /**
          * @description 호스트 종료 때 노드가 한 일
          * @enum {string}
@@ -16647,6 +17128,17 @@ export interface components {
              * @default null
              */
             total_bytes: number | null;
+        };
+        /** @description 스토리지 합 */
+        StorageTotals: {
+            /** Format: int64 */
+            provisioned_bytes: number;
+            /** Format: int64 */
+            total_bytes: number;
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int32 */
+            volumes: number;
         };
         /** @description 저장소가 사는 곳. JSON은 `{"pool": "bk"}` 또는 `{"s3": {...}}`이다. */
         StoreBackend: {
@@ -17637,6 +18129,13 @@ export interface components {
             totp: boolean;
             /** @description 확인을 기다리는 TOTP가 있다 */
             totp_pending: boolean;
+        };
+        /** @description VXLAN·Geneve underlay */
+        UnderlayLink: {
+            /** @description `NodeStatus.underlay`, 없으면 SDN `encap_ip` */
+            address: string;
+            /** @description 그 주소를 가진 인터페이스(못 찾으면 없음) */
+            port?: string;
         };
         UpdateAccessRoleRequest: {
             description?: string;
@@ -21612,6 +22111,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_capacity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Capacity"];
                 };
             };
             "4XX": {
@@ -27483,6 +28009,33 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    physical_topology: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PhysicalTopology"];
+                };
             };
             "4XX": {
                 headers: {

@@ -4,6 +4,7 @@ import {
   CONDITION_KINDS,
   emptyRuleForm,
   isEvent,
+  isLink,
   isSdn,
   ruleFormOf,
   ruleSpecOf,
@@ -115,7 +116,32 @@ it("offers SDN conditions and filters nodes only on node subjects (plan 67)", ()
   expect(isEvent("sdn_gateway_failover")).toBe(true);
   expect(ruleSpecOf({ ...form, kind: "sdn_gateway_failover", forSecs: "60" }).for_secs).toBe(0);
   expect(CONDITION_KINDS.filter(isSdn)).toHaveLength(8);
-  expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(CONDITION_KINDS.filter(isSdn).sort());
+  expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(
+    CONDITION_KINDS.filter((k) => isSdn(k) || isLink(k)).sort(),
+  );
+});
+
+it("edits the link conditions with a port pattern and a role (plan 75)", () => {
+  const form = { ...emptyRuleForm(), name: "links", targets: ["ops"], nodes: "svc01" };
+  expect(CONDITION_KINDS.filter(isLink)).toEqual(["node_link_down", "bond_degraded"]);
+  expect(takesNodes("node_link_down")).toBe(true);
+  expect(isEvent("bond_degraded")).toBe(false);
+  const down = { ...form, kind: "node_link_down" as const };
+  expect(ruleSpecOf(down).condition).toEqual({ kind: "node_link_down", role: "uplink" });
+  expect(ruleSpecOf(down).nodes).toEqual(["svc01"]);
+  const spec = ruleSpecOf({ ...down, ports: " eno* ", role: "any" });
+  expect(spec.condition).toEqual({ kind: "node_link_down", role: "any", ports: "eno*" });
+  const back = ruleFormOf(rule({ condition: spec.condition }));
+  expect([back.kind, back.ports, back.role]).toEqual(["node_link_down", "eno*", "any"]);
+  expect(ruleSpecOf({ ...form, kind: "bond_degraded" }).condition).toEqual({
+    kind: "bond_degraded",
+  });
+  for (const bad of ["eno 1", "a/b", "x".repeat(65)]) {
+    expect(checkRuleForm({ ...down, ports: bad }, [])).toEqual({
+      ports: "alerts.rules.errors.ports",
+    });
+  }
+  expect(checkRuleForm({ ...down, ports: "eno?" }, [])).toEqual({});
 });
 
 it("does not filter the backup store conditions by node or VM", () => {

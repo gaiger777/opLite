@@ -21,6 +21,7 @@ import {
   isBackupStore,
   isEvent,
   isSdn,
+  LINK_ROLES,
   NODE_METRICS,
   ruleFormOf,
   ruleSpecOf,
@@ -66,6 +67,14 @@ export function conditionText(t: TFunction, c: AlertCondition): string {
       return c.ops?.length
         ? t("alerts.condition.task_failed_ops", { ops: c.ops.join(", ") })
         : t("alerts.condition.task_failed");
+    case "node_link_down": {
+      const text = t(
+        c.role === "any"
+          ? "alerts.condition.node_link_down_any"
+          : "alerts.condition.node_link_down",
+      );
+      return c.ports ? `${text} (${c.ports})` : text;
+    }
     default:
       return t(`alerts.condition.${c.kind}`);
   }
@@ -256,7 +265,7 @@ function RuleDialog({
 
   const input = (
     id: string,
-    key: "value" | "percent" | "ops" | "forSecs" | "repeatSecs" | "nodes" | "vms",
+    key: "value" | "percent" | "ops" | "ports" | "forSecs" | "repeatSecs" | "nodes" | "vms",
     label: string,
     hint?: string,
   ) => (
@@ -371,6 +380,25 @@ function RuleDialog({
         {form.kind === "pool_usage" && input("rule-percent", "percent", t("alerts.rules.percent"))}
         {form.kind === "task_failed" &&
           input("rule-ops", "ops", t("alerts.rules.ops"), t("alerts.rules.opsHint"))}
+        {form.kind === "node_link_down" && (
+          <>
+            <Field id="rule-role" label={t("alerts.rules.role")}>
+              <NativeSelect
+                id="rule-role"
+                className="w-full"
+                value={form.role}
+                onChange={(e) => change({ role: e.target.value as RuleForm["role"] })}
+              >
+                {LINK_ROLES.map((r) => (
+                  <NativeSelectOption key={r} value={r}>
+                    {t(`alerts.rules.roles.${r}`)}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+            {input("rule-ports", "ports", t("alerts.rules.ports"), t("alerts.rules.portsHint"))}
+          </>
+        )}
         {!event &&
           input("rule-for", "forSecs", t("alerts.rules.forSecs"), t("alerts.rules.forSecsHint"))}
         <Field id="rule-severity" label={t("alerts.rules.severity")}>

@@ -481,6 +481,11 @@ fn rule_row(r: &Value) -> Vec<String> {
 /// 경보 대상 칸: `node/node-a`, `vm/web@node-a`(노드가 아닌 대상은 그 노드를 붙인다)
 fn subject_text(s: &Value) -> String {
     let mut text = format!("{}/{}", cell(&s["kind"]), cell(&s["name"]));
+    // 링크 경보(계획 75)는 포트마다: `node/svc01/eno1`
+    if let Some(port) = s["port"].as_str() {
+        text.push('/');
+        text.push_str(port);
+    }
     if let Some(node) = s["node"].as_str()
         && s["kind"] != "node"
     {
@@ -1779,6 +1784,21 @@ mod tests {
                 "DELETE /api/v1/notification-targets/hook HTTP/1.1",
                 "POST /api/v1/notification-targets/hook/test HTTP/1.1",
             ]
+        );
+    }
+
+    /// 링크 경보(계획 75)는 대상에 포트를 단다.
+    #[test]
+    fn link_alert_subjects_name_the_port() {
+        assert_eq!(
+            subject_text(
+                &json!({ "kind": "node", "id": "i1", "name": "n1", "node": "n1", "port": "eno1" })
+            ),
+            "node/n1/eno1"
+        );
+        assert_eq!(
+            subject_text(&json!({ "kind": "node", "id": "i1", "name": "n1", "node": "n1" })),
+            "node/n1"
         );
     }
 }

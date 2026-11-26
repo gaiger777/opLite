@@ -73,6 +73,10 @@ fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     if spec.condition.is_declarative() {
         require_feature(&state.cluster, orbivisor_types::node::DECLARATIVE)?;
     }
+    // 링크 조건(계획 75 §3.4)도 옛 노드가 풀지 못한다.
+    if spec.condition.is_link() {
+        require_feature(&state.cluster, orbivisor_types::node::LINK_ALERTS)?;
+    }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for t in &spec.targets {
@@ -178,7 +182,8 @@ pub struct SdnDefaultsResponse {
 
 /// "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 한 번에 만든다 — `sdn-quorum-lost` critical 0초,
 /// `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info,
-/// `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 같은 이름의
+/// `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 모든 노드가
+/// `link-alerts`를 알면 링크 규칙 둘(계획 75)도 — `node-link-down`(업링크 포트) critical 30초, `bond-degraded` warning 60초. 같은 이름의
 /// 규칙이 있으면 건드리지 않는다. 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`sdn-services`를 알아야
 /// 한다.
 #[utoipa::path(post, path = "/alert-rules/sdn-defaults", tag = "alerts",
@@ -195,10 +200,16 @@ pub async fn create_sdn_default_rules(
         "alert-rule sdn-defaults -> {}",
         req.targets.join(",")
     ));
-    let rules = orbivisor_types::alert::sdn::default_rules(&req.targets);
+    let mut rules = orbivisor_types::alert::sdn::default_rules(&req.targets);
     // 대상·기능은 한 번 본다(모든 규칙이 같은 대상이다).
     if let Some((_, spec)) = rules.first() {
         check_rule(&state, spec)?;
+    }
+    // 링크 규칙(계획 75)은 모든 노드가 `link-alerts`를 알 때만 만든다(섞인 판에서도 SDN 규칙은 만든다).
+    if !crate::cluster::missing_feature(&state.cluster, orbivisor_types::node::LINK_ALERTS)?
+        .is_empty()
+    {
+        rules.retain(|(_, spec)| !spec.condition.is_link());
     }
     let mut out = SdnDefaultsResponse {
         created: Vec::new(),

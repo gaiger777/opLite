@@ -7,6 +7,7 @@ export type ConditionKind = AlertCondition["kind"];
 export type NodeMetric = Schemas["NodeAlertMetric"];
 export type VmMetric = Schemas["VmAlertMetric"];
 type Op = Schemas["AlertOp"];
+export type LinkRole = Schemas["LinkRole"];
 
 export const CONDITION_KINDS: readonly ConditionKind[] = [
   "node_metric",
@@ -29,7 +30,11 @@ export const CONDITION_KINDS: readonly ConditionKind[] = [
   // 백업 저장소(계획 68 §10.5·§6) — 리더가 평가한다.
   "backup_verify_failed",
   "backup_store_unavailable",
+  // 링크(계획 75 §3.4) — 리더가 노드 상태의 포트·본딩으로 평가한다.
+  "node_link_down",
+  "bond_degraded",
 ];
+export const LINK_ROLES: readonly LinkRole[] = ["uplink", "any"];
 export const NODE_METRICS: readonly NodeMetric[] = [
   "cpu",
   "mem_percent",
@@ -63,6 +68,16 @@ export function isEvent(kind: ConditionKind): boolean {
 /** 백업 저장소 조건(서버 `AlertCondition::is_backup_store`) — 노드·VM으로 거르지 않는다. */
 export function isBackupStore(kind: ConditionKind): boolean {
   return kind === "backup_verify_failed" || kind === "backup_store_unavailable";
+}
+
+/** 링크 조건(서버 `AlertCondition::is_link`) */
+export function isLink(kind: ConditionKind): boolean {
+  return kind === "node_link_down" || kind === "bond_degraded";
+}
+
+/** `NodeLinkDown.ports` 글롭(서버 `valid_port_glob`): 1~64자, 공백·`/`·`:` 없음, `*`·`?` */
+export function validPortGlob(text: string): boolean {
+  return /^[!-~]{1,64}$/.test(text) && !/[/:]/.test(text);
 }
 
 /** SDN 조건(서버 `AlertCondition::is_sdn`) */
@@ -111,6 +126,9 @@ export const SDN_DEFAULTS: readonly {
     forSecs: 60,
   },
   { name: "sdn-lb-member-down", kind: "sdn_lb_member_down", severity: "warning", forSecs: 30 },
+  // 링크(계획 75) — 모든 노드가 `link-alerts`를 알 때만 서버가 만든다.
+  { name: "node-link-down", kind: "node_link_down", severity: "critical", forSecs: 30 },
+  { name: "bond-degraded", kind: "bond_degraded", severity: "warning", forSecs: 60 },
 ];
 
 /** `vms`로 거를 수 있는 조건(서버의 `about_vms`) */
@@ -130,6 +148,9 @@ export interface RuleForm {
   percent: string;
   /** `task_failed`의 Task 종류(쉼표로 나눔, 비면 모두) */
   ops: string;
+  /** `node_link_down`의 포트 글롭(비면 모두)과 역할 */
+  ports: string;
+  role: LinkRole;
   forSecs: string;
   severity: Severity;
   targets: string[];
@@ -153,6 +174,8 @@ export function emptyRuleForm(): RuleForm {
     value: "90",
     percent: "85",
     ops: "",
+    ports: "",
+    role: "uplink",
     forSecs: "300",
     severity: "warning",
     targets: [],
@@ -175,6 +198,7 @@ export function ruleFormOf(rule: AlertRule): RuleForm {
     ...(c.kind === "vm_metric" && { vmMetric: c.metric, op: c.op, value: String(c.value) }),
     ...(c.kind === "pool_usage" && { percent: String(c.percent) }),
     ...(c.kind === "task_failed" && { ops: (c.ops ?? []).join(", ") }),
+    ...(c.kind === "node_link_down" && { ports: c.ports ?? "", role: c.role ?? "uplink" }),
     ...(!CONDITION_KINDS.includes(c.kind) && { rawCondition: c }),
     forSecs: String(spec.for_secs),
     severity: spec.severity,
@@ -223,6 +247,13 @@ export function checkRuleForm(form: RuleForm, taken: string[] | null): Record<st
       errors.percent = "alerts.rules.errors.percent";
     }
   }
+  if (
+    form.kind === "node_link_down" &&
+    form.ports.trim() !== "" &&
+    !validPortGlob(form.ports.trim())
+  ) {
+    errors.ports = "alerts.rules.errors.ports";
+  }
   if (!isEvent(form.kind)) {
     const f = integer(form.forSecs);
     if (f === null || f > 86_400) {
@@ -255,6 +286,10 @@ function conditionOf(form: RuleForm): AlertCondition {
     case "task_failed": {
       const ops = splitNames(form.ops);
       return ops.length > 0 ? { kind: "task_failed", ops } : { kind: "task_failed" };
+    }
+    case "node_link_down": {
+      const ports = form.ports.trim();
+      return { kind: "node_link_down", role: form.role, ...(ports !== "" && { ports }) };
     }
     // 인증서 조건(계획 73)은 아직 폼에 없다(CONDITION_KINDS 밖). 받은 조건을 그대로, 없으면 서버 기본값으로 보낸다.
     case "certificate_expiring":

@@ -3147,7 +3147,10 @@
       "sdn_physnet_not_ready": "물리 네트워크 준비 안 됨",
       "sdn_lb_member_down": "부하 분산기 멤버 죽음",
       "backup_verify_failed": "백업 검증 실패",
-      "backup_store_unavailable": "백업 저장소에 닿지 않음"
+      "backup_store_unavailable": "백업 저장소에 닿지 않음",
+      "node_link_down": "업링크 포트 링크 끊김",
+      "node_link_down_any": "랜 포트 링크 끊김",
+      "bond_degraded": "본딩 저하"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3179,7 +3182,9 @@
       "sdn_physnet_not_ready": "물리 네트워크 준비 안 됨",
       "sdn_lb_member_down": "부하 분산기 멤버 죽음",
       "backup_verify_failed": "백업 검증 실패",
-      "backup_store_unavailable": "백업 저장소에 닿지 않음"
+      "backup_store_unavailable": "백업 저장소에 닿지 않음",
+      "node_link_down": "랜 포트 링크 끊김",
+      "bond_degraded": "본딩 저하"
     },
     "rules": {
       "create": "규칙 만들기",
@@ -3207,6 +3212,13 @@
       "percent": "사용률이 넘으면(%)",
       "ops": "작업 종류",
       "opsHint": "예: vm-start, vm-migrate. 비우면 모든 작업입니다.",
+      "role": "볼 포트",
+      "roles": {
+        "uplink": "업링크·underlay 포트만",
+        "any": "모든 랜 포트"
+      },
+      "ports": "포트 이름",
+      "portsHint": "* 와 ? 를 쓰는 패턴(예: eno*). 비우면 모든 포트입니다.",
       "forSecs": "지속 시간(초)",
       "forSecsHint": "조건이 이만큼 이어져야 알립니다(0~86400).",
       "noTargets": "알림 대상이 없습니다. 먼저 만드세요.",
@@ -3222,6 +3234,7 @@
         "taken": "이미 쓰는 이름입니다.",
         "value": "숫자를 넣으세요.",
         "percent": "0~100 사이의 퍼센트를 넣으세요.",
+        "ports": "공백·'/'·':' 없이 1~64자로 넣으세요(* 와 ? 를 쓸 수 있습니다).",
         "forSecs": "0~86400 사이의 초를 정수로 넣으세요.",
         "repeatSecs": "0이나 60~604800 사이의 초를 정수로 넣으세요.",
         "targets": "알림 대상을 1~16개 고르세요."
@@ -4328,7 +4341,7 @@
       "rulesLink": "경보 규칙",
       "enable": "SDN 경보 켜기",
       "dialogTitle": "SDN 경보 켜기",
-      "dialogDescription": "권하는 SDN 규칙(정족수, 중앙, chassis, 게이트웨이, 동기화, 물리 네트워크, 부하 분산기 멤버)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
+      "dialogDescription": "권하는 SDN 규칙(정족수, 중앙, chassis, 게이트웨이, 동기화, 물리 네트워크, 부하 분산기 멤버)과 링크 규칙(업링크 포트 끊김, 본딩 저하)을 만듭니다. 만든 뒤로는 보통 규칙입니다. 이미 있는 규칙은 건너뜁니다.",
       "for": "{{secs}}초 동안",
       "exists": "있음",
       "create_one": "규칙 {{count}}개 만들기",

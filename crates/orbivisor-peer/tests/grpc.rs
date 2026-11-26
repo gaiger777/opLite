@@ -1583,6 +1583,7 @@ impl orbivisor_peer::AlertsSource for FakeAlerts {
                     id: rule,
                     name: "n2".into(),
                     node: Some("n2".into()),
+                    port: None,
                 },
                 state: AlertState::Firing,
                 since: 1_000,

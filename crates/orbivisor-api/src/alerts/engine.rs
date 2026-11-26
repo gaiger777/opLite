@@ -4,9 +4,9 @@
 //! - **노드 경보**(지표·`VmFailed`·로컬 풀 `PoolUsage`·`TaskFailed`·`HaRecovery`)는 그 일이 일어난 노드가 평가하고 상태를
 //!   노드 장부(`alerts/state.json`)에 둔다. 공유 풀은 그 풀이 `ready`인 온라인 노드 가운데 id가 가장 작은 노드가 본다.
 //!   Raft에 쓰지 않는다.
-//! - **리더 경보**(`NodeOffline`·`BackupJobFailed`, 계획 67의 SDN 조건 여덟)는 리더가 평가하고 상태를 `AlertRule.status`
-//!   (Raft)에 둔다. 상태를 먼저 쓰고 쓰기가 된 뒤에만 보내므로 리더가 바뀌어도 다시 보내지 않는다. SDN 조건은
-//!   [`orbivisor_types::alert::sdn::evaluate`]가 Raft와 리더 OvnSync의 관찰(같은 프로세스의 메모리)로 본다.
+//! - **리더 경보**(`NodeOffline`·`BackupJobFailed`, 계획 67의 SDN 조건 여덟, 계획 75의 링크 조건 둘)는 리더가 평가하고
+//!   상태를 `AlertRule.status`(Raft)에 둔다. 상태를 먼저 쓰고 쓰기가 된 뒤에만 보내므로 리더가 바뀌어도 다시 보내지
+//!   않는다. SDN 조건은 [`orbivisor_types::alert::sdn::evaluate`]가 Raft와 리더 OvnSync의 관찰(같은 프로세스의 메모리)로 본다.
 //!
 //! 단계는 [`orbivisor_types::alert::advance`]다: pending → firing(알림) → `repeat_secs`마다 다시 → 거짓인 채 60초 → 해제(알림).
 //! 노드 장부도 파일에 먼저 쓰고 보내므로 opld를 다시 시작해도 같은 알림을 다시 보내지 않는다.
@@ -33,6 +33,7 @@ use orbivisor_types::load_balancer::LoadBalancerSpec;
 use orbivisor_types::metrics::{MetricsQuery, MetricsScope, NodeSample, VmSample};
 use orbivisor_types::network::NetworkSpec;
 use orbivisor_types::node::{Node, NodeSpec};
+use orbivisor_types::physical::{self, Impact};
 use orbivisor_types::resource::Kind;
 use orbivisor_types::router::RouterSpec;
 use orbivisor_types::sdn::{SDN_NAME, SdnSpec};
@@ -220,6 +221,12 @@ struct Pending {
     detail: Option<String>,
 }
 
+/// 링크 조건의 영향 문구에 쓰는 Raft 입력(장애가 있는 tick에 한 번 읽음)
+struct LinkWorld {
+    networks: Vec<orbivisor_types::network::Network>,
+    vms: Vec<Vm>,
+}
+
 /// SDN 조건의 Raft 입력(한 tick에 한 번 읽음)
 struct SdnWorld {
     sdn: Option<orbivisor_types::sdn::Sdn>,
@@ -370,6 +377,7 @@ impl Engine {
                 id: task.id,
                 name: format!("{op} {target_name}"),
                 node: Some(me.name.clone()),
+                port: None,
             };
             let key = subject.key(rule.id);
             if state.events.contains_key(&key) {
@@ -470,6 +478,7 @@ impl Engine {
                 id: me.id,
                 name: me.name.clone(),
                 node: Some(me.name.clone()),
+                port: None,
             };
             for r in rules
                 .iter()
@@ -508,6 +517,7 @@ impl Engine {
                     id: vm.id,
                     name: vm.name.clone(),
                     node: Some(me.name.clone()),
+                    port: None,
                 };
                 // 도는 VM만 지표를 본다(멈춘 VM의 지표 경보는 알림 없이 뺀다).
                 let running = vm.status.phase == VmPhase::Running;
@@ -559,6 +569,7 @@ impl Engine {
                     id: pool.id,
                     name: pool.name.clone(),
                     node: Some(me.name.clone()),
+                    port: None,
                 };
                 // 잠깐 준비되지 않은 로컬 풀은 값을 모른다. 공유 풀은 준비된 다른 노드가 이어 본다.
                 if !ps.ready {
@@ -604,6 +615,7 @@ impl Engine {
                     id: me.id,
                     name: me.name.clone(),
                     node: Some(me.name.clone()),
+                    port: None,
                 };
                 let seen = soonest.map(|not_after| {
                     let left = (not_after - crate::backups::now() as i64) as f64 / 86_400.0;
@@ -670,6 +682,8 @@ impl Engine {
             .then(|| self.sdn_world())
             .flatten();
         let observed = self.observed();
+        // 링크 조건(계획 75)의 영향 문구에 쓰는 네트워크·VM: 장애가 있을 때만 이 tick에 한 번 읽는다.
+        let mut link_world: Option<LinkWorld> = None;
         for rule in all
             .into_iter()
             .filter(|r| r.spec.condition.evaluator() == Evaluator::Leader)
@@ -696,6 +710,11 @@ impl Engine {
                 // 적용 묶음 드리프트(계획 73 §12.5 — 리더 DriftChecker가 status에 쓴 것): 목록을 읽지 못하면 그대로 둔다.
                 AlertCondition::ApplySetDrift => match self.drift_findings() {
                     Some(f) => self.subject_rule(now, &rule, f, "The apply set was deleted."),
+                    None => continue,
+                },
+                // 링크 조건(계획 75 §3.4): 노드 상태의 포트·본딩. 영향을 읽지 못하면 그대로 둔다.
+                ref c if c.is_link() => match self.link_findings(&rule, nodes, &mut link_world) {
+                    Some(f) => self.sdn_rule(now, &rule, f),
                     None => continue,
                 },
                 ref c if c.is_sdn() => {
@@ -754,9 +773,105 @@ impl Engine {
         })
     }
 
+    /// 링크 규칙 하나(계획 75 §3.4)의 대상: 노드의 끊긴 포트(`node_link_down`)·저하된 본딩(`bond_degraded`)마다 하나 —
+    /// 경보 키에 포트가 들어가 포트마다 따로다. 문구는 [`physical::describe`](그 노드만 [`physical::build`]한 영향).
+    /// 오프라인 노드의 상태는 낡았으므로 그 노드의 경보는 그대로 둔다(노드 꺼짐은 `node_offline`이 알린다). 다시 올라온
+    /// 포트는 거짓으로 보아 해제 규칙(60초)을 따른다. 네트워크·VM을 읽지 못하면 None이다.
+    fn link_findings(
+        &self,
+        rule: &AlertRule,
+        nodes: &[Node],
+        world: &mut Option<LinkWorld>,
+    ) -> Option<Vec<SdnFinding>> {
+        let mut out = Vec::new();
+        for node in nodes.iter().filter(|n| rule.spec.applies_to_node(&n.name)) {
+            let mine = rule
+                .status
+                .active
+                .iter()
+                .filter(|a| a.subject.id == node.id && a.subject.port.is_some());
+            if !node.status.online {
+                out.extend(mine.map(|a| SdnFinding {
+                    subject: a.subject.clone(),
+                    holds: None,
+                    detail: None,
+                }));
+                continue;
+            }
+            let faults = match &rule.spec.condition {
+                AlertCondition::NodeLinkDown { ports, role } => {
+                    physical::link_faults(&node.status, *role, ports.as_deref())
+                }
+                _ => physical::bond_faults(&node.status),
+            };
+            out.extend(
+                mine.filter(|a| {
+                    !faults
+                        .iter()
+                        .any(|f| a.subject.port.as_ref() == Some(&f.port))
+                })
+                .map(|a| SdnFinding {
+                    subject: a.subject.clone(),
+                    holds: Some(false),
+                    detail: None,
+                }),
+            );
+            if faults.is_empty() {
+                continue;
+            }
+            if world.is_none() {
+                *world = Some(LinkWorld {
+                    networks: self.cluster().list::<NetworkSpec>().ok()?.1,
+                    vms: self.cluster().list::<VmSpec>().ok()?.1,
+                });
+            }
+            let w = world.as_ref().expect("just read");
+            let topology = physical::build(std::slice::from_ref(node), &w.networks, &w.vms);
+            let impacts = topology
+                .nodes
+                .first()
+                .map(|n| n.impact.as_slice())
+                .unwrap_or_default();
+            for f in faults {
+                // 본딩 경보는 본딩의 영향, 없으면(구성 포트가 끊김) 그 본딩에 든 포트의 영향
+                let impact = impacts
+                    .iter()
+                    .find(|i| i.port == f.port)
+                    .or_else(|| {
+                        impacts
+                            .iter()
+                            .find(|i| i.bond.as_deref() == Some(f.port.as_str()))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| Impact {
+                        port: f.port.clone(),
+                        severity: f.severity,
+                        bond: f.bond.clone(),
+                        bridges: Vec::new(),
+                        underlay: false,
+                        networks: Vec::new(),
+                        vms: 0,
+                        vm_ids: Vec::new(),
+                    });
+                out.push(SdnFinding {
+                    subject: AlertSubject {
+                        kind: SubjectKind::Node,
+                        id: node.id,
+                        name: node.name.clone(),
+                        node: Some(node.name.clone()),
+                        port: Some(f.port.clone()),
+                    },
+                    holds: Some(true),
+                    detail: Some(physical::describe(&node.name, &impact)),
+                });
+            }
+        }
+        Some(out)
+    }
+
     /// SDN 규칙 하나(계획 67 §11)를 본 결과로 진행한다. 상태 조건은 [`advance`](값을 모르면 단계를 그대로), 이벤트
     /// (`sdn_gateway_failover`)는 참인 대상마다 한 번 보낸다. 대상이 사라진(라우터·노드를 지움, 중앙이 아니게 됨) `firing`
-    /// 경보는 해제로 알린다. 끈 규칙은 알림 없이 비운다.
+    /// 경보는 해제로 알린다. 끈 규칙은 알림 없이 비운다. 링크 규칙(계획 75)도 이 길이다.
     fn sdn_rule(
         &mut self,
         now: i64,
@@ -847,6 +962,7 @@ impl Engine {
                     id: node.id,
                     name: node.name.clone(),
                     node: Some(node.name.clone()),
+                    port: None,
                 };
                 let before = current.remove(&subject.key(rule.id));
                 let seen = Observation::new(!node.status.online, None);
@@ -920,6 +1036,7 @@ impl Engine {
                         id: b.id,
                         name: b.name.clone(),
                         node: None,
+                        port: None,
                     };
                     (subject, failed, detail)
                 })
@@ -943,6 +1060,7 @@ impl Engine {
                         id: s.id,
                         name: s.name.clone(),
                         node: None,
+                        port: None,
                     };
                     let detail = (n > 0).then(|| {
                         format!(
@@ -971,6 +1089,7 @@ impl Engine {
                         id: c.id,
                         name: c.name.clone(),
                         node: None,
+                        port: None,
                     };
                     // 노드마다 인증서는 노드마다 센다(요약 `failures`는 가장 많이 실패한 노드) — 그 노드들을 적는다.
                     let detail = failing.then(|| {
@@ -1036,6 +1155,7 @@ impl Engine {
                         id: s.id,
                         name: s.name.clone(),
                         node: None,
+                        port: None,
                     };
                     let detail = (!failing.is_empty()).then(|| {
                         format!(
@@ -1141,6 +1261,7 @@ impl Engine {
                 id: job.id,
                 name: job.name.clone(),
                 node: None,
+                port: None,
             };
             out.push(Pending {
                 alert: event_alert(rule, subject, now),
@@ -1438,6 +1559,7 @@ mod tests {
             id: Uuid::from_u128(n),
             name: format!("vm{n}"),
             node: Some("node1".into()),
+            port: None,
         }
     }
 

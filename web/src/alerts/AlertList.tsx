@@ -44,7 +44,7 @@ export function AlertList({
         const phase = alertPhase(alert);
         return (
           <li
-            key={`${alert.rule}/${alert.subject.kind}/${alert.subject.id}`}
+            key={`${alert.rule}/${alert.subject.kind}/${alert.subject.id}/${alert.subject.port ?? ""}`}
             className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2"
           >
             <SeverityBadge severity={alert.severity} />
