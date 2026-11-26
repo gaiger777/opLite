@@ -1,0 +1,37 @@
+{
+  "lldp": {
+    "interface": {
+      "eno1": {
+        "via": "LLDP",
+        "rid": "1",
+        "age": "0 day, 02:11:45",
+        "chassis": {
+          "tor-a.example": {
+            "id": {
+              "type": "mac",
+              "value": "00:1c:73:aa:bb:cc"
+            },
+            "descr": "Arista Networks EOS version 4.28.3M",
+            "mgmt-ip": ["192.0.2.10", "fe80::21c:73ff:feaa:bbcc"],
+            "capability": [
+              {"type": "Bridge", "enabled": true},
+              {"type": "Router", "enabled": false}
+            ]
+          }
+        },
+        "port": {
+          "id": {
+            "type": "ifname",
+            "value": "Ethernet12"
+          },
+          "descr": "svc01 eno1",
+          "ttl": "120"
+        },
+        "vlan": {
+          "vlan-id": "100",
+          "pvid": true
+        }
+      }
+    }
+  }
+}

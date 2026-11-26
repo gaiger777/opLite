@@ -1,0 +1,43 @@
+{
+  "lldp": {
+    "interface": [
+      {
+        "eno1": {
+          "via": "LLDP",
+          "rid": "1",
+          "chassis": {
+            "tor-a": {
+              "id": {"type": "mac", "value": "00:1c:73:aa:bb:cc"},
+              "mgmt-ip": "192.0.2.10"
+            }
+          },
+          "port": {
+            "id": {"type": "ifname", "value": "Gi1/0/12"},
+            "descr": "GigabitEthernet1/0/12"
+          }
+        }
+      },
+      {
+        "eno2": {
+          "via": "LLDP",
+          "rid": "2",
+          "chassis": {
+            "id": {"type": "mac", "value": "00:1c:73:dd:ee:ff"},
+            "descr": "switch without a system name"
+          },
+          "port": {
+            "id": {"type": "mac", "value": "00:1c:73:dd:ee:01"}
+          }
+        }
+      },
+      {
+        "eno1": {
+          "via": "CDPv2",
+          "rid": "3",
+          "chassis": {"other-switch": {"id": {"type": "local", "value": "x"}}},
+          "port": {"id": {"type": "ifname", "value": "Te1/1"}}
+        }
+      }
+    ]
+  }
+}

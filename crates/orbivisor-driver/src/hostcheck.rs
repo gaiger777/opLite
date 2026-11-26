@@ -2,6 +2,7 @@
 //! (디렉터리 읽기, iSCSI 세션, multipath 경로, RADOS)를 본다. 파일 읽기는 블로킹 함수이고 명령은 async
 //! 함수다. 모두 cfg 없이 컴파일되며 Linux가 아니면 sysfs가 없어 `unknown`·`failing`이 된다.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,8 @@ use std::time::Duration;
 use orbivisor_types::ha_check::CheckState;
 use orbivisor_types::network::is_managed_ifname;
 use orbivisor_types::node::{
-    BondPort, BondState, BondStatus, InterfaceKind, MAX_NODE_INTERFACES, NodeInterface, PortState,
+    BondPort, BondState, BondStatus, InterfaceKind, LldpNeighbor, MAX_NODE_INTERFACES,
+    NodeInterface, PortState,
 };
 use serde::Deserialize;
 
@@ -26,6 +28,8 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const RBD_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// `pvs` 하나를 기다리는 시간
 pub const PVS_TIMEOUT: Duration = Duration::from_secs(5);
+/// `lldpcli` 하나를 기다리는 시간
+pub const LLDP_TIMEOUT: Duration = Duration::from_secs(3);
 /// RBD probe가 찾는 객체 이름. 없어도 OSD가 답하면 통과다.
 pub const RBD_PROBE_OBJECT: &str = "orbivisor-health-probe";
 /// 명령이 스스로 끝낼 시간(핑의 `-W`)에 더해 기다리는 여유
@@ -99,6 +103,11 @@ fn speed(net: &NetFs, iface: &str) -> Option<u32> {
 
 fn operstate(net: &NetFs, iface: &str) -> Option<String> {
     read_trim(&net.net(iface).join("operstate")).ok()
+}
+
+/// sysfs `mtu`
+fn mtu(net: &NetFs, iface: &str) -> Option<u32> {
+    read_trim(&net.net(iface).join("mtu")).ok()?.parse().ok()
 }
 
 /// 인터페이스 하나의 `link` 판정. 본딩이면 포트 상태로, 브리지면 아래 포트(업링크)로 본다([`bridge_uplinks`]).
@@ -416,7 +425,15 @@ pub struct IpLink {
     pub info_kind: Option<String>,
     /// IP 주소(CIDR)
     pub addresses: Vec<String>,
+    pub mtu: Option<u32>,
+    /// VLAN·macvlan·ipvlan의 아래 장치(`link`). 다른 이름공간에 있으면(`link_netnsid`) `ip`가 이름을 주지 않아 없다.
+    pub parent: Option<String>,
+    /// VLAN이면 그 id(`linkinfo.info_data.id`)
+    pub vlan_id: Option<u16>,
 }
+
+/// 아래 장치(`link`)를 [`IpLink::parent`]로 받는 종류. veth의 `link`는 짝이라 받지 않는다.
+const PARENT_KINDS: &[&str] = &["vlan", "macvlan", "macvtap", "ipvlan", "ipvtap"];
 
 #[derive(Debug, Deserialize)]
 struct AddrLink {
@@ -430,6 +447,10 @@ struct AddrLink {
     #[serde(default)]
     link_type: Option<String>,
     #[serde(default)]
+    mtu: Option<u32>,
+    #[serde(default)]
+    link: Option<String>,
+    #[serde(default)]
     linkinfo: Option<AddrLinkInfo>,
     #[serde(default)]
     addr_info: Vec<AddrInfo>,
@@ -439,6 +460,9 @@ struct AddrLink {
 struct AddrLinkInfo {
     #[serde(default)]
     info_kind: Option<String>,
+    /// 종류마다 모양이 달라(VXLAN의 `id`는 VNI) 값으로 받고 VLAN일 때만 본다.
+    #[serde(default)]
+    info_data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,18 +479,33 @@ pub fn parse_ip_addr(json: &str) -> Result<Vec<IpLink>, String> {
         serde_json::from_str(json).map_err(|e| format!("unexpected ip output: {e}"))?;
     Ok(links
         .into_iter()
-        .map(|l| IpLink {
-            name: l.ifname,
-            state: l.operstate.unwrap_or_default().to_ascii_lowercase(),
-            master: l.master,
-            mac: l.address,
-            link_type: l.link_type,
-            info_kind: l.linkinfo.and_then(|i| i.info_kind),
-            addresses: l
-                .addr_info
-                .into_iter()
-                .filter_map(|a| Some(format!("{}/{}", a.local?, a.prefixlen?)))
-                .collect(),
+        .map(|l| {
+            let (info_kind, info_data) = l
+                .linkinfo
+                .map_or((None, None), |i| (i.info_kind, i.info_data));
+            let kind = info_kind.as_deref();
+            let vlan_id = (kind == Some("vlan"))
+                .then(|| info_data.as_ref()?.get("id")?.as_u64())
+                .flatten()
+                .and_then(|id| u16::try_from(id).ok());
+            IpLink {
+                parent: l
+                    .link
+                    .filter(|_| kind.is_some_and(|k| PARENT_KINDS.contains(&k))),
+                vlan_id,
+                mtu: l.mtu,
+                name: l.ifname,
+                state: l.operstate.unwrap_or_default().to_ascii_lowercase(),
+                master: l.master,
+                mac: l.address,
+                link_type: l.link_type,
+                info_kind,
+                addresses: l
+                    .addr_info
+                    .into_iter()
+                    .filter_map(|a| Some(format!("{}/{}", a.local?, a.prefixlen?)))
+                    .collect(),
+            }
         })
         .collect())
 }
@@ -495,17 +534,18 @@ fn interface_kind(link: &IpLink) -> InterfaceKind {
 }
 
 /// 이 노드의 인터페이스 목록(모두, 노드 상태에는 [`reported_interfaces`]로 줄여 쓴다). `ip_json`은
-/// `ip -j -d addr show`의 출력이고 carrier·속도·본딩은 sysfs에서 읽는다.
+/// `ip -j -d addr show`의 출력이고 carrier·속도·MTU·본딩은 sysfs에서 읽는다(sysfs에 없으면 MTU는 `ip`의 값).
+/// LLDP 이웃은 부르는 쪽이 붙인다([`attach_lldp`]).
 pub fn interfaces(net: &NetFs, ip_json: &str) -> Result<Vec<NodeInterface>, String> {
     let mut list: Vec<NodeInterface> = parse_ip_addr(ip_json)?
         .into_iter()
         .filter(reported)
         .map(|l| NodeInterface {
-            mtu: None,
-            parent: None,
-            vlan_id: None,
-            lldp: None,
             kind: interface_kind(&l),
+            mtu: l.mtu,
+            parent: l.parent,
+            vlan_id: l.vlan_id,
+            lldp: None,
             name: l.name,
             state: l.state,
             carrier: None,
@@ -547,12 +587,15 @@ pub fn reported_interfaces(list: &[NodeInterface]) -> Vec<NodeInterface> {
         .collect()
 }
 
-/// operstate·carrier·속도·본딩 포트를 sysfs에서 다시 읽는다(`ip`를 부르지 않는 짧은 회차).
-/// 읽지 못한 operstate는 그대로 둔다.
+/// operstate·carrier·속도·MTU·본딩 포트를 sysfs에서 다시 읽는다(`ip`를 부르지 않는 짧은 회차).
+/// 읽지 못한 operstate·MTU는 그대로 둔다.
 pub fn refresh_interfaces(net: &NetFs, list: &mut [NodeInterface]) {
     for iface in list {
         if let Some(state) = operstate(net, &iface.name) {
             iface.state = state;
+        }
+        if let Some(mtu) = mtu(net, &iface.name) {
+            iface.mtu = Some(mtu);
         }
         iface.carrier = carrier(net, &iface.name);
         iface.speed_mbps = speed(net, &iface.name);
@@ -561,6 +604,110 @@ pub fn refresh_interfaces(net: &NetFs, list: &mut [NodeInterface]) {
         } else {
             None
         };
+    }
+}
+
+/// `PATH`에서 실행 파일 `name`을 찾는다.
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// 값 하나 또는 배열의 각 값(lldpd의 JSON은 같은 이름이 하나면 객체, 여럿이면 배열이다)
+fn one_or_many(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match v {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        v => vec![v],
+    }
+}
+
+/// lldpd JSON의 글 값: 문자열, `{"value": …}`(속성이 붙은 값), 그 배열이면 첫 값. 빈 글은 없다.
+fn lldp_text(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        serde_json::Value::Object(o) => lldp_text(o.get("value")),
+        serde_json::Value::Array(items) => items.iter().find_map(|v| lldp_text(Some(v))),
+        _ => None,
+    }
+}
+
+/// 인터페이스 하나의 lldpd JSON(`via`·`chassis`·`port` …)에서 이웃
+fn lldp_neighbor(data: &serde_json::Value) -> LldpNeighbor {
+    let first = |key: &str| {
+        data.get(key)
+            .and_then(|v| one_or_many(v).into_iter().next())
+    };
+    // 섀시는 sysName이 있으면 `{"<이름>": {id, descr, mgmt-ip …}}`, 없으면 그 안쪽이 바로 온다(`json0`은 `name` 칸).
+    let (name, chassis) = match first("chassis") {
+        Some(serde_json::Value::Object(o)) if o.len() == 1 && !o.contains_key("id") => {
+            let (name, body) = o.iter().next().expect("one entry");
+            (Some(name.clone()), Some(body))
+        }
+        c => (None, c),
+    };
+    let chassis_field = |key: &str| lldp_text(chassis.and_then(|c| c.get(key)));
+    let port = first("port");
+    let port_field = |key: &str| lldp_text(port.and_then(|p| p.get(key)));
+    LldpNeighbor {
+        chassis_name: name.or_else(|| chassis_field("name")),
+        chassis_id: chassis_field("id"),
+        port_id: port_field("id"),
+        port_descr: port_field("descr"),
+        mgmt_ip: chassis_field("mgmt-ip"),
+    }
+}
+
+/// `lldpcli -f json show neighbors`의 출력에서 인터페이스 이름 → 이웃. `interface`는 하나면 객체, 여럿이면 배열이고
+/// 이웃이 없으면 없다. 한 인터페이스에 이웃이 여럿이면 첫 이웃이다. 모든 값이 배열인 `-f json0`도 읽는다.
+pub fn parse_lldp_neighbors(json: &str) -> Result<BTreeMap<String, LldpNeighbor>, String> {
+    let root: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("unexpected lldpcli output: {e}"))?;
+    let lldp = root
+        .get("lldp")
+        .ok_or_else(|| "unexpected lldpcli output: no lldp".to_string())?;
+    let mut out = BTreeMap::new();
+    for lldp in one_or_many(lldp) {
+        let Some(ifaces) = lldp.get("interface") else {
+            continue;
+        };
+        for entry in one_or_many(ifaces) {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            // `json0`은 이름이 칸이다(`{"name": "eno1", "chassis": […], …}`).
+            if let Some(serde_json::Value::String(name)) = entry.get("name") {
+                out.entry(name.clone())
+                    .or_insert_with(|| lldp_neighbor(&serde_json::Value::Object(entry.clone())));
+                continue;
+            }
+            for (name, data) in entry {
+                out.entry(name.clone())
+                    .or_insert_with(|| lldp_neighbor(data));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// lldpd에 이웃을 묻는다(`bin` = `lldpcli`, [`LLDP_TIMEOUT`] 안에). lldpd가 돌지 않으면 lldpcli가 실패한다.
+pub async fn lldp_neighbors(bin: &Path) -> Result<BTreeMap<String, LldpNeighbor>, ProbeError> {
+    let args = ["-f", "json", "show", "neighbors"].map(String::from);
+    let out = run_limited(bin, &args, &[], LLDP_TIMEOUT, "lldpd").await?;
+    if !out.status.success() {
+        return Err(ProbeError::Failed(format!(
+            "lldpcli: {}",
+            first_line(&out.stderr, out.status)
+        )));
+    }
+    parse_lldp_neighbors(&String::from_utf8_lossy(&out.stdout)).map_err(ProbeError::Failed)
+}
+
+/// 이름이 같은 인터페이스에 LLDP 이웃을 붙인다(없으면 지운다).
+pub fn attach_lldp(list: &mut [NodeInterface], neighbors: &BTreeMap<String, LldpNeighbor>) {
+    for iface in list {
+        iface.lldp = neighbors.get(&iface.name).cloned();
     }
 }
 
@@ -1437,6 +1584,164 @@ mod tests {
         assert_eq!(list[1].bond.as_ref().unwrap().state, BondState::Down);
 
         assert!(interfaces(&net, "not json").is_err());
+    }
+
+    /// 계획 75: VLAN(이더넷 위·본딩 위)의 아래 장치·id, MTU(sysfs가 있으면 그 값 — 짧은 회차도 다시 읽음). VXLAN의
+    /// `id`(VNI)·veth의 `link`(짝)는 받지 않는다.
+    #[test]
+    fn vlan_parents_ids_and_mtu() {
+        const IP_VLAN: &str = r#"[
+          {"ifindex":2,"ifname":"eno1","mtu":1500,"operstate":"UP","link_type":"ether","addr_info":[]},
+          {"ifindex":3,"ifname":"eno1.100","link":"eno1","mtu":1500,"operstate":"UP","link_type":"ether","linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":100,"flags":["REORDER_HDR"]}},"addr_info":[]},
+          {"ifindex":4,"ifname":"bond1","mtu":9000,"operstate":"UP","link_type":"ether","linkinfo":{"info_kind":"bond","info_data":{"mode":"802.3ad"}},"addr_info":[]},
+          {"ifindex":5,"ifname":"storage","link":"bond1","mtu":9000,"master":"vmbr9","operstate":"UP","link_type":"ether","linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":4094}},"addr_info":[]},
+          {"ifindex":6,"ifname":"mv0","link":"eno1","mtu":1500,"operstate":"UP","link_type":"ether","linkinfo":{"info_kind":"macvlan","info_data":{"mode":"bridge"}}},
+          {"ifindex":7,"ifname":"vxlan9","mtu":1450,"operstate":"UNKNOWN","link_type":"ether","linkinfo":{"info_kind":"vxlan","info_data":{"id":70000}}},
+          {"ifindex":8,"ifname":"veth1","link":"veth2","mtu":1500,"operstate":"UP","link_type":"ether","linkinfo":{"info_kind":"veth"}},
+          {"ifindex":9,"ifname":"eno2.7","link_index":2,"link_netnsid":0,"operstate":"UP","link_type":"ether","linkinfo":{"info_kind":"vlan","info_data":{"id":7}}}
+        ]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let net = fake_net(tmp.path(), &[link("bond1", "up", 1)]);
+        std::fs::write(net.net("bond1").join("mtu"), "9000\n").unwrap();
+        let mut list = interfaces(&net, IP_VLAN).unwrap();
+        let got: Vec<_> = list
+            .iter()
+            .map(|i| {
+                (
+                    i.name.as_str(),
+                    i.kind,
+                    i.mtu,
+                    i.parent.as_deref(),
+                    i.vlan_id,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("eno1", InterfaceKind::Ethernet, Some(1500), None, None),
+                (
+                    "eno1.100",
+                    InterfaceKind::Vlan,
+                    Some(1500),
+                    Some("eno1"),
+                    Some(100)
+                ),
+                ("bond1", InterfaceKind::Bond, Some(9000), None, None),
+                (
+                    "storage",
+                    InterfaceKind::Vlan,
+                    Some(9000),
+                    Some("bond1"),
+                    Some(4094)
+                ),
+                ("mv0", InterfaceKind::Other, Some(1500), Some("eno1"), None),
+                ("vxlan9", InterfaceKind::Other, Some(1450), None, None),
+                ("veth1", InterfaceKind::Veth, Some(1500), None, None),
+                ("eno2.7", InterfaceKind::Vlan, None, None, Some(7)),
+            ]
+        );
+        assert!(list.iter().all(|i| i.lldp.is_none()));
+        std::fs::write(net.net("bond1").join("mtu"), "1500\n").unwrap();
+        refresh_interfaces(&net, &mut list);
+        assert_eq!(list[2].mtu, Some(1500));
+        // sysfs에 없으면 지난 값을 둔다.
+        assert_eq!(list[3].mtu, Some(9000));
+    }
+
+    const LLDP_ONE: &str = include_str!("../tests/fixtures/lldp/one.json");
+    const LLDP_MANY: &str = include_str!("../tests/fixtures/lldp/many.json");
+    const LLDP_NONE: &str = include_str!("../tests/fixtures/lldp/none.json");
+
+    /// 계획 75: lldpd JSON — 이웃 하나(객체), 여럿(배열, 이름 없는 섀시, 같은 포트의 둘째 이웃은 버림), 없음.
+    #[test]
+    fn parses_lldp_neighbors() {
+        let one = parse_lldp_neighbors(LLDP_ONE).unwrap();
+        assert_eq!(
+            one.into_iter().collect::<Vec<_>>(),
+            [(
+                "eno1".to_string(),
+                LldpNeighbor {
+                    chassis_name: Some("tor-a.example".into()),
+                    chassis_id: Some("00:1c:73:aa:bb:cc".into()),
+                    port_id: Some("Ethernet12".into()),
+                    port_descr: Some("svc01 eno1".into()),
+                    mgmt_ip: Some("192.0.2.10".into()),
+                }
+            )]
+        );
+        let many = parse_lldp_neighbors(LLDP_MANY).unwrap();
+        assert_eq!(many.len(), 2);
+        assert_eq!(many["eno1"].chassis_name.as_deref(), Some("tor-a"));
+        assert_eq!(many["eno1"].port_id.as_deref(), Some("Gi1/0/12"));
+        assert_eq!(many["eno1"].mgmt_ip.as_deref(), Some("192.0.2.10"));
+        assert_eq!(
+            many["eno2"],
+            LldpNeighbor {
+                chassis_id: Some("00:1c:73:dd:ee:ff".into()),
+                port_id: Some("00:1c:73:dd:ee:01".into()),
+                ..Default::default()
+            }
+        );
+        assert!(parse_lldp_neighbors(LLDP_NONE).unwrap().is_empty());
+        assert!(
+            parse_lldp_neighbors(r#"{"lldp":[{"interface":[]}]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        // `json0`(모든 값이 배열)도 읽는다.
+        let json0 = r#"{"lldp":[{"interface":[{"name":"eno3","via":"LLDP","chassis":[{"id":[{"type":"mac","value":"aa"}],"name":[{"value":"sw3"}]}],"port":[{"id":[{"type":"ifname","value":"p3"}]}]}]}]}"#;
+        let n = parse_lldp_neighbors(json0).unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n["eno3"].chassis_name.as_deref(), Some("sw3"));
+        assert_eq!(n["eno3"].chassis_id.as_deref(), Some("aa"));
+        assert_eq!(n["eno3"].port_id.as_deref(), Some("p3"));
+        assert!(parse_lldp_neighbors("not json").is_err());
+        assert!(parse_lldp_neighbors("{}").is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = interfaces(&NetFs::under(tmp.path()), IP_ADDR).unwrap();
+        list[0].lldp = Some(LldpNeighbor::default());
+        attach_lldp(&mut list, &many);
+        assert_eq!(list[0].name, "eno1");
+        assert_eq!(list[0].lldp.as_ref(), Some(&many["eno1"]));
+        assert!(list[1..].iter().all(|i| i.lldp.is_none()));
+        attach_lldp(&mut list, &BTreeMap::new());
+        assert!(list.iter().all(|i| i.lldp.is_none()));
+    }
+
+    /// 계획 75: lldpcli는 시간 상한 안에 돌리고, 없으면 `unavailable`, 실패하면 그 줄이다.
+    #[tokio::test]
+    async fn lldpcli_runs_with_a_time_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ok, args) = fake_command(
+            dir.path(),
+            "lldp-ok",
+            &format!("cat <<'EOF'\n{LLDP_MANY}\nEOF"),
+        );
+        assert_eq!(lldp_neighbors(&ok).await.unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(args).unwrap(),
+            "-f\njson\nshow\nneighbors\n"
+        );
+        let (bad, _) = fake_command(
+            dir.path(),
+            "lldp-bad",
+            "echo 'unable to connect to socket /run/lldpd.socket' >&2; exit 1",
+        );
+        assert_eq!(
+            lldp_neighbors(&bad).await,
+            Err(ProbeError::Failed(
+                "lldpcli: unable to connect to socket /run/lldpd.socket".into()
+            ))
+        );
+        let missing = dir.path().join("lldpcli");
+        assert!(matches!(
+            lldp_neighbors(&missing).await,
+            Err(ProbeError::Unavailable(m)) if m.contains("install lldpd")
+        ));
+        assert!(find_in_path("sh").is_some());
+        assert!(find_in_path("orbivisor-no-such-command").is_none());
     }
 
     /// 목록은 모두 읽고(자동 검사가 쓴다), 노드 상태에는 64개까지 쓰되 주소가 있는 인터페이스를 먼저 남긴다.

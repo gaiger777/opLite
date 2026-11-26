@@ -130,6 +130,26 @@ async fn sees_real_links_bonds_and_interfaces() {
         );
     }
 
+    // 계획 75: dummy 위 VLAN(MTU 9000은 아래 장치부터). 8021q 모듈이 없는 커널이면 건너뛴다.
+    let vlan = format!("oplhv{s}");
+    ip(&["link", "set", &dummy, "mtu", "9000"]);
+    let made = Command::new("ip")
+        .args([
+            "link", "add", "link", &dummy, "name", &vlan, "type", "vlan", "id", "100",
+        ])
+        .output()
+        .unwrap();
+    let have_vlan = made.status.success();
+    if have_vlan {
+        dev.links.push(vlan.clone());
+        ip(&["link", "set", &vlan, "mtu", "9000"]);
+    } else {
+        eprintln!(
+            "cannot create a VLAN ({}); skipping the VLAN part",
+            String::from_utf8_lossy(&made.stderr).trim()
+        );
+    }
+
     let json = ip(&["-j", "-d", "addr", "show"]);
     let list = interfaces(&NetFs::default(), &json).unwrap();
     let find = |name: &str| list.iter().find(|i| i.name == name);
@@ -138,6 +158,15 @@ async fn sees_real_links_bonds_and_interfaces() {
         assert_eq!(find(&veth).unwrap().kind, InterfaceKind::Veth);
         assert_eq!(find(&veth).unwrap().carrier, Some(false));
         assert_eq!(find(&dummy).unwrap().kind, InterfaceKind::Dummy);
+        assert_eq!(find(&dummy).unwrap().mtu, Some(9000));
+        if have_vlan {
+            let v = find(&vlan).unwrap();
+            assert_eq!(v.kind, InterfaceKind::Vlan);
+            assert_eq!(
+                (v.parent.as_deref(), v.vlan_id, v.mtu),
+                (Some(&*dummy), Some(100), Some(9000))
+            );
+        }
         if have_bond {
             let b = find(&bond).unwrap();
             assert_eq!(b.kind, InterfaceKind::Bond);
