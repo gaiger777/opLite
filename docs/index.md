@@ -50,6 +50,7 @@
 - [VMware 이전 2 설계 — vCenter 일괄 이전, CBT 따뜻한 이전·전환·자동 되돌림, OVA/OVF 내보내기 (계획 72)](superpowers/specs/2026-11-25-vmware2-design.md)
 - [선언형 운영 설계 — 선언형 적용(apply·diff·plan·export), Terraform/OpenTofu 공급자, ACME 인증서, 설정 이력과 되돌리기·드리프트 (계획 73)](superpowers/specs/2026-11-25-declarative-design.md)
 - [이름 맞추기 2 설계 — 서비스·경로·환경 변수·쿠키·크레이트를 orbivisor로 (계획 74)](superpowers/specs/2026-11-26-naming-orbivisor-design.md)
+- [운영자 대시보드 설계 — 홈 + 2.5D 인프라 지도 + 물리·가상 관계(포트 → 본딩 → VLAN → 브리지 → 네트워크 → VM)·노드별 할당·사용·링크 경보 (계획 75)](superpowers/specs/2026-11-26-operator-dashboard-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](superpowers/plans/2026-10-21-plan3-opl-cluster.md)
@@ -124,3 +125,4 @@
 - [계획 72: VMware 이전 2 — vCenter 일괄 이전·따뜻한 이전·전환·되돌리기·OVA 내보내기](superpowers/plans/2026-11-25-plan72-vmware2.md)
 - [계획 73: 선언형 운영 — 선언형 적용·Terraform/OpenTofu 공급자·ACME 인증서·설정 이력과 되돌리기·드리프트](superpowers/plans/2026-11-25-plan73-declarative.md)
 - [계획 74: 이름 맞추기 2 — 서비스·경로·환경 변수·쿠키·크레이트를 orbivisor로](superpowers/plans/2026-11-26-plan74-naming.md)
+- [계획 75: 운영자 대시보드 — 홈 지도·자세히 판·노드별 할당·사용 표, 지도 포트 줄·네트워크 레일, LLDP, 링크·본딩 경보](superpowers/plans/2026-11-26-plan75-operator-dashboard.md)

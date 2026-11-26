@@ -1524,6 +1524,10 @@ graph LR
 - **노드 9개 값**(`crates/orbivisor-types/src/metrics.rs:172`): CPU %, 메모리 사용/전체, 디스크 읽기/쓰기 B/s, 망 받기/보내기
   B/s, `data_dir` 파일 시스템 사용/전체. Linux에서 `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`(전체 디스크만),
   `/sys/class/net/*/statistics`(물리 장치만), `statvfs`(`crates/orbivisord/src/metrics/host.rs:56-227`).
+- **인터페이스별 값**(계획 75): 노드 점의 `interfaces`(`IfaceSample{name, rx_bps, tx_bps, rx_errors, tx_errors, rx_dropped, tx_dropped}`)는
+  노드 상태 인터페이스 가운데 이더넷·본딩·VLAN·브리지(veth·dummy 뺌), `MAX_IFACE_SAMPLES` 64개까지의 `statistics` 카운터 차다(바이트/초,
+  오류·버림은 점 사이 증가, 첫 점·되감김은 빈 값). 메모리 저장소는 **마지막 점에만** 남기고(새 점이 오면 앞 점의 것을 비움) RRD·
+  `LoadSummary`에는 넣지 않는다(`crates/orbivisor-types/src/metrics.rs`, `crates/orbivisord/src/metrics/{sampler,store}.rs`).
 - **VM 8개 값**: CPU(`/proc/<pid>/stat`을 vCPU 수로 나눔), RSS, 디스크 읽기/쓰기 B/s·IOPS(QMP `query-blockstats`, VM마다
   1초 제한), 망 받기/보내기(tap 카운터를 게스트 쪽에서 본 방향으로)(`sampler.rs:164-366`). Running·Paused VM만.
   cgroup이나 load average는 쓰지 않는다.
@@ -1594,9 +1598,10 @@ graph LR
 
 - **규칙 종류**: `node_metric`, `vm_metric`, `pool_usage`, `node_offline`, `vm_failed`, `task_failed`, `ha_recovery`,
   `backup_job_failed`(`crates/orbivisor-types/src/alert.rs`), 계획 67의 SDN 여덟(`sdn_quorum_lost`·`sdn_central_down`·`sdn_chassis_down`·
-  `sdn_gateway_unavailable`·`sdn_gateway_failover`·`sdn_sync_failed`·`sdn_physnet_not_ready`·`sdn_lb_member_down` — §11.6).
+  `sdn_gateway_unavailable`·`sdn_gateway_failover`·`sdn_sync_failed`·`sdn_physnet_not_ready`·`sdn_lb_member_down` — §11.6), 계획 75의 링크
+  둘(`node_link_down{ports?, role}`·`bond_degraded` — §12.7).
 - **누가 평가하나.** 모든 비위트니스 노드에서 5초 틱 + watch로 돈다. 노드 규칙(지표, VM 실패, Task 실패, HA 복구, 로컬
-  풀)은 사건이 난 노드가, 공유 풀은 온라인 노드 가운데 id가 가장 작은 노드가, `node_offline`·`backup_job_failed`와 SDN 조건은
+  풀)은 사건이 난 노드가, 공유 풀은 온라인 노드 가운데 id가 가장 작은 노드가, `node_offline`·`backup_job_failed`와 SDN·링크 조건은
   리더가 한다(`crates/orbivisor-api/src/alerts/engine.rs:1-8,548-588`).
 - **상태.** 노드 알림은 `{data_dir}/alerts/state.json`(임시 파일 → fsync → rename, Raft 아님), 리더 알림은
   `AlertRule.status.active`(Raft, 쓰기에 성공해야 통지)(`alerts/book.rs:1-30`). `pending → firing`(`for_secs` 뒤),
@@ -1612,6 +1617,41 @@ graph LR
 (`orbivisor_cluster_*`, `orbivisor_node_is_raft_leader`, `orbivisor_alerts_firing`)를 낸다. 설정 `prometheus.enabled`가
 꺼져 있으면 404, Node 읽기와 루트 VM 읽기 권한이 필요하다(viewer 토큰이면 됨). 5초 캐시, 15초보다 오래된 VM 점은 뺀다
 (`crates/orbivisor-api/src/prometheus.rs:1-456`). 그래서 Prometheus는 모든 노드를 긁어야 한다.
+
+### 12.7 운영자 대시보드: 물리 관계·용량·링크 경보 (계획 75)
+
+[설계](superpowers/specs/2026-11-26-operator-dashboard-design.md), [안내](guide/web-ui.md#운영자-대시보드).
+
+- **수집.** 노드 검사기(`crates/orbivisord/src/checks.rs`, `INTERFACES_EVERY` 30초)가 `ip -j -d addr show`로 `NodeInterface`의 새 칸
+  `mtu`(sysfs가 있으면 그 값 — `ip`를 부르지 않는 짧은 회차도 다시 읽음)·`parent`(VLAN·macvlan·ipvlan의 `link`, veth의 짝은 아님)·
+  `vlan_id`(`linkinfo.info_data.id`, VLAN만)를 채운다(`crates/orbivisor-driver/src/hostcheck.rs`). `lldpcli`는 처음 쓸 때 `PATH`에서
+  찾고(없으면 다시 시작까지 찾지 않음) `ip` 회차마다 `lldpcli -f json show neighbors`(`LLDP_TIMEOUT` 3초)를 불러 이름이 같은 인터페이스에
+  `lldp: LldpNeighbor{chassis_name, chassis_id, port_id, port_descr, mgmt_ip}`를 붙인다. 파서는 `-f json`(하나면 객체, 여럿이면 배열)과
+  `-f json0`(모두 배열)을 읽는 순수 함수다. 새 칸은 모두 `serde(default, skip_serializing_if)`라 비면 옛 JSON과 바이트가 같다.
+- **`physical::build(nodes, networks, vms, pools) -> PhysicalTopology`**(`crates/orbivisor-types/src/physical.rs`, 순수). 노드마다 포트
+  (역할 `uplink`·`underlay`·`unused`·`other`, 아래로 본 `health`)·브리지(업링크 = `master == bridge`, 네트워크, VM NIC 수)·underlay·physnet,
+  그리고 장애 포트·본딩마다 `Impact{port, severity(down|degraded), bridges, networks, vms, vm_ids ≤ 50}`. 사슬은 VM NIC → 네트워크 →
+  (bridge·VLAN → 노드 브리지 | SDN 공급자 → physnet 브리지 | VXLAN·SDN 오버레이 → underlay 주소의 인터페이스) → 브리지 업링크 → VLAN
+  아래 장치 → 본딩 구성 포트. 네트워크마다 `NetRail{carrier, nodes[{node, state(up|degraded|down|absent)}]}`. 옛 노드(`legacy`)는 VLAN
+  아래 장치를 이름 규칙(`eno1.100`)으로 짐작한다. 경보가 쓰는 `link_faults(status, role, glob)`·`bond_faults`·`describe`도 여기다.
+- **`capacity::build`**(`crates/orbivisor-types/src/capacity.rs`, 순수): 노드마다 CPU(스레드·예약·전용·도는 전용 VM이 잡은 것, 자리 잡은
+  VM의 vCPU 합·실행 중·공유 정책, `overcommit` = 공유 vCPU ÷ (스레드 − 예약 − 전용), `use_pct` = 배치 부하 요약), 메모리(전체·hugepages로
+  떼어 둔 것·할당·사용·크기별 hugepages·`overcommit`), NUMA 노드별(토폴로지가 있으면), 로컬 풀(`provisioned_bytes` = 볼륨 `size_bytes` 합,
+  `used_bytes` = 전체 − 남은 양), 공유 풀과 온라인 노드 합. 지난 홈의 `CapacityWidget` 계산과 같은 값인지 시험한다.
+- **끝점 둘**(`crates/orbivisor-api/src/dashboard.rs`): `GET /topology/physical`·`GET /capacity`, 경로표의 루트 `cluster.read`, 모든 노드가
+  기능 `operator-dashboard`를 알아야 한다(`require_feature`, §14). `DashboardCache`(`AppState`에 하나)가 끝점마다 마지막 결과 하나를
+  둔다(`Memo`): 물리 관계는 상태 머신 리비전, 용량은 리비전 + 노드마다 (1분 CPU, 사용 메모리)가 열쇠이고 같으면 다시 셈하지 않는다
+  (계산은 잠금 밖). 웹은 둘을 15초마다 읽는다.
+- **링크 경보.** `AlertCondition::NodeLinkDown{ports: Option<글롭>, role: uplink|any}`·`BondDegraded`는 리더 경보다(§12.5). 리더 엔진이
+  tick마다 노드 상태의 인터페이스로 `link_faults`·`bond_faults`를 보고 끊긴 포트·저하된 본딩마다 경보 하나를 둔다 — `AlertSubject`에
+  `port`가 더해져 경보 키(규칙 id + 대상 + 포트)와 알림 이름(`노드/포트`)이 포트마다 따로다. 문구는 그 노드만 `physical::build`한 영향의
+  `describe`("eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs")이고, 장애가 있는 tick에만 네트워크·VM을 한 번 읽는다.
+  오프라인 노드의 경보는 그대로 둔다. 권하는 묶음 `link_default_rules`(`node-link-down` critical 30초, `bond-degraded` warning 60초)가
+  `POST /alert-rules/link-defaults`이고 SDN 묶음과 같은 `create_default_rules`를 쓴다(같은 이름은 그대로). 조건 만들기·묶음은 기능
+  `link-alerts`가 모든 노드에 있어야 한다.
+- **웹.** 홈(`web/src/pages/DashboardPage.tsx`)이 늦게 읽는 `dashboard/OperatorBoard`(지도·자세히 판·할당 표), 지도는 인프라 › 지도와 같은
+  `clusterMap/InfraMap`(`variant: home|page`)이고 네트워크 층(포트 줄·레일, `clusterMap/network.ts`·`netPaths.ts`·늦게 읽는 `netUi.tsx`)을
+  더했다. `/capacity`가 409면 지난 홈이다.
 
 ---
 
@@ -1653,7 +1693,7 @@ ACME로 자동 갱신할 수 있다(계획 73).
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
   `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store`, `file-restore`, `vm-check`, …,
-  `declarative`, `config-history`, `acme`)을 `Node` status에 알린다(`crates/orbivisor-types/src/node.rs:341-369`).
+  `declarative`, `config-history`, `acme`, `operator-dashboard`, `link-alerts`)을 `Node` status에 알린다(`crates/orbivisor-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/orbivisor-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.

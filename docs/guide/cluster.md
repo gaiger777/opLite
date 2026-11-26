@@ -1106,6 +1106,10 @@ orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Line
   `zd`·`rbd` 장치를 뺀 합 — LVM·RAID·ZFS 위의 쓰기를 두 번 세지 않는다, macOS는 없음), 실제 NIC의 받기·보내기
   바이트/초(Linux는 `/sys/class/net/<if>/device`가 있는 장치, macOS는 `en*`), 데이터 디렉터리(`data_dir`)의 파일 시스템
   사용/전체.
+- **인터페이스 값(계획 75).** 노드 점에 인터페이스마다 받기·보내기 바이트/초와 직전 점 뒤 늘어난 오류·버림 수가 붙는다
+  (`interfaces: [{name, rx_bps, tx_bps, rx_errors, tx_errors, rx_dropped, tx_dropped}]`, `/sys/class/net/<if>/statistics`). 대상은 노드
+  상태의 이더넷·본딩·VLAN·브리지(veth·tap·dummy 아님), 노드당 64개까지다. **마지막 점에만** 있고(앞 점의 것은 새 점이 오면 지움)
+  기록 파일·클러스터 요약에는 들지 않는다 — 홈 자세히 판의 포트 트래픽이 이것을 읽는다.
 - **VM 값.** CPU %는 QEMU 프로세스의 CPU 시간을 vCPU 수(sockets × cores)로 나눈 것이라 vCPU가 모두 바쁘면 100이고
   I/O 스레드 때문에 조금 넘을 수 있다. 메모리는 QEMU 프로세스의 RSS(게스트가 쓰는 양이 아님), 디스크는 QMP
   `query-blockstats`의 모든 VM 디스크 합(바이트/초와 IOPS), 네트워크는 tap NIC 카운터의 합을 게스트 기준으로 바꾼
@@ -1264,12 +1268,38 @@ orbivisorctl node stats --range day           # 노드 이름 없이 범위를 �
   들어가고 열·줄에서 빠진다(CLI는 stderr `warning: no metrics history from: …`, `note: these nodes do not keep metrics
   history yet: …`, `warning: left out because their clock is far off: …`). 요약 자체는 노드 문제로 실패하지 않는다.
 
+### 용량 요약
+
+홈의 노드별 할당·사용 표(계획 75, [운영자 대시보드](web-ui.md#운영자-대시보드))가 읽는 값이다. 지표 기록과 달리 Raft의 지금 상태와 배치
+부하 요약(리더가 리스로 받은 것)으로 셈한다.
+
+```bash
+orbivisorctl capacity
+# NODE   ONLINE  VCPUS  OVERCOMMIT  CPU    MEMORY           MEM USED  STORAGE
+# svc01  yes     18/10  x1.80       37.2%  32.0GiB/64.0GiB  16.0GiB   1.0TiB/2.0TiB
+# svc02  no      0/14   -           -      0B/62.0GiB       -         -
+#
+# POOL  PROVISIONED  USED    TOTAL   VOLUMES  NODES
+# ceph  2.1TiB       1.2TiB  4.0TiB  41       2/3
+orbivisorctl -o json capacity    # 응답 그대로(NUMA 노드별·hugepages·풀마다)
+```
+
+- `VCPUS`는 공유 정책 VM의 vCPU / 공유 스레드(스레드 − 예약 − 전용, [호스트 준비](#호스트-준비-예약전용-cpu와-hugepages)), `OVERCOMMIT`은 그 비,
+  `CPU`는 지난 1분 사용률, `MEMORY`는 자리 잡은 VM(시작·실행·정지 중·옮기는 중)의 메모리 합 / 노드 메모리, `STORAGE`는 로컬 풀의
+  프로비전(볼륨 `size_bytes` 합 — 씬 할당) / 전체 합이다. 아래 표는 공유 풀(노드 = 준비된 노드 / 쓰는 노드)이다.
+- `GET /api/v1/capacity`(루트 `cluster.read`)는 `{"nodes":[{"node","online","cpu":{threads,reserved,dedicated_total,dedicated_used,
+  vcpus_allocated,vcpus_running,vcpus_shared,overcommit?,use_pct?},"memory":{total_mib,reserved_mib,allocated_mib,used_mib?,hugepages,
+  overcommit?},"numa":[…],"storage":[{pool,ready,total_bytes,used_bytes,provisioned_bytes,volumes}]}],"shared_pools":[…],"totals":{…}}`다.
+  위트니스는 빼고 오프라인 노드는 넣는다(`totals`는 온라인 노드의 합). 부하 요약이 없으면 `use_pct`·`used_mib`가 빈다.
+- 입력(상태 머신 리비전과 노드 부하)이 같으면 API 노드가 이전 결과를 그대로 준다. 모든 노드가 기능 `operator-dashboard`를 알아야
+  한다(아니면 **409** `cluster_upgrading` — 웹은 지난 홈).
+
 ### 웹 화면
 
-- **홈.** 건강 띠(노드·VM 수, 울리는 경보) 아래에 활성 경보 위젯(심각도 순, 30초마다, "모든 경보 보기")·용량·풀 사용률
-  막대(85 %를 넘으면 경고색), **클러스터 부하** 차트 넷(CPU·메모리·디스크·네트워크, 범위 고르기 1시간·1일·1주·1개월·1년),
+- **홈.** 건강 띠(노드·VM 수, 울리는 경보) 아래에 운영자 대시보드(지도·자세히 판·노드별 할당·사용 표 — 계획 75), 활성 경보 위젯
+  (심각도 순, 30초마다, "모든 경보 보기")·상위 VM(섞인 판이면 지난 홈의 용량·풀 사용률 막대 — 85 %를 넘으면 경고색), **클러스터 부하** 차트 넷(CPU·메모리·디스크·네트워크, 범위 고르기 1시간·1일·1주·1개월·1년),
   **노드 부하**(범위 평균, 20개 넘으면 가장 바쁜 20개)와 **상위 VM** 10개가 있다. 범위를 바꾸면 노드 부하·상위 VM도 그
-  범위가 된다. 넣지 못한 노드는 차트 아래 한 줄로 알린다(답하지 않음·옛 버전·시계가 어긋남). 홈의 배치는
+  범위가 된다(노드 부하는 지난 홈에만). 넣지 못한 노드는 차트 아래 한 줄로 알린다(답하지 않음·옛 버전·시계가 어긋남). 홈의 배치는
   [웹 화면 둘러보기](web-ui.md#홈과-첫-걸음)에 있다.
 - **노드 상세**(인프라 › 노드, `/nodes/{이름}`, 노드 목록·노드 부하 위젯의 이름을 누름). 머리(상태, "유지보수"·"비우기" 단추,
   나머지 업데이트·인터페이스·디스크·레이블·펜싱·지우기는 동작 메뉴 ⋯), 요약 카드,
@@ -1283,7 +1313,7 @@ orbivisorctl node stats --range day           # 노드 이름 없이 범위를 �
 
 ### 한계
 
-- 측정 간격(5초)과 층(5초·1분·30분·6시간)은 바꿀 수 없다. 디스크·NIC마다 나눈 값, 게스트 안의 지표(파일 시스템 사용량
+- 측정 간격(5초)과 층(5초·1분·30분·6시간)은 바꿀 수 없다. 디스크·NIC마다 나눈 값의 기록(노드 인터페이스는 마지막 점뿐), 게스트 안의 지표(파일 시스템 사용량
   등), 기록 내보내기(CSV), 지표 밀어 보내기(Graphite·InfluxDB), 사용자 정의 대시보드는 없다.
 - 1시간보다 긴 범위의 p50·p95는 평균으로 셈한 근사다(분 단위보다 짧은 봉우리를 낮게 봄).
 - 마이그레이션 직후 기록이 새 주인 노드로 넘어가기 전(최대 약 10분)에는 기록 조회의 앞쪽이 비어 보인다(`covered_from`).
@@ -1362,6 +1392,7 @@ orbivisorctl alert rule create ha --ha-recovery --severity critical --target pho
 orbivisorctl alert rule create backup --backup-job-failed --target ops-mail
 orbivisorctl alert rule create chassis --condition sdn_chassis_down --for 1m --node n2 --target ops-mail
 orbivisorctl alert rule add-sdn-defaults --target ops-mail   # 권하는 SDN 규칙 여덟을 한 번에(같은 이름은 그대로 둠)
+orbivisorctl alert rule add-link-defaults --target ops-mail  # 권하는 링크 규칙 둘(업링크 포트 끊김·본딩 저하)
 orbivisorctl alert rule list                     # NAME ENABLED SEVERITY CONDITION FOR TARGETS
 orbivisorctl alert rule set cpu-hot --gt 95      # 준 것만 바꾼다(--gt·--lt만 주면 문턱만)
 orbivisorctl alert rule set cpu-hot --disable    # --enable, --all-nodes, --all-vms
@@ -1386,6 +1417,8 @@ orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보�
 | `--condition sdn_sync_failed` | OvnSync 오류, 300초 넘게 동기화 없음, 또는 OVN 잠금 표가 맞지 않는 노드 | **리더** | SDN |
 | `--condition sdn_physnet_not_ready` | 설정한 physnet(옮기기 다리 포함)이 준비 안 됨 | **리더** | 노드 |
 | `--condition sdn_lb_member_down` | 부하 분산기의 건강 검사 멤버 가운데 죽은 것이 있음(LB마다 하나) | **리더** | 부하 분산기 |
+| `node_link_down`(웹·API) | 노드의 랜 포트 링크가 끊김(계획 75, [링크 경보](#링크-경보)) | **리더** | 노드의 포트 |
+| `bond_degraded`(웹·API) | 본딩이 저하(구성 포트 일부만 살아 이중화를 잃음)되거나 끊김 | **리더** | 노드의 본딩 |
 
 - **칸.** `--for`(조건이 이만큼 이어지면 알림, `0`~`24h`, 기본 0), `--severity info|warning|critical`(기본 warning), `--target`
   (알림 대상 이름 1~16개, 있어야 함), `--repeat`(계속 firing이면 이 간격으로 다시, 기본 `4h`, `0`이면 다시 보내지 않음,
@@ -1452,11 +1485,34 @@ orbivisorctl alert history --since 1h   # 보낸 알림(새 것부터, 기본 �
   `sdn-lb-member-down` warning 30초를 만든다. 같은 이름이 있으면 건드리지 않으므로 다시 불러도 된다. 모든 노드가 기능 `sdn-services`를
   알아야 SDN 조건을 쓸 수 있다(409 `cluster_upgrading`).
 
+### 링크 경보
+
+랜 포트·본딩 장애를 그 포트 이름과 영향으로 알린다(계획 75). 입력은 노드 상태의 인터페이스 목록(노드가 30초마다 `ip`·sysfs로 씀 —
+[네트워크](network.md#물리-네트워크-포트본딩lldp))이고 **리더**가 다른 리더 경보처럼 평가한다(상태는 규칙의 `status.active`).
+
+- **`node_link_down {ports?, role}`.** carrier가 없는 이더넷 포트마다 경보 하나다(경보 키에 포트가 들어가 포트마다 따로). `role`이
+  `uplink`(기본)면 브리지·본딩·underlay 아래의 포트만, `any`면 모든 랜 포트를 본다. `ports`는 `*`·`?` 글롭(예: `eno*`, 1~64자, 공백·`/`·`:`
+  없음)이고 비우면 모든 포트다.
+- **`bond_degraded`.** 본딩마다 하나 — 구성 포트 일부가 끊겨 이중화를 잃었거나(저하) 본딩이 끊김.
+- **문구.** 대상은 `node/svc01/eno1`(CLI `alert list`의 SUBJECT, 알림의 이름 `svc01/eno1`), 메시지는 물리 관계로 셈한 영향이다:
+  `eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs`. 영향 계산은 `GET /topology/physical`과 같은 함수다.
+- **상태.** 지속 조건이라 `--for`·`--repeat`·해제가 있다. 다시 올라온 포트는 60초 뒤 해제다. 오프라인 노드의 상태는 낡았으므로 그 노드의
+  링크 경보는 그대로 둔다(노드 꺼짐은 `node-offline`이 알림). 노드 거르기(`nodes`)를 받는다.
+- **링크 경보 켜기.** `alert rule add-link-defaults --target T`(여러 번 줄 수 있음, API `POST /api/v1/alert-rules/link-defaults
+  {"targets": [...]}` → `{created, existing}`, 웹 홈의 "링크 경보 켜기")가 `node-link-down`(업링크 포트, critical, 30초)과
+  `bond-degraded`(warning, 60초)를 만든다. SDN 묶음과 따로라 SDN을 쓰지 않는 클러스터에서도 쓴다. 같은 이름이 있으면 건드리지 않고
+  만든 것·그대로 둔 것을 줄마다 알린다(`alert rule node-link-down created`, `alert rule bond-degraded already exists; kept`). 만든 뒤로는
+  보통 규칙이다.
+- **다른 규칙.** 포트 글롭·`role: any`는 웹 규칙 폼(조건 "랜 포트 링크 끊김" — 볼 포트·포트 이름 칸)이나 API로 만든다:
+  `POST /alert-rules {"name":"storage-nic","spec":{"condition":{"kind":"node_link_down","ports":"ens1f*","role":"any"},"for_secs":10,
+  "severity":"critical","targets":["phone"]}}`. CLI `--condition`은 링크 조건을 받지 않는다.
+- 모든 노드가 기능 `link-alerts`를 알아야 링크 조건 규칙을 만들고 묶음을 쓴다(아니면 **409** `cluster_upgrading`).
+
 ### 웹
 
 - **경보**(활동 › 경보 탭 `/alerts`, 홈 경보 위젯이나 종 서랍의 "모든 경보 보기"): **활성** 탭(심각도·대상·단계
   울림/대기/해제 중·값과 문턱·시작 시각, 답하지 않은·옛 노드 안내), **규칙** 탭(누구나 읽음, admin만 만들기·고치기·지우기 —
-  조건 종류에 따라 칸이 바뀌는 폼, 조건 고르기에 SDN 묶음 — 노드 거르기는 대상이 노드인 SDN 조건에만, 게이트웨이 넘김은 지속 시간 없는 이벤트), **보낸 알림** 탭(지난 24시간·7일, 500개까지). 경보는 화면 알림으로 띄우지 않고 머리줄 종의 숫자와 서랍에 보인다([웹 화면 둘러보기](web-ui.md#알림-센터)).
+  조건 종류에 따라 칸이 바뀌는 폼, 조건 고르기에 SDN 묶음과 링크 조건(볼 포트 업링크·underlay만 | 모든 랜 포트, 포트 이름 글롭) — 노드 거르기는 대상이 노드인 SDN 조건에만, 게이트웨이 넘김은 지속 시간 없는 이벤트), **보낸 알림** 탭(지난 24시간·7일, 500개까지). 경보는 화면 알림으로 띄우지 않고 머리줄 종의 숫자와 서랍에 보인다([웹 화면 둘러보기](web-ui.md#알림-센터)).
 - **알림 대상**(설정 › 알림 대상 탭 `/settings/notifications`, admin — 규칙 탭의 링크로도 간다): SMTP·webhook 폼, 시험 보내기.
   저장된 비밀은 비워 두면 지키고 "지우기"로 지운다. 서버·포트·사용자·TLS나 URL·CA를 바꾸면서 비밀을 다시 넣지 않으면
   폼이 먼저 막는다.

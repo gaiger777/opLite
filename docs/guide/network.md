@@ -1,9 +1,10 @@
 # 네트워크
 
-VXLAN 네트워크, VM 방화벽(보안 그룹), SDN(OVN) 네트워크. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+VXLAN 네트워크, VM 방화벽(보안 그룹), 물리 네트워크(포트·본딩·LLDP), SDN(OVN) 네트워크. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [VXLAN 네트워크](#vxlan-네트워크)
 - [VM 방화벽 (보안 그룹)](#vm-방화벽-보안-그룹)
+- [물리 네트워크: 포트·본딩·LLDP](#물리-네트워크-포트본딩lldp)
 - [SDN (OVN)](#sdn-ovn)
 
 ## VXLAN 네트워크
@@ -152,6 +153,43 @@ revision), VM NIC의 `security_groups: ["web"]`, Node `status.firewall`이다.
 위 설명(nftables, 노드마다의 테이블, `status.firewall`)은 **단순 NIC**의 것이다. 같은 그룹을 SDN NIC에 걸면 뜻(순서, 처음
 맞는 규칙, 기본 정책, 늘 허용되는 것)은 같고 OVN ACL이 집행한다 — 다른 점 셋은 [SDN NIC의 보안 그룹](#sdn-nic의-보안-그룹)에
 있다. 그룹 목록의 "인터페이스" 칸은 그룹을 쓰는 NIC를 "단순 n · SDN n"으로 센다.
+
+## 물리 네트워크: 포트·본딩·LLDP
+
+Orbivisor는 호스트의 NIC·본딩·VLAN을 설정하지 않는다(그대로 Debian `ifupdown`·NetworkManager 몫). 노드는 있는 것을 **읽어서** 알리고,
+API가 "물리 포트 → 본딩 → VLAN → 브리지 → 네트워크 → VM" 사슬로 엮어 홈 대시보드·지도·링크 경보가 함께 쓴다(계획 75,
+[운영자 대시보드](web-ui.md#운영자-대시보드), [링크 경보](cluster.md#링크-경보)).
+
+- **노드가 알리는 것.** 30초마다 `ip -j -d addr show`와 sysfs로 인터페이스(이름·종류·operstate·carrier·속도·MAC·주소·`master`), 본딩
+  상태(모드·구성 포트마다 up/down/LACP 어긋남/속도 어긋남), **MTU**, VLAN·macvlan의 **아래 장치**(`ip`의 `link`)와 **VLAN id**를 노드
+  상태(`status.interfaces`)에 쓴다. 본딩 상태가 바뀌면 감사 항목과 기록 Task `bond-degraded`도 남는다([HA 상태 검사](ha.md#ha-상태-검사)).
+- **LLDP(스위치 쪽 이웃).** 노드에 **lldpd**가 있으면 같은 30초 회차에 `lldpcli -f json show neighbors`(3초 상한)를 불러 포트마다 건너편
+  스위치 이름·섀시 id·스위치 포트·포트 설명·관리 주소를 붙인다. 없으면 칸이 비고 화면이 "lldpd를 설치하면 스위치 포트가 보입니다."를 보인다.
+  Orbivisor가 직접 LLDP를 받지는 않는다.
+
+  ```bash
+  apt install lldpd                  # Debian·Ubuntu (RHEL 계열은 EPEL의 lldpd: dnf install lldpd)
+  systemctl enable --now lldpd
+  lldpcli show neighbors             # 스위치가 보이는지 먼저 확인
+  systemctl restart orbivisord       # lldpcli는 처음 쓸 때 한 번 찾는다 — 없었으면 다시 시작해야 찾는다
+  ```
+
+  **스위치 쪽에서도 LLDP를 켠다**(제조사마다 `lldp run`·`feature lldp`·`lldp enable` 등 — 많은 스위치가 기본으로 켜져 있지만 포트마다
+  송신을 끈 곳이 있다). 이웃이 30초 회차 안에 보이지 않으면 lldpd의 첫 교환(기본 30초 간격)을 기다린다. lldpd가 멈추면 다음 회차에 이웃이 빈다.
+- **역할.** 포트마다 `uplink`(브리지·본딩 아래), `underlay`(VXLAN·SDN 터널 주소를 가진 것과 그 아래), `unused`, `other`다. 링크 경보의
+  기본(`role: uplink`)과 지도의 포트 줄은 업링크·underlay만 본다.
+- **`GET /api/v1/topology/physical`**(루트 `cluster.read`, 기능 `operator-dashboard` — 아니면 **409** `cluster_upgrading`):
+  `{"nodes":[{"node","online","legacy","ports":[{name,kind,state,carrier,speed_mbps,mtu,mac,master,parent,vlan_id,lldp,bond,role,health}],"bridges":[{name,
+  uplinks,vlan_filtering,networks,vm_nics}],"underlay","physnets","impact":[{port,severity,bridges,networks,vms,vm_ids}]}],"networks":[{id,name,
+  kind,carrier,vlan,nodes:[{node,state}]}]}`(노드는 이름 순, veth는 포트에서 뺌). `health`는 그 포트에서 아래로 본 상태(본딩은 본딩 상태, VLAN은
+  아래 장치, 브리지는 업링크들)다. `impact`는 포트·본딩 장애마다 하나다 — 포트 carrier 없음·본딩 끊김이면 그 위 브리지·네트워크·
+  이 노드의 VM이 `down`, 본딩 저하·구성 포트 하나만 끊김이면 `degraded`(이중화 잃음), `vm_ids`는 50개까지. `networks`는 네트워크마다
+  노드별 레일 상태다: 사슬이 끝까지 up이면 `up`, 본딩 저하면 `degraded`, 끊기면 `down`, 그 노드에 그 네트워크를 실을 수단이 없으면
+  `absent`. 사슬은 bridge·VLAN 네트워크 → 노드 브리지, SDN 공급자 → 노드 physnet 브리지, VXLAN·SDN 오버레이 → underlay 주소를 가진
+  인터페이스, 그다음 브리지 업링크(`master`) → VLAN이면 아래 장치 → 본딩이면 구성 포트다. 상태 머신 리비전이 같으면 이전 결과를 준다.
+- **옛 판 노드**(`legacy: true`)는 MTU·LLDP가 없고 VLAN 아래 장치를 이름(`eno1.100` → `eno1`)으로 짐작한다.
+- **한계.** 포트·본딩 설정 바꾸기, SNMP, 노드 사이 실제 경로 추적, 인터페이스별 트래픽 기록은 없다(트래픽은 마지막 표본뿐 —
+  [지표](cluster.md#측정)).
 
 ## SDN (OVN)
 
