@@ -3,8 +3,8 @@
 # purge여도 지우지 않는다.
 # opld가 쓴 APT 소스 파일(첫 줄이 관리 표시)은 지운다: 함께 지워진 저장소 공개 키를 가리켜 apt-get
 # update가 실패한다. 관리자가 직접 쓴 파일은 남긴다.
-# 이름 바꾸기(계획 74) 앞의 판으로 되돌릴 때(dpkg가 옛 판을 푼 뒤 이 postrm을 `upgrade <옛 판>`으로 부른다)는 데몬이
-# 옮긴 OVN 중앙 단위 이름을 되돌린다(revert_ovn_units).
+# 이름 바꾸기(계획 74) 앞의 판으로 되돌릴 때(dpkg가 옛 판을 푼 뒤 이 postrm을 `upgrade <옛 판>`으로 부른다)는 postinst가
+# 옮긴 enable 링크·/etc 유닛 파일(revert_unit_links)과 데몬이 옮긴 OVN 중앙 단위 이름(revert_ovn_units)을 되돌린다.
 set -eu
 
 SYSTEMD_DIR="${ORBIVISOR_SYSTEMD_DIR:-/run/systemd/system}"
@@ -76,15 +76,51 @@ revert_ovn_units() {
 	return $reverted
 }
 
+# 옛 판으로 되돌림(리뷰 2): postinst가 새 이름으로 옮긴 데몬의 enable 링크와 /etc의 진짜 유닛 파일을 옛 이름으로
+# 되돌린다. 옛 판의 postinst는 `is-enabled opld.service`로 다시 시작할지 정하는데, systemd 257은 enable 링크가
+# `wants/orbivisord.service`(옛 판에서는 별칭)뿐이면 opld를 disabled로 본다 — 그러면 옛 데몬이 다시 시작하지 않고 지워진
+# 새 바이너리가 재부팅까지 돌며(OVN 단위를 다시 새 이름으로 옮긴다) 옛 판과 섞인다. /etc의 진짜 orbivisord.service
+# (`systemctl edit --full`을 옮긴 것)는 옛 이름 진짜 파일로 옮기고 새 이름은 지운다(다시 올릴 때 postinst가 옮길 수 있게,
+# 옛 판의 /usr/lib 별칭이 그 이름을 풀어 준다). 0: 되돌린 것이 있음, 1: 없음, 2: 실패.
+revert_unit_links() {
+	wants="$SYSTEMD_ETC/multi-user.target.wants"
+	reverted=1
+	old_unit="$SYSTEMD_ETC/opld.service"
+	new_unit="$SYSTEMD_ETC/orbivisord.service"
+	if [ -f "$new_unit" ] && [ ! -L "$new_unit" ] && [ -L "$old_unit" ] &&
+		[ "$(readlink "$old_unit")" = orbivisord.service ]; then
+		rm -f "$old_unit" || return 2
+		mv "$new_unit" "$old_unit" || return 2
+		reverted=0
+	fi
+	if [ -L "$wants/orbivisord.service" ] && [ ! -e "$wants/opld.service" ] && [ ! -L "$wants/opld.service" ]; then
+		ln -s "$SYSTEMD_LIB/opld.service" "$wants/opld.service" || return 2
+		rm -f "$wants/orbivisord.service" || return 2
+		reverted=0
+	fi
+	return $reverted
+}
+
 case "$1" in
 upgrade | failed-upgrade)
 	# 풀린 판이 이름 바꾸기 앞의 것인지는 그 판의 유닛 파일로 본다(그 판은 opld.service가 진짜 파일이다).
 	if [ -f "$SYSTEMD_LIB/opld.service" ] && [ ! -L "$SYSTEMD_LIB/opld.service" ]; then
+		reload=no
+		rc=0
+		revert_unit_links || rc=$?
+		if [ "$rc" = 2 ]; then
+			echo "orbivisor: cannot move the orbivisord.service enable link in $SYSTEMD_ETC back to opld.service; run systemctl enable opld.service and systemctl restart opld.service" >&2
+		elif [ "$rc" = 0 ]; then
+			reload=yes
+		fi
 		rc=0
 		revert_ovn_units || rc=$?
 		if [ "$rc" = 2 ]; then
 			echo "orbivisor: cannot rename the OVN central units in $SYSTEMD_ETC back to opl-ovn-*.service; rename them by hand (docs/guide/getting-started.md)" >&2
-		elif [ "$rc" = 0 ] && [ -d "$SYSTEMD_DIR" ]; then
+		elif [ "$rc" = 0 ]; then
+			reload=yes
+		fi
+		if [ "$reload" = yes ] && [ -d "$SYSTEMD_DIR" ]; then
 			systemctl daemon-reload || true
 		fi
 	fi

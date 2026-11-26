@@ -14,7 +14,8 @@
 # 이미지는 Depends: orbivisor (= 판)이라 판마다 함께 내야 한다.
 # 끝으로 지금(계획 43~73) 노드에 깔린 orbivisor의 모양(fixtures/orbivisor-v1 — 진짜 opld.service와 별칭 링크
 # orbivisord.service, 옛 유지 스크립트)을 설치·enable하고 덮어쓰기를 둔 뒤 받은 판으로 올려, enable 링크·덮어쓰기·유닛
-# 파일·디렉터리가 새 이름으로 옮겨지는지 본다(계획 74 리뷰 2 — 가장 흔한 업그레이드 길).
+# 파일·디렉터리가 새 이름으로 옮겨지는지, 다시 V1로 되돌리면 옛 판이 enable된 opld.service를 보는지 본다(계획 74 리뷰 2 —
+# 가장 흔한 업그레이드 길과 되돌리기).
 # 쓰는 법(CI): docker run --rm -v "$PWD:/work" debian:13 bash /work/packaging/tests/repo-test.sh /work/<orbivisor deb> /work/<oplite deb> [/work/<orbivisor-restore-image deb>]
 set -eu
 
@@ -294,5 +295,14 @@ if [ -e "$OLD_LINK" ] || [ -L "$OLD_LINK" ]; then fail "V1에서 올린 뒤: 옛
 [ ! -e /usr/share/orbivisor/opld.toml.example ] || fail "V1에서 올린 뒤: 옛 예시 설정이 남음"
 dpkg --verify orbivisor || fail "V1에서 올린 뒤: dpkg --verify orbivisor"
 check_layout "V1에서 올린 뒤"
+# 옛 판(V1)으로 되돌림: 새 판의 postrm이 enable 링크를 opld.service로 되돌려 옛 postinst의 is-enabled opld가 참이다(리뷰 2).
+apt-get install -y --no-install-recommends --allow-downgrades "$V1_DEB"
+[ "$(dpkg-query -W -f '${Version}' orbivisor)" = "$V1" ] || fail "되돌린 버전: $(dpkg-query -W -f '${Version}' orbivisor)"
+[ "$(readlink "$OLD_LINK")" = /usr/lib/systemd/system/opld.service ] || fail "되돌린 뒤 enable 링크: $(ls -l "$OLD_LINK" 2>&1)"
+[ "$(systemctl is-enabled opld.service)" = enabled ] || fail "되돌린 뒤 is-enabled opld: $(systemctl is-enabled opld.service 2>&1)"
+# 다시 올리면 다시 옮긴다.
+apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold "$DEB"
+[ "$(readlink "$LINK")" = "$UNIT" ] || fail "다시 올린 뒤 enable 링크: $(ls -l "$LINK" 2>&1)"
+[ "$(systemctl is-enabled orbivisord.service)" = enabled ] || fail "다시 올린 뒤 is-enabled orbivisord: $(systemctl is-enabled orbivisord.service 2>&1)"
 
 echo "repo-test: 모두 통과"

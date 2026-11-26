@@ -329,6 +329,36 @@ else
 	FAILED=1
 fi
 rm -rf "$ETC" "$LIB"
+# 데몬의 enable 링크·/etc의 진짜 유닛도 옛 이름으로 되돌린다(리뷰 2): systemd 257은 enable 링크가 wants/orbivisord.service
+# (옛 판에서는 별칭)뿐이면 opld를 disabled로 보아 옛 postinst가 옛 데몬을 다시 시작하지 않는다.
+mkdir -p "$WANTS" "$LIB"
+old_package_unpacked
+ln -s /usr/lib/systemd/system/orbivisord.service "$WANTS/orbivisord.service"
+printf '[Service]\nExecStart=/usr/bin/orbivisord --config /srv/node.toml\n' >"$ETC/orbivisord.service"
+ln -s orbivisord.service "$ETC/opld.service"
+# 되돌린 뒤의 reload는 옛 이름이 진짜인 모양에서 한다(가짜 systemctl이 "(old names)"로 적는다 — 옛 판의 모양이다).
+check "postrm upgrade <옛 판>: 데몬 enable 링크·/etc 유닛 되돌림" yes "daemon-reload (old names)" postrm upgrade 0.0.9
+if [ "$(readlink "$WANTS/opld.service")" = "$LIB/opld.service" ] && [ ! -L "$WANTS/orbivisord.service" ] &&
+	[ -f "$ETC/opld.service" ] && [ ! -L "$ETC/opld.service" ] && grep -qF -- '--config /srv/node.toml' "$ETC/opld.service" &&
+	[ ! -e "$ETC/orbivisord.service" ] && [ ! -L "$ETC/orbivisord.service" ]; then
+	echo "ok   enable 링크는 opld.service, /etc의 운영자 유닛은 opld.service"
+else
+	echo "FAIL 데몬 유닛 되돌린 뒤: $(ls -la "$ETC" "$WANTS")"
+	FAILED=1
+fi
+check "postrm upgrade <옛 판>: 데몬 유닛 이미 되돌림" yes "" postrm upgrade 0.0.9
+# 다시 올리면 postinst가 다시 옮긴다(되돌린 모양에서 막히지 않음).
+check "되돌린 뒤 다시 올림: postinst가 다시 옮김" yes "daemon-reload
+is-enabled --quiet orbivisord.service
+restart orbivisord.service" postinst configure 0.0.9
+if [ -L "$WANTS/orbivisord.service" ] && [ ! -L "$WANTS/opld.service" ] && [ -f "$ETC/orbivisord.service" ] &&
+	[ ! -L "$ETC/orbivisord.service" ] && [ "$(readlink "$ETC/opld.service")" = orbivisord.service ]; then
+	echo "ok   되돌린 모양에서 다시 새 이름으로"
+else
+	echo "FAIL 되돌린 뒤 다시 올림: $(ls -la "$ETC" "$WANTS")"
+	FAILED=1
+fi
+rm -rf "$ETC" "$LIB"
 
 # remove·purge는 opld가 쓴 소스 파일(관리 표시)을 지우고, 관리자가 쓴 파일과 업그레이드 때는 남긴다.
 SOURCES="$WORK/oplite.sources"
