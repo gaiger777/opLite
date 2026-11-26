@@ -329,7 +329,8 @@ fn assert_failed_start(hop: &Hop, code: &str) {
     assert!(hop.cookie("opl_oidc").is_none(), "{:?}", hop.cookies);
 }
 
-/// 계획 74: 옛 판 노드가 시작한 로그인(옛 이름 상태 쿠키 `opl_oidc`만)도 콜백이 받는다. 둘 다 있으면 새 이름을 읽는다.
+/// 계획 74: 옛 판 노드가 시작한 로그인(옛 이름 상태 쿠키 `opl_oidc`만)도 콜백이 받는다. 둘 다 있으면 새 이름을 먼저
+/// 보고, 맞지 않으면(옛 노드가 끝낸 로그인이 남긴 낡은 새 이름 쿠키) 옛 이름을 본다.
 #[tokio::test]
 async fn the_callback_accepts_the_legacy_state_cookie() {
     let (env, idp) = setup().await;
@@ -346,10 +347,25 @@ async fn the_callback_accepts_the_legacy_state_cookie() {
     let (status, me) = whoami(&env, &hop.pair("opl_session").unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{me}");
 
-    // 새 이름이 틀렸으면 옛 이름이 맞아도 실패한다(새 이름 먼저).
+    // 새 이름이 낡았으면(다른 로그인의 것) 옛 이름으로 다시 본다(리뷰 1 M1).
+    let (_, stale) = authorize(&env, &idp).await;
     let (callback, cookie) = authorize(&env, &idp).await;
     let legacy = cookie.replacen("orbivisor_oidc=", "opl_oidc=", 1);
-    let hop = open(&callback, Some(&format!("orbivisor_oidc=x; {legacy}"))).await;
+    let hop = open(&callback, Some(&format!("{stale}; {legacy}"))).await;
+    assert_eq!(
+        (hop.status, hop.location.as_str()),
+        (StatusCode::FOUND, "/"),
+        "{:?}",
+        hop.cookies
+    );
+    // 둘 다 맞지 않으면 실패한다.
+    let (callback, _) = authorize(&env, &idp).await;
+    let stale_legacy = stale.replacen("orbivisor_oidc=", "opl_oidc=", 1);
+    let hop = open(
+        &callback,
+        Some(&format!("orbivisor_oidc=x; {stale_legacy}")),
+    )
+    .await;
     assert_failed(&hop, "sso_failed");
 }
 

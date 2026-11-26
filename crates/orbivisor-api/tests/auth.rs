@@ -131,7 +131,7 @@ async fn legacy_session_cookie_name_is_accepted() {
         StatusCode::OK
     );
     assert_eq!(whoami_with_cookie(&env.base, &new).await.0, StatusCode::OK);
-    // 둘 다 있으면 새 이름을 읽는다.
+    // 둘 다 있고 옛 이름이 끝난 세션이면 새 이름을 읽는다.
     let both = format!("opl_session={:064x}; {new}", 1);
     assert_eq!(whoami_with_cookie(&env.base, &both).await.0, StatusCode::OK);
     // 새 이름 쿠키의 세션이 끝났으면(옛 판 노드에서 로그아웃하고 다시 로그인) 옛 이름 쿠키로 된다.
@@ -142,6 +142,15 @@ async fn legacy_session_cookie_name_is_accepted() {
         whoami_with_cookie(&env.base, &both).await.0,
         StatusCode::UNAUTHORIZED
     );
+
+    // 두 이름이 다른 살아 있는 세션이면(새 판 노드에서 로그인한 뒤 옛 판 노드에서 다른 사용자로 로그인) 더 나중의
+    // 로그인인 옛 이름을 읽는다(리뷰 1 M2 — 노드마다 다른 사용자가 되지 않게).
+    env.user("viewer", "viewer").await;
+    let other = cookie_login(&env.base, "viewer", "password-1").await;
+    let mixed = format!("{new}; opl_session={}", cookie_value(&other));
+    let (status, me) = whoami_with_cookie(&env.base, &mixed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["name"], "viewer", "{me}");
 
     // 옛 이름만 든 로그아웃도 세션을 끝내고 두 이름을 다 지운다.
     let resp = reqwest::Client::new()

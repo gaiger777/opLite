@@ -633,21 +633,24 @@ impl AppState {
 
     /// 쿠키 세션과 그 사용자. 대기 세션도 돌려준다(부르는 쪽이 `pending`을 본다).
     fn session_login(&self, parts: &Parts) -> Result<(User, FoundSession, String), ApiError> {
-        let session = session_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
-        // 계획 74: 새 이름 쿠키의 세션이 끝났으면 옛 이름 쿠키를 본다 — 옛 판 노드에서 로그아웃(옛 이름만 지움)하고
-        // 다시 로그인한 브라우저에는 끝난 `orbivisor_session`이 남는다(다음 판에서 뺌).
-        let (session, found) = match self.find_session(session)? {
-            Some(found) => (session, found),
-            None => {
-                let legacy = cookie_value(&parts.headers, LEGACY_SESSION_COOKIE)
-                    .filter(|legacy| *legacy != session)
-                    .ok_or_else(ApiError::unauthorized)?;
-                let found = self
-                    .find_session(legacy)?
-                    .ok_or_else(ApiError::unauthorized)?;
-                (legacy, found)
-            }
+        // 계획 74: 두 이름의 값이 다르면 옛 이름을 먼저 본다. 새 판 노드는 두 이름에 같은 값을 쓰므로, 다른 값은 그 뒤
+        // 옛 판 노드에서 한 로그인(옛 이름만 씀)이다 — 더 나중의 로그인이다(리뷰 1 M2: 같은 브라우저에서 다른 사용자로
+        // 로그인하면 노드마다 다른 사용자가 되지 않게). 옛 이름의 세션이 끝났으면 새 이름을 본다. 옛 판 노드에서
+        // 로그아웃(옛 이름만 지움)하고 다시 로그인한 브라우저에는 끝난 `orbivisor_session`이 남는다(1e760031, 다음 판에서 뺌).
+        let new = cookie_value(&parts.headers, SESSION_COOKIE);
+        let legacy = cookie_value(&parts.headers, LEGACY_SESSION_COOKIE);
+        let order = match (new, legacy) {
+            (Some(n), Some(l)) if n != l => [Some(l), Some(n)],
+            (n, l) => [n.or(l), None],
         };
+        let mut chosen = None;
+        for cookie in order.into_iter().flatten() {
+            if let Some(found) = self.find_session(cookie)? {
+                chosen = Some((cookie, found));
+                break;
+            }
+        }
+        let (session, found) = chosen.ok_or_else(ApiError::unauthorized)?;
         self.check_cookie_origin(parts)?;
         let user = self
             .cluster

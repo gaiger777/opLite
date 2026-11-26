@@ -281,17 +281,26 @@ fn open_state(
     params: Result<Query<CallbackParams>, QueryRejection>,
 ) -> Result<(LoginState, CallbackParams), Failed> {
     let Query(params) = params.map_err(|e| failed(Code::SsoFailed, e.body_text()))?;
-    let cookie = state_cookie_value(headers)
-        .ok_or_else(|| failed(Code::SsoFailed, "there is no login state cookie"))?;
     let query_state = params.state.as_deref().unwrap_or_default();
-    let login = LoginState::open(cookie, &state_key(state)?, query_state, oidc::unix_now())?;
-    Ok((login, params))
-}
-
-/// 로그인 상태 쿠키의 값. 새 이름 먼저, 없으면 옛 이름(옛 판 노드가 시작한 로그인).
-fn state_cookie_value(headers: &HeaderMap) -> Option<&str> {
-    crate::auth::cookie_value(headers, STATE_COOKIE)
-        .or_else(|| crate::auth::cookie_value(headers, LEGACY_STATE_COOKIE))
+    let key = state_key(state)?;
+    // 새 이름 먼저, 맞지 않으면 옛 이름(세션 쿠키와 같은 규칙 — 리뷰 1 M1): 섞인 판에서 옛 노드가 끝낸 로그인은 옛 이름만
+    // 지우므로 낡은 새 이름 쿠키가 남아 있을 수 있다. 둘 다 맞지 않으면 처음 것의 오류다.
+    let mut first = None;
+    for cookie in [STATE_COOKIE, LEGACY_STATE_COOKIE]
+        .into_iter()
+        .filter_map(|name| crate::auth::cookie_value(headers, name))
+    {
+        match LoginState::open(cookie, &key, query_state, oidc::unix_now()) {
+            Ok(login) => return Ok((login, params)),
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    Err(first.map_or_else(
+        || failed(Code::SsoFailed, "there is no login state cookie"),
+        Failed::from,
+    ))
 }
 
 /// 실패를 로그·감사 로그에 남기고 상태 쿠키를 지운 뒤 로그인 화면으로 보낸다.
