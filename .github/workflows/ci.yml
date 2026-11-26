@@ -277,7 +277,7 @@ jobs:
           sudo zpool create opltestz "$RUNNER_TEMP/opltestz.img"
           sudo zfs create opltestz/opl
           sudo zfs list -r opltestz
-          zfs version
+          sudo zfs version
           sudo zpool status opltestz
       # RBD 풀 시험이 이미지를 만들 Ceph 풀 `rbd`. Ubuntu apt 패키지(ceph 19.2)로 노드 하나짜리 Ceph(모니터·
       # 매니저 하나, 4G 성긴 파일 위 BlueStore OSD 하나, 복제 1)를 손으로 띄운다(snap 스토어가 러너에서
