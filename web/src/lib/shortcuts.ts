@@ -24,7 +24,10 @@ export type ShortcutId =
   | "list.open"
   | "map.enter"
   | "map.leave"
-  | "map.move";
+  | "map.move"
+  | "map.port"
+  | "map.rail"
+  | "map.railUp";
 
 export interface Shortcut {
   id: ShortcutId;
@@ -60,6 +63,11 @@ export const SHORTCUTS: readonly Shortcut[] = [
   { id: "map.leave", keys: ["["], group: "map" },
   // VM 타일 단계에서 옮기기 모드(계획 71 — 끌기 대신): 화살표로 노드, Enter로 옮기기 대화상자, Esc로 취소
   { id: "map.move", keys: ["m"], group: "map" },
+  // 네트워크 층(계획 75): `p` 노드의 포트 줄로(←·→ 포트 사이), 포트에서 `↓` 그 레일로(←·→ 레일 사이), `↑` 다시 포트.
+  // `[`(map.leave)가 노드로 나온다.
+  { id: "map.port", keys: ["p"], group: "map" },
+  { id: "map.rail", keys: ["ArrowDown"], group: "map" },
+  { id: "map.railUp", keys: ["ArrowUp"], group: "map" },
 ];
 
 /** 머리줄이 받는 단축키(목록 키는 표가, 지도 키는 지도가 받는다) */
@@ -210,8 +218,20 @@ export function isMac(): boolean {
   return /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 }
 
+/** 화살표 키 이름의 글 */
+const ARROWS: Record<string, string> = {
+  ArrowLeft: "←",
+  ArrowRight: "→",
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+};
+
 /** 도움말·머리줄에 보이는 키 글 */
 export function keyLabel(key: string): string {
+  const arrow = ARROWS[key];
+  if (arrow) {
+    return arrow;
+  }
   if (key === "mod+k") {
     return isMac() ? "⌘K" : "Ctrl K";
   }

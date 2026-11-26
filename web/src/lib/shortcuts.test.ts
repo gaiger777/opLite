@@ -40,6 +40,14 @@ it("labels Shift keys", () => {
   expect(keyLabel("n")).toBe("n");
 });
 
+it("labels arrow keys and lists the map's network keys in help only", () => {
+  expect(keyLabel("ArrowDown")).toBe("↓");
+  expect(keyLabel("ArrowUp")).toBe("↑");
+  // 지도 키는 지도가 받는다 — 머리줄 해석기는 `p`를 모른다.
+  expect(createSequence().feed("p", 0)).toBeNull();
+  expect(SHORTCUTS.find((s) => s.id === "map.port")?.keys).toEqual(["p"]);
+});
+
 it("has a single-key shortcut for no power or delete action", () => {
   const single = SHORTCUTS.filter((s) => s.keys.length === 1).map((s) => s.id);
   expect(single).toEqual([
@@ -58,6 +66,9 @@ it("has a single-key shortcut for no power or delete action", () => {
     "map.enter",
     "map.leave",
     "map.move",
+    "map.port",
+    "map.rail",
+    "map.railUp",
   ]);
 });
 

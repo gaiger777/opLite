@@ -3428,7 +3428,10 @@
     "map": {
       "enter": "Go into a node's VMs",
       "leave": "Back to the node",
-      "move": "Move the VM to another node (instead of dragging)"
+      "move": "Move the VM to another node (instead of dragging)",
+      "port": "Go into the node's port row (network layer; ← → between ports)",
+      "rail": "From a port down to its network rail (← → between rails)",
+      "railUp": "From a rail back up to its port"
     }
   },
   "table": {
