@@ -1136,7 +1136,7 @@ flowchart LR
   `host_alloc::repin`(`host_alloc.rs:296`)을 부른다: 도는 VM마다 기록과 지금 세 집합으로 고정을 다시 셈해 스코프 `AllowedCPUs`
   (`systemctl set-property --runtime`)와 스레드 친화가 다를 때만 다시 걸고 경고 로그를 남긴다(누가 `taskset`을 썼거나 공유 집합이
   바뀜). swtpm은 다시 걸지 않는다.
-- **업그레이드.** 기능 `numa`(`crates/orbivisor-types/src/node.rs:386`)를 모든 노드가 알릴 때까지 노드는 토폴로지를 쓰지 않고(읽기와 노드
+- **업그레이드.** 기능 `numa`(`crates/orbivisor-types/src/node.rs:568`)를 모든 노드가 알릴 때까지 노드는 토폴로지를 쓰지 않고(읽기와 노드
   설정 적용은 함), API는 새 칸을 409 `cluster_upgrading`으로 막는다. 기록·응답의 새 칸은 그 기능을 쓰는 VM에만 생기고, Raft 검사는
   `demand > 0`인 VM에만 걸리므로 복제본마다 같은 판정이다. 쓰는 법은 [NUMA·전용 CPU·hugepages](guide/vms.md#numa전용-cpuhugepages)·
   [호스트 준비](guide/cluster.md#호스트-준비-예약전용-cpu와-hugepages).
@@ -1624,29 +1624,39 @@ graph LR
 
 - **수집.** 노드 검사기(`crates/orbivisord/src/checks.rs`, `INTERFACES_EVERY` 30초)가 `ip -j -d addr show`로 `NodeInterface`의 새 칸
   `mtu`(sysfs가 있으면 그 값 — `ip`를 부르지 않는 짧은 회차도 다시 읽음)·`parent`(VLAN·macvlan·ipvlan의 `link`, veth의 짝은 아님)·
-  `vlan_id`(`linkinfo.info_data.id`, VLAN만)를 채운다(`crates/orbivisor-driver/src/hostcheck.rs`). `lldpcli`는 처음 쓸 때 `PATH`에서
-  찾고(없으면 다시 시작까지 찾지 않음) `ip` 회차마다 `lldpcli -f json show neighbors`(`LLDP_TIMEOUT` 3초)를 불러 이름이 같은 인터페이스에
+  `vlan_id`(`linkinfo.info_data.id`, VLAN만)·`admin_up`(`flags`의 `UP`, 짧은 회차는 sysfs `flags`)을 채운다
+  (`crates/orbivisor-driver/src/hostcheck.rs`). `lldpcli`는 처음 쓸 때 `PATH`에서 찾고(없으면 5분마다 다시 찾음) `ip` 회차마다
+  `lldpcli -f json show neighbors`(`LLDP_TIMEOUT` 3초)를 따로 띄워(검사 회차를 막지 않음) 끝난 뒤의 회차가 이름이 같은 인터페이스에
   `lldp: LldpNeighbor{chassis_name, chassis_id, port_id, port_descr, mgmt_ip}`를 붙인다. 파서는 `-f json`(하나면 객체, 여럿이면 배열)과
-  `-f json0`(모두 배열)을 읽는 순수 함수다. 새 칸은 모두 `serde(default, skip_serializing_if)`라 비면 옛 JSON과 바이트가 같다.
-- **`physical::build(nodes, networks, vms, pools) -> PhysicalTopology`**(`crates/orbivisor-types/src/physical.rs`, 순수). 노드마다 포트
-  (역할 `uplink`·`underlay`·`unused`·`other`, 아래로 본 `health`)·브리지(업링크 = `master == bridge`, 네트워크, VM NIC 수)·underlay·physnet,
-  그리고 장애 포트·본딩마다 `Impact{port, severity(down|degraded), bridges, networks, vms, vm_ids ≤ 50}`. 사슬은 VM NIC → 네트워크 →
+  `-f json0`(모두 배열)을 읽는 순수 함수다. 상태를 쓸 때 본딩에서 본 적 있는 구성 포트의 netdev가 사라졌으면 `BondPort{state: missing}`으로
+  남기고 본딩을 `degraded`로 보며(`keep_missing_bond_ports`), underlay 주소마다 마지막으로 그 주소를 가졌던 인터페이스를
+  `NodeStatus.underlay_ports`에 둔다(`underlay_ports` — 링크가 끊겨 주소가 떨어져도 그 포트를 본다). 새 칸은 모두
+  `serde(default, skip_serializing_if)`라 비면 옛 JSON과 바이트가 같다(옛 노드는 `missing`을 `unknown`으로 읽는다).
+- **`physical::build(nodes, networks, vms) -> PhysicalTopology`**(`crates/orbivisor-types/src/physical.rs`, 순수). 노드마다 포트
+  (역할 `uplink`·`underlay`·`service`(전역 주소를 가진 물리 포트와 그 아래 — 스토리지·클러스터 링크·관리망)·`unused`·`other`, 쓰임
+  `uses`(클러스터 링크·관리), 아래로 본 `health` — 관리자가 내린 브리지는 down)·브리지(업링크 = `master == bridge`, 네트워크, VM NIC 수)·
+  underlay(주소를 가진 인터페이스, 없으면 `underlay_ports`의 마지막 이름)·physnet, 장애 포트·본딩마다 `Impact{port, severity(down|degraded),
+  bridges, underlay, uses, networks, vms, vm_ids ≤ 50}`, 도는 VM의 NIC 네트워크가 그 노드에 없으면 `unreachable`. 사슬은 VM NIC → 네트워크 →
   (bridge·VLAN → 노드 브리지 | SDN 공급자 → physnet 브리지 | VXLAN·SDN 오버레이 → underlay 주소의 인터페이스) → 브리지 업링크 → VLAN
-  아래 장치 → 본딩 구성 포트. 네트워크마다 `NetRail{carrier, nodes[{node, state(up|degraded|down|absent)}]}`. 옛 노드(`legacy`)는 VLAN
-  아래 장치를 이름 규칙(`eno1.100`)으로 짐작한다. 경보가 쓰는 `link_faults(status, role, glob)`·`bond_faults`·`describe`도 여기다.
+  아래 장치 → 본딩 구성 포트. 네트워크마다 `NetRail{carrier, nodes[{node, state(up|degraded|down|absent|unknown)}]}` — 오프라인 노드와
+  underlay 주인을 모르는 노드는 `unknown`이다. 옛 노드(`legacy`)는 VLAN 아래 장치를 이름 규칙(`eno1.100`)으로 짐작한다. 경보가 쓰는
+  `link_faults(node, role, glob)`·`bond_faults(node)`·`describe`도 여기다.
 - **`capacity::build`**(`crates/orbivisor-types/src/capacity.rs`, 순수): 노드마다 CPU(스레드·예약·전용·도는 전용 VM이 잡은 것, 자리 잡은
-  VM의 vCPU 합·실행 중·공유 정책, `overcommit` = 공유 vCPU ÷ (스레드 − 예약 − 전용), `use_pct` = 배치 부하 요약), 메모리(전체·hugepages로
-  떼어 둔 것·할당·사용·크기별 hugepages·`overcommit`), NUMA 노드별(토폴로지가 있으면), 로컬 풀(`provisioned_bytes` = 볼륨 `size_bytes` 합,
+  VM의 vCPU 합·실행 중·공유 정책, `overcommit` = 공유 vCPU ÷ (스레드 − 예약 − 전용), `use_pct` = 배치 부하 요약 — 노드 전체), 메모리(전체·
+  hugepages로 떼어 둔 것·할당·그 가운데 hugepages VM 몫·사용·크기별 hugepages·`overcommit` = hugepages 아닌 VM의 할당 ÷ (전체 − 떼어 둔 것)), NUMA 노드별(토폴로지가 있으면), 로컬 풀(`provisioned_bytes` = 볼륨 `size_bytes` 합,
   `used_bytes` = 전체 − 남은 양), 공유 풀과 온라인 노드 합. 지난 홈의 `CapacityWidget` 계산과 같은 값인지 시험한다.
-- **끝점 둘**(`crates/orbivisor-api/src/dashboard.rs`): `GET /topology/physical`·`GET /capacity`, 경로표의 루트 `cluster.read`, 모든 노드가
-  기능 `operator-dashboard`를 알아야 한다(`require_feature`, §14). `DashboardCache`(`AppState`에 하나)가 끝점마다 마지막 결과 하나를
+- **끝점 둘**(`crates/orbivisor-api/src/dashboard.rs`): `GET /topology/physical`·`GET /capacity`, 경로표의 루트 `cluster.read`, 온라인
+  노드가 모두 기능 `operator-dashboard`를 알아야 한다(`require_dashboard` — §14의 게이트와 같은 409이되 꺼진 옛 노드는 막지 않고 `legacy`로
+  보인다). `DashboardCache`(`AppState`에 하나)가 끝점마다 마지막 결과 하나를
   둔다(`Memo`): 물리 관계는 상태 머신 리비전, 용량은 리비전 + 노드마다 (1분 CPU, 사용 메모리)가 열쇠이고 같으면 다시 셈하지 않는다
   (계산은 잠금 밖). 웹은 둘을 15초마다 읽는다.
 - **링크 경보.** `AlertCondition::NodeLinkDown{ports: Option<글롭>, role: uplink|any}`·`BondDegraded`는 리더 경보다(§12.5). 리더 엔진이
-  tick마다 노드 상태의 인터페이스로 `link_faults`·`bond_faults`를 보고 끊긴 포트·저하된 본딩마다 경보 하나를 둔다 — `AlertSubject`에
+  tick마다 노드 상태의 인터페이스로 `link_faults`·`bond_faults`를 보고 끊긴 포트·저하된 본딩마다 경보 하나를 둔다. 본딩 구성 포트는
+  따로 세지 않는다: 본딩이 흐르면 `bond_degraded` 하나, 본딩이 끊기면 본딩 이름으로 `node_link_down` 하나다. `AlertSubject`에
   `port`가 더해져 경보 키(규칙 id + 대상 + 포트)와 알림 이름(`노드/포트`)이 포트마다 따로다. 문구는 그 노드만 `physical::build`한 영향의
   `describe`("eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs")이고, 장애가 있는 tick에만 네트워크·VM을 한 번 읽는다.
-  오프라인 노드의 경보는 그대로 둔다. 권하는 묶음 `link_default_rules`(`node-link-down` critical 30초, `bond-degraded` warning 60초)가
+  오프라인·유지보수 노드의 경보는 그대로 두되 되풀이하지 않고, 경보가 난 포트가 인터페이스 목록에서 사라지면 풀지 않고 "사라짐"으로
+  둔다. 알림 본문에 지도 경로(`/cluster/map?focus=port:<노드>/<포트>` — 웹훅 JSON은 `subject.map`)를 붙인다. 권하는 묶음 `link_default_rules`(`node-link-down` critical 30초, `bond-degraded` warning 60초)가
   `POST /alert-rules/link-defaults`이고 SDN 묶음과 같은 `create_default_rules`를 쓴다(같은 이름은 그대로). 조건 만들기·묶음은 기능
   `link-alerts`가 모든 노드에 있어야 한다.
 - **웹.** 홈(`web/src/pages/DashboardPage.tsx`)이 늦게 읽는 `dashboard/OperatorBoard`(지도·자세히 판·할당 표), 지도는 인프라 › 지도와 같은
@@ -1693,7 +1703,7 @@ ACME로 자동 갱신할 수 있다(계획 73).
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
   `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store`, `file-restore`, `vm-check`, …,
-  `declarative`, `config-history`, `acme`, `operator-dashboard`, `link-alerts`)을 `Node` status에 알린다(`crates/orbivisor-types/src/node.rs:341-369`).
+  `declarative`, `config-history`, `acme`, `operator-dashboard`, `link-alerts`)을 `Node` status에 알린다(`crates/orbivisor-types/src/node.rs:444-488`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/orbivisor-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.

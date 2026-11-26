@@ -1275,24 +1275,26 @@ orbivisorctl node stats --range day           # 노드 이름 없이 범위를 �
 
 ```bash
 orbivisorctl capacity
-# NODE   ONLINE  VCPUS  OVERCOMMIT  CPU    MEMORY           MEM USED  STORAGE
-# svc01  yes     18/10  x1.80       37.2%  32.0GiB/64.0GiB  16.0GiB   1.0TiB/2.0TiB
-# svc02  no      0/14   -           -      0B/62.0GiB       -         -
+# NODE   ONLINE  SHARED  OVERCOMMIT  DEDICATED  CPU    MEMORY           MEM USED  STORAGE
+# svc01  yes     18/10   x1.80       2/4        37.2%  32.0GiB/64.0GiB  16.0GiB   1.0TiB/2.0TiB
+# svc02  no      0/14    -           0/0        -      0B/62.0GiB       -         -
 #
 # POOL  PROVISIONED  USED    TOTAL   VOLUMES  NODES
 # ceph  2.1TiB       1.2TiB  4.0TiB  41       2/3
 orbivisorctl -o json capacity    # 응답 그대로(NUMA 노드별·hugepages·풀마다)
 ```
 
-- `VCPUS`는 공유 정책 VM의 vCPU / 공유 스레드(스레드 − 예약 − 전용, [호스트 준비](#호스트-준비-예약전용-cpu와-hugepages)), `OVERCOMMIT`은 그 비,
-  `CPU`는 지난 1분 사용률, `MEMORY`는 자리 잡은 VM(시작·실행·정지 중·옮기는 중)의 메모리 합 / 노드 메모리, `STORAGE`는 로컬 풀의
+- `SHARED`는 공유 정책 VM의 vCPU / 공유 스레드(스레드 − 예약 − 전용, [호스트 준비](#호스트-준비-예약전용-cpu와-hugepages)), `OVERCOMMIT`은 그 비,
+  `DEDICATED`는 도는 전용 VM이 잡은 전용 CPU / 전용 CPU, `CPU`는 지난 1분 노드 전체(모든 스레드) 사용률, `MEMORY`는 자리 잡은 VM(시작·실행·정지 중·옮기는 중)의 메모리 합 / 노드 메모리, `STORAGE`는 로컬 풀의
   프로비전(볼륨 `size_bytes` 합 — 씬 할당) / 전체 합이다. 아래 표는 공유 풀(노드 = 준비된 노드 / 쓰는 노드)이다.
 - `GET /api/v1/capacity`(루트 `cluster.read`)는 `{"nodes":[{"node","online","cpu":{threads,reserved,dedicated_total,dedicated_used,
-  vcpus_allocated,vcpus_running,vcpus_shared,overcommit?,use_pct?},"memory":{total_mib,reserved_mib,allocated_mib,used_mib?,hugepages,
-  overcommit?},"numa":[…],"storage":[{pool,ready,total_bytes,used_bytes,provisioned_bytes,volumes}]}],"shared_pools":[…],"totals":{…}}`다.
-  위트니스는 빼고 오프라인 노드는 넣는다(`totals`는 온라인 노드의 합). 부하 요약이 없으면 `use_pct`·`used_mib`가 빈다.
-- 입력(상태 머신 리비전과 노드 부하)이 같으면 API 노드가 이전 결과를 그대로 준다. 모든 노드가 기능 `operator-dashboard`를 알아야
-  한다(아니면 **409** `cluster_upgrading` — 웹은 지난 홈).
+  vcpus_allocated,vcpus_running,vcpus_shared,overcommit?,use_pct?},"memory":{total_mib,reserved_mib,allocated_mib,allocated_hugepages_mib?,
+  used_mib?,hugepages,overcommit?},"numa":[…],"storage":[{pool,ready,total_bytes,used_bytes,provisioned_bytes,volumes}]}],"shared_pools":[…],"totals":{…}}`다.
+  위트니스는 빼고 오프라인 노드는 넣는다(`totals`는 온라인 노드의 합). 부하 요약이 없으면 `use_pct`·`used_mib`가 빈다. 메모리 `overcommit`은
+  보통 메모리의 비다: hugepages 아닌 VM의 할당(`allocated_mib − allocated_hugepages_mib`) ÷ (노드 메모리 − hugepages로 떼어 둔 것) — 보통 VM은
+  그 풀을 쓰지 못한다.
+- 입력(상태 머신 리비전과 노드 부하)이 같으면 API 노드가 이전 결과를 그대로 준다. 온라인 노드가 모두 기능 `operator-dashboard`를 알아야
+  한다(아니면 **409** `cluster_upgrading` — 웹은 지난 홈). 꺼진 옛 노드는 막지 않는다.
 
 ### 웹 화면
 
@@ -1490,14 +1492,23 @@ orbivisorctl alert history --since 1h   # 보낸 알림(새 것부터, 기본 �
 랜 포트·본딩 장애를 그 포트 이름과 영향으로 알린다(계획 75). 입력은 노드 상태의 인터페이스 목록(노드가 30초마다 `ip`·sysfs로 씀 —
 [네트워크](network.md#물리-네트워크-포트본딩lldp))이고 **리더**가 다른 리더 경보처럼 평가한다(상태는 규칙의 `status.active`).
 
-- **`node_link_down {ports?, role}`.** carrier가 없는 이더넷 포트마다 경보 하나다(경보 키에 포트가 들어가 포트마다 따로). `role`이
-  `uplink`(기본)면 브리지·본딩·underlay 아래의 포트만, `any`면 모든 랜 포트를 본다. `ports`는 `*`·`?` 글롭(예: `eno*`, 1~64자, 공백·`/`·`:`
-  없음)이고 비우면 모든 포트다.
-- **`bond_degraded`.** 본딩마다 하나 — 구성 포트 일부가 끊겨 이중화를 잃었거나(저하) 본딩이 끊김.
+- **`node_link_down {ports?, role}`.** 링크가 끊긴 포트(carrier 없음, operstate `down`·`lowerlayerdown`·`notpresent`)마다 경보 하나다(경보
+  키에 포트가 들어가 포트마다 따로). 이더넷, dummy 같은 그 밖의 장치, 아래 장치가 살아 있는 VLAN, 관리자가 내린 브리지(`ip link set vmbr0
+  down`)를 센다. 본딩 구성 포트는 따로 세지 않는다: 본딩이 아직 흐르면 이중화만 잃은 것이라 `bond_degraded`가 맡고, 본딩이 통째로 끊기면
+  본딩 이름(`bond0`)으로 하나다. `role`이 `uplink`(기본)면 쓰이는 포트만 본다 — 브리지·본딩·underlay 아래의 포트와 전역 주소를 가진 물리
+  포트(스토리지·복제·관리·클러스터 링크망, 본딩 없이 주소만 가진 `ens1f0` 같은 것)와 그 아래. 쓰지 않는(묶이지 않고 주소도 없는) 포트는
+  `any`에서만 본다. `any`도 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int` — 늘 down)는 보지 않는다. `ports`는 `*`·`?` 글롭(예:
+  `eno*`, 1~64자, 공백·`/`·`:` 없음)이고 비우면 모든 포트다.
+- **`bond_degraded`.** 본딩마다 하나 — 구성 포트 일부가 끊기거나 노드에서 사라져(PCIe 장애·드라이버 unbind — 노드가 본 적 있는 구성
+  포트를 `missing`으로 남김) 이중화를 잃었고 아직 흐름. 본딩이 끊기면 이 경보는 풀리고 `node_link_down`(본딩 이름)이 새로 울린다.
 - **문구.** 대상은 `node/svc01/eno1`(CLI `alert list`의 SUBJECT, 알림의 이름 `svc01/eno1`), 메시지는 물리 관계로 셈한 영향이다:
-  `eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs`. 영향 계산은 `GET /topology/physical`과 같은 함수다.
-- **상태.** 지속 조건이라 `--for`·`--repeat`·해제가 있다. 다시 올라온 포트는 60초 뒤 해제다. 오프라인 노드의 상태는 낡았으므로 그 노드의
-  링크 경보는 그대로 둔다(노드 꺼짐은 `node-offline`이 알림). 노드 거르기(`nodes`)를 받는다.
+  `eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs`, 주소만 가진 포트는 `ens1f0 down on svc01 — cluster link`(노드의 클러스터
+  링크 주소·API 주소면 `cluster link`·`management`). 영향 계산은 `GET /topology/physical`과 같은 함수다. 알림 본문에는 지도에서 그 포트로
+  가는 경로 `Map: /cluster/map?focus=port:svc01/eno1`(웹훅 JSON은 `subject.map`)이 붙는다 — 앞에 웹 주소를 붙여 연다.
+- **상태.** 지속 조건이라 `--for`·`--repeat`·해제가 있다. 다시 올라온 포트는 60초 뒤 해제다. 경보가 난 포트가 노드의 인터페이스 목록에서
+  사라지면 풀지 않고 그대로 두고 되풀이 알림에 `eno2 disappeared from svc01`을 싣는다(다시 나타나 살아 있으면 풀림). 오프라인·유지보수
+  노드의 상태는 낡았거나 일부러 바꾸는 중이므로 그 노드의 링크 경보는 새로 내지도·풀지도·되풀이하지도 않는다(노드 꺼짐은 `node-offline`이
+  알림). 노드 거르기(`nodes`)를 받는다.
 - **링크 경보 켜기.** `alert rule add-link-defaults --target T`(여러 번 줄 수 있음, API `POST /api/v1/alert-rules/link-defaults
   {"targets": [...]}` → `{created, existing}`, 웹 홈의 "링크 경보 켜기")가 `node-link-down`(업링크 포트, critical, 30초)과
   `bond-degraded`(warning, 60초)를 만든다. SDN 묶음과 따로라 SDN을 쓰지 않는 클러스터에서도 쓴다. 같은 이름이 있으면 건드리지 않고

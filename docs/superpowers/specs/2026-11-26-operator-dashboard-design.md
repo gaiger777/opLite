@@ -38,7 +38,8 @@
 - **LLDP: lldpd가 있으면 읽음(채택) vs 직접 LLDP 수신.** `lldpcli -f json show neighbors`(30초, 인터페이스 수집과 함께)로 이웃 스위치 이름·포트를 붙인다. lldpd가 없으면 칸이
   비고 안내("lldpd를 설치하면 스위치 포트가 보입니다"). 직접 수신(raw socket)은 권한·보안 면이 넓다.
 - **경보: 새 조건 `NodeLinkDown`·`BondDegraded`(채택) vs HA 검사 결과를 경보로.** HA 검사는 사람이 정한 인터페이스만 보고 Task로 남는다. 새 조건은 상태의 `interfaces`를 리더의
-  경보 엔진이 보고(이미 있는 이벤트 조건 방식), **업링크로 쓰이는 포트만**(브리지·본딩에 속한 ethernet, underlay를 가진 인터페이스) 기본으로 본다. 기능 `link-alerts`.
+  경보 엔진이 보고(이미 있는 이벤트 조건 방식), **쓰이는 포트만**(브리지·본딩에 속한 ethernet, underlay를 가진 인터페이스, 전역 주소를 가진
+  물리 포트 — 리뷰 1) 기본으로 본다. 기능 `link-alerts`.
 - **2.5D 표현: 지도의 네트워크 층을 "포트 줄 + 네트워크 레일"로(채택) vs 노드 사이 선 그리기.** 노드 블록 앞면 아래에 물리 포트를 작은 블록 줄로(본딩은 묶음 테두리), 지도 밑에
   네트워크 레일(브리지/physnet/VXLAN underlay별 가로 띠)을 깔고 노드의 업링크 포트에서 레일로 짧은 세로 선. 포트가 죽으면 그 포트와 선이 빨갛고, 레일에서 떨어진 노드가 보인다.
   노드끼리 선을 그으면 100노드에서 선이 수천 개가 되어 예산을 넘는다(계획 70 §16의 "노드 사이 선"을 이 방식으로 푼다).
@@ -53,39 +54,61 @@
 - LLDP: `lldpcli`가 있으면 30초마다(시간 상한 3초), 출력 파싱은 순수 함수 + 고정물 시험. 없으면 `None`.
 
 ### 3.2 물리 관계 `GET /topology/physical` (권한 `cluster.read`, 기능 `operator-dashboard`)
-순수 함수 `orbivisor_types::physical::build(nodes, networks, vms, pools) -> PhysicalTopology`:
+순수 함수 `orbivisor_types::physical::build(nodes, networks, vms) -> PhysicalTopology`(풀은 보지 않는다 — 스토리지망은 주소를 가진 포트의
+역할 `service`와 쓰임으로 보인다):
 ```
 PhysicalTopology { nodes: [NodePhysical {
   node, online,
-  ports: [Port{name, kind(ethernet|bond|vlan|bridge), state, carrier, speed_mbps, mtu, mac, parent, vlan_id, lldp,
-               bond: Option<{mode, state, members[]}>, role(uplink|underlay|unused|other)}],
+  ports: [Port{name, kind(ethernet|bond|vlan|bridge|other), state, carrier, speed_mbps, mtu, mac, parent, vlan_id, lldp,
+               bond: Option<{mode, state, members[]}>, role(uplink|underlay|service|unused|other), uses[cluster|management], health}],
   bridges: [Bridge{name, uplinks[port], vlan_filtering, networks[network id], vm_nics: u32}],
   underlay: Option<{address, port}>,
   physnets: [{name, bridge, ready, error}],
-  impact: [Impact{port, severity(down|degraded), bridges[], networks[], vms: u32, vm_ids (최대 50)}],
-}], networks: [NetRail{id, name, kind(bridge|vlan|vxlan|sdn-overlay|sdn-provider), carrier(bridge 이름|physnet|underlay), vlan, nodes[{node, state(up|degraded|down|absent)}]}] }
+  impact: [Impact{port, severity(down|degraded), bond, bridges[], underlay, uses[], networks[], vms: u32, vm_ids (최대 50)}],
+  unreachable: [{network, vms, vm_ids}],
+}], networks: [NetRail{id, name, kind(bridge|vlan|vxlan|sdn-overlay|sdn-provider), carrier(bridge 이름|physnet|underlay), vlan, nodes[{node, state(up|degraded|down|absent|unknown)}]}] }
 ```
 - 사슬: VM NIC → 네트워크 → (bridge·vlan → 노드 브리지 | provider physnet → 노드 physnet 브리지 | vxlan·overlay → underlay 주소를 가진 인터페이스) → 브리지 업링크(`master == bridge`)
   → VLAN이면 `parent` → 본딩이면 구성 포트.
-- 영향: 포트 down(carrier 없음)·본딩 down → 그 위 브리지·네트워크·이 노드의 VM 수 "down", 본딩 degraded·포트 down이지만 본딩은 up → "degraded"(이중화 잃음).
-- 레일 상태: 노드마다 그 네트워크의 사슬이 끝까지 up이면 up, 본딩 degraded면 degraded, 끊기면 down, 그 노드에 그 네트워크를 쓸 수단이 없으면 absent.
+- 역할(리뷰 1): 브리지 아래·본딩과 그 구성 포트 = `uplink`, underlay 주소의 인터페이스와 그 아래 = `underlay`, 그 밖에 전역 주소(IPv4·IPv6,
+  링크 로컬 빼고)를 가진 물리 포트(ethernet·bond·vlan·other)와 그 아래 = `service`(스토리지·복제·관리·클러스터 링크망 — 노드의
+  `cluster_addresses`·API 주소면 `uses`에 `cluster`·`management`), 묶이지 않고 주소도 없는 ethernet = `unused`, 나머지 = `other`.
+- 영향: 포트 down(carrier 없음)·본딩 down·관리자가 내린 브리지(`admin_up` 거짓) → 그 위 브리지·네트워크·이 노드의 VM 수 "down", 본딩 degraded·
+  포트 down이지만 본딩은 up → "degraded"(이중화 잃음). `uplink`·`underlay`·`service` 포트만 영향을 낸다. 도는 VM의 NIC 네트워크를 이 노드에서 쓸
+  수단이 없으면 `unreachable`.
+- underlay 주인: 주소를 가진 인터페이스, 없으면(NetworkManager가 carrier를 잃은 장치의 주소를 뗌) 노드가 마지막으로 본 이름(`NodeStatus.underlay_ports`).
+  그 이름이 목록에서도 사라졌으면 끊김, 이름도 없으면 레일은 `unknown`.
+- 본딩 구성 포트가 사라짐(PCIe 장애·unbind·핫플러그): 노드가 본딩마다 본 적 있는 구성 포트를 기억해 `missing`으로 남기고 본딩을 degraded로 본다.
+- 레일 상태: 노드마다 그 네트워크의 사슬이 끝까지 up이면 up, 본딩 degraded면 degraded, 끊기면 down, 그 노드에 그 네트워크를 쓸 수단이 없으면 absent,
+  노드가 오프라인이거나 underlay 주인을 모르면 unknown(낡은 상태·모르는 것을 끊김·정상으로 그리지 않는다). 오프라인 노드의 `impact`는 마지막으로
+  본 값이고 화면은 그렇게 적는다(배지 수에는 넣지 않는다).
 - watch·캐시: 노드·네트워크·VM 리비전이 같으면 이전 결과(서버 메모리 캐시 하나). 웹은 15초 갱신 + 노드 watch에서 바뀌면 다시.
 
 ### 3.3 용량 `GET /capacity` (권한 `cluster.read`, 같은 기능)
 ```
 Capacity { nodes: [NodeCapacity{ node, online,
-  cpu: {threads, reserved, dedicated_total, dedicated_used, vcpus_allocated, vcpus_running, overcommit (vcpus_allocated / (threads - reserved - dedicated_total)), use_pct (placement 부하)},
-  memory: {total_mib, reserved_mib, allocated_mib, used_mib, hugepages: [{size_kib, total, used}], overcommit},
+  cpu: {threads, reserved, dedicated_total, dedicated_used, vcpus_allocated, vcpus_running, vcpus_shared, overcommit (vcpus_shared / (threads - reserved - dedicated_total)), use_pct (placement 부하 — 노드 전체)},
+  memory: {total_mib, reserved_mib, allocated_mib, allocated_hugepages_mib, used_mib, hugepages: [{size_kib, total, used}], overcommit ((allocated_mib - allocated_hugepages_mib) / (total_mib - reserved_mib))},
   numa: [{id, cpus, memory_mib, dedicated_used, pinned_vcpus}] (topology 있으면),
   storage: [{pool, total_bytes, used_bytes, provisioned_bytes, volumes}] (그 노드의 로컬 풀) }],
   shared_pools: [{pool, total, used, provisioned, volumes, nodes_ready, nodes}], totals: {...같은 모양 합} }
 ```
-- `vcpus_allocated` = 그 노드에 놓인(실행·멈춤 포함, 상태 node 기준) VM vCPU 합, `vcpus_running` = 실행 중만. `CapacityWidget.usage`와 같은 규칙 — 서버 값과 같은지 시험한 뒤 위젯이 서버 값을 쓴다.
+- `vcpus_allocated` = 그 노드에 자리 잡은 VM의 vCPU 합 — QEMU가 떠 있는 단계(시작·실행·정지 중·옮기는 중, 상태 node 기준 — 멈춘·실패한 VM은
+  세지 않고, 옮기는 VM은 원본 노드에만 센다), `vcpus_running` = 실행 중만, `vcpus_shared` = 그 가운데 공유 정책. `CapacityWidget.usage`와 같은
+  규칙이다(서버 값과 같은지 시험). 오버커밋은 공유 vCPU ÷ 공유 스레드다(전용 VM은 자기 스레드 위에서 돈다). 표는 공유 할당(공유 vCPU / 공유 스레드)과
+  전용 할당(잡힌 전용 / 전용)을 따로 보이고, 사용률은 노드 전체 %를 글로 보인다(공유 풀 막대에 얹지 않는다 — 리뷰 1). "문제만"은 공유 vCPU
+  오버커밋 > 4(설정 한도가 생기면 그 값)·메모리 오버커밋 > 1·사용 > 90%·링크 장애·없는 네트워크다.
 - `provisioned_bytes` = 그 풀 볼륨 `size_bytes` 합(씬 할당), `used_bytes` = `total - available`.
 
 ### 3.4 경보
 - `AlertCondition::NodeLinkDown{ ports: Option<String>(글롭), role: uplink|any }`, `AlertCondition::BondDegraded{}`. 리더 경보 엔진의 이벤트 조건 방식(노드 상태 바뀜을 봄), 메시지는
-  `physical::impact`로 "eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs". 해소되면 resolved. 권하는 묶음(`default_rules`)에 둘 다(심각도 critical/warning).
+  `physical::describe`로 "eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs". 해소되면 resolved. 권하는 묶음은 SDN 묶음과 따로
+  `link_default_rules`(`POST /alert-rules/link-defaults`, 심각도 critical/warning — SDN 없는 클러스터에서도 켤 수 있게).
+- 본딩(리뷰 1): 구성 포트가 끊기고 본딩은 흐르면 `bond_degraded`(warning) 하나만, 본딩이 끊기면 본딩 이름으로 `node_link_down`(critical) 하나 —
+  구성 포트는 따로 울리지 않는다. 저하 → 끊김은 새 알림(`node_link_down`)이고 저하 경보는 풀린다. `role: any`는 이더넷·VLAN과 묶인 포트까지
+  보되 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int`)는 보지 않는다.
+- 경보가 난 포트가 노드의 인터페이스 목록에서 사라지면 풀지 않고 "사라짐"으로 둔다(다시 나타나 살아 있으면 풀림). 오프라인·유지보수 노드의 링크
+  경보는 새로 내지도·풀지도·되풀이하지도 않는다. 알림 본문에 지도 경로 `/cluster/map?focus=port:<노드>/<포트>`를 붙인다.
 - 기능 `link-alerts` — 섞인 판에서 새 조건 만들기는 409 `cluster_upgrading`.
 
 ## 4. 웹
@@ -121,12 +144,14 @@ Capacity { nodes: [NodeCapacity{ node, online,
 - **네트워크 레일**: 지도 아래 바닥 판에 레일(브리지·physnet·underlay별, 최대 8 + "+n"), 노드의 업링크 포트 → 레일 세로 선. 레일 위에 그 네트워크 수. down이면 선이 끊김 표시.
   레일을 고르면 그 레일을 쓰는 노드·네트워크·VM이 강조.
 - **장애 초점**: `?focus=port:<node>/<port>` — 지도가 그 노드로 이동·포트 강조, 판은 네트워크 칸.
-- 예산(100노드 × 50VM): 배치+경로 < 30ms 그대로, 요소: 네트워크 층 켜면 < 4,500(포트 줄 merged path, 레일 선 merged path — 색·층마다 path 하나), 칸 크기 < 24KB gzip(예산 올림 — 까닭 기록),
+- 예산(100노드 × 50VM): 배치+경로 < 30ms 그대로, 요소: 네트워크 층 켜면 < 4,500(포트 줄 merged path, 레일 선 merged path — 색·층마다 path 하나), 칸 크기 < 24 KiB(24,576바이트) gzip(예산 올림 — 까닭 기록),
   홈 첫 로드 늘어남 < 3KB(지도·판은 늦게 읽음).
 
 ## 5. 섞인 판·호환
 - 새 상태 칸은 옛 노드에 없음 → 물리 끝점은 그 노드의 `parent`·`mtu`·`lldp`를 비우고 VLAN 아래 장치는 이름 규칙(`eno1.100`)으로 추정, 표시 "옛 판 — 일부 정보 없음".
-- 기능 `operator-dashboard`가 클러스터 전체가 아니면 웹은 지금 홈(위젯만)을 보이고 "업그레이드 뒤 대시보드" 안내. 새 경보 조건은 `link-alerts` 게이트.
+- 기능 `operator-dashboard`를 온라인 노드가 모두 알지 않으면 두 끝점이 409이고 웹은 지금 홈(위젯만)을 보이고 "업그레이드 뒤 대시보드" 안내. 꺼진
+  옛 노드는 막지 않는다(리뷰 1 — 지우지 않은 죽은 노드 하나가 대시보드를 영영 막지 않게): 그 노드는 위의 `legacy` 표시로 마지막 상태를 보인다.
+  새 경보 조건은 `link-alerts` 게이트(모든 노드).
 
 ## 6. 시험
 - 수집: `ip -j -d` 고정물(VLAN `link`, MTU), sysfs 통계 차(되감김·없어진 인터페이스), lldpcli JSON 고정물(이웃 없음·여럿).
