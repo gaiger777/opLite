@@ -93,6 +93,10 @@ impl Notification {
                 line.push_str(&format!(" port {port}"));
             }
             lines.push(line);
+            // 링크 경보(계획 75 리뷰 1): 웹 지도에서 그 포트로 가는 길(주소 앞부분은 받는 쪽의 웹 주소)
+            if let Some(path) = map_path(s) {
+                lines.push(format!("Map: {path}"));
+            }
         }
         match (self.value, self.threshold) {
             (Some(v), Some(t)) => {
@@ -110,6 +114,23 @@ impl Notification {
         }
         lines.join("\n")
     }
+}
+
+/// 포트가 있는 경보 대상(링크 경보)의 지도 경로: `/cluster/map?focus=port:<노드>/<포트>`
+fn map_path(s: &AlertSubject) -> Option<String> {
+    let port = s.port.as_ref()?;
+    let node = s.node.as_deref().unwrap_or(&s.name);
+    // 쿼리 값에 그대로 둘 수 있는 글자만 두고 나머지는 %XX(노드·인터페이스 이름은 보통 그대로)
+    let focus: String = format!("port:{node}/{port}")
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    Some(format!("/cluster/map?focus={focus}"))
 }
 
 /// 소수점 둘째 자리까지, 정수면 소수점 없이
@@ -179,6 +200,7 @@ pub(crate) fn webhook_request(w: &WebhookTarget, n: &Notification) -> WebhookReq
                 // 링크 경보(계획 75)만 포트를 단다(다른 경보의 본문은 그대로).
                 if let Some(port) = &s.port {
                     v["port"] = json!(port);
+                    v["map"] = json!(map_path(s));
                 }
                 v
             });

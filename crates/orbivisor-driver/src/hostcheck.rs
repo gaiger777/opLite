@@ -2,7 +2,7 @@
 //! (디렉터리 읽기, iSCSI 세션, multipath 경로, RADOS)를 본다. 파일 읽기는 블로킹 함수이고 명령은 async
 //! 함수다. 모두 cfg 없이 컴파일되며 Linux가 아니면 sysfs가 없어 `unknown`·`failing`이 된다.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -106,6 +106,13 @@ fn operstate(net: &NetFs, iface: &str) -> Option<String> {
 }
 
 /// sysfs `mtu`
+/// 관리자가 올렸는지(sysfs `flags`의 IFF_UP)
+fn admin_up(net: &NetFs, iface: &str) -> Option<bool> {
+    let flags = read_trim(&net.net(iface).join("flags")).ok()?;
+    let flags = u32::from_str_radix(flags.trim_start_matches("0x"), 16).ok()?;
+    Some(flags & 0x1 != 0)
+}
+
 fn mtu(net: &NetFs, iface: &str) -> Option<u32> {
     read_trim(&net.net(iface).join("mtu")).ok()?.parse().ok()
 }
@@ -256,6 +263,7 @@ pub fn port_state_name(state: PortState) -> &'static str {
         PortState::Down => "down",
         PortState::LacpMismatch => "lacp_mismatch",
         PortState::SpeedMismatch => "speed_mismatch",
+        PortState::Missing => "missing",
         PortState::Unknown => "unknown",
     }
 }
@@ -430,6 +438,8 @@ pub struct IpLink {
     pub parent: Option<String>,
     /// VLAN이면 그 id(`linkinfo.info_data.id`)
     pub vlan_id: Option<u16>,
+    /// 관리자가 올렸는지(`flags`에 `UP`). `flags`가 없으면 모른다.
+    pub admin_up: Option<bool>,
 }
 
 /// 아래 장치(`link`)를 [`IpLink::parent`]로 받는 종류. veth의 `link`는 짝이라 받지 않는다.
@@ -450,6 +460,8 @@ struct AddrLink {
     mtu: Option<u32>,
     #[serde(default)]
     link: Option<String>,
+    #[serde(default)]
+    flags: Option<Vec<String>>,
     #[serde(default)]
     linkinfo: Option<AddrLinkInfo>,
     #[serde(default)]
@@ -493,6 +505,7 @@ pub fn parse_ip_addr(json: &str) -> Result<Vec<IpLink>, String> {
                     .link
                     .filter(|_| kind.is_some_and(|k| PARENT_KINDS.contains(&k))),
                 vlan_id,
+                admin_up: l.flags.map(|f| f.iter().any(|f| f == "UP")),
                 mtu: l.mtu,
                 name: l.ifname,
                 state: l.operstate.unwrap_or_default().to_ascii_lowercase(),
@@ -546,6 +559,7 @@ pub fn interfaces(net: &NetFs, ip_json: &str) -> Result<Vec<NodeInterface>, Stri
             parent: l.parent,
             vlan_id: l.vlan_id,
             lldp: None,
+            admin_up: l.admin_up,
             name: l.name,
             state: l.state,
             carrier: None,
@@ -587,8 +601,8 @@ pub fn reported_interfaces(list: &[NodeInterface]) -> Vec<NodeInterface> {
         .collect()
 }
 
-/// operstate·carrier·속도·MTU·본딩 포트를 sysfs에서 다시 읽는다(`ip`를 부르지 않는 짧은 회차).
-/// 읽지 못한 operstate·MTU는 그대로 둔다.
+/// operstate·carrier·속도·MTU·관리자 UP·본딩 포트를 sysfs에서 다시 읽는다(`ip`를 부르지 않는 짧은 회차).
+/// 읽지 못한 operstate·MTU·관리자 UP은 그대로 둔다.
 pub fn refresh_interfaces(net: &NetFs, list: &mut [NodeInterface]) {
     for iface in list {
         if let Some(state) = operstate(net, &iface.name) {
@@ -596,6 +610,9 @@ pub fn refresh_interfaces(net: &NetFs, list: &mut [NodeInterface]) {
         }
         if let Some(mtu) = mtu(net, &iface.name) {
             iface.mtu = Some(mtu);
+        }
+        if let Some(up) = admin_up(net, &iface.name) {
+            iface.admin_up = Some(up);
         }
         iface.carrier = carrier(net, &iface.name);
         iface.speed_mbps = speed(net, &iface.name);
@@ -605,6 +622,68 @@ pub fn refresh_interfaces(net: &NetFs, list: &mut [NodeInterface]) {
             None
         };
     }
+}
+
+/// 본딩에서 본 적 있는 구성 포트가 사라졌으면 `missing`으로 남긴다(계획 75 리뷰 1 — PCIe 장애·드라이버 unbind·핫플러그
+/// 제거로 netdev가 없어지면 커널이 `slaves`에서도 빼서 본딩이 "모두 up"으로 보인다). `before`는 지난번 목록(노드 상태 —
+/// 다시 시작해도 남음), `present`는 지금 이 노드에 있는 모든 인터페이스 이름이다. 사라진 이름이 다시 나타났으면(다른 데
+/// 묶였거나 관리자가 본딩에서 뺐어도) 남기지 않는다. 남긴 포트가 있으면 `up`인 본딩은 `degraded`다.
+pub fn keep_missing_bond_ports(
+    before: &[NodeInterface],
+    now: &mut [NodeInterface],
+    present: &BTreeSet<&str>,
+) {
+    for iface in now.iter_mut() {
+        let Some(bond) = iface.bond.as_mut() else {
+            continue;
+        };
+        let Some(old) = before
+            .iter()
+            .find(|b| b.name == iface.name)
+            .and_then(|b| b.bond.as_ref())
+        else {
+            continue;
+        };
+        for port in &old.ports {
+            if !present.contains(port.name.as_str())
+                && !bond.ports.iter().any(|p| p.name == port.name)
+            {
+                bond.ports.push(BondPort {
+                    name: port.name.clone(),
+                    state: PortState::Missing,
+                    speed_mbps: None,
+                    aggregator: None,
+                });
+            }
+        }
+        if bond.state == BondState::Up && bond.ports.iter().any(|p| p.state == PortState::Missing) {
+            bond.state = BondState::Degraded;
+        }
+    }
+}
+
+/// underlay 주소마다 그 주소를 가진 인터페이스(계획 75 리뷰 1, `NodeStatus.underlay_ports`). 지금 가진 것이 없으면(링크가
+/// 끊겨 주소가 떨어짐) 지난번 이름을 둔다. 주소 목록에 없는 주소는 뺀다.
+pub fn underlay_ports(
+    before: &BTreeMap<String, String>,
+    addresses: &[IpAddr],
+    list: &[NodeInterface],
+) -> BTreeMap<String, String> {
+    addresses
+        .iter()
+        .filter_map(|ip| {
+            let key = ip.to_string();
+            let holder = list.iter().find(|i| {
+                i.addresses.iter().any(|a| {
+                    a.split('/').next().and_then(|a| a.parse::<IpAddr>().ok()) == Some(*ip)
+                })
+            });
+            match holder {
+                Some(i) => Some((key, i.name.clone())),
+                None => before.get(&key).map(|name| (key, name.clone())),
+            }
+        })
+        .collect()
 }
 
 /// `PATH`에서 실행 파일 `name`을 찾는다.
@@ -1647,6 +1726,113 @@ mod tests {
         assert_eq!(list[2].mtu, Some(1500));
         // sysfs에 없으면 지난 값을 둔다.
         assert_eq!(list[3].mtu, Some(9000));
+    }
+
+    /// 리뷰 1: 관리자 UP은 `ip -j`의 `flags`(없으면 모름), 짧은 회차는 sysfs `flags`의 IFF_UP으로 다시 읽는다.
+    #[test]
+    fn admin_up_comes_from_the_flags() {
+        const IP_FLAGS: &str = r#"[
+          {"ifindex":2,"ifname":"vmbr0","flags":["BROADCAST","MULTICAST"],"operstate":"DOWN","link_type":"ether","linkinfo":{"info_kind":"bridge"}},
+          {"ifindex":3,"ifname":"eno1","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"operstate":"UP","link_type":"ether"},
+          {"ifindex":4,"ifname":"eno2","operstate":"UP","link_type":"ether"}
+        ]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let net = fake_net(tmp.path(), &[link("vmbr0", "down", 0)]);
+        let mut list = interfaces(&net, IP_FLAGS).unwrap();
+        let got: Vec<_> = list.iter().map(|i| i.admin_up).collect();
+        assert_eq!(got, [Some(false), Some(true), None]);
+        std::fs::write(net.net("vmbr0").join("flags"), "0x1003\n").unwrap();
+        refresh_interfaces(&net, &mut list);
+        assert_eq!(list[0].admin_up, Some(true));
+    }
+
+    /// 리뷰 1: 본딩에서 본 구성 포트의 netdev가 사라지면 `missing`으로 남기고 본딩을 저하로 본다. 다시 나타났거나 본딩에
+    /// 있으면 남기지 않는다.
+    #[test]
+    fn missing_bond_ports_are_kept() {
+        let bond = |ports: &[(&str, PortState)], state: BondState| NodeInterface {
+            name: "bond0".into(),
+            kind: InterfaceKind::Bond,
+            state: "up".into(),
+            carrier: Some(true),
+            speed_mbps: None,
+            mac: None,
+            master: None,
+            addresses: vec![],
+            bond: Some(BondStatus {
+                mode: "active-backup".into(),
+                state,
+                ports: ports
+                    .iter()
+                    .map(|(n, s)| BondPort {
+                        name: n.to_string(),
+                        state: *s,
+                        speed_mbps: None,
+                        aggregator: None,
+                    })
+                    .collect(),
+            }),
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
+            admin_up: None,
+        };
+        let before = [bond(
+            &[("eno1", PortState::Up), ("eno2", PortState::Up)],
+            BondState::Up,
+        )];
+        let mut now = [bond(&[("eno1", PortState::Up)], BondState::Up)];
+        keep_missing_bond_ports(&before, &mut now, &["eno1", "bond0"].into());
+        let b = now[0].bond.as_ref().unwrap();
+        assert_eq!(b.state, BondState::Degraded);
+        assert_eq!(
+            b.ports
+                .iter()
+                .map(|p| (p.name.as_str(), p.state))
+                .collect::<Vec<_>>(),
+            [("eno1", PortState::Up), ("eno2", PortState::Missing)]
+        );
+        // 다음 회차에도 남는다(지난번 목록의 `missing`에서).
+        let before = now.clone();
+        let mut again = [bond(&[("eno1", PortState::Up)], BondState::Up)];
+        keep_missing_bond_ports(&before, &mut again, &["eno1", "bond0"].into());
+        assert_eq!(again, now);
+        // 다시 나타나면(본딩 밖이어도) 남기지 않는다.
+        let mut back = [bond(&[("eno1", PortState::Up)], BondState::Up)];
+        keep_missing_bond_ports(&before, &mut back, &["eno1", "eno2", "bond0"].into());
+        assert_eq!(back[0].bond.as_ref().unwrap().ports.len(), 1);
+        assert_eq!(back[0].bond.as_ref().unwrap().state, BondState::Up);
+    }
+
+    /// 리뷰 1: underlay 주소의 인터페이스는 지금 가진 것, 없으면 지난번 이름이다. 설정에서 빠진 주소는 뺀다.
+    #[test]
+    fn underlay_ports_remember_the_last_holder() {
+        let mut eno4 = NodeInterface {
+            name: "eno4".into(),
+            kind: InterfaceKind::Ethernet,
+            state: "up".into(),
+            carrier: Some(true),
+            speed_mbps: None,
+            mac: None,
+            master: None,
+            addresses: vec!["10.1.0.11/24".into()],
+            bond: None,
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
+            admin_up: None,
+        };
+        let ip: IpAddr = "10.1.0.11".parse().unwrap();
+        let seen = underlay_ports(&BTreeMap::new(), &[ip], std::slice::from_ref(&eno4));
+        assert_eq!(seen, [("10.1.0.11".to_string(), "eno4".to_string())].into());
+        eno4.addresses.clear();
+        assert_eq!(
+            underlay_ports(&seen, &[ip], std::slice::from_ref(&eno4)),
+            seen
+        );
+        assert!(underlay_ports(&seen, &[], &[eno4]).is_empty());
     }
 
     const LLDP_ONE: &str = include_str!("../tests/fixtures/lldp/one.json");

@@ -1108,6 +1108,7 @@ mod tests {
             version: None,
             updates: None,
             features: vec![],
+            underlay_ports: Default::default(),
             cluster_addresses: vec![],
             shutdown: None,
             fence_check: None,

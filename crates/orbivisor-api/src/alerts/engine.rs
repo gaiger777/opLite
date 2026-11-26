@@ -11,7 +11,7 @@
 //! 단계는 [`orbivisor_types::alert::advance`]다: pending → firing(알림) → `repeat_secs`마다 다시 → 거짓인 채 60초 → 해제(알림).
 //! 노드 장부도 파일에 먼저 쓰고 보내므로 opld를 다시 시작해도 같은 알림을 다시 보내지 않는다.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -714,7 +714,15 @@ impl Engine {
                 },
                 // 링크 조건(계획 75 §3.4): 노드 상태의 포트·본딩. 영향을 읽지 못하면 그대로 둔다.
                 ref c if c.is_link() => match self.link_findings(&rule, nodes, &mut link_world) {
-                    Some(f) => self.sdn_rule(now, &rule, f),
+                    Some((f, quiet)) => {
+                        let (status, mut out) = self.sdn_rule(now, &rule, f);
+                        // 오프라인·유지보수 노드의 경보는 그대로 두되 되풀이하지 않는다(낡은 상태 — 노드 꺼짐은 `node_offline`).
+                        out.retain(|p| {
+                            p.state != NotificationState::Firing
+                                || !quiet.contains(&p.alert.subject.key(rule.id))
+                        });
+                        (status, out)
+                    }
                     None => continue,
                 },
                 ref c if c.is_sdn() => {
@@ -775,34 +783,40 @@ impl Engine {
 
     /// 링크 규칙 하나(계획 75 §3.4)의 대상: 노드의 끊긴 포트(`node_link_down`)·저하된 본딩(`bond_degraded`)마다 하나 —
     /// 경보 키에 포트가 들어가 포트마다 따로다. 문구는 [`physical::describe`](그 노드만 [`physical::build`]한 영향).
-    /// 오프라인 노드의 상태는 낡았으므로 그 노드의 경보는 그대로 둔다(노드 꺼짐은 `node_offline`이 알린다). 다시 올라온
-    /// 포트는 거짓으로 보아 해제 규칙(60초)을 따른다. 네트워크·VM을 읽지 못하면 None이다.
+    /// 오프라인·유지보수 노드의 상태는 낡았거나 일부러 바꾸는 중이므로 그 노드의 경보는 새로 내지도 풀지도 되풀이하지도
+    /// 않는다(돌려주는 두 번째 값이 되풀이하지 않을 경보 키 — 노드 꺼짐은 `node_offline`이 알린다). 경보가 난 포트가 노드의
+    /// 인터페이스 목록에서 사라졌으면 풀지 않고 "사라짐"으로 그대로 둔다(리뷰 1 — 포트가 다시 나타나 살아 있으면 풀림).
+    /// 다시 올라온 포트는 거짓으로 보아 해제 규칙(60초)을 따른다. 네트워크·VM을 읽지 못하면 None이다.
     fn link_findings(
         &self,
         rule: &AlertRule,
         nodes: &[Node],
         world: &mut Option<LinkWorld>,
-    ) -> Option<Vec<SdnFinding>> {
+    ) -> Option<(Vec<SdnFinding>, HashSet<String>)> {
         let mut out = Vec::new();
+        let mut quiet = HashSet::new();
         for node in nodes.iter().filter(|n| rule.spec.applies_to_node(&n.name)) {
             let mine = rule
                 .status
                 .active
                 .iter()
                 .filter(|a| a.subject.id == node.id && a.subject.port.is_some());
-            if !node.status.online {
-                out.extend(mine.map(|a| SdnFinding {
-                    subject: a.subject.clone(),
-                    holds: None,
-                    detail: None,
-                }));
+            if !node.status.online || node.spec.maintenance {
+                for a in mine {
+                    quiet.insert(a.subject.key(rule.id));
+                    out.push(SdnFinding {
+                        subject: a.subject.clone(),
+                        holds: None,
+                        detail: None,
+                    });
+                }
                 continue;
             }
             let faults = match &rule.spec.condition {
                 AlertCondition::NodeLinkDown { ports, role } => {
-                    physical::link_faults(&node.status, *role, ports.as_deref())
+                    physical::link_faults(node, *role, ports.as_deref())
                 }
-                _ => physical::bond_faults(&node.status),
+                _ => physical::bond_faults(node),
             };
             out.extend(
                 mine.filter(|a| {
@@ -810,10 +824,14 @@ impl Engine {
                         .iter()
                         .any(|f| a.subject.port.as_ref() == Some(&f.port))
                 })
-                .map(|a| SdnFinding {
-                    subject: a.subject.clone(),
-                    holds: Some(false),
-                    detail: None,
+                .map(|a| {
+                    let port = a.subject.port.as_deref().unwrap_or_default();
+                    let gone = !node.status.interfaces.iter().any(|i| i.name == port);
+                    SdnFinding {
+                        subject: a.subject.clone(),
+                        holds: (!gone).then_some(false),
+                        detail: gone.then(|| format!("{port} disappeared from {}", node.name)),
+                    }
                 }),
             );
             if faults.is_empty() {
@@ -849,6 +867,7 @@ impl Engine {
                         bond: f.bond.clone(),
                         bridges: Vec::new(),
                         underlay: false,
+                        uses: Vec::new(),
                         networks: Vec::new(),
                         vms: 0,
                         vm_ids: Vec::new(),
@@ -866,7 +885,7 @@ impl Engine {
                 });
             }
         }
-        Some(out)
+        Some((out, quiet))
     }
 
     /// SDN 규칙 하나(계획 67 §11)를 본 결과로 진행한다. 상태 조건은 [`advance`](값을 모르면 단계를 그대로), 이벤트

@@ -281,6 +281,7 @@ async fn record_node(
             hotplug: Some(host.hotplug),
             // 드라이버가 살핀 TPM·Secure Boot 능력(계획 59). 위트니스는 없다.
             firmware_caps: Some(host.firmware_caps),
+            underlay_ports: Default::default(),
         };
         true
     })
@@ -1200,6 +1201,7 @@ pub(crate) mod tests {
             parent: None,
             vlan_id: None,
             lldp: None,
+            admin_up: None,
             name: "eno1".into(),
             kind: orbivisor_types::node::InterfaceKind::Ethernet,
             state: "up".into(),

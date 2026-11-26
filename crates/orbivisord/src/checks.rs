@@ -6,7 +6,7 @@
 //! 회차마다 노드 설정 `host_resources`를 적용하고 30초마다 다시 읽어 `NodeStatus.topology`를 쓴다. 노드 SDN 에이전트(계획 65,
 //! [`SdnReport`])가 읽은 `NodeStatus.sdn`도 여기서 쓴다. 위트니스는 띄우지 않는다.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -22,7 +22,8 @@ use orbivisor_driver::{Hypervisor, NetFs, PING_TIMEOUT, PROBE_TIMEOUT, ProbeErro
 use orbivisor_types::audit::AuditTarget;
 use orbivisor_types::ha_check::{AUTO_PREFIX, CheckReport, CheckState, HaCheckSpec, HaCheckTarget};
 use orbivisor_types::node::{
-    BondState, BondStatus, FirmwareCaps, HA_CHECKS, NodeHotplug, NodeInterface, NodeSpec, PortState,
+    BondState, BondStatus, FirmwareCaps, HA_CHECKS, LldpNeighbor, NodeHotplug, NodeInterface,
+    NodeSpec, PortState,
 };
 use orbivisor_types::numa::HostResources;
 use orbivisor_types::resource::Resource;
@@ -50,6 +51,8 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 const IP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 본딩의 새 상태가 이만큼의 회차(15초) 이어져야 알린다(흔들리는 포트가 알림을 쏟아내지 않게).
 const BOND_STEADY_ROUNDS: u32 = 3;
+/// `lldpcli`가 없을 때 `PATH`에서 다시 찾는 간격(lldpd를 설치하면 다시 시작하지 않아도 이웃이 보이게)
+const LLDPCLI_SEARCH_EVERY: Duration = Duration::from_secs(300);
 /// 본딩마다 저하·끊김 알림(감사 항목·기록 Task)의 최소 간격
 const BOND_ALERT_EVERY: Duration = Duration::from_secs(600);
 
@@ -181,6 +184,10 @@ pub struct State {
     lldpcli: Lldpcli,
     /// 마지막 `lldpcli` 실패(같은 실패를 회차마다 적지 않는다)
     lldp_error: Option<String>,
+    /// 도는 `lldpcli`(검사 회차를 막지 않게 따로 돈다 — 리뷰 1)
+    lldp_task: Option<JoinHandle<Result<BTreeMap<String, LldpNeighbor>, ProbeError>>>,
+    /// 마지막으로 받은 LLDP 이웃(실패하면 비움)
+    lldp_last: BTreeMap<String, LldpNeighbor>,
     /// 검사 이름 → (실패·degraded 상태, 노드 시계로 시작된 유닉스 초)
     since: HashMap<String, (CheckState, u64)>,
     /// 시간 안에 끝나지 않은 디렉터리 probe(디렉터리별). 끝날 때까지 새로 띄우지 않는다.
@@ -197,11 +204,12 @@ pub struct State {
     pins: Option<PinWatch>,
 }
 
-/// `lldpcli`(계획 75): 처음 쓸 때 `PATH`에서 찾고, 없으면 다음 시작까지 다시 찾지 않는다.
+/// `lldpcli`(계획 75): 처음 쓸 때 `PATH`에서 찾고, 없으면 [`LLDPCLI_SEARCH_EVERY`]마다 다시 찾는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Lldpcli {
     Unsearched,
-    Missing,
+    /// 그때 찾지 못했음
+    Missing(Instant),
     At(PathBuf),
 }
 
@@ -278,6 +286,8 @@ impl State {
             ip_error: None,
             lldpcli: Lldpcli::Unsearched,
             lldp_error: None,
+            lldp_task: None,
+            lldp_last: BTreeMap::new(),
             since: HashMap::new(),
             stuck: HashMap::new(),
             pvs_cache: HashMap::new(),
@@ -319,7 +329,8 @@ impl State {
                 .and_then(|json| orbivisor_driver::interfaces(&self.config.net, &json));
             match read {
                 Ok(mut list) => {
-                    self.attach_lldp(&mut list).await;
+                    self.ask_lldp().await;
+                    orbivisor_driver::attach_lldp(&mut list, &self.lldp_last);
                     self.seen.extend(list.iter().map(|i| i.name.clone()));
                     self.interfaces = Some(list);
                     self.ip_error = None;
@@ -333,31 +344,27 @@ impl State {
                 }
             }
         }
+        let fresh = self.take_lldp().await;
         if let Some(list) = &mut self.interfaces {
             orbivisor_driver::refresh_interfaces(&self.config.net, list);
+            if fresh {
+                orbivisor_driver::attach_lldp(list, &self.lldp_last);
+            }
         }
     }
 
-    /// lldpd가 있으면 이웃을 물어 이름이 같은 인터페이스에 붙인다([`INTERFACES_EVERY`]마다, `ip`와 함께). 묻지 못하면
-    /// 이웃 없이 둔다.
-    async fn attach_lldp(&mut self, list: &mut [NodeInterface]) {
-        if self.lldpcli == Lldpcli::Unsearched {
-            self.lldpcli = match orbivisor_driver::find_in_path("lldpcli") {
-                Some(bin) => Lldpcli::At(bin),
-                None => {
-                    tracing::info!(
-                        "lldpcli not found: install lldpd to see the switch ports of the interfaces"
-                    );
-                    Lldpcli::Missing
-                }
-            };
+    /// 끝난 `lldpcli`가 있으면 결과를 받는다(실패하면 이웃을 비운다). 받았으면 참이다.
+    async fn take_lldp(&mut self) -> bool {
+        if !self.lldp_task.as_ref().is_some_and(JoinHandle::is_finished) {
+            return false;
         }
-        let Lldpcli::At(bin) = &self.lldpcli else {
-            return;
-        };
-        match orbivisor_driver::lldp_neighbors(bin).await {
+        let task = self.lldp_task.take().expect("finished task");
+        let read = task
+            .await
+            .unwrap_or_else(|e| Err(ProbeError::Failed(format!("lldpcli task: {e}"))));
+        match read {
             Ok(neighbors) => {
-                orbivisor_driver::attach_lldp(list, &neighbors);
+                self.lldp_last = neighbors;
                 self.lldp_error = None;
             }
             Err(e) => {
@@ -366,7 +373,43 @@ impl State {
                     tracing::info!(error = %e, "cannot read the LLDP neighbors");
                 }
                 self.lldp_error = Some(e);
+                self.lldp_last.clear();
             }
+        }
+        true
+    }
+
+    /// lldpd가 있으면 이웃을 묻는 `lldpcli`를 따로 띄운다([`INTERFACES_EVERY`]마다, `ip`와 함께 — 앞 것이 아직 돌면 띄우지
+    /// 않는다). 결과는 끝난 뒤의 회차가 이름이 같은 인터페이스에 붙인다([`Self::take_lldp`]).
+    async fn ask_lldp(&mut self) {
+        self.take_lldp().await;
+        let search = match &self.lldpcli {
+            Lldpcli::Unsearched => true,
+            Lldpcli::Missing(at) => at.elapsed() >= LLDPCLI_SEARCH_EVERY,
+            Lldpcli::At(_) => false,
+        };
+        if search {
+            let first = self.lldpcli == Lldpcli::Unsearched;
+            self.lldpcli = match orbivisor_driver::find_in_path("lldpcli") {
+                Some(bin) => Lldpcli::At(bin),
+                None => {
+                    if first {
+                        tracing::info!(
+                            "lldpcli not found: install lldpd to see the switch ports of the interfaces"
+                        );
+                    }
+                    Lldpcli::Missing(Instant::now())
+                }
+            };
+        }
+        let Lldpcli::At(bin) = &self.lldpcli else {
+            return;
+        };
+        if self.lldp_task.is_none() {
+            let bin = bin.clone();
+            self.lldp_task = Some(tokio::spawn(async move {
+                orbivisor_driver::lldp_neighbors(&bin).await
+            }));
         }
     }
 
@@ -706,17 +749,25 @@ impl State {
             .as_deref()
             .map(orbivisor_driver::reported_interfaces);
         let interfaces = interfaces.as_ref();
+        // 지금 이 노드에 있는 모든 인터페이스(64개 상한 밖 포함) — 사라진 본딩 구성 포트를 가린다.
+        let present: Option<BTreeSet<&str>> = self
+            .interfaces
+            .as_ref()
+            .map(|all| all.iter().map(|i| i.name.as_str()).collect());
         let written = bootstrap::update_node_status(&self.cluster, |status| {
             let mut changed = false;
             if status.checks != checks {
                 status.checks = checks.to_vec();
                 changed = true;
             }
-            if let Some(list) = interfaces
-                && status.interfaces != *list
-            {
-                status.interfaces = list.clone();
-                changed = true;
+            if let (Some(list), Some(present)) = (interfaces, &present) {
+                // 본딩에서 본 구성 포트가 사라졌으면 `missing`으로 남긴다(리뷰 1, 지난 상태에서 이어 감).
+                let mut list = list.clone();
+                orbivisor_driver::keep_missing_bond_ports(&status.interfaces, &mut list, present);
+                if status.interfaces != list {
+                    status.interfaces = list;
+                    changed = true;
+                }
             }
             // 옛 리더가 모르는 필드를 버리고 상태를 다시 썼으면 핫플러그 능력을 다시 쓴다.
             if let Some(hotplug) = self.config.hotplug
@@ -756,6 +807,22 @@ impl State {
             {
                 status.sdn = Some(s.clone());
                 changed = true;
+            }
+            // underlay 주소마다 마지막으로 그 주소를 가졌던 인터페이스(리뷰 1 — 링크가 끊겨 주소가 떨어져도 그 포트를 본다)
+            if let Some(all) = &self.interfaces {
+                let addresses: Vec<IpAddr> = [
+                    status.underlay,
+                    status.sdn.as_ref().and_then(|s| s.encap_ip),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let ports =
+                    orbivisor_driver::underlay_ports(&status.underlay_ports, &addresses, all);
+                if status.underlay_ports != ports {
+                    status.underlay_ports = ports;
+                    changed = true;
+                }
             }
             changed
         })
@@ -1226,7 +1293,7 @@ mod tests {
                 self.audit.clone(),
             );
             state.ip = "/nonexistent/ip".into();
-            state.lldpcli = Lldpcli::Missing;
+            state.lldpcli = Lldpcli::Missing(Instant::now());
             state
         }
 
@@ -2017,6 +2084,7 @@ mod tests {
             parent: None,
             vlan_id: None,
             lldp: None,
+            admin_up: None,
             name: name.into(),
             kind,
             state: "up".into(),
@@ -2151,8 +2219,19 @@ mod tests {
         assert_eq!(s.node().status.interfaces, interfaces);
     }
 
-    /// 계획 75: lldpcli가 있으면 `ip`와 함께 이웃을 물어 노드 상태의 인터페이스에 붙이고(짧은 회차에도 남음), 실패하면
-    /// 이웃 없이 쓴다. 없으면 묻지 않는다.
+    /// 띄운 `lldpcli`가 끝날 때까지 기다린다.
+    async fn lldp_done(state: &State) {
+        for _ in 0..500 {
+            if state.lldp_task.as_ref().is_none_or(JoinHandle::is_finished) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("lldpcli did not finish");
+    }
+
+    /// 계획 75: lldpcli가 있으면 `ip`와 함께 따로 띄워 이웃을 묻고(검사 회차를 막지 않음 — 리뷰 1), 끝난 뒤의 회차가 노드
+    /// 상태의 인터페이스에 붙인다(짧은 회차에도 남음). 실패하면 이웃 없이 쓴다. 없으면 묻지 않고 5분마다 다시 찾는다.
     #[tokio::test]
     async fn lldp_neighbors_are_attached_to_the_interfaces() {
         let s = setup().await;
@@ -2164,6 +2243,8 @@ mod tests {
             "fake-lldpcli",
             &format!("#!/bin/sh\ncat <<'EOF'\n{lldp}\nEOF\n"),
         ));
+        run_once(&mut state).await;
+        lldp_done(&state).await;
         run_once(&mut state).await;
         let neighbor = |s: &Setup| {
             s.node()
@@ -2194,8 +2275,21 @@ mod tests {
         state.lldpcli = Lldpcli::At(s.script("bad-lldpcli", "#!/bin/sh\nexit 1\n"));
         state.interfaces_at = None;
         run_once(&mut state).await;
+        lldp_done(&state).await;
+        run_once(&mut state).await;
         assert!(neighbor(&s).iter().all(|(_, n)| n.is_none()));
         assert!(state.lldp_error.is_some());
+        // 찾지 못한 뒤 5분이 지나면 다시 찾는다(PATH에 있으면 `At`, 없으면 찾은 때가 새로 바뀜). 5분 안이면 그대로다.
+        let recent = Instant::now();
+        state.lldpcli = Lldpcli::Missing(recent);
+        state.interfaces_at = None;
+        run_once(&mut state).await;
+        assert_eq!(state.lldpcli, Lldpcli::Missing(recent));
+        let long_ago = recent - LLDPCLI_SEARCH_EVERY - Duration::from_secs(1);
+        state.lldpcli = Lldpcli::Missing(long_ago);
+        state.interfaces_at = None;
+        run_once(&mut state).await;
+        assert_ne!(state.lldpcli, Lldpcli::Missing(long_ago));
     }
 
     /// 인터페이스가 64개를 넘어도 자동 검사는 모두에서 찾고, 노드 상태에는 주소가 있는 것을 남긴 64개를 쓴다.

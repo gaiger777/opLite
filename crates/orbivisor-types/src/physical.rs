@@ -3,7 +3,7 @@
 //! `BondDegraded`)가 같은 계산을 쓴다. 입력은 노드 상태(`interfaces`·`bridges`·`underlay`·`sdn`)와 네트워크·VM 스펙뿐이다.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,10 +58,27 @@ pub struct NodePhysical {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub physnets: Vec<PhysnetState>,
-    /// 지금 장애가 난 포트·본딩마다 영향(포트 순서)
+    /// 지금 장애가 난 포트·본딩마다 영향(포트 순서). 오프라인 노드는 마지막으로 본 상태의 값이다(`online`이 거짓).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub impact: Vec<Impact>,
+    /// 이 노드에서 도는 VM이 NIC를 붙였는데 이 노드에 그 네트워크를 쓸 수단(브리지·physnet·underlay)이 없는 것(이름 순,
+    /// 계획 75 리뷰 1). 그 NIC는 끊겨 있다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub unreachable: Vec<Unreachable>,
+}
+
+/// 이 노드에 없는 네트워크에 붙은 VM NIC
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Unreachable {
+    /// 네트워크 id
+    pub network: Uuid,
+    /// 이 노드에서 그 네트워크에 NIC가 있는 VM 수
+    pub vms: u32,
+    /// 그 VM의 id([`MAX_IMPACT_VM_IDS`]개까지, 이름 순)
+    pub vm_ids: Vec<Uuid>,
 }
 
 /// 포트(인터페이스) 하나
@@ -103,8 +120,32 @@ pub struct Port {
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub bond: Option<PortBond>,
     pub role: PortRole,
-    /// 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들
+    /// 이 포트(또는 그 위)가 가진 주소의 쓰임: 클러스터 링크(`cluster_addresses`)·관리(노드 API 주소)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub uses: Vec<PortUse>,
+    /// 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들(관리자가 내렸으면 down)
     pub health: LinkHealth,
+}
+
+/// 주소를 가진 포트의 쓰임
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PortUse {
+    /// 노드의 클러스터 링크 주소(`NodeStatus.cluster_addresses`)
+    Cluster,
+    /// 노드의 API 주소(`NodeSpec.address`)
+    Management,
+}
+
+impl PortUse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cluster => "cluster link",
+            Self::Management => "management",
+        }
+    }
 }
 
 /// 포트 종류(`dummy` 등 그 밖은 `other`)
@@ -137,9 +178,12 @@ pub enum PortRole {
     Uplink,
     /// VXLAN·Geneve 주소를 가진 인터페이스와 그 아래
     Underlay,
+    /// 전역 주소(IPv4·IPv6, 링크 로컬 빼고)를 가진 물리 포트(이더넷·본딩·VLAN·그 밖)와 그 아래 — 스토리지·복제·관리·
+    /// 클러스터 링크망(계획 75 리뷰 1). 쓰임은 [`Port::uses`].
+    Service,
     /// 어디에도 묶이지 않고 주소도 없는 이더넷
     Unused,
-    /// 그 밖(관리 주소만 가진 포트, 업링크가 아닌 브리지 등)
+    /// 그 밖(업링크가 아닌 브리지, 어디에도 묶이지 않은 가상 장치 등)
     Other,
 }
 
@@ -218,6 +262,10 @@ pub struct Impact {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub underlay: bool,
+    /// 끊긴 포트가 실어 나르던 노드 주소의 쓰임(클러스터 링크·관리)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub uses: Vec<PortUse>,
     /// 영향받는 네트워크 id(이름 순)
     pub networks: Vec<Uuid>,
     /// 이 노드에서 그 네트워크에 NIC가 있는 VM 수
@@ -275,10 +323,12 @@ pub enum RailState {
     Up,
     /// 본딩 저하 등으로 이중화를 잃음
     Degraded,
-    /// 사슬이 끊김(노드 오프라인 포함)
+    /// 사슬이 끊김
     Down,
     /// 이 노드에 이 네트워크를 쓸 수단이 없음(브리지·physnet·underlay 없음)
     Absent,
+    /// 모름: 노드가 오프라인이거나, underlay 주소를 가진 인터페이스를 찾지 못했고 전에 본 것도 없음(계획 75 리뷰 1)
+    Unknown,
 }
 
 impl From<LinkHealth> for RailState {
@@ -296,10 +346,12 @@ impl From<LinkHealth> for RailState {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LinkRole {
-    /// 업링크·underlay 포트만([`PortRole::Uplink`]·[`PortRole::Underlay`])
+    /// 업링크·underlay·주소를 가진 포트([`PortRole::Uplink`]·[`PortRole::Underlay`]·[`PortRole::Service`])와 관리자가
+    /// 내린 브리지
     #[default]
     Uplink,
-    /// 모든 이더넷 포트(쓰지 않는 포트 포함)
+    /// 그에 더해 이더넷·VLAN 포트 모두(쓰지 않는 포트 포함). 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int` 등)는
+    /// 보지 않는다.
     Any,
 }
 
@@ -332,9 +384,50 @@ struct Host<'a> {
     vlan_ids: Vec<Option<u16>>,
     /// 브리지 이름 → `vlan_filtering`(opld가 만든 장치 뺌)
     bridges: BTreeMap<String, bool>,
+    /// 노드 주소의 쓰임(클러스터 링크·관리)
+    uses: Vec<(IpAddr, PortUse)>,
+}
+
+/// `host:port`·`[v6]:port`·주소만 가운데 IP 주소(이름이면 없음)
+fn ip_of(addr: &str) -> Option<IpAddr> {
+    addr.parse::<SocketAddr>()
+        .map(|a| a.ip())
+        .or_else(|_| addr.parse::<IpAddr>())
+        .ok()
+}
+
+/// 전역 주소인지(IPv4 링크 로컬 169.254/16·IPv6 fe80::/10·루프백 빼고)
+fn is_global(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local() && !v4.is_loopback() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) != 0xfe80 && !v6.is_loopback() && !v6.is_unspecified()
+        }
+    }
+}
+
+/// 인터페이스의 주소(CIDR에서 앞)
+fn addrs(i: &NodeInterface) -> impl Iterator<Item = IpAddr> + '_ {
+    i.addresses
+        .iter()
+        .filter_map(|a| a.split('/').next().and_then(|a| a.parse::<IpAddr>().ok()))
 }
 
 impl<'a> Host<'a> {
+    fn of(node: &'a Node) -> Host<'a> {
+        let mut host = Host::new(&node.status);
+        let cluster = node
+            .status
+            .cluster_addresses
+            .iter()
+            .filter_map(|a| ip_of(a));
+        host.uses = cluster
+            .map(|ip| (ip, PortUse::Cluster))
+            .chain(ip_of(&node.spec.address).map(|ip| (ip, PortUse::Management)))
+            .collect();
+        host
+    }
+
     fn new(status: &'a NodeStatus) -> Host<'a> {
         let ifs: Vec<&NodeInterface> = status
             .interfaces
@@ -381,6 +474,7 @@ impl<'a> Host<'a> {
             parents,
             vlan_ids,
             bridges,
+            uses: Vec::new(),
         }
     }
 
@@ -458,7 +552,8 @@ impl<'a> Host<'a> {
                     _ => redundant(&below()),
                 }
             }
-            // 브리지는 업링크가 없으면(내부 브리지) carrier가 없어도 끊김이 아니다.
+            // 관리자가 내린 브리지는 끊김이다. 올라와 있으면 업링크가 없을 때(내부 브리지) carrier가 없어도 끊김이 아니다.
+            InterfaceKind::Bridge if i.admin_up == Some(false) => LinkHealth::Down,
             InterfaceKind::Bridge => redundant(&below()),
             _ if link_down(i) => LinkHealth::Down,
             _ => below().into_iter().max().unwrap_or(LinkHealth::Up),
@@ -469,21 +564,69 @@ impl<'a> Host<'a> {
     fn holder(&self, ip: IpAddr) -> Option<&'a str> {
         self.ifs
             .iter()
-            .find(|i| {
-                i.addresses
-                    .iter()
-                    .any(|a| a.split('/').next().and_then(|a| a.parse::<IpAddr>().ok()) == Some(ip))
-            })
+            .find(|i| addrs(i).any(|a| a == ip))
             .map(|i| i.name.as_str())
     }
 
-    /// underlay 주소들(VXLAN `underlay`, SDN `encap_ip`)을 가진 인터페이스
+    /// underlay 주소 `ip`의 인터페이스: 지금 가진 것, 없으면 노드가 마지막으로 본 것(`underlay_ports` — 링크가 끊겨
+    /// 주소가 떨어졌거나 인터페이스가 사라졌음). 둘 다 없으면 모른다.
+    fn underlay_owner(&self, ip: IpAddr) -> Option<&'a str> {
+        self.holder(ip).or_else(|| {
+            self.status
+                .underlay_ports
+                .get(&ip.to_string())
+                .map(String::as_str)
+        })
+    }
+
+    /// underlay 주인의 상태: 목록에 없으면(사라진 인터페이스) 끊김이다.
+    fn owner_health(&self, name: &str) -> LinkHealth {
+        if self.get(name).is_some() {
+            self.health(name)
+        } else {
+            LinkHealth::Down
+        }
+    }
+
+    /// underlay 주소들(VXLAN `underlay`, SDN `encap_ip`)의 인터페이스
     fn underlay_holders(&self) -> BTreeSet<&'a str> {
         [self.status.underlay, encap_ip(self.status)]
             .into_iter()
             .flatten()
-            .filter_map(|ip| self.holder(ip))
+            .filter_map(|ip| self.underlay_owner(ip))
             .collect()
+    }
+
+    /// 이름과 그 아래 사슬
+    fn with_lower(&self, name: &'a str) -> BTreeSet<&'a str> {
+        let mut s = self.lower(name);
+        s.insert(name);
+        s
+    }
+
+    /// 전역 주소를 가진 브리지 아닌 인터페이스와 그 아래(역할 `service`의 후보)
+    fn addressed(&self) -> BTreeSet<&'a str> {
+        self.ifs
+            .iter()
+            .filter(|i| i.kind != InterfaceKind::Bridge && addrs(i).any(is_global))
+            .flat_map(|i| self.with_lower(&i.name))
+            .collect()
+    }
+
+    /// 인터페이스 `name`(또는 그 위)이 가진 노드 주소의 쓰임
+    fn uses_of(&self, name: &str) -> Vec<PortUse> {
+        let mut out: Vec<PortUse> = self
+            .uses
+            .iter()
+            .filter(|(ip, _)| {
+                self.holder(*ip)
+                    .is_some_and(|h| h == name || self.lower(h).contains(name))
+            })
+            .map(|(_, u)| *u)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn role(
@@ -491,6 +634,7 @@ impl<'a> Host<'a> {
         i: &NodeInterface,
         uplinks: &BTreeSet<&str>,
         underlay: &BTreeSet<&str>,
+        service: &BTreeSet<&str>,
     ) -> PortRole {
         let name = i.name.as_str();
         let master_is_bond = i
@@ -505,6 +649,9 @@ impl<'a> Host<'a> {
         }
         if underlay.contains(name) {
             return PortRole::Underlay;
+        }
+        if i.kind != InterfaceKind::Bridge && service.contains(name) {
+            return PortRole::Service;
         }
         let used = i.master.is_some()
             || !i.addresses.is_empty()
@@ -521,12 +668,9 @@ impl<'a> Host<'a> {
         let underlay: BTreeSet<&str> = self
             .underlay_holders()
             .into_iter()
-            .flat_map(|h| {
-                let mut s = self.lower(h);
-                s.insert(h);
-                s
-            })
+            .flat_map(|h| self.with_lower(h))
             .collect();
+        let service = self.addressed();
         self.ifs
             .iter()
             .enumerate()
@@ -547,7 +691,8 @@ impl<'a> Host<'a> {
                     state: b.state,
                     members: b.ports.clone(),
                 }),
-                role: self.role(i, &uplinks, &underlay),
+                role: self.role(i, &uplinks, &underlay, &service),
+                uses: self.uses_of(&i.name),
                 health: self.health(&i.name),
             })
             .collect()
@@ -594,7 +739,7 @@ impl<'a> Host<'a> {
         }
     }
 
-    /// 링크가 끊긴 포트(이더넷·그 밖·VLAN — VLAN은 아래 장치가 살았을 때만)와 그 무게
+    /// 링크가 끊긴 포트(이더넷·그 밖·VLAN — VLAN은 아래 장치가 살았을 때만 — 와 관리자가 내린 브리지)와 그 무게
     fn link_faults(&self, ports: &[Port]) -> Vec<(usize, FaultSeverity)> {
         self.ifs
             .iter()
@@ -606,7 +751,8 @@ impl<'a> Host<'a> {
                         PortKind::Vlan => self
                             .parent(&i.name)
                             .is_none_or(|p| self.health(p) != LinkHealth::Down),
-                        PortKind::Bond | PortKind::Bridge => false,
+                        PortKind::Bridge => i.admin_up == Some(false),
+                        PortKind::Bond => false,
                     }
             })
             .map(|(n, i)| (n, self.link_severity(i)))
@@ -721,40 +867,61 @@ fn rail_kind(spec: &NetworkSpec) -> (RailKind, String, Option<u16>) {
 // 공개 함수
 // ---------------------------------------------------------------------------------------------------------------
 
-/// 노드 상태 하나의 포트(역할·상태 포함). 네트워크·VM은 보지 않는다.
-pub fn ports(status: &NodeStatus) -> Vec<Port> {
-    Host::new(status).ports()
+/// 노드 하나의 포트(역할·쓰임·상태 포함). 네트워크·VM은 보지 않는다.
+pub fn ports(node: &Node) -> Vec<Port> {
+    Host::of(node).ports()
 }
 
-/// 링크 경보 `NodeLinkDown`: 이 노드 상태에서 지금 링크가 끊긴 포트. `role`이 `uplink`면 업링크·underlay 포트만,
-/// `ports`(글롭)가 있으면 그 이름만이다.
-pub fn link_faults(status: &NodeStatus, role: LinkRole, ports: Option<&str>) -> Vec<LinkFault> {
-    let host = Host::new(status);
+/// 기본 링크 경보가 보는 포트인지: 업링크·underlay·주소를 가진 포트, 관리자가 내린 브리지
+fn watched(p: &Port) -> bool {
+    matches!(
+        p.role,
+        PortRole::Uplink | PortRole::Underlay | PortRole::Service
+    ) || p.kind == PortKind::Bridge
+}
+
+/// 링크 경보 `NodeLinkDown`: 이 노드에서 지금 링크가 끊긴 포트. 본딩 구성 포트는 따로 세지 않는다(계획 75 리뷰 1): 본딩이
+/// 살아 있으면 이중화만 잃은 것이라 `BondDegraded`가 맡고, 본딩이 끊기면 본딩 이름 하나로 낸다. `role`이 `uplink`면 업링크·
+/// underlay·주소를 가진 포트와 관리자가 내린 브리지만, `any`면 이더넷·VLAN 포트도 모두(어디에도 묶이지 않은 가상 장치는
+/// 빼고), `ports`(글롭)가 있으면 그 이름만이다.
+pub fn link_faults(node: &Node, role: LinkRole, ports: Option<&str>) -> Vec<LinkFault> {
+    let host = Host::of(node);
     let list = host.ports();
-    host.link_faults(&list)
+    let members = host
+        .link_faults(&list)
+        .into_iter()
+        .filter(|(n, _)| host.bond_of(host.ifs[*n]).is_none());
+    let bonds = list
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind == PortKind::Bond && p.health == LinkHealth::Down)
+        .map(|(n, _)| (n, FaultSeverity::Down));
+    let mut faults: Vec<(usize, FaultSeverity)> = members.chain(bonds).collect();
+    faults.sort_by_key(|(n, _)| *n);
+    faults
         .into_iter()
         .map(|(n, severity)| (&list[n], severity))
-        .filter(|(p, _)| {
-            role == LinkRole::Any || matches!(p.role, PortRole::Uplink | PortRole::Underlay)
+        .filter(|(p, _)| match role {
+            LinkRole::Uplink => watched(p),
+            LinkRole::Any => watched(p) || matches!(p.kind, PortKind::Ethernet | PortKind::Vlan),
         })
         .filter(|(p, _)| ports.is_none_or(|g| glob_match(g, &p.name)))
         .map(|(p, severity)| LinkFault {
             port: p.name.clone(),
             severity,
-            bond: host
-                .bond_of(host.ifs[host.by_name[p.name.as_str()]])
-                .map(|b| b.name.clone()),
+            bond: None,
             role: p.role,
         })
         .collect()
 }
 
-/// 링크 경보 `BondDegraded`: 이 노드 상태에서 지금 저하·끊긴 본딩
-pub fn bond_faults(status: &NodeStatus) -> Vec<LinkFault> {
-    let host = Host::new(status);
+/// 링크 경보 `BondDegraded`: 이 노드에서 지금 저하된(아직 흐르는) 본딩. 끊긴 본딩은 `NodeLinkDown`이 본딩 이름으로 낸다.
+pub fn bond_faults(node: &Node) -> Vec<LinkFault> {
+    let host = Host::of(node);
     let list = host.ports();
     host.bond_faults(&list)
         .into_iter()
+        .filter(|(_, severity)| *severity == FaultSeverity::Degraded)
         .map(|(n, severity)| LinkFault {
             port: list[n].name.clone(),
             severity,
@@ -789,7 +956,7 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
         })
         .collect();
     for node in nodes {
-        let host = Host::new(&node.status);
+        let host = Host::of(node);
         let carriers: Vec<Option<Carrier>> = networks
             .iter()
             .map(|n| host.carrier(node, &n.spec))
@@ -867,14 +1034,20 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
         let mut impact = Vec::new();
         for (n, severity) in faults {
             let p = &ports[n];
-            if !matches!(p.role, PortRole::Uplink | PortRole::Underlay) {
+            if !watched(p) {
                 continue;
             }
-            let (above, holders) = host.tops(&p.name);
+            let (mut above, holders) = host.tops(&p.name);
+            if p.kind == PortKind::Bridge {
+                above.insert(0, p.name.as_str());
+            }
             let underlay_ips: Vec<IpAddr> = [node.status.underlay, encap_ip(&node.status)]
                 .into_iter()
                 .flatten()
-                .filter(|ip| host.holder(*ip).is_some_and(|h| holders.contains(&h)))
+                .filter(|ip| {
+                    host.underlay_owner(*ip)
+                        .is_some_and(|h| holders.contains(&h))
+                })
                 .collect();
             let nets: BTreeSet<usize> = carriers
                 .iter()
@@ -897,6 +1070,7 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
                 bond: host.bond_of(host.ifs[n]).map(|b| b.name.clone()),
                 bridges: above.iter().map(|b| b.to_string()).collect(),
                 underlay: !holders.is_empty(),
+                uses: p.uses.clone(),
                 networks: nets.iter().map(|i| networks[*i].id).collect(),
                 vms: hit.len() as u32,
                 vm_ids: hit.iter().take(MAX_IMPACT_VM_IDS).map(|vm| vm.id).collect(),
@@ -909,13 +1083,36 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
             .next()
             .map(|ip| UnderlayLink {
                 address: ip.to_string(),
-                port: host.holder(ip).map(str::to_string),
+                port: host.underlay_owner(ip).map(str::to_string),
             });
+
+        // 도는 VM의 NIC가 붙었는데 이 노드에 쓸 수단이 없는 네트워크
+        let unreachable = networks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| carriers[*i].is_none())
+            .filter_map(|(i, net)| {
+                let hit: Vec<&Vm> = here
+                    .iter()
+                    .filter(|(_, v)| v.contains(&i))
+                    .map(|(vm, _)| *vm)
+                    .collect();
+                (!hit.is_empty()).then(|| Unreachable {
+                    network: net.id,
+                    vms: hit.len() as u32,
+                    vm_ids: hit.iter().take(MAX_IMPACT_VM_IDS).map(|vm| vm.id).collect(),
+                })
+            })
+            .collect();
 
         if !node.spec.witness {
             for (i, rail) in rails.iter_mut().enumerate() {
+                // 오프라인 노드의 상태는 낡았으므로 쓸 수단이 있던 네트워크는 "모름"이다(끊김이 아니라).
                 let state = if !node.status.online {
-                    RailState::Down
+                    match &carriers[i] {
+                        None => RailState::Absent,
+                        Some(_) => RailState::Unknown,
+                    }
                 } else {
                     match &carriers[i] {
                         None => RailState::Absent,
@@ -941,9 +1138,9 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
                             if chassis_down {
                                 RailState::Down
                             } else {
-                                host.holder(*ip)
-                                    .map_or(LinkHealth::Up, |h| host.health(h))
-                                    .into()
+                                // 주소의 인터페이스를 못 찾고 전에 본 것도 없으면 모른다(정상으로 보이지 않게).
+                                host.underlay_owner(*ip)
+                                    .map_or(RailState::Unknown, |h| host.owner_health(h).into())
                             }
                         }
                     }
@@ -970,6 +1167,7 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
                 .map(|s| s.physnets.clone())
                 .unwrap_or_default(),
             impact,
+            unreachable,
         });
     }
     out.networks = rails;
@@ -990,6 +1188,7 @@ pub fn describe(node: &str, impact: &Impact) -> String {
     if impact.underlay {
         parts.push("underlay".into());
     }
+    parts.extend(impact.uses.iter().map(|u| u.as_str().to_string()));
     let count =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     if !impact.networks.is_empty() {
@@ -1061,6 +1260,7 @@ mod tests {
             parent: None,
             vlan_id: None,
             lldp: None,
+            admin_up: None,
         }
     }
 
@@ -1282,6 +1482,7 @@ mod tests {
                 bond: None,
                 bridges: vec!["vmbr0".into()],
                 underlay: false,
+                uses: vec![],
                 networks: vec![lan.id],
                 vms: 1,
                 vm_ids: vec![vms[0].id],
@@ -1293,7 +1494,7 @@ mod tests {
         );
         assert_eq!(p.nodes[0].bridges[0].health, LinkHealth::Down);
         assert_eq!(rail(&p, "lan")[0].1, RailState::Down);
-        let faults = link_faults(&n.status, LinkRole::Uplink, None);
+        let faults = link_faults(&n, LinkRole::Uplink, None);
         assert_eq!(
             faults,
             vec![LinkFault {
@@ -1304,7 +1505,7 @@ mod tests {
             }]
         );
         n.status.interfaces[0] = eth("eno1", Some("vmbr0"));
-        assert!(link_faults(&n.status, LinkRole::Uplink, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Uplink, None).is_empty());
         assert!(build(&[n], &[lan], &vms).nodes[0].impact.is_empty());
     }
 
@@ -1365,7 +1566,7 @@ mod tests {
         );
         assert_eq!(rail(&p, "lan")[0].1, RailState::Degraded);
         assert_eq!(
-            bond_faults(&n.status),
+            bond_faults(&n),
             vec![LinkFault {
                 port: "bond0".into(),
                 severity: FaultSeverity::Degraded,
@@ -1373,12 +1574,9 @@ mod tests {
                 role: PortRole::Uplink,
             }]
         );
-        assert_eq!(
-            link_faults(&n.status, LinkRole::Uplink, None)[0]
-                .bond
-                .as_deref(),
-            Some("bond0")
-        );
+        // 본딩이 살아 있으면 구성 포트의 끊김은 `node_link_down`이 아니다(이중화만 잃음 — `bond_degraded` 하나).
+        assert!(link_faults(&n, LinkRole::Uplink, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Any, None).is_empty());
 
         let mut n = n;
         n.status.interfaces[1] = down(eth("eno2", Some("bond0")));
@@ -1396,7 +1594,17 @@ mod tests {
             "eno1 down on svc01: bond0 down — vmbr0, 3 networks, 12 VMs"
         );
         assert_eq!(rail(&p, "lan")[0].1, RailState::Down);
-        assert_eq!(bond_faults(&n.status)[0].severity, FaultSeverity::Down);
+        // 본딩이 끊기면 본딩 이름 하나로 `node_link_down`(구성 포트는 따로 없음), `bond_degraded`는 아니다.
+        assert!(bond_faults(&n).is_empty());
+        assert_eq!(
+            link_faults(&n, LinkRole::Uplink, None),
+            vec![LinkFault {
+                port: "bond0".into(),
+                severity: FaultSeverity::Down,
+                bond: None,
+                role: PortRole::Uplink,
+            }]
+        );
     }
 
     /// 본딩이 저하인데 끊긴 구성 포트는 없음(LACP 어긋남): 본딩 자체가 영향의 포트다.
@@ -1428,7 +1636,7 @@ mod tests {
             describe("svc01", &i[0]),
             "bond0 degraded on svc01 — vmbr0, 1 network"
         );
-        assert!(link_faults(&n.status, LinkRole::Any, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Any, None).is_empty());
     }
 
     /// 본딩 위 VLAN 위 브리지(`eno1,eno2 → bond0 → bond0.100 → vmbr100`): 사슬 끝의 포트가 업링크이고 영향이
@@ -1500,7 +1708,8 @@ mod tests {
         assert_eq!(p.nodes[0].node, "a");
     }
 
-    /// 브리지 없음: 네트워크의 브리지가 없는 노드는 absent, 영향 없음. 오프라인 노드는 down, 위트니스는 레일에 없다.
+    /// 브리지 없음: 네트워크의 브리지가 없는 노드는 absent, 영향 없음. 오프라인 노드는 쓸 수단이 있던 레일이 모름(낡은
+    /// 상태로 끊김을 그리지 않음), 없던 레일은 absent, 위트니스는 레일에 없다.
     #[test]
     fn missing_bridge_offline_and_witness_nodes() {
         let a = node(
@@ -1523,9 +1732,13 @@ mod tests {
             [
                 ("a".to_string(), RailState::Up),
                 ("b".to_string(), RailState::Absent),
-                ("c".to_string(), RailState::Down),
+                ("c".to_string(), RailState::Unknown),
             ]
         );
+        let mut d = node("d", vec![eth("eno1", None)], &[]);
+        d.status.online = false;
+        let p2 = build(&[d], &[bridge_net("lan", "vmbr0")], &[]);
+        assert_eq!(rail(&p2, "lan")[0].1, RailState::Absent);
         assert_eq!(p.nodes.len(), 4);
         assert!(p.nodes.iter().all(|n| n.impact.is_empty()));
     }
@@ -1637,7 +1850,7 @@ mod tests {
         // `uplink`은 underlay 포트를 보고, 쓰지 않는 포트는 `any`에서만 본다.
         a.status.interfaces[1] = down(eth("eno1", None));
         let names = |role| -> Vec<String> {
-            link_faults(&a.status, role, None)
+            link_faults(&a, role, None)
                 .into_iter()
                 .map(|f| f.port)
                 .collect()
@@ -1645,11 +1858,11 @@ mod tests {
         assert_eq!(names(LinkRole::Uplink), ["eno4"]);
         assert_eq!(names(LinkRole::Any), ["eno4", "eno1"]);
         assert!(
-            link_faults(&a.status, LinkRole::Any, Some("eno1"))
+            link_faults(&a, LinkRole::Any, Some("eno1"))
                 .iter()
                 .all(|f| f.port == "eno1")
         );
-        assert!(link_faults(&a.status, LinkRole::Any, Some("eth*")).is_empty());
+        assert!(link_faults(&a, LinkRole::Any, Some("eth*")).is_empty());
     }
 
     /// SDN 오버레이: Geneve 주소(`encap_ip`)의 인터페이스로 따라가고, ovn-controller가 꺼졌으면 down, chassis가 아니면
@@ -1780,6 +1993,178 @@ mod tests {
         assert_eq!((i.vms, i.vm_ids.len()), (60, MAX_IMPACT_VM_IDS));
         assert_eq!(i.vm_ids[0], vms[0].id);
         assert_eq!(p.nodes[0].bridges[0].vm_nics, 60);
+    }
+
+    /// 주소만 가진 비본딩 NIC(스토리지·클러스터 링크·관리망)는 역할 `service`라 기본 경보·영향에 들고, 노드 주소의 쓰임을
+    /// 꼬리표로 단다. 링크 로컬 주소만 가진 포트는 아니다.
+    #[test]
+    fn addressed_ports_are_service_ports() {
+        let mut storage = eth("ens1f0", None);
+        storage.addresses = vec!["10.10.0.11/24".into(), "fe80::1/64".into()];
+        let mut vlan = iface("eno3.20", InterfaceKind::Vlan);
+        vlan.parent = Some("eno3".into());
+        vlan.addresses = vec!["192.168.0.181/24".into()];
+        let mut ll = eth("eno4", None);
+        ll.addresses = vec!["fe80::2/64".into(), "169.254.1.1/16".into()];
+        let mut n = node(
+            "svc01",
+            vec![down(storage), eth("eno3", None), vlan, down(ll)],
+            &[],
+        );
+        n.spec.address = "192.168.0.181:8006".into();
+        n.status.cluster_addresses = vec!["10.10.0.11:8007".into()];
+        let p = build(std::slice::from_ref(&n), &[], &[]);
+        let s = port(&p, "svc01", "ens1f0");
+        assert_eq!(
+            (s.role, s.uses.as_slice()),
+            (PortRole::Service, [PortUse::Cluster].as_slice())
+        );
+        for name in ["eno3", "eno3.20"] {
+            let x = port(&p, "svc01", name);
+            assert_eq!(
+                (x.role, x.uses.as_slice()),
+                (PortRole::Service, [PortUse::Management].as_slice()),
+                "{name}"
+            );
+        }
+        assert_eq!(port(&p, "svc01", "eno4").role, PortRole::Other);
+        let i = &p.nodes[0].impact;
+        assert_eq!(i.len(), 1, "{i:?}");
+        assert_eq!(i[0].uses, [PortUse::Cluster]);
+        assert_eq!(
+            describe("svc01", &i[0]),
+            "ens1f0 down on svc01 — cluster link"
+        );
+        let names: Vec<String> = link_faults(&n, LinkRole::Uplink, None)
+            .into_iter()
+            .map(|f| f.port)
+            .collect();
+        assert_eq!(names, ["ens1f0"]);
+    }
+
+    /// underlay 주소가 떨어진 인터페이스(NetworkManager가 carrier를 잃은 장치의 주소를 뗌): 노드가 마지막으로 본 이름
+    /// (`underlay_ports`)으로 그 포트를 계속 본다. 그 포트가 목록에서 사라졌으면 끊김, 본 것도 없으면 레일은 모름이다.
+    #[test]
+    fn underlay_falls_back_to_the_last_seen_port() {
+        let mut a = node("a", vec![down(eth("eno4", None))], &[]);
+        a.status.underlay = Some("10.1.0.11".parse().unwrap());
+        a.status
+            .underlay_ports
+            .insert("10.1.0.11".into(), "eno4".into());
+        let vx = net("vx", |s| s.vxlan = Some(Vxlan { vni: 5000 }));
+        let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
+        assert_eq!(port(&p, "a", "eno4").role, PortRole::Underlay);
+        assert_eq!(
+            p.nodes[0].underlay.as_ref().unwrap().port.as_deref(),
+            Some("eno4")
+        );
+        assert_eq!(rail(&p, "vx")[0].1, RailState::Down);
+        assert!(p.nodes[0].impact[0].underlay);
+        assert_eq!(link_faults(&a, LinkRole::Uplink, None)[0].port, "eno4");
+        // 그 인터페이스가 사라짐 → 끊김
+        a.status.interfaces.clear();
+        let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
+        assert_eq!(rail(&p, "vx")[0].1, RailState::Down);
+        // 본 것도 없음 → 모름(정상이 아님)
+        a.status.underlay_ports.clear();
+        let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
+        assert_eq!(rail(&p, "vx")[0].1, RailState::Unknown);
+        assert_eq!(p.nodes[0].underlay.as_ref().unwrap().port, None);
+    }
+
+    /// 본딩 구성 포트가 노드에서 사라짐(노드가 `missing`으로 남김): 본딩은 저하이고 `bond_degraded`가 본딩에 낸다.
+    #[test]
+    fn a_missing_bond_member_degrades_the_bond() {
+        let n = node(
+            "a",
+            vec![
+                eth("eno1", Some("bond0")),
+                bond(
+                    "bond0",
+                    Some("vmbr0"),
+                    BondState::Degraded,
+                    &[("eno1", PortState::Up), ("eno2", PortState::Missing)],
+                ),
+                br("vmbr0"),
+            ],
+            &[("vmbr0", false)],
+        );
+        let p = build(std::slice::from_ref(&n), &[bridge_net("lan", "vmbr0")], &[]);
+        assert_eq!(port(&p, "a", "bond0").health, LinkHealth::Degraded);
+        assert_eq!(rail(&p, "lan")[0].1, RailState::Degraded);
+        let i = &p.nodes[0].impact;
+        assert_eq!(
+            (i[0].port.as_str(), i[0].severity),
+            ("bond0", FaultSeverity::Degraded)
+        );
+        assert_eq!(bond_faults(&n)[0].port, "bond0");
+        assert!(link_faults(&n, LinkRole::Any, None).is_empty());
+    }
+
+    /// 관리자가 내린 브리지(`ip link set vmbr0 down`)는 업링크가 살아도 끊김이다. 올라와 있는 내부 브리지는 아니다.
+    #[test]
+    fn an_admin_down_bridge_is_down() {
+        let mut vmbr0 = br("vmbr0");
+        vmbr0.admin_up = Some(false);
+        vmbr0.state = "down".into();
+        vmbr0.carrier = Some(false);
+        let n = node(
+            "a",
+            vec![eth("eno1", Some("vmbr0")), vmbr0],
+            &[("vmbr0", false)],
+        );
+        let lan = bridge_net("lan", "vmbr0");
+        let vms = [vm("x", &n, VmPhase::Running, &["lan"])];
+        let p = build(std::slice::from_ref(&n), std::slice::from_ref(&lan), &vms);
+        assert_eq!(p.nodes[0].bridges[0].health, LinkHealth::Down);
+        assert_eq!(rail(&p, "lan")[0].1, RailState::Down);
+        let i = &p.nodes[0].impact[0];
+        assert_eq!(
+            (i.port.as_str(), i.bridges.as_slice(), i.vms),
+            ("vmbr0", ["vmbr0".to_string()].as_slice(), 1)
+        );
+        assert_eq!(link_faults(&n, LinkRole::Uplink, None)[0].port, "vmbr0");
+    }
+
+    /// `role: any`는 이더넷·VLAN과 묶인 포트를 본다. 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int`)는 늘 down이라
+    /// 보지 않는다.
+    #[test]
+    fn any_role_skips_unattached_virtual_devices() {
+        let n = node(
+            "a",
+            vec![
+                down(iface("ovs-system", InterfaceKind::Other)),
+                down(iface("br-int", InterfaceKind::Other)),
+                down(eth("eno9", None)),
+            ],
+            &[],
+        );
+        let names: Vec<String> = link_faults(&n, LinkRole::Any, None)
+            .into_iter()
+            .map(|f| f.port)
+            .collect();
+        assert_eq!(names, ["eno9"]);
+        assert!(link_faults(&n, LinkRole::Uplink, None).is_empty());
+    }
+
+    /// 도는 VM의 NIC 네트워크가 이 노드에 없으면 `unreachable`로 센다(멈춘 VM은 세지 않음).
+    #[test]
+    fn nics_on_networks_missing_from_the_node_are_unreachable() {
+        let n = node("a", vec![eth("eno1", None)], &[]);
+        let lan = bridge_net("lan", "vmbr0");
+        let vms = [
+            vm("x", &n, VmPhase::Running, &["lan"]),
+            vm("y", &n, VmPhase::Stopped, &["lan"]),
+        ];
+        let p = build(std::slice::from_ref(&n), std::slice::from_ref(&lan), &vms);
+        assert_eq!(
+            p.nodes[0].unreachable,
+            vec![Unreachable {
+                network: lan.id,
+                vms: 1,
+                vm_ids: vec![vms[0].id],
+            }]
+        );
     }
 
     #[test]

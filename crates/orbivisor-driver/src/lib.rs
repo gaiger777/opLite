@@ -28,9 +28,10 @@ pub use firewall::{Firewall, FirewallNic, Nft, ruleset};
 pub use hostcheck::{
     IpLink, LLDP_TIMEOUT, LinkProbe, NetFs, PING_TIMEOUT, PROBE_TIMEOUT, Paths, ProbeError,
     ProcBonding, ProcPort, RBD_PROBE_TIMEOUT, attach_lldp, bond_detail, bond_status, find_in_path,
-    interfaces, iscsi_logged_in, link_state, lldp_neighbors, parse_ip_addr, parse_lldp_neighbors,
-    parse_proc_bonding, parse_pvs, ping, ping_args, probe_dir, pv_paths, pvs, rados, rados_args,
-    rados_result, refresh_interfaces, reported_interfaces,
+    interfaces, iscsi_logged_in, keep_missing_bond_ports, link_state, lldp_neighbors,
+    parse_ip_addr, parse_lldp_neighbors, parse_proc_bonding, parse_pvs, ping, ping_args, probe_dir,
+    pv_paths, pvs, rados, rados_args, rados_result, refresh_interfaces, reported_interfaces,
+    underlay_ports,
 };
 pub use hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, CpuProbe, DiskBitmaps, DiskCounters,

@@ -87,6 +87,7 @@ async fn node(env: &Env, name: &str) -> Uuid {
         firmware_caps: None,
         backup_stores: Vec::new(),
         file_restore: None,
+        underlay_ports: Default::default(),
     };
     env.cluster.create(&node).await.unwrap();
     node.id

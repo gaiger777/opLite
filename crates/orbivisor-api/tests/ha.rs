@@ -149,6 +149,7 @@ async fn node_with(
         firmware_caps: None,
         backup_stores: Vec::new(),
         file_restore: None,
+        underlay_ports: Default::default(),
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();
@@ -2879,6 +2880,7 @@ async fn vm_net_node(env: &Env, name: &str, memory_mib: u64) -> Uuid {
                 parent: None,
                 vlan_id: None,
                 lldp: None,
+                admin_up: None,
                 name: "eth0".into(),
                 kind: InterfaceKind::Ethernet,
                 state: "up".into(),
@@ -2894,6 +2896,7 @@ async fn vm_net_node(env: &Env, name: &str, memory_mib: u64) -> Uuid {
                 parent: None,
                 vlan_id: None,
                 lldp: None,
+                admin_up: None,
                 name: "vmbr0".into(),
                 kind: InterfaceKind::Bridge,
                 state: "up".into(),

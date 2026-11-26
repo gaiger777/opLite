@@ -139,6 +139,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub interfaces: Vec<NodeInterface>,
+    /// underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
+    /// NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub underlay_ports: BTreeMap<String, String>,
     /// 이 노드의 HA 검사 결과(화면용, 바뀔 때만 쓴다). 리더는 리스 갱신에 실린 결과로 판단한다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
@@ -328,6 +333,11 @@ pub struct NodeInterface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub lldp: Option<LldpNeighbor>,
+    /// 관리자가 올렸는지(`ip -j`의 `flags`에 `UP`, 계획 75 리뷰 1). 모르면(옛 노드) 없다. 업링크가 없는 내부 브리지의
+    /// carrier 없음과 `ip link set … down`을 가른다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub admin_up: Option<bool>,
 }
 
 /// LLDP 이웃(스위치) 하나(`lldpcli -f json show neighbors`, 계획 75). 모르는 칸은 없다.
@@ -422,6 +432,9 @@ pub enum PortState {
     LacpMismatch,
     /// 올라온 포트 가운데 가장 빠른 것보다 느림
     SpeedMismatch,
+    /// 이 본딩에서 본 적 있는 구성 포트가 노드에서 사라짐(PCIe 장애·드라이버 unbind·핫플러그 제거, 계획 75 리뷰 1).
+    /// 옛 노드는 `unknown`으로 읽는다.
+    Missing,
     /// 이 빌드가 모르는 값(뒤 버전이 더한 상태). 이상도 정상도 아닌 "모름"으로 본다.
     #[serde(other)]
     Unknown,
@@ -874,6 +887,7 @@ mod tests {
                     parent: None,
                     vlan_id: None,
                     lldp: None,
+                    admin_up: None,
                     name: "bond0".into(),
                     kind: InterfaceKind::Bond,
                     state: "up".into(),
@@ -906,6 +920,7 @@ mod tests {
                     parent: None,
                     vlan_id: None,
                     lldp: None,
+                    admin_up: None,
                     name: "eno3".into(),
                     kind: InterfaceKind::Ethernet,
                     state: "down".into(),

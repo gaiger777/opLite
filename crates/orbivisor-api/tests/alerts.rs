@@ -1634,22 +1634,29 @@ async fn apply_set_drift_alerts_name_the_set() {
     assert!(text.contains("Apply set web drifted: 1 object"), "{text}");
 }
 
-/// 링크 경보(계획 75 §3.4): 노드 상태의 끊긴 업링크 포트(`node_link_down`)·저하된 본딩(`bond_degraded`)마다 하나, 문구는
-/// 영향(위 브리지·네트워크·VM). 역할 거르기(`uplink`는 쓰지 않는 포트를 보지 않음)와 포트 글롭, 포트가 돌아오면 해제.
+/// 링크 경보(계획 75 §3.4, 리뷰 1): 본딩 구성 포트 하나가 끊기면(본딩은 흐름) `bond_degraded`(warning) 하나만, 본딩이
+/// 통째로 끊기면 본딩 이름으로 `node_link_down`(critical) 하나 — 새 알림이다. 문구는 영향(위 브리지·네트워크·VM). 역할
+/// 거르기(`uplink`는 쓰지 않는 포트를 보지 않음)와 포트 글롭, 포트가 돌아오면 해제.
 #[tokio::test]
 async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     use orbivisor_types::network::Network;
     use orbivisor_types::node::{FEATURES, NodeInterface};
     use orbivisor_types::vm::{Vm, VmPhase};
 
-    let interfaces = |eno2_up: bool| -> Vec<NodeInterface> {
-        let eno2 = if eno2_up { "up" } else { "down" };
+    let interfaces = |eno1_up: bool, eno2_up: bool| -> Vec<NodeInterface> {
+        let st = |up: bool| if up { "up" } else { "down" };
+        let bond = match (eno1_up, eno2_up) {
+            (true, true) => "up",
+            (false, false) => "down",
+            _ => "degraded",
+        };
         serde_json::from_value(json!([
-            { "name": "eno1", "kind": "ethernet", "state": "up", "carrier": true, "master": "bond0" },
-            { "name": "eno2", "kind": "ethernet", "state": eno2, "carrier": eno2_up, "master": "bond0" },
-            { "name": "bond0", "kind": "bond", "state": "up", "carrier": true, "master": "vmbr0",
-              "bond": { "mode": "active-backup", "state": if eno2_up { "up" } else { "degraded" },
-                        "ports": [ { "name": "eno1", "state": "up" }, { "name": "eno2", "state": eno2 } ] } },
+            { "name": "eno1", "kind": "ethernet", "state": st(eno1_up), "carrier": eno1_up, "master": "bond0" },
+            { "name": "eno2", "kind": "ethernet", "state": st(eno2_up), "carrier": eno2_up, "master": "bond0" },
+            { "name": "bond0", "kind": "bond", "state": st(eno1_up || eno2_up), "carrier": eno1_up || eno2_up,
+              "master": "vmbr0",
+              "bond": { "mode": "active-backup", "state": bond,
+                        "ports": [ { "name": "eno1", "state": st(eno1_up) }, { "name": "eno2", "state": st(eno2_up) } ] } },
             { "name": "vmbr0", "kind": "bridge", "state": "up", "carrier": true },
             { "name": "eno3", "kind": "ethernet", "state": "down", "carrier": false }
         ]))
@@ -1663,7 +1670,7 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
         NodeStatus {
             online: true,
             features: FEATURES.iter().map(|f| f.to_string()).collect(),
-            interfaces: interfaces(false),
+            interfaces: interfaces(true, false),
             ..NodeStatus::default()
         },
     )
@@ -1697,64 +1704,78 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     )
     .await;
     let engine = rig.engine();
-    let hits = rig.hook.wait(3).await;
+    let hits = rig.hook.wait(2).await;
     settle().await;
-    assert_eq!(rig.hook.hits().len(), 3, "{:?}", rig.hook.hits());
+    // 구성 포트 하나: 본딩 저하 하나뿐(critical 포트 경보는 없음)
+    assert_eq!(rig.hook.hits().len(), 2, "{:?}", rig.hook.hits());
     let by_rule = |hits: &[Hit], rule: &str, state: &str| -> Value {
         hits.iter()
             .map(Hit::json)
             .find(|h| h["rule"] == rule && h["state"] == state)
             .unwrap_or_else(|| panic!("no {state} {rule} in {hits:?}"))
     };
-    let up = by_rule(&hits, "uplinks", "firing");
-    assert_eq!(
-        up["subject"],
-        json!({ "kind": "node", "id": svc01, "name": "svc01", "node": "svc01", "port": "eno2" }),
-        "{up}"
-    );
-    assert_eq!(
-        up["detail"], "eno2 down on svc01: bond0 degraded — vmbr0, 1 network, 1 VM",
-        "{up}"
-    );
-    assert!(
-        up["title"]
-            .as_str()
-            .unwrap()
-            .ends_with("uplinks on svc01/eno2"),
-        "{up}"
-    );
     let bond = by_rule(&hits, "bonds", "firing");
-    assert_eq!(bond["subject"]["port"], "bond0", "{bond}");
+    assert_eq!(
+        bond["subject"],
+        json!({ "kind": "node", "id": svc01, "name": "svc01", "node": "svc01", "port": "bond0",
+                "map": "/cluster/map?focus=port:svc01/bond0" }),
+        "{bond}"
+    );
     assert_eq!(
         bond["detail"], "eno2 down on svc01: bond0 degraded — vmbr0, 1 network, 1 VM",
+        "{bond}"
+    );
+    assert!(
+        bond["title"]
+            .as_str()
+            .unwrap()
+            .ends_with("bonds on svc01/bond0"),
         "{bond}"
     );
     // 쓰지 않는 포트는 `role: any`와 글롭으로만 본다(영향 없음).
     let spare = by_rule(&hits, "spare", "firing");
     assert_eq!(spare["subject"]["port"], "eno3", "{spare}");
     assert_eq!(spare["detail"], "eno3 down on svc01", "{spare}");
+
+    // 본딩이 통째로 끊김: 본딩 이름으로 critical 하나(새 알림), 저하 경보는 풀리기 시작한다.
+    let set = |eno1: bool, eno2: bool| {
+        let env = &rig.env;
+        async move {
+            let mut n = env.cluster.get::<NodeSpec>(svc01).unwrap().unwrap();
+            n.status.interfaces = interfaces(eno1, eno2);
+            env.cluster
+                .update_status::<NodeSpec>(svc01, &n.status)
+                .await
+                .unwrap();
+        }
+    };
+    set(false, false).await;
+    let hits = rig.hook.wait(3).await;
+    let up = by_rule(&hits, "uplinks", "firing");
+    assert_eq!(up["subject"]["port"], "bond0", "{up}");
+    assert_eq!(up["severity"], "critical", "{up}");
+    assert_eq!(
+        up["detail"], "eno1 down on svc01: bond0 down — vmbr0, 1 network, 1 VM",
+        "{up}"
+    );
     // 경보 목록도 포트마다
     let a = rig.alerts().await;
-    let ports: Vec<&str> = a["alerts"]
+    let mut ports: Vec<(String, String)> = a["alerts"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|a| a["subject"]["port"].as_str().unwrap())
+        .map(|a| {
+            (
+                a["rule_name"].as_str().unwrap_or_default().to_string(),
+                a["subject"]["port"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
+    ports.sort();
     assert_eq!(ports.len(), 3, "{a}");
-    assert!(
-        ports.contains(&"eno2") && ports.contains(&"bond0") && ports.contains(&"eno3"),
-        "{a}"
-    );
 
-    // eno2가 돌아오면 60초 뒤 두 경보가 풀린다(eno3는 그대로).
-    let mut n = rig.env.cluster.get::<NodeSpec>(svc01).unwrap().unwrap();
-    n.status.interfaces = interfaces(true);
-    rig.env
-        .cluster
-        .update_status::<NodeSpec>(svc01, &n.status)
-        .await
-        .unwrap();
+    // 모두 돌아오면 60초 뒤 두 경보가 풀린다(eno3는 그대로).
+    set(true, true).await;
     rig.wait_alerts(|a| {
         a["alerts"]
             .as_array()
@@ -1775,6 +1796,106 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     let a = rig.alerts().await;
     assert_eq!(a["alerts"].as_array().unwrap().len(), 1, "{a}");
     assert_eq!(a["alerts"][0]["subject"]["port"], "eno3", "{a}");
+    engine.shutdown().await;
+}
+
+/// 리뷰 1: 주소만 가진 NIC(스토리지·클러스터 링크망)도 기본 규칙이 본다. 경보가 난 포트가 인터페이스 목록에서 사라지면
+/// 풀지 않고 그대로 두고(다시 나타나 살아 있으면 풀림), 오프라인 노드의 경보는 되풀이하지 않는다.
+#[tokio::test]
+async fn link_alerts_hold_vanished_ports_and_stay_quiet_offline() {
+    use orbivisor_types::node::{FEATURES, NodeInterface};
+
+    let storage = |present: bool, up: bool| -> Vec<NodeInterface> {
+        let st = if up { "up" } else { "down" };
+        let mut list =
+            vec![json!({ "name": "eno1", "kind": "ethernet", "state": "up", "carrier": true })];
+        if present {
+            list.push(
+                json!({ "name": "ens1f0", "kind": "ethernet", "state": st, "carrier": up,
+                              "addresses": ["10.10.0.11/24"] }),
+            );
+        }
+        serde_json::from_value(Value::Array(list)).unwrap()
+    };
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    let svc01 = add_node(
+        &rig.env,
+        "svc01",
+        NodeStatus {
+            online: true,
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+            cluster_addresses: vec!["10.10.0.11:8007".into()],
+            interfaces: storage(true, false),
+            ..NodeStatus::default()
+        },
+    )
+    .await;
+    rig.rule(
+        "uplinks",
+        json!({"condition": {"kind": "node_link_down"}, "severity": "critical", "for_secs": 0,
+               "repeat_secs": 60, "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    let hits = rig.hook.wait(1).await;
+    let first = hits[0].json();
+    assert_eq!(first["subject"]["port"], "ens1f0", "{first}");
+    assert_eq!(
+        first["detail"], "ens1f0 down on svc01 — cluster link",
+        "{first}"
+    );
+
+    let set = |f: &dyn Fn(&mut NodeStatus)| {
+        let mut n = rig.env.cluster.get::<NodeSpec>(svc01).unwrap().unwrap();
+        f(&mut n.status);
+        n.status
+    };
+    // 사라짐: 풀리지 않고(해제 시작 없음) 그대로
+    let status = set(&|s| s.interfaces = storage(false, false));
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(svc01, &status)
+        .await
+        .unwrap();
+    settle().await;
+    rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
+    settle().await;
+    let a = rig.alerts().await;
+    assert_eq!(a["alerts"].as_array().unwrap().len(), 1, "{a}");
+    assert!(a["alerts"][0]["clear_since"].is_null(), "{a}");
+    // 되풀이 때가 지나면 "사라짐"으로 다시 알린다.
+    let hits = rig.hook.wait(2).await;
+    assert_eq!(hits[1].json()["detail"], "ens1f0 disappeared from svc01");
+
+    // 오프라인: 그대로 두되 되풀이하지 않는다.
+    let status = set(&|s| s.online = false);
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(svc01, &status)
+        .await
+        .unwrap();
+    settle().await;
+    rig.step(120_000, 1.0);
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 2, "{:?}", rig.hook.hits());
+    assert_eq!(rig.alerts().await["alerts"].as_array().unwrap().len(), 1);
+
+    // 다시 켜지고 포트가 돌아와 살아 있으면 풀린다.
+    let status = set(&|s| {
+        s.online = true;
+        s.interfaces = storage(true, true);
+    });
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(svc01, &status)
+        .await
+        .unwrap();
+    rig.wait_alerts(|a| a["alerts"][0]["clear_since"].is_i64())
+        .await;
+    rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
+    let hits = rig.hook.wait(3).await;
+    assert_eq!(hits[2].json()["state"], "resolved", "{:?}", hits[2].json());
     engine.shutdown().await;
 }
 

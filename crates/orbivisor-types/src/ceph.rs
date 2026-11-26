@@ -523,6 +523,7 @@ mod tests {
                     parent: None,
                     vlan_id: None,
                     lldp: None,
+                    admin_up: None,
                     name: name.to_string(),
                     kind: InterfaceKind::Ethernet,
                     state: "up".into(),
