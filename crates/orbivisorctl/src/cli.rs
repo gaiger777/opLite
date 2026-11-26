@@ -175,6 +175,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PlacementCmd,
     },
+    /// 노드마다 할당·사용(vCPU·오버커밋·CPU 사용률, 메모리, 로컬 풀 프로비전)과 공유 풀(계획 75 `GET /capacity`)
+    Capacity,
     /// VM 백업(백업 풀에 담은 디스크 복사본과 VM 설정)과 복원
     Backup {
         #[command(subcommand)]
@@ -4334,6 +4336,97 @@ fn placement_node_row(n: &Value) -> Vec<String> {
     ]
 }
 
+/// `capacity`의 노드 표 열
+const CAPACITY_NODE_HEADERS: &[&str] = &[
+    "NODE",
+    "ONLINE",
+    "VCPUS",
+    "OVERCOMMIT",
+    "CPU",
+    "MEMORY",
+    "MEM USED",
+    "STORAGE",
+];
+
+/// `capacity`의 공유 풀 표 열
+const CAPACITY_POOL_HEADERS: &[&str] =
+    &["POOL", "PROVISIONED", "USED", "TOTAL", "VOLUMES", "NODES"];
+
+/// `capacity`의 노드 행: VCPUS는 공유 정책 VM의 vCPU/공유 스레드(`threads − reserved − dedicated_total` — 오버커밋과 같은
+/// 셈, 웹 표의 CPU 막대와 같음), MEMORY는 할당/전체,
+/// STORAGE는 로컬 풀 프로비전 합/전체 합
+fn capacity_node_row(n: &Value) -> Vec<String> {
+    let cpu = &n["cpu"];
+    let shared = cpu["threads"].as_u64().unwrap_or(0).saturating_sub(
+        cpu["reserved"].as_u64().unwrap_or(0) + cpu["dedicated_total"].as_u64().unwrap_or(0),
+    );
+    let mem = &n["memory"];
+    let pools = n["storage"].as_array().cloned().unwrap_or_default();
+    let sum = |key: &str| pools.iter().filter_map(|p| p[key].as_u64()).sum::<u64>();
+    let storage = if pools.is_empty() {
+        "-".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            bytes(&json!(sum("provisioned_bytes"))),
+            bytes(&json!(sum("total_bytes")))
+        )
+    };
+    let ratio = |v: &Value| {
+        v.as_f64()
+            .map_or_else(|| "-".into(), |r| format!("x{r:.2}"))
+    };
+    vec![
+        cell(&n["node"]),
+        if n["online"].as_bool() == Some(true) {
+            "yes"
+        } else {
+            "no"
+        }
+        .into(),
+        format!("{}/{shared}", cell(&cpu["vcpus_shared"])),
+        ratio(&cpu["overcommit"]),
+        percent_cell(&cpu["use_pct"]),
+        mib_pair_cell(&mem["allocated_mib"], &mem["total_mib"]),
+        mib_cell(&mem["used_mib"]),
+        storage,
+    ]
+}
+
+/// `capacity`의 공유 풀 행
+fn capacity_pool_row(p: &Value) -> Vec<String> {
+    vec![
+        cell(&p["pool"]),
+        bytes(&p["provisioned_bytes"]),
+        bytes(&p["used_bytes"]),
+        bytes(&p["total_bytes"]),
+        cell(&p["volumes"]),
+        format!("{}/{}", cell(&p["nodes_ready"]), cell(&p["nodes"])),
+    ]
+}
+
+async fn capacity(
+    client: &Client,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let cap = client.get("/capacity").await?;
+    if json_out {
+        print_json(out, &cap)?;
+        return Ok(());
+    }
+    let nodes = cap["nodes"].as_array().cloned().unwrap_or_default();
+    let rows: Vec<_> = nodes.iter().map(capacity_node_row).collect();
+    table(out, CAPACITY_NODE_HEADERS, &rows)?;
+    let pools = cap["shared_pools"].as_array().cloned().unwrap_or_default();
+    if !pools.is_empty() {
+        writeln!(out)?;
+        let rows: Vec<_> = pools.iter().map(capacity_pool_row).collect();
+        table(out, CAPACITY_POOL_HEADERS, &rows)?;
+    }
+    Ok(())
+}
+
 /// `placement recommendations`의 표 열
 const RECOMMENDATION_HEADERS: &[&str] = &["ID", "VM", "FROM", "TO", "REASON", "GAIN", "COST"];
 
@@ -6842,6 +6935,7 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         Cmd::Realm { cmd } => realm(&client, cmd, json_out, out).await?,
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
         Cmd::Placement { cmd } => placement(&client, cmd, json_out, out).await?,
+        Cmd::Capacity => capacity(&client, json_out, out).await?,
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
         Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
         Cmd::Alert { cmd } => alert(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
@@ -16027,6 +16121,54 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
         }
         assert!(Cli::try_parse_from(["oplctl", "placement", "status"]).is_ok());
+    }
+
+    /// `capacity` 행: vCPU는 공유 vCPU/공유 스레드, 오버커밋·사용률·사용 메모리가 없으면 `-`, 로컬 풀은 합
+    #[test]
+    fn capacity_rows() {
+        let node = json!({
+            "node": "svc01", "online": true,
+            "cpu": { "threads": 16, "reserved": 2, "dedicated_total": 4, "dedicated_used": 2,
+                     "vcpus_allocated": 20, "vcpus_running": 12, "vcpus_shared": 18,
+                     "overcommit": 1.8, "use_pct": 37.25 },
+            "memory": { "total_mib": 65536, "reserved_mib": 0, "allocated_mib": 32768, "used_mib": 16384 },
+            "storage": [
+                { "pool": "local", "ready": true, "total_bytes": 1u64 << 40, "used_bytes": 1u64 << 38,
+                  "provisioned_bytes": 1u64 << 39, "volumes": 3 },
+                { "pool": "fast", "ready": true, "total_bytes": 1u64 << 40, "used_bytes": 0,
+                  "provisioned_bytes": 1u64 << 39, "volumes": 1 }
+            ]
+        });
+        assert_eq!(
+            capacity_node_row(&node),
+            [
+                "svc01",
+                "yes",
+                "18/10",
+                "x1.80",
+                "37.2%",
+                "32.0GiB/64.0GiB",
+                "16.0GiB",
+                "1.0TiB/2.0TiB"
+            ]
+        );
+        let bare = json!({
+            "node": "svc02", "online": false,
+            "cpu": { "threads": 0, "reserved": 0, "dedicated_total": 0, "dedicated_used": 0,
+                     "vcpus_allocated": 0, "vcpus_running": 0, "vcpus_shared": 0 },
+            "memory": { "total_mib": 0, "reserved_mib": 0, "allocated_mib": 0 },
+            "storage": []
+        });
+        assert_eq!(
+            capacity_node_row(&bare),
+            ["svc02", "no", "0/0", "-", "-", "0B/0B", "-", "-"]
+        );
+        let pool = json!({ "pool": "ceph", "total_bytes": 1024, "used_bytes": 0,
+                           "provisioned_bytes": 2048, "volumes": 2, "nodes_ready": 1, "nodes": 2 });
+        assert_eq!(
+            capacity_pool_row(&pool),
+            ["ceph", "2.0KiB", "0B", "1.0KiB", "2", "1/2"]
+        );
     }
 
     /// `placement status`의 머리 줄(빠진 설정은 기본값)과 노드 행(요약이 없으면 `-`)

@@ -155,6 +155,12 @@ pub(crate) enum RuleCmd {
         #[arg(long = "target", value_name = "NAME", required = true)]
         targets: Vec<String>,
     },
+    /// 권하는 링크 경보 규칙 둘(`node-link-down`·`bond-degraded`)을 한 번에 만든다. 같은 이름의 규칙은 그대로 둔다.
+    AddLinkDefaults {
+        /// 알림 대상 이름(여러 번 줄 수 있다)
+        #[arg(long = "target", value_name = "NAME", required = true)]
+        targets: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -688,21 +694,36 @@ pub(crate) async fn alert(
                 writeln!(out, "alert rule {rule} deleted")?;
             }
             RuleCmd::AddSdnDefaults { targets } => {
-                let resp = client
-                    .post("/alert-rules/sdn-defaults", &json!({ "targets": targets }))
+                add_default_rules(client, "/alert-rules/sdn-defaults", targets, json_out, out)
                     .await?;
-                if json_out {
-                    print_json(out, &resp)?;
-                } else {
-                    for r in resp["created"].as_array().into_iter().flatten() {
-                        writeln!(out, "alert rule {} created", cell(&r["name"]))?;
-                    }
-                    for name in resp["existing"].as_array().into_iter().flatten() {
-                        writeln!(out, "alert rule {} already exists; kept", cell(name))?;
-                    }
-                }
+            }
+            RuleCmd::AddLinkDefaults { targets } => {
+                add_default_rules(client, "/alert-rules/link-defaults", targets, json_out, out)
+                    .await?;
             }
         },
+    }
+    Ok(())
+}
+
+/// 권하는 묶음(`sdn-defaults`·`link-defaults`)을 대상과 함께 한 번 보내고 만든 것·그대로 둔 것을 줄마다 알린다.
+async fn add_default_rules(
+    client: &Client,
+    path: &str,
+    targets: Vec<String>,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let resp = client.post(path, &json!({ "targets": targets })).await?;
+    if json_out {
+        print_json(out, &resp)?;
+    } else {
+        for r in resp["created"].as_array().into_iter().flatten() {
+            writeln!(out, "alert rule {} created", cell(&r["name"]))?;
+        }
+        for name in resp["existing"].as_array().into_iter().flatten() {
+            writeln!(out, "alert rule {} already exists; kept", cell(name))?;
+        }
     }
     Ok(())
 }
@@ -1469,6 +1490,34 @@ mod tests {
             "POST /api/v1/alert-rules/sdn-defaults HTTP/1.1"
         );
         assert_eq!(seen[0].body, json!({ "targets": ["ops", "pager"] }));
+    }
+
+    /// `alert rule add-link-defaults`도 같은 모양으로 `link-defaults`에 한 번 보낸다(계획 75 §3.4).
+    #[tokio::test]
+    async fn link_defaults_are_one_request() {
+        let (client, seen) = fake_api(|_, _| {
+            (
+                200,
+                json!({ "created": [{ "name": "node-link-down" }], "existing": ["bond-degraded"] }),
+            )
+        })
+        .await;
+        assert!(Cli::try_parse_from(["t", "alert", "rule", "add-link-defaults"]).is_err());
+        let cmd = alert_cmd(&["rule", "add-link-defaults", "--target", "ops"]);
+        let mut out = Vec::new();
+        alert(&client, cmd, false, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "alert rule node-link-down created\nalert rule bond-degraded already exists; kept\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0].line,
+            "POST /api/v1/alert-rules/link-defaults HTTP/1.1"
+        );
+        assert_eq!(seen[0].body, json!({ "targets": ["ops"] }));
     }
 
     /// 활성 경보와 보낸 기록은 표로 보이고 빠진 노드·잘림은 stderr에 알린다. `--since 1h`는 밀리초로 바꿔 보낸다.
