@@ -2778,6 +2778,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/nodes/{key}/forget-ports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드가 기억하는 포트(`NodeStatus.known_ports`, 리뷰 2)를 잊는다: NIC를 빼거나 다른 이름의 NIC로 바꿨거나, 주소를
+         *     일부러 지운 포트가 `missing`·끊김으로 남지 않게 한다. 리더가 노드 상태의 기억에서 지우고(revision 확인), 노드의
+         *     다음 수집은 그 상태에서 이어 가므로 다시 넣지 않는다 — 지금 쓰는 포트라면 다음 수집이 다시 기억한다. 그 포트의
+         *     링크 경보는 해제 규칙대로 풀린다. 기억에 없는 이름만이면 404 `not_found`, 모든 노드가 `link-alerts`를 알아야 한다
+         *     (409 `cluster_upgrading`). 권한은 노드 바꾸기(`cluster.admin`).
+         */
+        post: operations["forget_ports"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/nodes/{key}/metrics": {
         parameters: {
             query?: never;
@@ -8341,6 +8364,11 @@ export interface components {
             /** @description 하위 트리 사용량(할당 기준, 전원과 무관). 템플릿은 디스크만 센다. */
             usage: components["schemas"]["FolderUsage"];
         };
+        /** @description `POST /nodes/{key}/forget-ports`의 몸 */
+        ForgetPorts: {
+            /** @description 잊을 포트 이름(1~64개) */
+            ports: string[];
+        };
         /**
          * @description 라우터 게이트웨이의 지금 모양
          * @enum {string}
@@ -9084,6 +9112,8 @@ export interface components {
             bond?: string;
             /** @description 위에 있는 브리지(이름 순) */
             bridges: string[];
+            /** @description 포트가 노드에서 사라짐(노드가 기억한 포트, 계획 75 리뷰 2) */
+            missing?: boolean;
             /** @description 영향받는 네트워크 id(이름 순) */
             networks: string[];
             /** @description 장애가 난 포트(이더넷·VLAN의 링크 끊김) 또는 본딩(구성 포트에 링크 끊김이 없는 저하·끊김) */
@@ -9573,6 +9603,37 @@ export interface components {
          * @enum {string}
          */
         Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store" | "vmware-source" | "vmware-migration" | "vmware-vm" | "vm-export" | "apply-set" | "acme-account" | "acme-dns" | "certificate";
+        /**
+         * @description 노드가 기억하는 포트 하나(`NodeStatus.known_ports`, 계획 75 리뷰 2). 역할이 업링크·underlay·service였던 이더넷·그 밖·
+         *     VLAN·본딩을 이름으로 기억한다. 장애 순간 주소가 떨어지거나(NetworkManager·networkd가 carrier를 잃은 장치의 주소를 뗌)
+         *     netdev가 사라져도(PCIe 장애·unbind·핫플러그 제거) 역할이 바뀌어 감시 밖으로 빠지지 않게 한다. 사라짐(`missing`)은
+         *     이더넷·그 밖만 남긴다 — VLAN·본딩은 지우지 않는 한 사라지지 않으므로 사라지면 잊는다. 잊는 길은 그 포트가 다시 나타나
+         *     감시 밖 역할이 되거나(관리자가 다시 구성), 본딩에 새 구성 포트가 들어오거나(그 본딩의 사라진 구성 포트), 운영자가
+         *     `forget-ports`로 지우는 것이다.
+         */
+        KnownPort: {
+            /**
+             * @description 이 포트가 스스로 가졌던 전역 주소(CIDR 없이, 마지막으로 본 것). 지금 이 포트도 다른 인터페이스도 이 주소를 갖지
+             *     않으면 주소를 잃은 것이다. 쓰임(클러스터 링크·관리)은 이 주소로 다시 셈한다.
+             */
+            addresses?: string[];
+            /** @description 속했던 본딩 */
+            bond?: string;
+            /** @description 위에 있던 브리지(이름 순) — 본딩 밖 업링크가 사라지면 그 브리지는 그 업링크를 잃은 것이다. */
+            bridges?: string[];
+            kind: components["schemas"]["PortKind"];
+            /**
+             * Format: int64
+             * @description 처음 기억했거나 다시 나타난 때, 사라졌으면 사라진 것을 안 때(유닉스 ms). 매 회차 바꾸지 않는다(노드 상태를
+             *     쓸데없이 다시 쓰지 않게).
+             */
+            last_seen_ms: number;
+            /** @description 노드의 인터페이스에서 사라짐 */
+            missing?: boolean;
+            name: string;
+            /** @description 마지막으로 본 역할(업링크·underlay·service) */
+            role: components["schemas"]["PortRole"];
+        };
         /** @description 바깥 VIP */
         LbExternal: {
             /**
@@ -10675,6 +10736,13 @@ export interface components {
                      */
                     interfaces?: components["schemas"]["NodeInterface"][];
                     /**
+                     * @description 노드가 기억하는 포트(계획 75 리뷰 2, [`crate::physical::KnownPort`]): 역할이 업링크·underlay·service였던 포트를
+                     *     이름으로 기억해, 링크가 끊길 때 주소가 떨어지거나 netdev가 사라져도 물리 관계·링크 경보가 그 포트를 그 역할 그대로
+                     *     끊김으로 본다. 노드가 쓰고(지난 값에서 이어 가므로 다시 시작해도 남음), 리더는 `POST /nodes/{key}/forget-ports`로
+                     *     일부러 뺀 포트를 지운다. 옛 노드는 무시한다.
+                     */
+                    known_ports?: components["schemas"]["KnownPort"][];
+                    /**
                      * Format: int64
                      * @default 0
                      */
@@ -10714,13 +10782,6 @@ export interface components {
                      *     None).
                      */
                     underlay?: string;
-                    /**
-                     * @description underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
-                     *     NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
-                     */
-                    underlay_ports?: {
-                        [key: string]: string;
-                    };
                     /**
                      * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
                      *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
@@ -12922,6 +12983,13 @@ export interface components {
              */
             interfaces?: components["schemas"]["NodeInterface"][];
             /**
+             * @description 노드가 기억하는 포트(계획 75 리뷰 2, [`crate::physical::KnownPort`]): 역할이 업링크·underlay·service였던 포트를
+             *     이름으로 기억해, 링크가 끊길 때 주소가 떨어지거나 netdev가 사라져도 물리 관계·링크 경보가 그 포트를 그 역할 그대로
+             *     끊김으로 본다. 노드가 쓰고(지난 값에서 이어 가므로 다시 시작해도 남음), 리더는 `POST /nodes/{key}/forget-ports`로
+             *     일부러 뺀 포트를 지운다. 옛 노드는 무시한다.
+             */
+            known_ports?: components["schemas"]["KnownPort"][];
+            /**
              * Format: int64
              * @default 0
              */
@@ -12961,13 +13029,6 @@ export interface components {
              *     None).
              */
             underlay?: string;
-            /**
-             * @description underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
-             *     NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
-             */
-            underlay_ports?: {
-                [key: string]: string;
-            };
             /**
              * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
              *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
@@ -13791,10 +13852,15 @@ export interface components {
         };
         /** @description 포트(인터페이스) 하나 */
         Port: {
+            /** @description 이 포트가 가진 전역 주소(CIDR 없이). 주소를 잃었거나 사라진 기억 포트는 마지막으로 가졌던 주소다(계획 75 리뷰 2). */
+            addresses?: string[];
             /** @description 본딩이면 모드·상태·구성 포트 */
             bond?: components["schemas"]["PortBond"];
             carrier?: boolean;
-            /** @description 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들(관리자가 내렸으면 down) */
+            /**
+             * @description 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들(관리자가 내렸으면 down).
+             *     주소를 잃은 기억 포트·사라진 기억 포트(`state: missing`)는 down이다(계획 75 리뷰 2).
+             */
             health: components["schemas"]["LinkHealth"];
             kind: components["schemas"]["PortKind"];
             lldp?: components["schemas"]["LldpNeighbor"];
@@ -15379,6 +15445,13 @@ export interface components {
                  */
                 interfaces?: components["schemas"]["NodeInterface"][];
                 /**
+                 * @description 노드가 기억하는 포트(계획 75 리뷰 2, [`crate::physical::KnownPort`]): 역할이 업링크·underlay·service였던 포트를
+                 *     이름으로 기억해, 링크가 끊길 때 주소가 떨어지거나 netdev가 사라져도 물리 관계·링크 경보가 그 포트를 그 역할 그대로
+                 *     끊김으로 본다. 노드가 쓰고(지난 값에서 이어 가므로 다시 시작해도 남음), 리더는 `POST /nodes/{key}/forget-ports`로
+                 *     일부러 뺀 포트를 지운다. 옛 노드는 무시한다.
+                 */
+                known_ports?: components["schemas"]["KnownPort"][];
+                /**
                  * Format: int64
                  * @default 0
                  */
@@ -15418,13 +15491,6 @@ export interface components {
                  *     None).
                  */
                 underlay?: string;
-                /**
-                 * @description underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
-                 *     NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
-                 */
-                underlay_ports?: {
-                    [key: string]: string;
-                };
                 /**
                  * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
                  *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
@@ -25855,6 +25921,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FenceTestResult"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    forget_ports: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ForgetPorts"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_NodeSpec_NodeStatus"];
                 };
             };
             "4XX": {

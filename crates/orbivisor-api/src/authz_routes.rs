@@ -139,6 +139,7 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/nodes/{key}/upgrade", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/drain", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/unfreeze", Root(ClusterAdmin)),
+    ("POST", "/nodes/{key}/forget-ports", Root(ClusterAdmin)),
     ("GET", "/nodes/{key}/fence", Root(ClusterAdmin)),
     ("PUT", "/nodes/{key}/fence", Root(ClusterAdmin)),
     ("DELETE", "/nodes/{key}/fence", Root(ClusterAdmin)),

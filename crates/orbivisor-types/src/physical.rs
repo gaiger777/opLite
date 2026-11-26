@@ -12,7 +12,7 @@ use crate::capacity::placed_on;
 use crate::network::{Network, NetworkSpec, is_managed_ifname};
 use crate::node::{
     BondPort, BondState, InterfaceKind, LldpNeighbor, Node, NodeInterface, NodeStatus,
-    OPERATOR_DASHBOARD,
+    OPERATOR_DASHBOARD, PortState,
 };
 use crate::sdn::{ChassisState, PhysnetState};
 use crate::vm::Vm;
@@ -124,7 +124,12 @@ pub struct Port {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub uses: Vec<PortUse>,
-    /// 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들(관리자가 내렸으면 down)
+    /// 이 포트가 가진 전역 주소(CIDR 없이). 주소를 잃었거나 사라진 기억 포트는 마지막으로 가졌던 주소다(계획 75 리뷰 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub addresses: Vec<String>,
+    /// 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들(관리자가 내렸으면 down).
+    /// 주소를 잃은 기억 포트·사라진 기억 포트(`state: missing`)는 down이다(계획 75 리뷰 2).
     pub health: LinkHealth,
 }
 
@@ -157,6 +162,8 @@ pub enum PortKind {
     Bond,
     Vlan,
     Bridge,
+    /// 그 밖, 그리고 이 빌드가 모르는 값(뒤 버전이 더한 종류 — 노드 상태의 기억 포트를 읽을 수 있게)
+    #[serde(other)]
     Other,
 }
 
@@ -183,7 +190,8 @@ pub enum PortRole {
     Service,
     /// 어디에도 묶이지 않고 주소도 없는 이더넷
     Unused,
-    /// 그 밖(업링크가 아닌 브리지, 어디에도 묶이지 않은 가상 장치 등)
+    /// 그 밖(업링크가 아닌 브리지, 어디에도 묶이지 않은 가상 장치 등), 그리고 이 빌드가 모르는 값(뒤 버전이 더한 역할)
+    #[serde(other)]
     Other,
 }
 
@@ -256,6 +264,10 @@ pub struct Impact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub bond: Option<String>,
+    /// 포트가 노드에서 사라짐(노드가 기억한 포트, 계획 75 리뷰 2)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub missing: bool,
     /// 위에 있는 브리지(이름 순)
     pub bridges: Vec<String>,
     /// underlay 주소를 가진 인터페이스가 위에 있다(VXLAN·SDN 오버레이가 영향받음).
@@ -369,11 +381,49 @@ pub struct LinkFault {
     pub role: PortRole,
 }
 
+/// 노드가 기억하는 포트 하나(`NodeStatus.known_ports`, 계획 75 리뷰 2). 역할이 업링크·underlay·service였던 이더넷·그 밖·
+/// VLAN·본딩을 이름으로 기억한다. 장애 순간 주소가 떨어지거나(NetworkManager·networkd가 carrier를 잃은 장치의 주소를 뗌)
+/// netdev가 사라져도(PCIe 장애·unbind·핫플러그 제거) 역할이 바뀌어 감시 밖으로 빠지지 않게 한다. 사라짐(`missing`)은
+/// 이더넷·그 밖만 남긴다 — VLAN·본딩은 지우지 않는 한 사라지지 않으므로 사라지면 잊는다. 잊는 길은 그 포트가 다시 나타나
+/// 감시 밖 역할이 되거나(관리자가 다시 구성), 본딩에 새 구성 포트가 들어오거나(그 본딩의 사라진 구성 포트), 운영자가
+/// `forget-ports`로 지우는 것이다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct KnownPort {
+    pub name: String,
+    pub kind: PortKind,
+    /// 마지막으로 본 역할(업링크·underlay·service)
+    pub role: PortRole,
+    /// 이 포트가 스스로 가졌던 전역 주소(CIDR 없이, 마지막으로 본 것). 지금 이 포트도 다른 인터페이스도 이 주소를 갖지
+    /// 않으면 주소를 잃은 것이다. 쓰임(클러스터 링크·관리)은 이 주소로 다시 셈한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub addresses: Vec<String>,
+    /// 속했던 본딩
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub bond: Option<String>,
+    /// 위에 있던 브리지(이름 순) — 본딩 밖 업링크가 사라지면 그 브리지는 그 업링크를 잃은 것이다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub bridges: Vec<String>,
+    /// 노드의 인터페이스에서 사라짐
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub missing: bool,
+    /// 처음 기억했거나 다시 나타난 때, 사라졌으면 사라진 것을 안 때(유닉스 ms). 매 회차 바꾸지 않는다(노드 상태를
+    /// 쓸데없이 다시 쓰지 않게).
+    pub last_seen_ms: u64,
+}
+
+/// 기억하는 포트의 상한(노드 인터페이스 상한과 같음)
+pub const MAX_KNOWN_PORTS: usize = 64;
+
 // ---------------------------------------------------------------------------------------------------------------
 // 노드 하나의 그래프
 // ---------------------------------------------------------------------------------------------------------------
 
-/// 노드 상태에서 읽은 인터페이스 그래프(VLAN 아래 장치는 없으면 이름으로 추정)
+/// 노드 상태에서 읽은 인터페이스 그래프(VLAN 아래 장치는 없으면 이름으로 추정)와 노드가 기억하는 포트
 struct Host<'a> {
     status: &'a NodeStatus,
     /// veth를 뺀 인터페이스
@@ -386,6 +436,12 @@ struct Host<'a> {
     bridges: BTreeMap<String, bool>,
     /// 노드 주소의 쓰임(클러스터 링크·관리)
     uses: Vec<(IpAddr, PortUse)>,
+    /// 사라진 기억 포트(이더넷·그 밖, 목록에 없음, 계획 75 리뷰 2). 포트 목록에서 `ifs` 뒤에 이 순서로 온다.
+    missing: Vec<&'a KnownPort>,
+    /// 주소를 잃은 기억 포트(목록에 있음): 지금 전역 주소가 없고, 기억한 주소를 어느 인터페이스도 갖지 않는다.
+    lost: BTreeSet<&'a str>,
+    /// 기억한 역할을 쓰는 포트: 주소를 잃은 포트와 그 아래
+    recalled: BTreeSet<&'a str>,
 }
 
 /// `host:port`·`[v6]:port`·주소만 가운데 IP 주소(이름이면 없음)
@@ -413,22 +469,26 @@ fn addrs(i: &NodeInterface) -> impl Iterator<Item = IpAddr> + '_ {
         .filter_map(|a| a.split('/').next().and_then(|a| a.parse::<IpAddr>().ok()))
 }
 
+/// 기억한 주소
+fn known_ips(k: &KnownPort) -> impl Iterator<Item = IpAddr> + '_ {
+    k.addresses.iter().filter_map(|a| a.parse::<IpAddr>().ok())
+}
+
+/// 기본 링크 경보가 보는 역할
+fn watched_role(role: PortRole) -> bool {
+    matches!(
+        role,
+        PortRole::Uplink | PortRole::Underlay | PortRole::Service
+    )
+}
+
 impl<'a> Host<'a> {
     fn of(node: &'a Node) -> Host<'a> {
-        let mut host = Host::new(&node.status);
-        let cluster = node
-            .status
-            .cluster_addresses
-            .iter()
-            .filter_map(|a| ip_of(a));
-        host.uses = cluster
-            .map(|ip| (ip, PortUse::Cluster))
-            .chain(ip_of(&node.spec.address).map(|ip| (ip, PortUse::Management)))
-            .collect();
-        host
+        Host::new(&node.status, &node.spec.address)
     }
 
-    fn new(status: &'a NodeStatus) -> Host<'a> {
+    /// `address`는 노드의 API 주소(`NodeSpec.address` — 쓰임 `management`)
+    fn new(status: &'a NodeStatus, address: &str) -> Host<'a> {
         let ifs: Vec<&NodeInterface> = status
             .interfaces
             .iter()
@@ -467,15 +527,48 @@ impl<'a> Host<'a> {
             }
         }
         bridges.retain(|name, _| !is_managed_ifname(name));
-        Host {
+        let uses = status
+            .cluster_addresses
+            .iter()
+            .filter_map(|a| ip_of(a))
+            .map(|ip| (ip, PortUse::Cluster))
+            .chain(ip_of(address).map(|ip| (ip, PortUse::Management)))
+            .collect();
+        let missing = status
+            .known_ports
+            .iter()
+            .filter(|k| {
+                k.missing
+                    && matches!(k.kind, PortKind::Ethernet | PortKind::Other)
+                    && !by_name.contains_key(k.name.as_str())
+            })
+            .collect();
+        let mut host = Host {
             status,
             ifs,
             by_name,
             parents,
             vlan_ids,
             bridges,
-            uses: Vec::new(),
-        }
+            uses,
+            missing,
+            lost: BTreeSet::new(),
+            recalled: BTreeSet::new(),
+        };
+        let lost: BTreeSet<&str> = status
+            .known_ports
+            .iter()
+            .filter(|k| {
+                !k.missing
+                    && k.addresses.iter().any(|a| a.parse::<IpAddr>().is_ok())
+                    && host.get(&k.name).is_some_and(|i| !addrs(i).any(is_global))
+                    && known_ips(k).all(|ip| host.holder(ip).is_none())
+            })
+            .map(|k| k.name.as_str())
+            .collect();
+        host.recalled = lost.iter().flat_map(|l| host.with_lower(l)).collect();
+        host.lost = lost;
+        host
     }
 
     fn get(&self, name: &str) -> Option<&'a NodeInterface> {
@@ -486,6 +579,21 @@ impl<'a> Host<'a> {
         self.by_name
             .get(name)
             .and_then(|n| self.parents[*n].as_deref())
+    }
+
+    /// 노드가 기억하는 포트
+    fn known(&self, name: &str) -> Option<&'a KnownPort> {
+        self.status.known_ports.iter().find(|k| k.name == name)
+    }
+
+    /// 사라진 기억 포트
+    fn missing_named(&self, name: &str) -> Option<&'a KnownPort> {
+        self.missing.iter().find(|k| k.name == name).copied()
+    }
+
+    /// 링크가 끊겼거나 주소를 잃었는지
+    fn is_down(&self, i: &NodeInterface) -> bool {
+        link_down(i) || self.lost.contains(i.name.as_str())
     }
 
     /// 바로 아래: `master`가 이것인 인터페이스와 아래 장치
@@ -521,30 +629,59 @@ impl<'a> Host<'a> {
         seen
     }
 
-    /// 이 인터페이스에서 아래로 본 상태. 없는 인터페이스는 모르므로 `up`으로 본다.
+    /// 사라진 기억 포트 가운데 이 본딩의 구성 포트였던 것
+    fn missing_members<'b>(&'b self, bond: &'b str) -> impl Iterator<Item = &'a KnownPort> + 'b {
+        self.missing
+            .iter()
+            .copied()
+            .filter(move |k| k.bond.as_deref() == Some(bond))
+    }
+
+    /// 이 인터페이스에서 아래로 본 상태. 사라진 기억 포트는 끊김, 그 밖에 없는 인터페이스는 모르므로 `up`으로 본다.
     fn health(&self, name: &str) -> LinkHealth {
         self.health_at(name, 0)
     }
 
     fn health_at(&self, name: &str, depth: usize) -> LinkHealth {
         let Some(i) = self.get(name) else {
-            return LinkHealth::Up;
+            return if self.missing_named(name).is_some() {
+                LinkHealth::Down
+            } else {
+                LinkHealth::Up
+            };
         };
         if depth >= MAX_DEPTH {
             return LinkHealth::Up;
         }
+        // 아래 장치와 사라진 아래 포트(본딩은 그 구성 포트, 브리지는 본딩 밖 업링크)
         let below = || -> Vec<LinkHealth> {
+            let gone = self
+                .missing
+                .iter()
+                .filter(|k| match i.kind {
+                    InterfaceKind::Bond => k.bond.as_deref() == Some(name),
+                    InterfaceKind::Bridge => {
+                        k.bond.is_none() && k.bridges.iter().any(|b| b == name)
+                    }
+                    _ => false,
+                })
+                .map(|_| LinkHealth::Down);
             self.children(name)
                 .into_iter()
                 .map(|c| self.health_at(c, depth + 1))
+                .chain(gone)
                 .collect()
         };
         match i.kind {
             InterfaceKind::Bond => {
-                if link_down(i) {
+                if self.is_down(i) {
                     return LinkHealth::Down;
                 }
                 match i.bond.as_ref().map(|b| b.state) {
+                    // 커널은 사라진 구성 포트를 `slaves`에서도 빼므로 "모두 up"으로 보인다.
+                    Some(BondState::Up) if self.missing_members(name).next().is_some() => {
+                        LinkHealth::Degraded
+                    }
                     Some(BondState::Up) => LinkHealth::Up,
                     Some(BondState::Degraded) => LinkHealth::Degraded,
                     Some(BondState::Down) => LinkHealth::Down,
@@ -553,14 +690,15 @@ impl<'a> Host<'a> {
                 }
             }
             // 관리자가 내린 브리지는 끊김이다. 올라와 있으면 업링크가 없을 때(내부 브리지) carrier가 없어도 끊김이 아니다.
+            // 업링크가 사라졌으면(기억 포트) 그 업링크는 끊김이다.
             InterfaceKind::Bridge if i.admin_up == Some(false) => LinkHealth::Down,
             InterfaceKind::Bridge => redundant(&below()),
-            _ if link_down(i) => LinkHealth::Down,
+            _ if self.is_down(i) => LinkHealth::Down,
             _ => below().into_iter().max().unwrap_or(LinkHealth::Up),
         }
     }
 
-    /// 주소 `ip`를 가진 인터페이스
+    /// 주소 `ip`를 지금 가진 인터페이스
     fn holder(&self, ip: IpAddr) -> Option<&'a str> {
         self.ifs
             .iter()
@@ -568,23 +706,27 @@ impl<'a> Host<'a> {
             .map(|i| i.name.as_str())
     }
 
-    /// underlay 주소 `ip`의 인터페이스: 지금 가진 것, 없으면 노드가 마지막으로 본 것(`underlay_ports` — 링크가 끊겨
-    /// 주소가 떨어졌거나 인터페이스가 사라졌음). 둘 다 없으면 모른다.
-    fn underlay_owner(&self, ip: IpAddr) -> Option<&'a str> {
-        self.holder(ip).or_else(|| {
-            self.status
-                .underlay_ports
-                .get(&ip.to_string())
-                .map(String::as_str)
-        })
+    /// 주소 `ip`를 마지막으로 가졌던 기억 포트
+    fn remembered_holder(&self, ip: IpAddr) -> Option<&'a str> {
+        self.status
+            .known_ports
+            .iter()
+            .find(|k| known_ips(k).any(|a| a == ip))
+            .map(|k| k.name.as_str())
     }
 
-    /// underlay 주인의 상태: 목록에 없으면(사라진 인터페이스) 끊김이다.
-    fn owner_health(&self, name: &str) -> LinkHealth {
-        if self.get(name).is_some() {
-            self.health(name)
-        } else {
-            LinkHealth::Down
+    /// underlay 주소 `ip`의 인터페이스: 지금 가진 것, 없으면 마지막으로 가졌던 기억 포트(링크가 끊겨 주소가 떨어졌거나
+    /// 인터페이스가 사라졌음). 둘 다 없으면 모른다.
+    fn underlay_owner(&self, ip: IpAddr) -> Option<&'a str> {
+        self.holder(ip).or_else(|| self.remembered_holder(ip))
+    }
+
+    /// underlay 주소의 상태: 가진 인터페이스의 상태, 아무도 갖지 않고 기억한 주인만 있으면 링크가 살아 있어도 끊김
+    /// (VTEP이 보낼 원본 주소가 없다 — 계획 75 리뷰 2), 그것도 없으면 모름(None)
+    fn underlay_health(&self, ip: IpAddr) -> Option<LinkHealth> {
+        match self.holder(ip) {
+            Some(h) => Some(self.health(h)),
+            None => self.remembered_holder(ip).map(|_| LinkHealth::Down),
         }
     }
 
@@ -613,13 +755,33 @@ impl<'a> Host<'a> {
             .collect()
     }
 
-    /// 인터페이스 `name`(또는 그 위)이 가진 노드 주소의 쓰임
+    /// 포트의 전역 주소: 지금 가진 것, 주소를 잃었거나 사라진 기억 포트는 마지막으로 가졌던 것
+    fn addresses_of(&self, name: &str) -> Vec<String> {
+        let now: Vec<String> = self
+            .get(name)
+            .map(|i| {
+                addrs(i)
+                    .filter(|ip| is_global(*ip))
+                    .map(|ip| ip.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !now.is_empty() || !(self.lost.contains(name) || self.missing_named(name).is_some()) {
+            return now;
+        }
+        self.known(name)
+            .map(|k| k.addresses.clone())
+            .unwrap_or_default()
+    }
+
+    /// 인터페이스 `name`(또는 그 위)이 가진 노드 주소의 쓰임. 아무도 갖지 않은 주소는 마지막으로 가졌던 기억 포트로 본다.
     fn uses_of(&self, name: &str) -> Vec<PortUse> {
         let mut out: Vec<PortUse> = self
             .uses
             .iter()
             .filter(|(ip, _)| {
                 self.holder(*ip)
+                    .or_else(|| self.remembered_holder(*ip))
                     .is_some_and(|h| h == name || self.lower(h).contains(name))
             })
             .map(|(_, u)| *u)
@@ -653,6 +815,13 @@ impl<'a> Host<'a> {
         if i.kind != InterfaceKind::Bridge && service.contains(name) {
             return PortRole::Service;
         }
+        // 주소를 잃은 포트와 그 아래는 기억한 역할 그대로다(감시 밖으로 빠지지 않게 — 계획 75 리뷰 2).
+        if self.recalled.contains(name)
+            && let Some(k) = self.known(name)
+            && watched_role(k.role)
+        {
+            return k.role;
+        }
         let used = i.master.is_some()
             || !i.addresses.is_empty()
             || self.ifs.iter().any(|o| self.parent(&o.name) == Some(name));
@@ -663,6 +832,7 @@ impl<'a> Host<'a> {
         }
     }
 
+    /// 포트 목록: 노드가 알린 인터페이스(veth 뺌) 뒤에 사라진 기억 포트(`state: missing`)
     fn ports(&self) -> Vec<Port> {
         let uplinks: BTreeSet<&str> = self.bridges.keys().flat_map(|b| self.lower(b)).collect();
         let underlay: BTreeSet<&str> = self
@@ -671,39 +841,79 @@ impl<'a> Host<'a> {
             .flat_map(|h| self.with_lower(h))
             .collect();
         let service = self.addressed();
-        self.ifs
-            .iter()
-            .enumerate()
-            .map(|(n, i)| Port {
-                name: i.name.clone(),
-                kind: port_kind(i.kind),
-                state: i.state.clone(),
-                carrier: i.carrier,
-                speed_mbps: i.speed_mbps,
-                mtu: i.mtu,
-                mac: i.mac.clone(),
-                master: i.master.clone(),
-                parent: self.parents[n].clone(),
-                vlan_id: self.vlan_ids[n],
-                lldp: i.lldp.clone(),
-                bond: i.bond.as_ref().map(|b| PortBond {
+        let present = self.ifs.iter().enumerate().map(|(n, i)| Port {
+            name: i.name.clone(),
+            kind: port_kind(i.kind),
+            state: i.state.clone(),
+            carrier: i.carrier,
+            speed_mbps: i.speed_mbps,
+            mtu: i.mtu,
+            mac: i.mac.clone(),
+            master: i.master.clone(),
+            parent: self.parents[n].clone(),
+            vlan_id: self.vlan_ids[n],
+            lldp: i.lldp.clone(),
+            bond: i.bond.as_ref().map(|b| {
+                let mut members = b.ports.clone();
+                for k in self.missing_members(&i.name) {
+                    if !members.iter().any(|m| m.name == k.name) {
+                        members.push(BondPort {
+                            name: k.name.clone(),
+                            state: PortState::Missing,
+                            speed_mbps: None,
+                            aggregator: None,
+                        });
+                    }
+                }
+                let state = if b.state == BondState::Up
+                    && members.iter().any(|m| m.state == PortState::Missing)
+                {
+                    BondState::Degraded
+                } else {
+                    b.state
+                };
+                PortBond {
                     mode: b.mode.clone(),
-                    state: b.state,
-                    members: b.ports.clone(),
-                }),
-                role: self.role(i, &uplinks, &underlay, &service),
-                uses: self.uses_of(&i.name),
-                health: self.health(&i.name),
-            })
-            .collect()
+                    state,
+                    members,
+                }
+            }),
+            role: self.role(i, &uplinks, &underlay, &service),
+            uses: self.uses_of(&i.name),
+            addresses: self.addresses_of(&i.name),
+            health: self.health(&i.name),
+        });
+        let gone = self.missing.iter().map(|k| Port {
+            name: k.name.clone(),
+            kind: k.kind,
+            state: "missing".into(),
+            carrier: None,
+            speed_mbps: None,
+            mtu: None,
+            mac: None,
+            master: k.bond.clone(),
+            parent: None,
+            vlan_id: None,
+            lldp: None,
+            bond: None,
+            role: k.role,
+            uses: self.uses_of(&k.name),
+            addresses: k.addresses.clone(),
+            health: LinkHealth::Down,
+        });
+        present.chain(gone).collect()
     }
 
-    /// 이 인터페이스를 아래에 둔 브리지(이름 순)와 underlay 주인
+    /// 이 인터페이스를 아래에 둔 브리지(이름 순)와 underlay 주인. 사라진 기억 포트는 기억한 브리지다.
     fn tops(&self, name: &str) -> (Vec<&str>, Vec<&'a str>) {
+        let gone = self.missing_named(name);
         let bridges = self
             .bridges
             .keys()
-            .filter(|b| self.lower(b).contains(name))
+            .filter(|b| {
+                self.lower(b).contains(name)
+                    || gone.is_some_and(|k| k.bridges.iter().any(|x| x == *b))
+            })
             .map(String::as_str)
             .collect();
         let underlay = self
@@ -722,16 +932,28 @@ impl<'a> Host<'a> {
             .filter(|m| m.kind == InterfaceKind::Bond)
     }
 
+    /// 포트 목록 `n`번째의 본딩 이름(사라진 기억 포트는 기억한 본딩이 아직 있을 때)
+    fn bond_name(&self, n: usize) -> Option<&'a str> {
+        match self.ifs.get(n) {
+            Some(i) => self.bond_of(i).map(|b| b.name.as_str()),
+            None => self.missing[n - self.ifs.len()]
+                .bond
+                .as_deref()
+                .filter(|b| self.get(b).is_some_and(|m| m.kind == InterfaceKind::Bond)),
+        }
+    }
+
     /// 링크가 끊긴 포트의 무게: 위의 브리지·underlay 가운데 하나라도 끊겼으면 `down`, 다 살았으면 `degraded`. 위에
     /// 아무것도 없으면 본딩(살았으면 `degraded`), 그것도 없으면 `down`이다.
-    fn link_severity(&self, i: &NodeInterface) -> FaultSeverity {
-        let (bridges, underlay) = self.tops(&i.name);
+    fn link_severity(&self, name: &str, bond: Option<&'a str>) -> FaultSeverity {
+        let (bridges, underlay) = self.tops(name);
         let mut tops: Vec<&str> = bridges.into_iter().chain(underlay).collect();
         if tops.is_empty()
-            && let Some(b) = self.bond_of(i)
+            && let Some(b) = bond
         {
-            tops.push(b.name.as_str());
+            tops.push(b);
         }
+        // underlay 주인이 끊긴 그 포트 자신이면 그 주소는 끊김이다.
         if tops.is_empty() || tops.iter().any(|t| self.health(t) == LinkHealth::Down) {
             FaultSeverity::Down
         } else {
@@ -739,23 +961,28 @@ impl<'a> Host<'a> {
         }
     }
 
-    /// 링크가 끊긴 포트(이더넷·그 밖·VLAN — VLAN은 아래 장치가 살았을 때만 — 와 관리자가 내린 브리지)와 그 무게
-    fn link_faults(&self, ports: &[Port]) -> Vec<(usize, FaultSeverity)> {
-        self.ifs
+    /// 링크가 끊긴 포트(이더넷·그 밖·VLAN — VLAN은 아래 장치가 살았을 때만 —, 주소를 잃은 포트, 사라진 기억 포트,
+    /// 관리자가 내린 브리지 가운데 네트워크가 실리는 것 `used`)와 그 무게. 순번은 [`Host::ports`]의 것이다.
+    fn link_faults(&self, ports: &[Port], used: &BTreeSet<String>) -> Vec<(usize, FaultSeverity)> {
+        let present = self
+            .ifs
             .iter()
             .enumerate()
             .filter(|(n, i)| {
-                link_down(i)
+                self.is_down(i)
                     && match ports[*n].kind {
                         PortKind::Ethernet | PortKind::Other => true,
                         PortKind::Vlan => self
                             .parent(&i.name)
                             .is_none_or(|p| self.health(p) != LinkHealth::Down),
-                        PortKind::Bridge => i.admin_up == Some(false),
+                        PortKind::Bridge => i.admin_up == Some(false) && used.contains(&i.name),
                         PortKind::Bond => false,
                     }
             })
-            .map(|(n, i)| (n, self.link_severity(i)))
+            .map(|(n, _)| n)
+            .chain(self.ifs.len()..self.ifs.len() + self.missing.len());
+        present
+            .map(|n| (n, self.link_severity(&ports[n].name, self.bond_name(n))))
             .collect()
     }
 
@@ -773,6 +1000,16 @@ impl<'a> Host<'a> {
             .collect()
     }
 
+    /// 네트워크가 실리는 브리지(관리자가 내린 브리지는 이것만 장애로 본다 — 쓰지 않는 브리지는 영향이 없다)
+    fn used_bridges(&self, node: &Node, networks: &[&Network]) -> BTreeSet<String> {
+        networks
+            .iter()
+            .filter_map(|n| match self.carrier(node, &n.spec) {
+                Some(Carrier::Bridge(b)) => Some(b),
+                _ => None,
+            })
+            .collect()
+    }
     /// 네트워크가 이 노드에서 실리는 곳. 없으면 이 노드에 쓸 수단이 없다.
     fn carrier(&self, node: &Node, spec: &NetworkSpec) -> Option<Carrier> {
         if let Some(bridge) = &spec.bridge {
@@ -867,30 +1104,37 @@ fn rail_kind(spec: &NetworkSpec) -> (RailKind, String, Option<u16>) {
 // 공개 함수
 // ---------------------------------------------------------------------------------------------------------------
 
-/// 노드 하나의 포트(역할·쓰임·상태 포함). 네트워크·VM은 보지 않는다.
+/// 노드 하나의 포트(역할·쓰임·상태 포함, 사라진 기억 포트도). 네트워크·VM은 보지 않는다.
 pub fn ports(node: &Node) -> Vec<Port> {
     Host::of(node).ports()
 }
 
-/// 기본 링크 경보가 보는 포트인지: 업링크·underlay·주소를 가진 포트, 관리자가 내린 브리지
+/// 기본 링크 경보가 보는 포트인지: 업링크·underlay·주소를 가진 포트, 관리자가 내린 브리지(네트워크가 실리는 것 —
+/// [`Host::link_faults`]가 거름)
 fn watched(p: &Port) -> bool {
-    matches!(
-        p.role,
-        PortRole::Uplink | PortRole::Underlay | PortRole::Service
-    ) || p.kind == PortKind::Bridge
+    watched_role(p.role) || p.kind == PortKind::Bridge
 }
 
-/// 링크 경보 `NodeLinkDown`: 이 노드에서 지금 링크가 끊긴 포트. 본딩 구성 포트는 따로 세지 않는다(계획 75 리뷰 1): 본딩이
-/// 살아 있으면 이중화만 잃은 것이라 `BondDegraded`가 맡고, 본딩이 끊기면 본딩 이름 하나로 낸다. `role`이 `uplink`면 업링크·
-/// underlay·주소를 가진 포트와 관리자가 내린 브리지만, `any`면 이더넷·VLAN 포트도 모두(어디에도 묶이지 않은 가상 장치는
-/// 빼고), `ports`(글롭)가 있으면 그 이름만이다.
-pub fn link_faults(node: &Node, role: LinkRole, ports: Option<&str>) -> Vec<LinkFault> {
+/// 링크 경보 `NodeLinkDown`: 이 노드에서 지금 링크가 끊긴 포트(주소를 잃은 기억 포트·사라진 기억 포트 포함, 계획 75
+/// 리뷰 2). 기본(글롭 없음)은 본딩 구성 포트를 따로 세지 않는다(리뷰 1): 본딩이 살아 있으면 이중화만 잃은 것이라
+/// `BondDegraded`가 맡고, 본딩이 끊기면 본딩 이름 하나로 낸다. `ports`(글롭)가 있으면 그 이름에 맞는 것만 보되 본딩
+/// 구성 포트도 본다(리뷰 2 — `eno*`처럼 물리 NIC만 보는 규칙이 본딩 장애를 놓치지 않게). `role`이 `uplink`면 업링크·
+/// underlay·주소를 가진 포트와 네트워크가 실리는데 관리자가 내린 브리지만, `any`면 이더넷·VLAN 포트도 모두(어디에도
+/// 묶이지 않은 가상 장치는 빼고)다. `networks`는 관리자가 내린 브리지가 쓰이는지 보는 데만 쓴다.
+pub fn link_faults(
+    node: &Node,
+    role: LinkRole,
+    ports: Option<&str>,
+    networks: &[Network],
+) -> Vec<LinkFault> {
     let host = Host::of(node);
     let list = host.ports();
+    let networks: Vec<&Network> = networks.iter().collect();
+    let used = host.used_bridges(node, &networks);
     let members = host
-        .link_faults(&list)
+        .link_faults(&list, &used)
         .into_iter()
-        .filter(|(n, _)| host.bond_of(host.ifs[*n]).is_none());
+        .filter(|(n, _)| ports.is_some() || host.bond_name(*n).is_none());
     let bonds = list
         .iter()
         .enumerate()
@@ -900,28 +1144,29 @@ pub fn link_faults(node: &Node, role: LinkRole, ports: Option<&str>) -> Vec<Link
     faults.sort_by_key(|(n, _)| *n);
     faults
         .into_iter()
-        .map(|(n, severity)| (&list[n], severity))
-        .filter(|(p, _)| match role {
+        .map(|(n, severity)| (n, &list[n], severity))
+        .filter(|(_, p, _)| match role {
             LinkRole::Uplink => watched(p),
             LinkRole::Any => watched(p) || matches!(p.kind, PortKind::Ethernet | PortKind::Vlan),
         })
-        .filter(|(p, _)| ports.is_none_or(|g| glob_match(g, &p.name)))
-        .map(|(p, severity)| LinkFault {
+        .filter(|(_, p, _)| ports.is_none_or(|g| glob_match(g, &p.name)))
+        .map(|(n, p, severity)| LinkFault {
             port: p.name.clone(),
             severity,
-            bond: None,
+            bond: host.bond_name(n).map(str::to_string),
             role: p.role,
         })
         .collect()
 }
 
-/// 링크 경보 `BondDegraded`: 이 노드에서 지금 저하된(아직 흐르는) 본딩. 끊긴 본딩은 `NodeLinkDown`이 본딩 이름으로 낸다.
+/// 링크 경보 `BondDegraded`: 이 노드에서 지금 저하된(`degraded`, 아직 흐르는) 본딩과 끊긴(`down`) 본딩. 끊긴 본딩은
+/// `NodeLinkDown`이 본딩 이름으로 새로 내고, 경보 엔진은 이미 울린 `BondDegraded`만 끊긴 동안 그대로 둔다(계획 75
+/// 리뷰 2 — 저하가 끊김으로 커질 때 "해소"를 보내지 않게).
 pub fn bond_faults(node: &Node) -> Vec<LinkFault> {
     let host = Host::of(node);
     let list = host.ports();
     host.bond_faults(&list)
         .into_iter()
-        .filter(|(_, severity)| *severity == FaultSeverity::Degraded)
         .map(|(n, severity)| LinkFault {
             port: list[n].name.clone(),
             severity,
@@ -929,6 +1174,124 @@ pub fn bond_faults(node: &Node) -> Vec<LinkFault> {
             role: list[n].role,
         })
         .collect()
+}
+
+/// 노드 수집(계획 75 리뷰 2): 지금 인터페이스(`status.interfaces` — 노드 상태에 쓸 목록)와 지난 기억(`status.known_ports`)
+/// 으로 새 기억을 셈한다. `address`는 노드 API 주소, `present`는 지금 이 노드에 있는 모든 인터페이스 이름(64개 상한 밖
+/// 포함 — 상한 때문에 거짓으로 사라지지 않게), `now_ms`는 지금(유닉스 ms)이다.
+/// - 지금 역할이 업링크·underlay·service인 이더넷·그 밖·VLAN·본딩은 기억한다(주소는 스스로 가진 전역 주소, 없으면 지난 값).
+/// - 주소를 잃은 포트와 그 아래는 기억한 역할 그대로 남는다. 그 밖에 감시 밖 역할이 된 포트는 잊는다(관리자가 다시 구성).
+/// - 목록에서 사라진 이더넷·그 밖은 `missing`으로 남긴다(한 번 본딩 상태를 못 읽어도 지우지 않음). VLAN·본딩은 잊는다.
+/// - 본딩에 지난번 기억에 없던 구성 포트가 들어왔으면(다른 이름의 새 NIC로 다시 묶음) 그 본딩의 사라진 구성 포트를 잊는다.
+pub fn remember_ports(
+    status: &NodeStatus,
+    address: &str,
+    present: &BTreeSet<&str>,
+    now_ms: u64,
+) -> Vec<KnownPort> {
+    let host = Host::new(status, address);
+    let list = host.ports();
+    let old = |name: &str| status.known_ports.iter().find(|k| k.name == name);
+    let mut out: Vec<KnownPort> = Vec::new();
+    for (n, i) in host.ifs.iter().enumerate() {
+        let p = &list[n];
+        if !matches!(
+            p.kind,
+            PortKind::Ethernet | PortKind::Other | PortKind::Vlan | PortKind::Bond
+        ) || !watched_role(p.role)
+        {
+            continue;
+        }
+        let prev = old(&i.name);
+        let own: Vec<String> = addrs(i)
+            .filter(|ip| is_global(*ip))
+            .map(|ip| ip.to_string())
+            .collect();
+        let (bridges, _) = host.tops(&i.name);
+        out.push(KnownPort {
+            name: i.name.clone(),
+            kind: p.kind,
+            role: p.role,
+            addresses: if own.is_empty() && host.lost.contains(i.name.as_str()) {
+                prev.map(|k| k.addresses.clone()).unwrap_or_default()
+            } else {
+                own
+            },
+            bond: host.bond_of(i).map(|b| b.name.clone()),
+            bridges: bridges.into_iter().map(str::to_string).collect(),
+            missing: false,
+            last_seen_ms: prev
+                .filter(|k| !k.missing)
+                .map_or(now_ms, |k| k.last_seen_ms),
+        });
+    }
+    // 본딩마다 지난번에 기억한 구성 포트
+    let had = |bond: &str, name: &str| {
+        status
+            .known_ports
+            .iter()
+            .any(|k| k.name == name && k.bond.as_deref() == Some(bond))
+    };
+    let rebonded: BTreeSet<&str> = host
+        .ifs
+        .iter()
+        .filter_map(|i| {
+            let b = host.bond_of(i)?;
+            let known_bond = status
+                .known_ports
+                .iter()
+                .any(|k| k.bond.as_deref() == Some(b.name.as_str()));
+            (known_bond && !had(&b.name, &i.name)).then_some(b.name.as_str())
+        })
+        .collect();
+    for k in &status.known_ports {
+        if host.get(&k.name).is_some() || !matches!(k.kind, PortKind::Ethernet | PortKind::Other) {
+            continue;
+        }
+        if present.contains(k.name.as_str()) {
+            // 상한 밖에 있음: 그대로
+            out.push(k.clone());
+            continue;
+        }
+        if k.bond.as_deref().is_some_and(|b| rebonded.contains(b)) {
+            continue;
+        }
+        out.push(KnownPort {
+            missing: true,
+            last_seen_ms: if k.missing { k.last_seen_ms } else { now_ms },
+            ..k.clone()
+        });
+    }
+    out.truncate(MAX_KNOWN_PORTS);
+    out
+}
+
+/// 노드의 본딩 감시(감사 `node.bond-degraded`)용: 사라진 기억 포트를 그 본딩의 `missing` 구성 포트로 넣고 `up`인 본딩은
+/// `degraded`로 바꾼다(커널은 사라진 netdev를 `slaves`에서도 빼서 본딩이 "모두 up"으로 보인다). 물리 관계와 같은 판단이다.
+pub fn mark_missing_members(known: &[KnownPort], list: &mut [NodeInterface]) {
+    let present: BTreeSet<String> = list.iter().map(|i| i.name.clone()).collect();
+    for iface in list.iter_mut() {
+        let Some(bond) = iface.bond.as_mut() else {
+            continue;
+        };
+        for k in known.iter().filter(|k| {
+            k.missing
+                && k.bond.as_deref() == Some(iface.name.as_str())
+                && !present.contains(&k.name)
+        }) {
+            if !bond.ports.iter().any(|p| p.name == k.name) {
+                bond.ports.push(BondPort {
+                    name: k.name.clone(),
+                    state: PortState::Missing,
+                    speed_mbps: None,
+                    aggregator: None,
+                });
+            }
+        }
+        if bond.state == BondState::Up && bond.ports.iter().any(|p| p.state == PortState::Missing) {
+            bond.state = BondState::Degraded;
+        }
+    }
 }
 
 /// 클러스터의 물리 관계(설계 §3.2). `nodes`·`networks`·`vms`는 상태 머신의 목록 그대로다.
@@ -1010,6 +1373,12 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
                         .iter()
                         .filter(|i| i.master.as_deref() == Some(name.as_str()))
                         .map(|i| i.name.clone())
+                        .chain(
+                            host.missing
+                                .iter()
+                                .filter(|k| k.bond.is_none() && k.bridges.contains(name))
+                                .map(|k| k.name.clone()),
+                        )
                         .collect(),
                     vlan_filtering: *filtering,
                     networks: nets.iter().map(|i| networks[*i].id).collect(),
@@ -1020,10 +1389,17 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
             .collect();
 
         // 영향: 끊긴 포트, 그리고 구성 포트에 끊긴 것이 없는 저하·끊긴 본딩
-        let mut faults = host.link_faults(&ports);
+        let used: BTreeSet<String> = carriers
+            .iter()
+            .filter_map(|c| match c {
+                Some(Carrier::Bridge(b)) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut faults = host.link_faults(&ports, &used);
         let linked: BTreeSet<&str> = faults
             .iter()
-            .filter_map(|(n, _)| host.bond_of(host.ifs[*n]).map(|b| b.name.as_str()))
+            .filter_map(|(n, _)| host.bond_name(*n))
             .collect();
         faults.extend(
             host.bond_faults(&ports)
@@ -1067,7 +1443,8 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
             impact.push(Impact {
                 port: p.name.clone(),
                 severity,
-                bond: host.bond_of(host.ifs[n]).map(|b| b.name.clone()),
+                bond: host.bond_name(n).map(str::to_string),
+                missing: n >= host.ifs.len(),
                 bridges: above.iter().map(|b| b.to_string()).collect(),
                 underlay: !holders.is_empty(),
                 uses: p.uses.clone(),
@@ -1138,9 +1515,10 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
                             if chassis_down {
                                 RailState::Down
                             } else {
-                                // 주소의 인터페이스를 못 찾고 전에 본 것도 없으면 모른다(정상으로 보이지 않게).
-                                host.underlay_owner(*ip)
-                                    .map_or(RailState::Unknown, |h| host.owner_health(h).into())
+                                // 주소를 아무도 갖지 않으면 기억한 주인의 링크가 살아도 끊김, 기억도 없으면 모른다(정상으로
+                                // 보이지 않게).
+                                host.underlay_health(*ip)
+                                    .map_or(RailState::Unknown, RailState::from)
                             }
                         }
                     }
@@ -1174,16 +1552,58 @@ pub fn build(nodes: &[Node], networks: &[Network], vms: &[Vm]) -> PhysicalTopolo
     out
 }
 
-/// 경보 문구(설계 §3.4): `eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs`
+/// 경보 문구(설계 §3.4): `eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs`. 사라진 포트는 `missing`이다.
 pub fn describe(node: &str, impact: &Impact) -> String {
+    let what = if impact.missing { "missing" } else { "down" };
     let mut head = match &impact.bond {
         Some(bond) => format!(
-            "{} down on {node}: {bond} {}",
+            "{} {what} on {node}: {bond} {}",
             impact.port,
             impact.severity.as_str()
         ),
+        None if impact.missing => format!("{} missing on {node}", impact.port),
         None => format!("{} {} on {node}", impact.port, impact.severity.as_str()),
     };
+    push_tail(&mut head, impact);
+    head
+}
+
+/// 본딩 경보 문구(계획 75 리뷰 2): `bond0 down on svc01 (eno1 down, eno2 missing) — vmbr0, 3 networks, 12 VMs`.
+/// `bond`는 본딩 포트(상태·구성 포트), `impact`는 그 본딩이나 그 구성 포트의 영향(위가 같으므로 하나만 쓴다).
+pub fn describe_bond(node: &str, bond: &Port, impact: Option<&Impact>) -> String {
+    let state = match bond.health {
+        LinkHealth::Down => "down",
+        LinkHealth::Degraded => "degraded",
+        LinkHealth::Up => "up",
+    };
+    let mut head = format!("{} {state} on {node}", bond.name);
+    let members: Vec<String> = bond
+        .bond
+        .iter()
+        .flat_map(|b| &b.members)
+        .filter_map(|m| {
+            let s = match m.state {
+                PortState::Up => return None,
+                PortState::Down => "down",
+                PortState::LacpMismatch => "LACP mismatch",
+                PortState::SpeedMismatch => "speed mismatch",
+                PortState::Missing => "missing",
+                PortState::Unknown => "unknown",
+            };
+            Some(format!("{} {s}", m.name))
+        })
+        .collect();
+    if !members.is_empty() {
+        head.push_str(&format!(" ({})", members.join(", ")));
+    }
+    if let Some(i) = impact {
+        push_tail(&mut head, i);
+    }
+    head
+}
+
+/// 문구 꼬리: ` — 브리지, underlay, 쓰임, 네트워크 n, VM n`
+fn push_tail(head: &mut String, impact: &Impact) {
     let mut parts: Vec<String> = impact.bridges.clone();
     if impact.underlay {
         parts.push("underlay".into());
@@ -1201,7 +1621,6 @@ pub fn describe(node: &str, impact: &Impact) -> String {
         head.push_str(" — ");
         head.push_str(&parts.join(", "));
     }
-    head
 }
 
 /// `*`(아무 글자 여럿)·`?`(아무 글자 하나)만 아는 글롭
@@ -1480,6 +1899,7 @@ mod tests {
                 port: "eno1".into(),
                 severity: FaultSeverity::Down,
                 bond: None,
+                missing: false,
                 bridges: vec!["vmbr0".into()],
                 underlay: false,
                 uses: vec![],
@@ -1494,7 +1914,7 @@ mod tests {
         );
         assert_eq!(p.nodes[0].bridges[0].health, LinkHealth::Down);
         assert_eq!(rail(&p, "lan")[0].1, RailState::Down);
-        let faults = link_faults(&n, LinkRole::Uplink, None);
+        let faults = link_faults(&n, LinkRole::Uplink, None, &[]);
         assert_eq!(
             faults,
             vec![LinkFault {
@@ -1505,7 +1925,7 @@ mod tests {
             }]
         );
         n.status.interfaces[0] = eth("eno1", Some("vmbr0"));
-        assert!(link_faults(&n, LinkRole::Uplink, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Uplink, None, &[]).is_empty());
         assert!(build(&[n], &[lan], &vms).nodes[0].impact.is_empty());
     }
 
@@ -1575,8 +1995,8 @@ mod tests {
             }]
         );
         // 본딩이 살아 있으면 구성 포트의 끊김은 `node_link_down`이 아니다(이중화만 잃음 — `bond_degraded` 하나).
-        assert!(link_faults(&n, LinkRole::Uplink, None).is_empty());
-        assert!(link_faults(&n, LinkRole::Any, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Uplink, None, &[]).is_empty());
+        assert!(link_faults(&n, LinkRole::Any, None, &[]).is_empty());
 
         let mut n = n;
         n.status.interfaces[1] = down(eth("eno2", Some("bond0")));
@@ -1594,10 +2014,17 @@ mod tests {
             "eno1 down on svc01: bond0 down — vmbr0, 3 networks, 12 VMs"
         );
         assert_eq!(rail(&p, "lan")[0].1, RailState::Down);
-        // 본딩이 끊기면 본딩 이름 하나로 `node_link_down`(구성 포트는 따로 없음), `bond_degraded`는 아니다.
-        assert!(bond_faults(&n).is_empty());
+        // 본딩이 끊기면 본딩 이름 하나로 `node_link_down`(구성 포트는 따로 없음). `bond_faults`에는 down으로 남는다
+        // (엔진이 이미 울린 `bond_degraded`만 이어 감 — 리뷰 2).
         assert_eq!(
-            link_faults(&n, LinkRole::Uplink, None),
+            bond_faults(&n)
+                .iter()
+                .map(|f| f.severity)
+                .collect::<Vec<_>>(),
+            [FaultSeverity::Down]
+        );
+        assert_eq!(
+            link_faults(&n, LinkRole::Uplink, None, &[]),
             vec![LinkFault {
                 port: "bond0".into(),
                 severity: FaultSeverity::Down,
@@ -1636,7 +2063,7 @@ mod tests {
             describe("svc01", &i[0]),
             "bond0 degraded on svc01 — vmbr0, 1 network"
         );
-        assert!(link_faults(&n, LinkRole::Any, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Any, None, &[]).is_empty());
     }
 
     /// 본딩 위 VLAN 위 브리지(`eno1,eno2 → bond0 → bond0.100 → vmbr100`): 사슬 끝의 포트가 업링크이고 영향이
@@ -1850,7 +2277,7 @@ mod tests {
         // `uplink`은 underlay 포트를 보고, 쓰지 않는 포트는 `any`에서만 본다.
         a.status.interfaces[1] = down(eth("eno1", None));
         let names = |role| -> Vec<String> {
-            link_faults(&a, role, None)
+            link_faults(&a, role, None, &[])
                 .into_iter()
                 .map(|f| f.port)
                 .collect()
@@ -1858,11 +2285,11 @@ mod tests {
         assert_eq!(names(LinkRole::Uplink), ["eno4"]);
         assert_eq!(names(LinkRole::Any), ["eno4", "eno1"]);
         assert!(
-            link_faults(&a, LinkRole::Any, Some("eno1"))
+            link_faults(&a, LinkRole::Any, Some("eno1"), &[])
                 .iter()
                 .all(|f| f.port == "eno1")
         );
-        assert!(link_faults(&a, LinkRole::Any, Some("eth*")).is_empty());
+        assert!(link_faults(&a, LinkRole::Any, Some("eth*"), &[]).is_empty());
     }
 
     /// SDN 오버레이: Geneve 주소(`encap_ip`)의 인터페이스로 따라가고, ovn-controller가 꺼졌으면 down, chassis가 아니면
@@ -2035,70 +2462,363 @@ mod tests {
             describe("svc01", &i[0]),
             "ens1f0 down on svc01 — cluster link"
         );
-        let names: Vec<String> = link_faults(&n, LinkRole::Uplink, None)
+        let names: Vec<String> = link_faults(&n, LinkRole::Uplink, None, &[])
             .into_iter()
             .map(|f| f.port)
             .collect();
         assert_eq!(names, ["ens1f0"]);
     }
 
-    /// underlay 주소가 떨어진 인터페이스(NetworkManager가 carrier를 잃은 장치의 주소를 뗌): 노드가 마지막으로 본 이름
-    /// (`underlay_ports`)으로 그 포트를 계속 본다. 그 포트가 목록에서 사라졌으면 끊김, 본 것도 없으면 레일은 모름이다.
+    fn known(name: &str, role: PortRole, addresses: &[&str]) -> KnownPort {
+        KnownPort {
+            name: name.into(),
+            kind: PortKind::Ethernet,
+            role,
+            addresses: addresses.iter().map(|a| a.to_string()).collect(),
+            bond: None,
+            bridges: vec![],
+            missing: false,
+            last_seen_ms: 1,
+        }
+    }
+
+    fn gone(mut k: KnownPort) -> KnownPort {
+        k.missing = true;
+        k
+    }
+
+    /// underlay 주소가 떨어진 인터페이스(NetworkManager가 carrier를 잃은 장치의 주소를 뗌): 기억 포트(`known_ports`)로 그
+    /// 포트를 계속 본다. 그 포트가 사라졌으면 끊김, 기억도 없으면 레일은 모름이다. 주소만 떨어지고 링크가 살았어도 끊김이다.
     #[test]
     fn underlay_falls_back_to_the_last_seen_port() {
         let mut a = node("a", vec![down(eth("eno4", None))], &[]);
         a.status.underlay = Some("10.1.0.11".parse().unwrap());
-        a.status
-            .underlay_ports
-            .insert("10.1.0.11".into(), "eno4".into());
+        a.status.known_ports = vec![known("eno4", PortRole::Underlay, &["10.1.0.11"])];
         let vx = net("vx", |s| s.vxlan = Some(Vxlan { vni: 5000 }));
         let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
         assert_eq!(port(&p, "a", "eno4").role, PortRole::Underlay);
+        assert_eq!(port(&p, "a", "eno4").addresses, ["10.1.0.11"]);
         assert_eq!(
             p.nodes[0].underlay.as_ref().unwrap().port.as_deref(),
             Some("eno4")
         );
         assert_eq!(rail(&p, "vx")[0].1, RailState::Down);
         assert!(p.nodes[0].impact[0].underlay);
-        assert_eq!(link_faults(&a, LinkRole::Uplink, None)[0].port, "eno4");
-        // 그 인터페이스가 사라짐 → 끊김
-        a.status.interfaces.clear();
+        assert_eq!(link_faults(&a, LinkRole::Uplink, None, &[])[0].port, "eno4");
+        // 링크는 살았는데 주소만 없음(DHCP 만료·`ip addr del`) → 그래도 끊김(리뷰 2)
+        a.status.interfaces = vec![eth("eno4", None)];
         let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
         assert_eq!(rail(&p, "vx")[0].1, RailState::Down);
-        // 본 것도 없음 → 모름(정상이 아님)
-        a.status.underlay_ports.clear();
+        assert_eq!(port(&p, "a", "eno4").health, LinkHealth::Down);
+        assert_eq!(link_faults(&a, LinkRole::Uplink, None, &[])[0].port, "eno4");
+        // 그 인터페이스가 사라짐 → 끊김, 포트 목록에 missing으로 남음
+        a.status.interfaces.clear();
+        a.status.known_ports[0].missing = true;
+        let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
+        assert_eq!(rail(&p, "vx")[0].1, RailState::Down);
+        assert_eq!(
+            (
+                port(&p, "a", "eno4").state.as_str(),
+                port(&p, "a", "eno4").health
+            ),
+            ("missing", LinkHealth::Down)
+        );
+        let i = &p.nodes[0].impact[0];
+        assert!(i.missing && i.underlay, "{i:?}");
+        assert_eq!(describe("a", i), "eno4 missing on a — underlay, 1 network");
+        assert_eq!(link_faults(&a, LinkRole::Uplink, None, &[])[0].port, "eno4");
+        // 기억도 없음 → 모름(정상이 아님)
+        a.status.known_ports.clear();
         let p = build(std::slice::from_ref(&a), std::slice::from_ref(&vx), &[]);
         assert_eq!(rail(&p, "vx")[0].1, RailState::Unknown);
         assert_eq!(p.nodes[0].underlay.as_ref().unwrap().port, None);
     }
 
-    /// 본딩 구성 포트가 노드에서 사라짐(노드가 `missing`으로 남김): 본딩은 저하이고 `bond_degraded`가 본딩에 낸다.
+    /// 주소만 가진 스토리지 NIC의 링크가 끊겨 NetworkManager가 주소를 뗌(리뷰 2): 기억한 역할(service)·쓰임·주소 그대로
+    /// 끊김이다. 주소가 다른 인터페이스로 옮겨 갔으면 잃은 것이 아니다.
+    #[test]
+    fn a_service_port_that_lost_its_address_stays_watched() {
+        let mut n = node("svc01", vec![down(eth("ens1f0", None))], &[]);
+        n.status.cluster_addresses = vec!["10.10.0.11:8007".into()];
+        n.status.known_ports = vec![known("ens1f0", PortRole::Service, &["10.10.0.11"])];
+        let p = build(std::slice::from_ref(&n), &[], &[]);
+        let s = port(&p, "svc01", "ens1f0");
+        assert_eq!(
+            (s.role, s.uses.as_slice(), s.addresses.as_slice()),
+            (
+                PortRole::Service,
+                [PortUse::Cluster].as_slice(),
+                ["10.10.0.11".to_string()].as_slice()
+            )
+        );
+        assert_eq!(
+            describe("svc01", &p.nodes[0].impact[0]),
+            "ens1f0 down on svc01 — cluster link"
+        );
+        assert_eq!(
+            link_faults(&n, LinkRole::Uplink, None, &[])[0].port,
+            "ens1f0"
+        );
+        // 링크가 살아 있어도 주소를 잃었으면 끊김
+        n.status.interfaces = vec![eth("ens1f0", None)];
+        assert_eq!(
+            link_faults(&n, LinkRole::Uplink, None, &[])[0].port,
+            "ens1f0"
+        );
+        // 주소가 bond1으로 옮겨 감 → 잃은 것이 아니고 감시 밖(쓰지 않는 포트)
+        let mut bond1 = bond("bond1", None, BondState::Up, &[]);
+        bond1.addresses = vec!["10.10.0.11/24".into()];
+        n.status.interfaces = vec![eth("ens1f0", None), bond1];
+        let p = build(std::slice::from_ref(&n), &[], &[]);
+        assert_eq!(port(&p, "svc01", "ens1f0").role, PortRole::Unused);
+        assert!(link_faults(&n, LinkRole::Uplink, None, &[]).is_empty());
+    }
+
+    /// 주소를 VLAN에 둔 포트: 주소를 잃으면 VLAN과 그 아래 이더넷이 기억한 역할로 남고, 끊긴 이더넷 하나로 낸다.
+    #[test]
+    fn a_vlan_service_address_recalls_the_lower_port() {
+        let mut vlan = iface("eno3.20", InterfaceKind::Vlan);
+        vlan.parent = Some("eno3".into());
+        let mut n = node("a", vec![down(eth("eno3", None)), down(vlan)], &[]);
+        let mut kv = known("eno3.20", PortRole::Service, &["10.20.0.1"]);
+        kv.kind = PortKind::Vlan;
+        n.status.known_ports = vec![known("eno3", PortRole::Service, &[]), kv];
+        let p = build(std::slice::from_ref(&n), &[], &[]);
+        assert_eq!(port(&p, "a", "eno3").role, PortRole::Service);
+        assert_eq!(port(&p, "a", "eno3.20").role, PortRole::Service);
+        let names: Vec<String> = link_faults(&n, LinkRole::Uplink, None, &[])
+            .into_iter()
+            .map(|f| f.port)
+            .collect();
+        assert_eq!(names, ["eno3"]);
+    }
+
+    /// 본딩 밖 브리지 업링크의 netdev가 사라짐(리뷰 2): 기억 포트로 브리지가 업링크를 잃어 끊김, 영향·경보가 난다.
+    #[test]
+    fn a_missing_bridge_uplink_takes_the_bridge_down() {
+        let mut n = node("a", vec![br("vmbr0")], &[("vmbr0", false)]);
+        let mut k = gone(known("eno1", PortRole::Uplink, &[]));
+        k.bridges = vec!["vmbr0".into()];
+        n.status.known_ports = vec![k];
+        let lan = bridge_net("lan", "vmbr0");
+        let vms = [vm("x", &n, VmPhase::Running, &["lan"])];
+        let p = build(std::slice::from_ref(&n), std::slice::from_ref(&lan), &vms);
+        let b = &p.nodes[0].bridges[0];
+        assert_eq!(
+            (b.health, b.uplinks.as_slice()),
+            (LinkHealth::Down, ["eno1".to_string()].as_slice())
+        );
+        assert_eq!(rail(&p, "lan")[0].1, RailState::Down);
+        let i = &p.nodes[0].impact[0];
+        assert_eq!(
+            describe("a", i),
+            "eno1 missing on a — vmbr0, 1 network, 1 VM"
+        );
+        assert_eq!(link_faults(&n, LinkRole::Uplink, None, &[])[0].port, "eno1");
+    }
+
+    /// 본딩 구성 포트가 노드에서 사라짐(기억 포트가 `missing`): 본딩은 저하이고 사라진 이름이 구성 포트·영향·문구에 보인다.
     #[test]
     fn a_missing_bond_member_degrades_the_bond() {
-        let n = node(
+        let mut n = node(
             "a",
             vec![
                 eth("eno1", Some("bond0")),
                 bond(
                     "bond0",
                     Some("vmbr0"),
-                    BondState::Degraded,
-                    &[("eno1", PortState::Up), ("eno2", PortState::Missing)],
+                    BondState::Up,
+                    &[("eno1", PortState::Up)],
                 ),
                 br("vmbr0"),
             ],
             &[("vmbr0", false)],
         );
+        let mut k = gone(known("eno2", PortRole::Uplink, &[]));
+        k.bond = Some("bond0".into());
+        k.bridges = vec!["vmbr0".into()];
+        n.status.known_ports = vec![k];
         let p = build(std::slice::from_ref(&n), &[bridge_net("lan", "vmbr0")], &[]);
-        assert_eq!(port(&p, "a", "bond0").health, LinkHealth::Degraded);
+        let b = port(&p, "a", "bond0");
+        assert_eq!(b.health, LinkHealth::Degraded);
+        let members = &b.bond.as_ref().unwrap().members;
+        assert_eq!(
+            (members[1].name.as_str(), members[1].state),
+            ("eno2", PortState::Missing)
+        );
         assert_eq!(rail(&p, "lan")[0].1, RailState::Degraded);
+        assert_eq!(port(&p, "a", "eno2").state, "missing");
         let i = &p.nodes[0].impact;
         assert_eq!(
-            (i[0].port.as_str(), i[0].severity),
-            ("bond0", FaultSeverity::Degraded)
+            (
+                i[0].port.as_str(),
+                i[0].severity,
+                i[0].bond.as_deref(),
+                i[0].missing
+            ),
+            ("eno2", FaultSeverity::Degraded, Some("bond0"), true)
+        );
+        assert_eq!(
+            describe("a", &i[0]),
+            "eno2 missing on a: bond0 degraded — vmbr0, 1 network"
+        );
+        assert_eq!(
+            describe_bond("a", b, Some(&i[0])),
+            "bond0 degraded on a (eno2 missing) — vmbr0, 1 network"
         );
         assert_eq!(bond_faults(&n)[0].port, "bond0");
-        assert!(link_faults(&n, LinkRole::Any, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Any, None, &[]).is_empty());
+        // 노드의 본딩 감시도 같은 판단
+        let mut list = n.status.interfaces.clone();
+        mark_missing_members(&n.status.known_ports, &mut list);
+        assert_eq!(list[1].bond.as_ref().unwrap().state, BondState::Degraded);
+    }
+
+    /// 글롭 규칙(`eno*`)은 본딩 구성 포트도 본다(리뷰 2): 본딩이 통째로 끊기면 구성 포트마다 낸다. 끊긴 본딩은
+    /// `bond_faults`에 down으로 남는다(엔진이 이미 울린 저하 경보를 이어 감).
+    #[test]
+    fn globs_see_bond_members_and_down_bonds_stay_in_bond_faults() {
+        let n = node(
+            "a",
+            vec![
+                down(eth("eno1", Some("bond0"))),
+                down(eth("eno2", Some("bond0"))),
+                bond(
+                    "bond0",
+                    Some("vmbr0"),
+                    BondState::Down,
+                    &[("eno1", PortState::Down), ("eno2", PortState::Down)],
+                ),
+                br("vmbr0"),
+            ],
+            &[("vmbr0", false)],
+        );
+        let names = |f: Vec<LinkFault>| f.into_iter().map(|f| f.port).collect::<Vec<_>>();
+        assert_eq!(
+            names(link_faults(&n, LinkRole::Uplink, Some("eno*"), &[])),
+            ["eno1", "eno2"]
+        );
+        assert_eq!(
+            names(link_faults(&n, LinkRole::Uplink, None, &[])),
+            ["bond0"]
+        );
+        let b = bond_faults(&n);
+        assert_eq!(
+            (b[0].port.as_str(), b[0].severity),
+            ("bond0", FaultSeverity::Down)
+        );
+        let p = build(std::slice::from_ref(&n), &[], &[]);
+        assert_eq!(
+            describe_bond("a", port(&p, "a", "bond0"), None),
+            "bond0 down on a (eno1 down, eno2 down)"
+        );
+    }
+
+    /// 노드 수집의 기억(리뷰 2): 감시하는 포트를 기억하고, 주소를 잃어도 남고, 사라지면 missing(한 번 시각을 적음),
+    /// VLAN은 사라지면 잊고, 상한 밖에 있는 것은 그대로, 감시 밖이 된 포트는 잊고, 본딩에 새 구성 포트가 오면 그 본딩의
+    /// 사라진 구성 포트를 잊는다.
+    #[test]
+    fn remember_ports_tracks_roles_addresses_and_missing_ports() {
+        let mut storage = eth("ens1f0", None);
+        storage.addresses = vec!["10.10.0.11/24".into()];
+        let mut vlan = iface("eno1.100", InterfaceKind::Vlan);
+        vlan.parent = Some("eno1".into());
+        vlan.master = Some("vmbr100".into());
+        let mut n = node(
+            "a",
+            vec![
+                storage,
+                eth("eno1", None),
+                vlan,
+                br("vmbr100"),
+                eth("eno2", Some("bond0")),
+                eth("eno3", Some("bond0")),
+                bond("bond0", None, BondState::Up, &[]),
+                eth("eno9", None),
+            ],
+            &[("vmbr100", false)],
+        );
+        let all = |n: &Node| -> BTreeSet<String> {
+            n.status.interfaces.iter().map(|i| i.name.clone()).collect()
+        };
+        let remember = |n: &Node, extra: &[&str], now: u64| {
+            let names = all(n);
+            let mut present: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+            present.extend(extra);
+            remember_ports(&n.status, &n.spec.address, &present, now)
+        };
+        n.status.known_ports = remember(&n, &[], 10);
+        let k = |n: &Node, name: &str| {
+            n.status
+                .known_ports
+                .iter()
+                .find(|k| k.name == name)
+                .cloned()
+        };
+        let names: Vec<&str> = n
+            .status
+            .known_ports
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["ens1f0", "eno1", "eno1.100", "eno2", "eno3", "bond0"]
+        );
+        assert_eq!(k(&n, "ens1f0").unwrap().addresses, ["10.10.0.11"]);
+        assert_eq!(k(&n, "eno1").unwrap().bridges, ["vmbr100"]);
+        assert_eq!(k(&n, "eno2").unwrap().bond.as_deref(), Some("bond0"));
+        // 주소를 잃음(링크 끊김) → 그대로 기억, 시각은 바꾸지 않음
+        n.status.interfaces[0] = down(eth("ens1f0", None));
+        n.status.known_ports = remember(&n, &[], 20);
+        let s = k(&n, "ens1f0").unwrap();
+        assert_eq!(
+            (s.role, s.addresses.as_slice(), s.last_seen_ms),
+            (PortRole::Service, ["10.10.0.11".to_string()].as_slice(), 10)
+        );
+        // eno1·eno1.100과 eno3이 사라짐 → 이더넷은 missing(사라진 것을 안 때), VLAN은 잊음
+        n.status
+            .interfaces
+            .retain(|i| !matches!(i.name.as_str(), "eno1" | "eno1.100" | "eno3"));
+        n.status.known_ports = remember(&n, &[], 30);
+        let e = k(&n, "eno1").unwrap();
+        assert_eq!((e.missing, e.last_seen_ms), (true, 30));
+        assert!(k(&n, "eno1.100").is_none());
+        assert!(k(&n, "eno3").unwrap().missing);
+        // 다음 회차에도 그대로(시각도), 본딩 상태를 한 번 못 읽어도 남음
+        n.status.interfaces[3].bond = None;
+        n.status.known_ports = remember(&n, &[], 40);
+        assert_eq!(k(&n, "eno1").unwrap().last_seen_ms, 30);
+        assert!(k(&n, "eno3").unwrap().missing);
+        // 상한 밖에 있는 것은 사라진 것이 아님
+        let before = k(&n, "eno1").unwrap();
+        n.status.known_ports.iter_mut().for_each(|k| {
+            if k.name == "eno1" {
+                k.missing = false
+            }
+        });
+        n.status.known_ports = remember(&n, &["eno1"], 50);
+        assert!(!k(&n, "eno1").unwrap().missing);
+        n.status.known_ports.iter_mut().for_each(|k| {
+            if k.name == "eno1" {
+                *k = before.clone()
+            }
+        });
+        // 새 이름의 NIC로 bond0을 다시 묶음 → bond0의 사라진 eno3을 잊음(eno1은 남음)
+        n.status.interfaces.push(eth("ens2f1", Some("bond0")));
+        n.status.known_ports = remember(&n, &[], 60);
+        assert!(k(&n, "eno3").is_none());
+        assert!(k(&n, "eno1").unwrap().missing);
+        assert!(k(&n, "ens2f1").is_some());
+        // 관리자가 eno2를 본딩에서 뺌(쓰지 않는 포트가 됨) → 잊음
+        n.status.interfaces.iter_mut().for_each(|i| {
+            if i.name == "eno2" {
+                i.master = None
+            }
+        });
+        n.status.known_ports = remember(&n, &[], 70);
+        assert!(k(&n, "eno2").is_none());
+        assert!(k(&n, "eno9").is_none());
     }
 
     /// 관리자가 내린 브리지(`ip link set vmbr0 down`)는 업링크가 살아도 끊김이다. 올라와 있는 내부 브리지는 아니다.
@@ -2123,7 +2843,14 @@ mod tests {
             (i.port.as_str(), i.bridges.as_slice(), i.vms),
             ("vmbr0", ["vmbr0".to_string()].as_slice(), 1)
         );
-        assert_eq!(link_faults(&n, LinkRole::Uplink, None)[0].port, "vmbr0");
+        assert_eq!(
+            link_faults(&n, LinkRole::Uplink, None, std::slice::from_ref(&lan))[0].port,
+            "vmbr0"
+        );
+        // 네트워크가 실리지 않는 브리지는 내려도 장애가 아니다(계획 75 리뷰 2).
+        assert!(link_faults(&n, LinkRole::Uplink, None, &[]).is_empty());
+        let p = build(std::slice::from_ref(&n), &[], &[]);
+        assert!(p.nodes[0].impact.is_empty());
     }
 
     /// `role: any`는 이더넷·VLAN과 묶인 포트를 본다. 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int`)는 늘 down이라
@@ -2139,12 +2866,12 @@ mod tests {
             ],
             &[],
         );
-        let names: Vec<String> = link_faults(&n, LinkRole::Any, None)
+        let names: Vec<String> = link_faults(&n, LinkRole::Any, None, &[])
             .into_iter()
             .map(|f| f.port)
             .collect();
         assert_eq!(names, ["eno9"]);
-        assert!(link_faults(&n, LinkRole::Uplink, None).is_empty());
+        assert!(link_faults(&n, LinkRole::Uplink, None, &[]).is_empty());
     }
 
     /// 도는 VM의 NIC 네트워크가 이 노드에 없으면 `unreachable`로 센다(멈춘 VM은 세지 않음).

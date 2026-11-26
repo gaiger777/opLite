@@ -1634,9 +1634,10 @@ async fn apply_set_drift_alerts_name_the_set() {
     assert!(text.contains("Apply set web drifted: 1 object"), "{text}");
 }
 
-/// 링크 경보(계획 75 §3.4, 리뷰 1): 본딩 구성 포트 하나가 끊기면(본딩은 흐름) `bond_degraded`(warning) 하나만, 본딩이
-/// 통째로 끊기면 본딩 이름으로 `node_link_down`(critical) 하나 — 새 알림이다. 문구는 영향(위 브리지·네트워크·VM). 역할
-/// 거르기(`uplink`는 쓰지 않는 포트를 보지 않음)와 포트 글롭, 포트가 돌아오면 해제.
+/// 링크 경보(계획 75 §3.4, 리뷰 1·2): 본딩 구성 포트 하나가 끊기면(본딩은 흐름) `bond_degraded`(warning) 하나만, 본딩이
+/// 통째로 끊기면 본딩 이름으로 `node_link_down`(critical) 하나 — 새 알림이고, 저하 경보는 "해소"를 보내지 않고 그대로다.
+/// 문구는 본딩과 구성 포트 상태, 영향(위 브리지·네트워크·VM). 역할 거르기(`uplink`는 쓰지 않는 포트를 보지 않음)와 포트
+/// 글롭, 포트가 돌아오면 해제.
 #[tokio::test]
 async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     use orbivisor_types::network::Network;
@@ -1722,7 +1723,7 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
         "{bond}"
     );
     assert_eq!(
-        bond["detail"], "eno2 down on svc01: bond0 degraded — vmbr0, 1 network, 1 VM",
+        bond["detail"], "bond0 degraded on svc01 (eno2 down) — vmbr0, 1 network, 1 VM",
         "{bond}"
     );
     assert!(
@@ -1737,7 +1738,7 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     assert_eq!(spare["subject"]["port"], "eno3", "{spare}");
     assert_eq!(spare["detail"], "eno3 down on svc01", "{spare}");
 
-    // 본딩이 통째로 끊김: 본딩 이름으로 critical 하나(새 알림), 저하 경보는 풀리기 시작한다.
+    // 본딩이 통째로 끊김: 본딩 이름으로 critical 하나(새 알림), 저하 경보는 풀리지 않는다(리뷰 2).
     let set = |eno1: bool, eno2: bool| {
         let env = &rig.env;
         async move {
@@ -1755,9 +1756,22 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     assert_eq!(up["subject"]["port"], "bond0", "{up}");
     assert_eq!(up["severity"], "critical", "{up}");
     assert_eq!(
-        up["detail"], "eno1 down on svc01: bond0 down — vmbr0, 1 network, 1 VM",
+        up["detail"], "bond0 down on svc01 (eno1 down, eno2 down) — vmbr0, 1 network, 1 VM",
         "{up}"
     );
+    settle().await;
+    rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
+    settle().await;
+    let a = rig.alerts().await;
+    assert!(
+        a["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["clear_since"].is_null()),
+        "{a}"
+    );
+    assert_eq!(rig.hook.hits().len(), 3, "{:?}", rig.hook.hits());
     // 경보 목록도 포트마다
     let a = rig.alerts().await;
     let mut ports: Vec<(String, String)> = a["alerts"]
@@ -1799,23 +1813,38 @@ async fn link_alerts_fire_per_port_with_the_impact_and_resolve() {
     engine.shutdown().await;
 }
 
-/// 리뷰 1: 주소만 가진 NIC(스토리지·클러스터 링크망)도 기본 규칙이 본다. 경보가 난 포트가 인터페이스 목록에서 사라지면
-/// 풀지 않고 그대로 두고(다시 나타나 살아 있으면 풀림), 오프라인 노드의 경보는 되풀이하지 않는다.
+/// 리뷰 1·2: 주소만 가진 NIC(스토리지·클러스터 링크망)도 기본 규칙이 본다. 노드가 기억하는 포트(`known_ports`)는 링크가
+/// 끊겨 주소가 떨어져도, netdev가 사라져도 그 역할 그대로 장애다 — pending이 firing으로 이어지고 firing은 풀리지 않는다
+/// (다시 나타나 살아 있으면 풀림). 오프라인 노드의 경보는 되풀이하지 않는다. 운영자가 잊으면(`forget-ports`) 풀린다.
 #[tokio::test]
 async fn link_alerts_hold_vanished_ports_and_stay_quiet_offline() {
     use orbivisor_types::node::{FEATURES, NodeInterface};
+    use orbivisor_types::physical::KnownPort;
 
-    let storage = |present: bool, up: bool| -> Vec<NodeInterface> {
+    // `addressed`: 주소가 붙어 있음(NM이 떼면 거짓)
+    let storage = |present: bool, up: bool, addressed: bool| -> Vec<NodeInterface> {
         let st = if up { "up" } else { "down" };
         let mut list =
             vec![json!({ "name": "eno1", "kind": "ethernet", "state": "up", "carrier": true })];
         if present {
+            let addresses: Vec<&str> = if addressed {
+                vec!["10.10.0.11/24"]
+            } else {
+                vec![]
+            };
             list.push(
                 json!({ "name": "ens1f0", "kind": "ethernet", "state": st, "carrier": up,
-                              "addresses": ["10.10.0.11/24"] }),
+                              "addresses": addresses }),
             );
         }
         serde_json::from_value(Value::Array(list)).unwrap()
+    };
+    let known = |missing: bool| -> Vec<KnownPort> {
+        serde_json::from_value(
+            json!([{ "name": "ens1f0", "kind": "ethernet", "role": "service",
+            "addresses": ["10.10.0.11"], "missing": missing, "last_seen_ms": 1 }]),
+        )
+        .unwrap()
     };
     let rig = Rig::start().await;
     rig.target("ops", "json").await;
@@ -1826,7 +1855,9 @@ async fn link_alerts_hold_vanished_ports_and_stay_quiet_offline() {
             online: true,
             features: FEATURES.iter().map(|f| f.to_string()).collect(),
             cluster_addresses: vec!["10.10.0.11:8007".into()],
-            interfaces: storage(true, false),
+            // 링크가 끊기자마자 주소가 떨어짐: 기억한 역할로 본다.
+            interfaces: storage(true, false, false),
+            known_ports: known(false),
             ..NodeStatus::default()
         },
     )
@@ -1851,8 +1882,11 @@ async fn link_alerts_hold_vanished_ports_and_stay_quiet_offline() {
         f(&mut n.status);
         n.status
     };
-    // 사라짐: 풀리지 않고(해제 시작 없음) 그대로
-    let status = set(&|s| s.interfaces = storage(false, false));
+    // 사라짐(노드가 missing으로 기억): 풀리지 않고(해제 시작 없음) 그대로
+    let status = set(&|s| {
+        s.interfaces = storage(false, false, false);
+        s.known_ports = known(true);
+    });
     rig.env
         .cluster
         .update_status::<NodeSpec>(svc01, &status)
@@ -1866,7 +1900,10 @@ async fn link_alerts_hold_vanished_ports_and_stay_quiet_offline() {
     assert!(a["alerts"][0]["clear_since"].is_null(), "{a}");
     // 되풀이 때가 지나면 "사라짐"으로 다시 알린다.
     let hits = rig.hook.wait(2).await;
-    assert_eq!(hits[1].json()["detail"], "ens1f0 disappeared from svc01");
+    assert_eq!(
+        hits[1].json()["detail"],
+        "ens1f0 missing on svc01 — cluster link"
+    );
 
     // 오프라인: 그대로 두되 되풀이하지 않는다.
     let status = set(&|s| s.online = false);
@@ -1881,21 +1918,88 @@ async fn link_alerts_hold_vanished_ports_and_stay_quiet_offline() {
     assert_eq!(rig.hook.hits().len(), 2, "{:?}", rig.hook.hits());
     assert_eq!(rig.alerts().await["alerts"].as_array().unwrap().len(), 1);
 
-    // 다시 켜지고 포트가 돌아와 살아 있으면 풀린다.
-    let status = set(&|s| {
-        s.online = true;
-        s.interfaces = storage(true, true);
-    });
+    // 다시 켜졌는데 여전히 사라져 있음: 운영자가 잊으면(NIC를 뺌) 풀린다.
+    let status = set(&|s| s.online = true);
     rig.env
         .cluster
         .update_status::<NodeSpec>(svc01, &status)
         .await
         .unwrap();
+    let admin = rig.env.admin().await;
+    let (st, node) = admin
+        .post("/nodes/svc01/forget-ports", json!({ "ports": ["ens1f0"] }))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{node}");
+    assert!(node["status"].get("known_ports").is_none(), "{node}");
+    // 다시 잊으려 하면 기억에 없음
+    let (st, body) = admin
+        .post("/nodes/svc01/forget-ports", json!({ "ports": ["ens1f0"] }))
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
     rig.wait_alerts(|a| a["alerts"][0]["clear_since"].is_i64())
         .await;
     rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
     let hits = rig.hook.wait(3).await;
     assert_eq!(hits[2].json()["state"], "resolved", "{:?}", hits[2].json());
+    engine.shutdown().await;
+}
+
+/// 리뷰 2: pending 중에 포트가 사라져도(PCIe 장애로 carrier가 먼저 떨어지고 netdev가 없어짐) 기억 포트라 `for_secs` 뒤
+/// firing이 된다.
+#[tokio::test]
+async fn a_port_that_vanishes_while_pending_still_fires() {
+    use orbivisor_types::node::{FEATURES, NodeInterface};
+    use orbivisor_types::physical::KnownPort;
+
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    let list: Vec<NodeInterface> = serde_json::from_value(json!([
+        { "name": "eno1", "kind": "ethernet", "state": "down", "carrier": false, "master": "vmbr0" },
+        { "name": "vmbr0", "kind": "bridge", "state": "down", "carrier": false }
+    ]))
+    .unwrap();
+    let known: Vec<KnownPort> =
+        serde_json::from_value(json!([{ "name": "eno1", "kind": "ethernet",
+        "role": "uplink", "bridges": ["vmbr0"], "last_seen_ms": 1 }]))
+        .unwrap();
+    let svc01 = add_node(
+        &rig.env,
+        "svc01",
+        NodeStatus {
+            online: true,
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+            interfaces: list,
+            known_ports: known.clone(),
+            ..NodeStatus::default()
+        },
+    )
+    .await;
+    rig.rule(
+        "uplinks",
+        json!({"condition": {"kind": "node_link_down"}, "severity": "critical", "for_secs": 30,
+               "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    rig.wait_alerts(|a| a["alerts"].as_array().is_some_and(|l| l.len() == 1))
+        .await;
+    let mut n = rig.env.cluster.get::<NodeSpec>(svc01).unwrap().unwrap();
+    n.status.interfaces.retain(|i| i.name != "eno1");
+    n.status.known_ports[0].missing = true;
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(svc01, &n.status)
+        .await
+        .unwrap();
+    settle().await;
+    rig.step(31_000, 1.0);
+    let hits = rig.hook.wait(1).await;
+    let h = hits[0].json();
+    assert_eq!(
+        (h["state"].as_str(), h["detail"].as_str()),
+        (Some("firing"), Some("eno1 missing on svc01 — vmbr0")),
+        "{h}"
+    );
     engine.shutdown().await;
 }
 

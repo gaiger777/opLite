@@ -162,10 +162,13 @@ API가 "물리 포트 → 본딩 → VLAN → 브리지 → 네트워크 → VM"
 
 - **노드가 알리는 것.** 30초마다 `ip -j -d addr show`와 sysfs로 인터페이스(이름·종류·operstate·carrier·속도·MAC·주소·`master`), 본딩
   상태(모드·구성 포트마다 up/down/LACP 어긋남/속도 어긋남/사라짐), **MTU**, 관리자 UP(`ip link set … down`이면 거짓), VLAN·macvlan의
-  **아래 장치**(`ip`의 `link`)와 **VLAN id**를 노드 상태(`status.interfaces`)에 쓴다. 본딩에서 본 적 있는 구성 포트의 netdev가 사라지면(PCIe
-  장애·드라이버 unbind·핫플러그 제거 — 커널이 본딩에서도 뺀다) 그 포트를 `missing`으로 남기고 본딩을 저하로 본다(다시 나타나면 지움).
-  underlay 주소마다 마지막으로 그 주소를 가졌던 인터페이스도 `status.underlay_ports`에 둔다 — 링크가 끊길 때 NetworkManager가 주소를
-  떼어도 그 포트를 계속 본다. 본딩 상태가 바뀌면 감사 항목과 기록 Task `bond-degraded`도 남는다([HA 상태 검사](ha.md#ha-상태-검사)).
+  **아래 장치**(`ip`의 `link`)와 **VLAN id**를 노드 상태(`status.interfaces`)에 쓴다. 역할이 업링크·underlay·service인 포트는 이름으로
+  **기억한다**(`status.known_ports`: 종류·역할·스스로 가진 주소·든 본딩·위 브리지·사라짐·본 때 — 지난 기억에서 이어 가므로 다시 시작해도 남음).
+  링크가 끊길 때 NetworkManager가 주소를 떼어도 그 포트를 그 역할 그대로 보고, netdev가 사라지면(PCIe 장애·드라이버 unbind·핫플러그 제거
+  — 커널이 본딩·브리지에서도 뺀다) `missing`으로 남긴다: 본딩 구성 포트였으면 본딩이 저하, 본딩 밖 브리지 업링크였으면 그 브리지가 그만큼
+  업링크를 잃는다. 다시 나타나 감시 밖 역할이 되거나 본딩에 새 이름의 구성 포트가 들어오면 잊는다. **NIC를 교체·뺐으면 잊기**:
+  `orbivisorctl node forget-ports <노드> <포트>…`([링크 경보](cluster.md#링크-경보)). 본딩 상태(사라진 구성 포트 포함)가 바뀌면 감사 항목과
+  기록 Task `bond-degraded`도 남는다([HA 상태 검사](ha.md#ha-상태-검사)).
 - **LLDP(스위치 쪽 이웃).** 노드에 **lldpd**가 있으면 같은 30초 회차에 `lldpcli -f json show neighbors`(3초 상한)를 따로 띄워(검사
   회차를 막지 않음) 끝난 뒤의 회차가 포트마다 건너편 스위치 이름·섀시 id·스위치 포트·포트 설명·관리 주소를 붙인다. 없으면 칸이 비고 화면이 "lldpd를 설치하면 스위치 포트가 보입니다."를 보인다.
   Orbivisor가 직접 LLDP를 받지는 않는다.
@@ -181,16 +184,19 @@ API가 "물리 포트 → 본딩 → VLAN → 브리지 → 네트워크 → VM"
   **스위치 쪽에서도 LLDP를 켠다**(제조사마다 `lldp run`·`feature lldp`·`lldp enable` 등 — 많은 스위치가 기본으로 켜져 있지만 포트마다
   송신을 끈 곳이 있다). 이웃이 30초 회차 안에 보이지 않으면 lldpd의 첫 교환(기본 30초 간격)을 기다린다. lldpd가 멈추면 다음 회차에 이웃이 빈다.
 - **역할.** 포트마다 `uplink`(브리지·본딩 아래와 본딩), `underlay`(VXLAN·SDN 터널 주소를 가진 것과 그 아래 — 주소가 떨어졌으면
-  마지막으로 본 인터페이스), `service`(그 밖에 전역 주소를 가진 물리 포트와 그 아래 — 스토리지·복제·관리·클러스터 링크망; 노드의 클러스터
+  그 주소를 기억한 포트. 아무 인터페이스도 그 주소를 갖지 않으면 링크가 살아 있어도 underlay 레일은 `down`), `service`(그 밖에 전역 주소를 가진 물리 포트와 그 아래 — 스토리지·복제·관리·클러스터 링크망; 노드의 클러스터
   링크 주소·API 주소면 `uses`에 `cluster`·`management`), `unused`(묶이지 않고 주소도 없는 이더넷), `other`(업링크가 아닌 브리지, 묶이지 않은
-  가상 장치)다. 링크 경보의 기본(`role: uplink`)과 지도의 포트 줄·영향은 `uplink`·`underlay`·`service`를 본다.
+  가상 장치)다. 주소를 잃은 기억 포트와 그 아래는 기억한 역할 그대로다. 링크 경보의 기본(`role: uplink`)과 지도의 포트 줄·영향은
+  `uplink`·`underlay`·`service`를 본다.
 - **`GET /api/v1/topology/physical`**(루트 `cluster.read`, 온라인 노드가 모두 기능 `operator-dashboard`를 알아야 함 — 아니면 **409**
   `cluster_upgrading`, 꺼진 옛 노드는 막지 않음):
-  `{"nodes":[{"node","online","legacy","ports":[{name,kind,state,carrier,speed_mbps,mtu,mac,master,parent,vlan_id,lldp,bond,role,uses,health}],"bridges":[{name,
-  uplinks,vlan_filtering,networks,vm_nics}],"underlay","physnets","impact":[{port,severity,bond,bridges,underlay,uses,networks,vms,vm_ids}],
+  `{"nodes":[{"node","online","legacy","ports":[{name,kind,state,carrier,speed_mbps,mtu,mac,master,parent,vlan_id,lldp,bond,role,uses,addresses,health}],"bridges":[{name,
+  uplinks,vlan_filtering,networks,vm_nics,health}],"underlay","physnets","impact":[{port,severity,bond,missing,bridges,underlay,uses,networks,vms,vm_ids}],
   "unreachable":[{network,vms,vm_ids}]}],"networks":[{id,name,kind,carrier,vlan,nodes:[{node,state}]}]}`(노드는 이름 순, veth는 포트에서 뺌).
-  `health`는 그 포트에서 아래로 본 상태(본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들 — 관리자가 내린 브리지는 `down`)다. `impact`는
-  포트·본딩 장애마다 하나다 — 포트 carrier 없음·본딩 끊김·관리자가 내린 브리지면 그 위 브리지·네트워크·이 노드의 VM이 `down`, 본딩 저하·
+  `health`는 그 포트에서 아래로 본 상태(본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들 — 관리자가 내린 브리지는 `down`, 주소를 잃은
+  기억 포트는 `down`)다. 사라진 기억 포트는 목록 끝에 `state: "missing"`·`health: "down"`으로 오고, 본딩의 `members`에도 `missing`으로 든다.
+  `addresses`는 포트가 가진 전역 주소(주소를 잃었거나 사라진 포트는 마지막으로 가졌던 것)다. `impact`는
+  포트·본딩 장애마다 하나다 — 포트 carrier 없음·주소 잃음·사라짐(`missing: true`)·본딩 끊김·네트워크가 실리는데 관리자가 내린 브리지면 그 위 브리지·네트워크·이 노드의 VM이 `down`, 본딩 저하·
   구성 포트 하나만 끊김이면 `degraded`(이중화 잃음), `vm_ids`는 50개까지. 오프라인 노드의 `impact`는 마지막으로 본 값이다(화면은 그렇게 적고
   배지에 세지 않는다). `unreachable`은 이 노드에서 도는 VM이 NIC를 붙였는데 이 노드에 실을 수단이 없는 네트워크다. `networks`는
   네트워크마다 노드별 레일 상태다: 사슬이 끝까지 up이면 `up`, 본딩 저하면 `degraded`, 끊기면 `down`, 그 노드에 그 네트워크를 실을 수단이

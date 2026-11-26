@@ -510,6 +510,13 @@ enum NodeCmd {
     Unfreeze {
         node: String,
     },
+    /// 노드가 기억하는 포트를 잊는다(계획 75 리뷰 2): NIC를 빼거나 다른 이름의 NIC로 바꿨거나 주소를 일부러 지운 포트가
+    /// 사라짐(missing)·끊김으로 남아 링크 경보가 울리는 것을 멈춘다. 지금 쓰는 포트는 다음 수집이 다시 기억한다.
+    ForgetPorts {
+        node: String,
+        #[arg(required = true)]
+        ports: Vec<String>,
+    },
     /// 노드의 전원 끄기 펜싱(IPMI·Redfish·명령). 리더가 리스를 잃은 노드를 끄고 꺼진 것을 확인하면 watchdog를
     /// 기다리지 않고 HA VM을 옮긴다. admin만 다룬다.
     Fence {
@@ -961,6 +968,23 @@ async fn node_unfreeze(
         out,
         "node {node}: shutdown mark cleared; HA moves its VMs to other nodes"
     )?;
+    Ok(())
+}
+
+/// `node forget-ports`: 노드가 기억하는 포트를 잊는다.
+async fn node_forget_ports(
+    client: &Client,
+    node: &str,
+    ports: &[String],
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    client
+        .post(
+            &format!("/nodes/{}/forget-ports", seg(node)),
+            &json!({ "ports": ports }),
+        )
+        .await?;
+    writeln!(out, "node {node}: forgot {}", ports.join(", "))?;
     Ok(())
 }
 
@@ -4354,14 +4378,20 @@ const CAPACITY_POOL_HEADERS: &[&str] =
     &["POOL", "PROVISIONED", "USED", "TOTAL", "VOLUMES", "NODES"];
 
 /// `capacity`의 노드 행: SHARED는 공유 정책 VM의 vCPU/공유 스레드(`threads − reserved − dedicated_total` — 오버커밋과 같은
-/// 셈, 웹 표의 CPU 막대와 같음), DEDICATED는 잡힌 전용 CPU/전용 CPU(리뷰 1), CPU는 노드 전체 사용률, MEMORY는 할당/전체,
-/// STORAGE는 로컬 풀 프로비전 합/전체 합
+/// 셈, 웹 표의 CPU 막대와 같음), DEDICATED는 잡힌 전용 CPU/전용 CPU(리뷰 1), CPU는 노드 전체 사용률, MEMORY는 보통 메모리
+/// 할당/보통 메모리(hugepages VM과 풀을 뺌 — 메모리 오버커밋과 같은 셈, 리뷰 2), STORAGE는 로컬 풀 프로비전 합/전체 합
 fn capacity_node_row(n: &Value) -> Vec<String> {
     let cpu = &n["cpu"];
     let shared = cpu["threads"].as_u64().unwrap_or(0).saturating_sub(
         cpu["reserved"].as_u64().unwrap_or(0) + cpu["dedicated_total"].as_u64().unwrap_or(0),
     );
     let mem = &n["memory"];
+    let normal = |a: &str, b: &str| -> Value {
+        match mem[a].as_u64() {
+            Some(x) => json!(x.saturating_sub(mem[b].as_u64().unwrap_or(0))),
+            None => Value::Null,
+        }
+    };
     let pools = n["storage"].as_array().cloned().unwrap_or_default();
     let sum = |key: &str| pools.iter().filter_map(|p| p[key].as_u64()).sum::<u64>();
     let storage = if pools.is_empty() {
@@ -4393,7 +4423,10 @@ fn capacity_node_row(n: &Value) -> Vec<String> {
             cell(&cpu["dedicated_total"])
         ),
         percent_cell(&cpu["use_pct"]),
-        mib_pair_cell(&mem["allocated_mib"], &mem["total_mib"]),
+        mib_pair_cell(
+            &normal("allocated_mib", "allocated_hugepages_mib"),
+            &normal("total_mib", "reserved_mib"),
+        ),
         mib_cell(&mem["used_mib"]),
         storage,
     ]
@@ -6540,6 +6573,9 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
                 node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
             }
             NodeCmd::Unfreeze { node } => node_unfreeze(&client, &node, out).await?,
+            NodeCmd::ForgetPorts { node, ports } => {
+                node_forget_ports(&client, &node, &ports, out).await?
+            }
             NodeCmd::Fence { cmd } => node_fence(&client, cmd, json_out, out).await?,
             NodeCmd::FenceTest { node } => node_fence_test(&client, &node, json_out, out).await?,
             NodeCmd::Interfaces { node } => {
@@ -13826,6 +13862,33 @@ mod tests {
         assert_eq!(node_shutdown_cell(&status(false, None)), "-");
     }
 
+    /// `node forget-ports`는 이름들을 노드의 잊기 경로로 보낸다(포트가 하나는 있어야 함).
+    #[tokio::test]
+    async fn node_forget_ports_posts_the_names() {
+        let (client, seen) = fake_api(|_| json!({ "id": "n1" })).await;
+        let Cmd::Node {
+            cmd: NodeCmd::ForgetPorts { node, ports },
+        } = Cli::try_parse_from(["oplctl", "node", "forget-ports", "n1", "eno2", "eno3"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let mut out = Vec::new();
+        node_forget_ports(&client, &node, &ports, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "node n1: forgot eno2, eno3\n"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST /api/v1/nodes/n1/forget-ports HTTP/1.1"]
+        );
+        assert!(Cli::try_parse_from(["oplctl", "node", "forget-ports", "n1"]).is_err());
+    }
+
     /// `node unfreeze`는 노드의 풀기 경로를 부른다.
     #[tokio::test]
     async fn node_unfreeze_posts_to_the_node() {
@@ -16137,7 +16200,8 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             "cpu": { "threads": 16, "reserved": 2, "dedicated_total": 4, "dedicated_used": 2,
                      "vcpus_allocated": 20, "vcpus_running": 12, "vcpus_shared": 18,
                      "overcommit": 1.8, "use_pct": 37.25 },
-            "memory": { "total_mib": 65536, "reserved_mib": 0, "allocated_mib": 32768, "used_mib": 16384 },
+            "memory": { "total_mib": 65536, "reserved_mib": 8192, "allocated_mib": 40960,
+                        "allocated_hugepages_mib": 8192, "used_mib": 16384 },
             "storage": [
                 { "pool": "local", "ready": true, "total_bytes": 1u64 << 40, "used_bytes": 1u64 << 38,
                   "provisioned_bytes": 1u64 << 39, "volumes": 3 },
@@ -16154,7 +16218,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "x1.80",
                 "2/4",
                 "37.2%",
-                "32.0GiB/64.0GiB",
+                "32.0GiB/56.0GiB",
                 "16.0GiB",
                 "1.0TiB/2.0TiB"
             ]

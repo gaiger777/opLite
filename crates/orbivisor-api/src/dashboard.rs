@@ -7,16 +7,23 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use orbivisor_cluster::ClusterError;
+use orbivisor_cluster::types::Rejection;
 use orbivisor_types::capacity::{self, Capacity};
 use orbivisor_types::network::NetworkSpec;
-use orbivisor_types::node::{NodeSpec, OPERATOR_DASHBOARD};
+use orbivisor_types::node::{LINK_ALERTS, Node, NodeSpec, NodeStatus, OPERATOR_DASHBOARD};
 use orbivisor_types::physical::{self, PhysicalTopology};
+use orbivisor_types::resource::{Resource, ResourceSpec};
 use orbivisor_types::storage::{StoragePoolSpec, VolumeSpec};
 use orbivisor_types::vm::VmSpec;
+use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::audit::AuditNote;
+use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json};
+use crate::resources::lookup;
 use crate::state::AppState;
 
 /// 마지막 결과 하나: 그때의 입력 열쇠와 값. 같은 열쇠면 값을 그대로 돌려준다.
@@ -128,6 +135,68 @@ pub async fn get_capacity(State(state): State<Arc<AppState>>) -> Result<Json<Cap
         Ok::<_, ApiError>(capacity::build(&nodes, &vms, &volumes, &pools, &loads))
     })?;
     Ok(Json(out))
+}
+
+/// `POST /nodes/{key}/forget-ports`의 몸
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForgetPorts {
+    /// 잊을 포트 이름(1~64개)
+    pub ports: Vec<String>,
+}
+
+/// 노드가 기억하는 포트(`NodeStatus.known_ports`, 리뷰 2)를 잊는다: NIC를 빼거나 다른 이름의 NIC로 바꿨거나, 주소를
+/// 일부러 지운 포트가 `missing`·끊김으로 남지 않게 한다. 리더가 노드 상태의 기억에서 지우고(revision 확인), 노드의
+/// 다음 수집은 그 상태에서 이어 가므로 다시 넣지 않는다 — 지금 쓰는 포트라면 다음 수집이 다시 기억한다. 그 포트의
+/// 링크 경보는 해제 규칙대로 풀린다. 기억에 없는 이름만이면 404 `not_found`, 모든 노드가 `link-alerts`를 알아야 한다
+/// (409 `cluster_upgrading`). 권한은 노드 바꾸기(`cluster.admin`).
+#[utoipa::path(post, path = "/nodes/{key}/forget-ports", tag = "nodes",
+    params(("key" = String, Path, description = "node id or name")),
+    request_body = ForgetPorts,
+    responses((status = 200, body = Resource<NodeSpec, NodeStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn forget_ports(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+    Json(req): Json<ForgetPorts>,
+) -> Result<Json<Node>, ApiError> {
+    state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
+    if req.ports.is_empty() || req.ports.len() > physical::MAX_KNOWN_PORTS {
+        return Err(ApiError::bad_request(format!(
+            "ports must name 1 to {} ports",
+            physical::MAX_KNOWN_PORTS
+        )));
+    }
+    crate::cluster::require_feature(&state.cluster, LINK_ALERTS)?;
+    for _ in 0..10 {
+        let node = lookup::<NodeSpec>(&state.cluster, &key)?;
+        let mut status = node.status.clone();
+        let before = status.known_ports.len();
+        status.known_ports.retain(|k| !req.ports.contains(&k.name));
+        if status.known_ports.len() == before {
+            return Err(ApiError::not_found(format!(
+                "node {:?} remembers none of these ports",
+                node.name
+            )));
+        }
+        match state
+            .cluster
+            .update_status_checked::<NodeSpec>(node.id, node.revision, &status)
+            .await
+        {
+            Ok(_) => {
+                audit.detail(format!("forgot {}", req.ports.join(", ")));
+                return Ok(Json(lookup::<NodeSpec>(&state.cluster, &key)?));
+            }
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the node kept changing while being updated; try again",
+    ))
 }
 
 #[cfg(test)]

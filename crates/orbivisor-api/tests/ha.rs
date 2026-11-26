@@ -149,7 +149,7 @@ async fn node_with(
         firmware_caps: None,
         backup_stores: Vec::new(),
         file_restore: None,
-        underlay_ports: Default::default(),
+        known_ports: Default::default(),
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();

@@ -33,7 +33,7 @@ use orbivisor_types::load_balancer::LoadBalancerSpec;
 use orbivisor_types::metrics::{MetricsQuery, MetricsScope, NodeSample, VmSample};
 use orbivisor_types::network::NetworkSpec;
 use orbivisor_types::node::{Node, NodeSpec};
-use orbivisor_types::physical::{self, Impact};
+use orbivisor_types::physical::{self, FaultSeverity, Impact, PortKind};
 use orbivisor_types::resource::Kind;
 use orbivisor_types::router::RouterSpec;
 use orbivisor_types::sdn::{SDN_NAME, SdnSpec};
@@ -782,10 +782,12 @@ impl Engine {
     }
 
     /// 링크 규칙 하나(계획 75 §3.4)의 대상: 노드의 끊긴 포트(`node_link_down`)·저하된 본딩(`bond_degraded`)마다 하나 —
-    /// 경보 키에 포트가 들어가 포트마다 따로다. 문구는 [`physical::describe`](그 노드만 [`physical::build`]한 영향).
-    /// 오프라인·유지보수 노드의 상태는 낡았거나 일부러 바꾸는 중이므로 그 노드의 경보는 새로 내지도 풀지도 되풀이하지도
-    /// 않는다(돌려주는 두 번째 값이 되풀이하지 않을 경보 키 — 노드 꺼짐은 `node_offline`이 알린다). 경보가 난 포트가 노드의
-    /// 인터페이스 목록에서 사라졌으면 풀지 않고 "사라짐"으로 그대로 둔다(리뷰 1 — 포트가 다시 나타나 살아 있으면 풀림).
+    /// 경보 키에 포트가 들어가 포트마다 따로다. 문구는 [`physical::describe`]·[`physical::describe_bond`](그 노드만
+    /// [`physical::build`]한 영향). 오프라인·유지보수 노드의 상태는 낡았거나 일부러 바꾸는 중이므로 그 노드의 경보는 새로
+    /// 내지도 풀지도 되풀이하지도 않는다(돌려주는 두 번째 값이 되풀이하지 않을 경보 키 — 노드 꺼짐은 `node_offline`이
+    /// 알린다). 노드가 기억하는 포트(계획 75 리뷰 2)는 주소를 잃거나 사라져도 장애로 나오므로 pending이 firing으로
+    /// 이어진다. 기억에도 목록에도 없는 포트(지운 본딩·VLAN, 운영자가 잊은 포트)의 경보는 풀린다. 이미 울린
+    /// `bond_degraded`는 본딩이 끊긴 동안 그대로 둔다(끊김은 `node_link_down`이 따로 알림 — "해소"를 보내지 않게).
     /// 다시 올라온 포트는 거짓으로 보아 해제 규칙(60초)을 따른다. 네트워크·VM을 읽지 못하면 None이다.
     fn link_findings(
         &self,
@@ -796,11 +798,12 @@ impl Engine {
         let mut out = Vec::new();
         let mut quiet = HashSet::new();
         for node in nodes.iter().filter(|n| rule.spec.applies_to_node(&n.name)) {
-            let mine = rule
+            let mine: Vec<_> = rule
                 .status
                 .active
                 .iter()
-                .filter(|a| a.subject.id == node.id && a.subject.port.is_some());
+                .filter(|a| a.subject.id == node.id && a.subject.port.is_some())
+                .collect();
             if !node.status.online || node.spec.maintenance {
                 for a in mine {
                     quiet.insert(a.subject.key(rule.id));
@@ -812,31 +815,6 @@ impl Engine {
                 }
                 continue;
             }
-            let faults = match &rule.spec.condition {
-                AlertCondition::NodeLinkDown { ports, role } => {
-                    physical::link_faults(node, *role, ports.as_deref())
-                }
-                _ => physical::bond_faults(node),
-            };
-            out.extend(
-                mine.filter(|a| {
-                    !faults
-                        .iter()
-                        .any(|f| a.subject.port.as_ref() == Some(&f.port))
-                })
-                .map(|a| {
-                    let port = a.subject.port.as_deref().unwrap_or_default();
-                    let gone = !node.status.interfaces.iter().any(|i| i.name == port);
-                    SdnFinding {
-                        subject: a.subject.clone(),
-                        holds: (!gone).then_some(false),
-                        detail: gone.then(|| format!("{port} disappeared from {}", node.name)),
-                    }
-                }),
-            );
-            if faults.is_empty() {
-                continue;
-            }
             if world.is_none() {
                 *world = Some(LinkWorld {
                     networks: self.cluster().list::<NetworkSpec>().ok()?.1,
@@ -844,34 +822,76 @@ impl Engine {
                 });
             }
             let w = world.as_ref().expect("just read");
+            let faults: Vec<_> = match &rule.spec.condition {
+                AlertCondition::NodeLinkDown { ports, role } => {
+                    physical::link_faults(node, *role, ports.as_deref(), &w.networks)
+                }
+                _ => physical::bond_faults(node)
+                    .into_iter()
+                    .filter(|f| {
+                        f.severity == FaultSeverity::Degraded
+                            || mine
+                                .iter()
+                                .any(|a| a.subject.port.as_ref() == Some(&f.port))
+                    })
+                    .collect(),
+            };
+            let ports = physical::ports(node);
+            out.extend(
+                mine.iter()
+                    .filter(|a| {
+                        !faults
+                            .iter()
+                            .any(|f| a.subject.port.as_ref() == Some(&f.port))
+                    })
+                    .map(|a| {
+                        let port = a.subject.port.as_deref().unwrap_or_default();
+                        let gone = !ports.iter().any(|p| p.name == port);
+                        SdnFinding {
+                            subject: a.subject.clone(),
+                            holds: Some(false),
+                            detail: gone.then(|| format!("{port} is no longer on {}", node.name)),
+                        }
+                    }),
+            );
+            if faults.is_empty() {
+                continue;
+            }
             let topology = physical::build(std::slice::from_ref(node), &w.networks, &w.vms);
-            let impacts = topology
+            let (impacts, listed) = topology
                 .nodes
                 .first()
-                .map(|n| n.impact.as_slice())
+                .map(|n| (n.impact.as_slice(), n.ports.as_slice()))
                 .unwrap_or_default();
             for f in faults {
                 // 본딩 경보는 본딩의 영향, 없으면(구성 포트가 끊김) 그 본딩에 든 포트의 영향
-                let impact = impacts
+                let impact = impacts.iter().find(|i| i.port == f.port).or_else(|| {
+                    impacts
+                        .iter()
+                        .find(|i| i.bond.as_deref() == Some(f.port.as_str()))
+                });
+                let bond = listed
                     .iter()
-                    .find(|i| i.port == f.port)
-                    .or_else(|| {
-                        impacts
-                            .iter()
-                            .find(|i| i.bond.as_deref() == Some(f.port.as_str()))
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| Impact {
-                        port: f.port.clone(),
-                        severity: f.severity,
-                        bond: f.bond.clone(),
-                        bridges: Vec::new(),
-                        underlay: false,
-                        uses: Vec::new(),
-                        networks: Vec::new(),
-                        vms: 0,
-                        vm_ids: Vec::new(),
-                    });
+                    .find(|p| p.name == f.port && p.kind == PortKind::Bond);
+                let detail = match (bond, impact) {
+                    (Some(b), _) => physical::describe_bond(&node.name, b, impact),
+                    (None, Some(i)) => physical::describe(&node.name, i),
+                    (None, None) => physical::describe(
+                        &node.name,
+                        &Impact {
+                            port: f.port.clone(),
+                            severity: f.severity,
+                            bond: f.bond.clone(),
+                            missing: false,
+                            bridges: Vec::new(),
+                            underlay: false,
+                            uses: Vec::new(),
+                            networks: Vec::new(),
+                            vms: 0,
+                            vm_ids: Vec::new(),
+                        },
+                    ),
+                };
                 out.push(SdnFinding {
                     subject: AlertSubject {
                         kind: SubjectKind::Node,
@@ -881,7 +901,7 @@ impl Engine {
                         port: Some(f.port.clone()),
                     },
                     holds: Some(true),
-                    detail: Some(physical::describe(&node.name, &impact)),
+                    detail: Some(detail),
                 });
             }
         }

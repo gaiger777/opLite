@@ -139,11 +139,13 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub interfaces: Vec<NodeInterface>,
-    /// underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
-    /// NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// 노드가 기억하는 포트(계획 75 리뷰 2, [`crate::physical::KnownPort`]): 역할이 업링크·underlay·service였던 포트를
+    /// 이름으로 기억해, 링크가 끊길 때 주소가 떨어지거나 netdev가 사라져도 물리 관계·링크 경보가 그 포트를 그 역할 그대로
+    /// 끊김으로 본다. 노드가 쓰고(지난 값에서 이어 가므로 다시 시작해도 남음), 리더는 `POST /nodes/{key}/forget-ports`로
+    /// 일부러 뺀 포트를 지운다. 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
-    pub underlay_ports: BTreeMap<String, String>,
+    pub known_ports: Vec<crate::physical::KnownPort>,
     /// 이 노드의 HA 검사 결과(화면용, 바뀔 때만 쓴다). 리더는 리스 갱신에 실린 결과로 판단한다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]

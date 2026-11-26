@@ -621,6 +621,11 @@ impl State {
         let Some(list) = &self.interfaces else {
             return;
         };
+        // 사라진 기억 포트를 그 본딩의 `missing` 구성 포트로(리뷰 2 — 대시보드·`bond_degraded`와 같은 판단)
+        let mut list = list.clone();
+        if let Ok(Some(me)) = self.cluster.get::<NodeSpec>(self.node) {
+            orbivisor_types::physical::mark_missing_members(&me.status.known_ports, &mut list);
+        }
         let now: BTreeMap<String, BondStatus> = list
             .iter()
             .filter_map(|i| Some((i.name.clone(), i.bond.clone()?)))
@@ -749,25 +754,28 @@ impl State {
             .as_deref()
             .map(orbivisor_driver::reported_interfaces);
         let interfaces = interfaces.as_ref();
-        // 지금 이 노드에 있는 모든 인터페이스(64개 상한 밖 포함) — 사라진 본딩 구성 포트를 가린다.
+        // 지금 이 노드에 있는 모든 인터페이스(64개 상한 밖 포함) — 사라진 기억 포트를 가린다.
         let present: Option<BTreeSet<&str>> = self
             .interfaces
             .as_ref()
             .map(|all| all.iter().map(|i| i.name.as_str()).collect());
+        // 기억 포트의 쓰임(관리)을 셈할 노드 API 주소
+        let address = match self.cluster.get::<NodeSpec>(self.node) {
+            Ok(Some(me)) => me.spec.address,
+            _ => String::new(),
+        };
+        let now_ms = unix_now().saturating_mul(1000);
         let written = bootstrap::update_node_status(&self.cluster, |status| {
             let mut changed = false;
             if status.checks != checks {
                 status.checks = checks.to_vec();
                 changed = true;
             }
-            if let (Some(list), Some(present)) = (interfaces, &present) {
-                // 본딩에서 본 구성 포트가 사라졌으면 `missing`으로 남긴다(리뷰 1, 지난 상태에서 이어 감).
-                let mut list = list.clone();
-                orbivisor_driver::keep_missing_bond_ports(&status.interfaces, &mut list, present);
-                if status.interfaces != list {
-                    status.interfaces = list;
-                    changed = true;
-                }
+            if let Some(list) = interfaces
+                && status.interfaces != *list
+            {
+                status.interfaces = list.clone();
+                changed = true;
             }
             // 옛 리더가 모르는 필드를 버리고 상태를 다시 썼으면 핫플러그 능력을 다시 쓴다.
             if let Some(hotplug) = self.config.hotplug
@@ -808,19 +816,16 @@ impl State {
                 status.sdn = Some(s.clone());
                 changed = true;
             }
-            // underlay 주소마다 마지막으로 그 주소를 가졌던 인터페이스(리뷰 1 — 링크가 끊겨 주소가 떨어져도 그 포트를 본다)
-            if let Some(all) = &self.interfaces {
-                let addresses: Vec<IpAddr> = [
-                    status.underlay,
-                    status.sdn.as_ref().and_then(|s| s.encap_ip),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                let ports =
-                    orbivisor_driver::underlay_ports(&status.underlay_ports, &addresses, all);
-                if status.underlay_ports != ports {
-                    status.underlay_ports = ports;
+            // 역할이 업링크·underlay·service였던 포트를 기억한다(리뷰 2, 지난 기억에서 이어 감 — 장애 순간 주소가
+            // 떨어지거나 netdev가 사라져도 그 역할 그대로 끊김으로 본다). 리더가 `forget-ports`로 지운 것은 다시 넣지
+            // 않는다(이 회차가 읽은 상태에 이미 빠져 있다).
+            if let Some(present) = &present
+                && interfaces.is_some()
+            {
+                let known =
+                    orbivisor_types::physical::remember_ports(status, &address, present, now_ms);
+                if status.known_ports != known {
+                    status.known_ports = known;
                     changed = true;
                 }
             }
@@ -2207,6 +2212,22 @@ mod tests {
         assert_eq!(names, ["eno1", "eno2", "bond0"]);
         assert_eq!(interfaces[2].kind, InterfaceKind::Bond);
         assert_eq!(interfaces[2].bond.as_ref().unwrap().state, BondState::Up);
+        // 본딩과 그 구성 포트(업링크)를 기억한다(리뷰 2).
+        let known: Vec<(String, Option<String>)> = s
+            .node()
+            .status
+            .known_ports
+            .into_iter()
+            .map(|k| (k.name, k.bond))
+            .collect();
+        assert_eq!(
+            known,
+            [
+                ("eno1".to_string(), Some("bond0".to_string())),
+                ("eno2".to_string(), Some("bond0".to_string())),
+                ("bond0".to_string(), None),
+            ]
+        );
 
         // `ip`가 실패해도 기록된 목록은 지우지 않는다.
         state.ip = "/nonexistent/ip".into();

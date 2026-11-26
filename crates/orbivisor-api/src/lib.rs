@@ -235,6 +235,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         // 운영자 대시보드(계획 75)
         .routes(routes!(dashboard::physical_topology))
         .routes(routes!(dashboard::get_capacity))
+        .routes(routes!(dashboard::forget_ports))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
         .routes(routes!(drain::unfreeze_node))

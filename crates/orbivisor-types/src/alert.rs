@@ -321,8 +321,11 @@ pub enum AlertCondition {
     },
     /// 적용 묶음의 선언과 실제가 다름(계획 73, 리더, 대상 묶음)
     ApplySetDrift,
-    /// 노드의 랜 포트(이더넷) 링크가 끊김(계획 75, 리더가 노드 상태 `interfaces`로 평가, 대상 노드). `ports`(`*`·`?` 글롭,
-    /// 예: `eno*`)가 있으면 그 이름의 포트만, `role`이 `uplink`(기본)면 브리지·본딩·underlay 아래 포트만 본다
+    /// 노드의 포트 링크가 끊김(계획 75, 리더가 노드 상태 `interfaces`·`known_ports`로 평가, 대상 노드 — 경보 키에 포트).
+    /// `role`이 `uplink`(기본)면 업링크(브리지·본딩 아래)·underlay·주소를 가진 포트(스토리지·관리·클러스터 링크망)와
+    /// 네트워크가 실리는데 관리자가 내린 브리지, `any`면 그에 더해 이더넷·VLAN 포트 모두를 본다. 노드가 기억하는 포트는
+    /// 주소를 잃거나 사라져도 그 역할 그대로 끊김이다. 기본은 본딩 구성 포트를 따로 내지 않고(본딩이 끊기면 본딩 이름 하나),
+    /// `ports`(`*`·`?` 글롭, 예: `eno*`)가 있으면 그 이름에 맞는 포트만 보되 본딩 구성 포트도 본다
     /// ([`crate::physical::link_faults`]).
     NodeLinkDown {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,8 +335,9 @@ pub enum AlertCondition {
         #[cfg_attr(feature = "openapi", schema(default))]
         role: LinkRole,
     },
-    /// 본딩이 저하(포트 일부만 살아 이중화를 잃음)되거나 끊김(계획 75, 리더, 대상 노드 —
-    /// [`crate::physical::bond_faults`])
+    /// 본딩이 저하됨(구성 포트 일부가 끊기거나 사라지거나 LACP·속도가 어긋나 이중화를 잃음, 계획 75, 리더, 대상 노드 —
+    /// [`crate::physical::bond_faults`]). 본딩이 통째로 끊기면 새로 내지 않고(`node_link_down`이 본딩 이름으로 냄), 이미
+    /// 울린 경보는 풀지 않고 끊긴 동안 그대로 둔다(문구 `bond0 down on …`). 다시 저하로 돌아오면 `node_link_down`만 풀린다.
     BondDegraded,
 }
 

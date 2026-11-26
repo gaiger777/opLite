@@ -1420,7 +1420,7 @@ orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보�
 | `--condition sdn_physnet_not_ready` | 설정한 physnet(옮기기 다리 포함)이 준비 안 됨 | **리더** | 노드 |
 | `--condition sdn_lb_member_down` | 부하 분산기의 건강 검사 멤버 가운데 죽은 것이 있음(LB마다 하나) | **리더** | 부하 분산기 |
 | `node_link_down`(웹·API) | 노드의 랜 포트 링크가 끊김(계획 75, [링크 경보](#링크-경보)) | **리더** | 노드의 포트 |
-| `bond_degraded`(웹·API) | 본딩이 저하(구성 포트 일부만 살아 이중화를 잃음)되거나 끊김 | **리더** | 노드의 본딩 |
+| `bond_degraded`(웹·API) | 본딩이 저하(구성 포트 일부가 끊기거나 사라져 이중화를 잃음 — 통째로 끊기면 `node_link_down`이 새로 내고 이 경보는 그대로) | **리더** | 노드의 본딩 |
 
 - **칸.** `--for`(조건이 이만큼 이어지면 알림, `0`~`24h`, 기본 0), `--severity info|warning|critical`(기본 warning), `--target`
   (알림 대상 이름 1~16개, 있어야 함), `--repeat`(계속 firing이면 이 간격으로 다시, 기본 `4h`, `0`이면 다시 보내지 않음,
@@ -1493,20 +1493,35 @@ orbivisorctl alert history --since 1h   # 보낸 알림(새 것부터, 기본 �
 [네트워크](network.md#물리-네트워크-포트본딩lldp))이고 **리더**가 다른 리더 경보처럼 평가한다(상태는 규칙의 `status.active`).
 
 - **`node_link_down {ports?, role}`.** 링크가 끊긴 포트(carrier 없음, operstate `down`·`lowerlayerdown`·`notpresent`)마다 경보 하나다(경보
-  키에 포트가 들어가 포트마다 따로). 이더넷, dummy 같은 그 밖의 장치, 아래 장치가 살아 있는 VLAN, 관리자가 내린 브리지(`ip link set vmbr0
-  down`)를 센다. 본딩 구성 포트는 따로 세지 않는다: 본딩이 아직 흐르면 이중화만 잃은 것이라 `bond_degraded`가 맡고, 본딩이 통째로 끊기면
-  본딩 이름(`bond0`)으로 하나다. `role`이 `uplink`(기본)면 쓰이는 포트만 본다 — 브리지·본딩·underlay 아래의 포트와 전역 주소를 가진 물리
-  포트(스토리지·복제·관리·클러스터 링크망, 본딩 없이 주소만 가진 `ens1f0` 같은 것)와 그 아래. 쓰지 않는(묶이지 않고 주소도 없는) 포트는
-  `any`에서만 본다. `any`도 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int` — 늘 down)는 보지 않는다. `ports`는 `*`·`?` 글롭(예:
-  `eno*`, 1~64자, 공백·`/`·`:` 없음)이고 비우면 모든 포트다.
-- **`bond_degraded`.** 본딩마다 하나 — 구성 포트 일부가 끊기거나 노드에서 사라져(PCIe 장애·드라이버 unbind — 노드가 본 적 있는 구성
-  포트를 `missing`으로 남김) 이중화를 잃었고 아직 흐름. 본딩이 끊기면 이 경보는 풀리고 `node_link_down`(본딩 이름)이 새로 울린다.
+  키에 포트가 들어가 포트마다 따로). 이더넷, dummy 같은 그 밖의 장치, 아래 장치가 살아 있는 VLAN, 네트워크가 실리는데 관리자가 내린
+  브리지(`ip link set vmbr0 down` — 네트워크가 없는 브리지는 내려도 장애가 아님), 그리고 **노드가 기억하는 포트**(아래)의 주소 잃음·사라짐을
+  센다. 기본(글롭 없음)은 본딩 구성 포트를 따로 세지 않는다: 본딩이 아직 흐르면 이중화만 잃은 것이라 `bond_degraded`가 맡고, 본딩이 통째로
+  끊기면 본딩 이름(`bond0`)으로 하나다. `ports`(글롭)를 주면 이름이 맞는 포트만 보되 본딩 구성 포트도 본다 — `eno*` 규칙은 본딩이 끊기면
+  `eno1`·`eno2`마다 낸다(본딩 이름 `bond0`은 글롭에 맞을 때만). `role`이 `uplink`(기본)면 쓰이는 포트만 본다 — 브리지·본딩·underlay 아래의
+  포트와 전역 주소를 가진 물리 포트(스토리지·복제·관리·클러스터 링크망, 본딩 없이 주소만 가진 `ens1f0` 같은 것)와 그 아래. 쓰지 않는(묶이지
+  않고 주소도 없는) 포트는 `any`에서만 본다. `any`도 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int` — 늘 down)는 보지 않는다.
+  `ports`는 `*`·`?` 글롭(예: `eno*`, 1~64자, 공백·`/`·`:` 없음)이고 비우면 모든 포트다.
+- **노드가 기억하는 포트.** 장애 순간 NetworkManager·networkd가 carrier를 잃은 장치의 주소를 떼거나(정적 IP도 `ignore-carrier`가 없으면)
+  netdev가 사라지면(PCIe 장애·드라이버 unbind·핫플러그) 역할이 바뀌어 감시 밖으로 빠질 수 있다. 그래서 노드가 역할이 업링크·underlay·
+  주소를 가진 포트였던 것을 이름으로 기억하고(노드 상태 `known_ports` — 다시 시작해도 남음), 그 포트가 주소를 잃으면(다른 인터페이스로
+  옮겨 가지 않았으면 링크가 살아 있어도) 끊김, 목록에서 사라지면 `missing`(끊김)으로 본다. 본딩 밖 브리지 업링크가 사라지면 그 브리지도
+  끊김이다. 경보는 30초 안에 사라져도 pending에서 firing으로 이어진다. 잊는 때: 포트가 다시 나타나 감시 밖 역할이 되면(관리자가 다시 구성),
+  본딩에 새 이름의 구성 포트가 들어오면(그 본딩의 사라진 구성 포트), 그리고 **NIC를 교체·뺐거나 주소를 일부러 지웠으면 잊기**:
+  `orbivisorctl node forget-ports svc01 eno2`(API `POST /api/v1/nodes/{key}/forget-ports {"ports":["eno2"]}`, admin, 감사에 남음, 웹 홈·지도
+  포트 카드의 사라진 포트 "잊기"). 잊으면 그 포트의 경보는 60초 뒤 해제된다. 지금 쓰는 포트는 다음 수집이 다시 기억한다.
+- **`bond_degraded`.** 본딩마다 하나 — 구성 포트 일부가 끊기거나 노드에서 사라지거나(기억한 구성 포트가 `missing`) LACP·속도가 어긋나
+  이중화를 잃었고 아직 흐름. 본딩이 통째로 끊기면 새로 내지 않고(`node_link_down`이 본딩 이름으로 critical을 새로 냄) 이미 울린 경보는
+  **풀지 않고** 그대로 둔다(문구가 `bond0 down on svc01 (eno1 down, eno2 down) — …`로 바뀜 — 장애가 커질 때 "해소"가 가지 않게). 다시 저하로
+  돌아오면 `node_link_down`만 풀린다.
 - **문구.** 대상은 `node/svc01/eno1`(CLI `alert list`의 SUBJECT, 알림의 이름 `svc01/eno1`), 메시지는 물리 관계로 셈한 영향이다:
-  `eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs`, 주소만 가진 포트는 `ens1f0 down on svc01 — cluster link`(노드의 클러스터
-  링크 주소·API 주소면 `cluster link`·`management`). 영향 계산은 `GET /topology/physical`과 같은 함수다. 알림 본문에는 지도에서 그 포트로
+  `eno1 down on svc01 — vmbr0, 3 networks, 12 VMs`, 사라진 포트는 `eno1 missing on svc01 — vmbr0, …`, 본딩 경보(대상이 본딩)는 본딩과 그
+  구성 포트 상태 `bond0 degraded on svc01 (eno2 missing) — vmbr0, 3 networks, 12 VMs`. 주소만 가진 포트는 노드의 클러스터 링크 주소·API
+  주소면 `ens1f0 down on svc01 — cluster link`(`cluster link`·`management`)이고, 그 밖의 주소(스토리지망 등)면 덧말 없이
+  `ens1f0 down on svc01`이다. 영향 계산은 `GET /topology/physical`과 같은 함수다. 알림 본문에는 지도에서 그 포트로
   가는 경로 `Map: /cluster/map?focus=port:svc01/eno1`(웹훅 JSON은 `subject.map`)이 붙는다 — 앞에 웹 주소를 붙여 연다.
-- **상태.** 지속 조건이라 `--for`·`--repeat`·해제가 있다. 다시 올라온 포트는 60초 뒤 해제다. 경보가 난 포트가 노드의 인터페이스 목록에서
-  사라지면 풀지 않고 그대로 두고 되풀이 알림에 `eno2 disappeared from svc01`을 싣는다(다시 나타나 살아 있으면 풀림). 오프라인·유지보수
+- **상태.** 지속 조건이라 `--for`·`--repeat`·해제가 있다. 다시 올라온 포트는 60초 뒤 해제다. 기억하는 포트가 사라지면 풀지 않고
+  `missing`으로 그대로다(다시 나타나 살아 있거나 잊으면 풀림). 기억에도 목록에도 없는 이름(지운 본딩·VLAN 등)의 경보는 60초 뒤 해제다
+  (`eno1.100 is no longer on svc01`). 오프라인·유지보수
   노드의 상태는 낡았거나 일부러 바꾸는 중이므로 그 노드의 링크 경보는 새로 내지도·풀지도·되풀이하지도 않는다(노드 꺼짐은 `node-offline`이
   알림). 노드 거르기(`nodes`)를 받는다.
 - **링크 경보 켜기.** `alert rule add-link-defaults --target T`(여러 번 줄 수 있음, API `POST /api/v1/alert-rules/link-defaults
