@@ -2,17 +2,19 @@
   "physical": {
     "badge_one": "물리 장애 {{count}}",
     "badge_other": "물리 장애 {{count}}",
+    "badgeUnknown": "물리 상태 모름",
     "map": {
       "title": "인프라 지도",
       "full": "지도 열기"
     },
     "bar": {
-      "cpu": "vCPU {{allocated}} / 공유 스레드 {{total}}",
-      "use": "사용 {{pct}} %",
+      "cpu": "공유 vCPU {{allocated}} / 스레드 {{total}}",
+      "use": "노드 사용 {{pct}} %",
       "allocated": "할당 {{allocated}} / {{total}}",
       "used": "사용 {{used}}",
       "provisioned": "프로비전 {{allocated}} / {{total}}",
-      "noStorage": "로컬 풀 없음"
+      "noStorage": "로컬 풀 없음",
+      "dedicated": "전용 {{used}} / {{total}}"
     },
     "table": {
       "title": "노드별 할당·사용",
@@ -38,13 +40,17 @@
       "pool_one": "준비 안 된 풀 {{count}}",
       "pool_other": "준비 안 된 풀 {{count}}",
       "link_one": "링크 장애 {{count}}",
-      "link_other": "링크 장애 {{count}}"
+      "link_other": "링크 장애 {{count}}",
+      "linkUnknown": "링크 상태 모름",
+      "unreachable_one": "네트워크 {{count}}개 없음",
+      "unreachable_other": "네트워크 {{count}}개 없음"
     },
     "health": {
       "up": "정상",
       "degraded": "저하",
       "down": "끊김",
-      "absent": "없음"
+      "absent": "없음",
+      "unknown": "모름"
     },
     "chain": {
       "summaryOk_one": "네트워크 사슬, 원소 {{count}}개, 장애 없음",
@@ -120,14 +126,20 @@
       "rail": "레일 {{name}}",
       "railNodes": "{{name}}의 노드",
       "gone": "고른 것이 없어졌습니다.",
-      "back": "클러스터 보기"
+      "back": "클러스터 보기",
+      "physicalUnknown": "물리 링크 상태를 모릅니다 — 서버가 답하지 않았습니다.",
+      "retry": "다시 시도",
+      "stale": "마지막으로 본 값",
+      "unreachableAt": "{{node}}에 네트워크 {{network}}이(가) 없음",
+      "staleRefresh": "다시 읽지 못해 마지막 답을 보입니다."
     },
     "rail": {
       "bridge": "브리지",
       "vlan": "VLAN",
       "vxlan": "VXLAN",
       "sdn-overlay": "SDN 오버레이",
-      "sdn-provider": "SDN 공급자"
+      "sdn-provider": "SDN 공급자",
+      "underlay": "underlay(VXLAN·Geneve)"
     },
     "vm": {
       "path": "이 VM의 경로",

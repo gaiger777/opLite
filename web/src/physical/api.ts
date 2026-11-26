@@ -23,9 +23,14 @@ export function isUpgrading(error: unknown): boolean {
   return error instanceof ApiError && error.code === "cluster_upgrading";
 }
 
+/** 403(루트 읽기 없음)·409(섞인 판): 물리 관계·용량이 이 사용자·이 클러스터에 없다(일시 실패가 아니다). */
+export function isUnavailable(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 403 || error.status === 409);
+}
+
 /** 403(루트 읽기 없음)·409(섞인 판)는 다시 묻지 않는다. 그 밖의 실패는 다음 주기에. */
 function retry(count: number, error: unknown): boolean {
-  if (error instanceof ApiError && (error.status === 403 || error.status === 409)) return false;
+  if (isUnavailable(error)) return false;
   return count < 1;
 }
 

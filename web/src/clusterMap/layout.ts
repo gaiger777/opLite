@@ -201,6 +201,8 @@ export interface RailItem {
   nodes: number;
   down: number;
   degraded: number;
+  /** 모름(노드 오프라인·underlay 주인을 못 찾음) */
+  unknown: number;
 }
 
 /** 노드 포트 → 레일의 바닥 선(세계 y를 따라) */
@@ -741,6 +743,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       nodes: 0,
       down: 0,
       degraded: 0,
+      unknown: 0,
     }));
     slabs.push({
       key: l.bucket.key,
@@ -786,6 +789,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
         rail.nodes += 1;
         rail.down += tone === "down" ? 1 : 0;
         rail.degraded += tone === "degraded" ? 1 : 0;
+        rail.unknown += tone === "unknown" ? 1 : 0;
         const leaves = n.net?.carriers[r.carrier] ?? [];
         const port = net?.ports.find((p) => leaves.includes(p.name)) ?? null;
         const x = port ? port.box.x + PORT_W / 2 : box.x + box.w / 2;

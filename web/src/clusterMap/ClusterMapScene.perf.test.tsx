@@ -1,5 +1,7 @@
 // 큰 클러스터의 예산(계획 70 §9.2): 100 노드 × 50 VM(5000 VM, 판 10개)의 배치 + 경로 시간과 단계마다 SVG 원소 수.
 // 원소 수는 그리기 없이 장면으로 센다(`elementCount`) — 화면(스테이지 2)이 같은 셈을 따르고 그린 DOM으로도 잰다.
+// 지도 칸(`InfraMap` 조각) 크기 예산은 gzip 24 KiB(24,576바이트, 계획 75 §4.2)이고 `vite build` 출력으로 잰다(이 시험 밖 — 2026-11-26
+// 리뷰 1에서 24,290바이트).
 import { layoutCluster } from "@/clusterMap/layout";
 import { toModel } from "@/clusterMap/model";
 import { netPaths } from "@/clusterMap/netPaths";

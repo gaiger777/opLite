@@ -62,7 +62,9 @@ const NetShape = memo(function NetShape({ piece, defs }: { piece: NetPiece; defs
           fill="none"
           style={{ stroke: color }}
           strokeWidth={piece.tone === "down" ? 2 : 1.4}
-          strokeDasharray={piece.tone === "degraded" ? "4 3" : undefined}
+          strokeDasharray={
+            piece.tone === "degraded" ? "4 3" : piece.tone === "unknown" ? "1 3" : undefined
+          }
           strokeLinejoin="round"
           aria-hidden
         />
@@ -181,6 +183,7 @@ const LINK_CHIP = {
   degraded: "warning",
   down: "danger",
   absent: "neutral",
+  unknown: "neutral",
 } as const;
 
 /**

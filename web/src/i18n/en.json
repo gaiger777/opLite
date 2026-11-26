@@ -1723,6 +1723,7 @@
         "down": "Down (no link)",
         "lacp_mismatch": "LACP mismatch (not in the active aggregator or no partner)",
         "speed_mismatch": "Slower than the other ports",
+        "missing": "Missing (the interface disappeared from the node)",
         "unknown": "Unknown"
       },
       "checks": "Health checks",

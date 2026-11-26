@@ -3,6 +3,7 @@ import { buildChain, carrierOf, faultList, lowerPorts } from "@/physical/chain";
 import { threadGroups, threadsOf } from "@/physical/threads";
 import { vmPath } from "@/physical/vmPath";
 import type { NodeTopologyInfo } from "@/numa/numa";
+import type { NodePhysical } from "@/physical/api";
 import { vm, volume } from "@/test/fixtures";
 import {
   CAP_A,
@@ -108,22 +109,115 @@ describe("network chain", () => {
 
   it("lists faults across the cluster", () => {
     expect(faultList(PHYSICAL.nodes)).toEqual([
-      { id: "n1", node: "node-a", port: "eno1", severity: "degraded", vms: 2 },
+      { id: "n1", node: "node-a", port: "eno1", severity: "degraded", vms: 2, stale: false },
     ]);
+    // 오프라인 노드의 것은 마지막으로 본 값, 노드에 없는 네트워크의 NIC도 장애다(리뷰 1).
+    const off = {
+      ...NODE_A,
+      online: false,
+      unreachable: [{ network: LAN, vms: 1, vm_ids: ["v"] }],
+    };
+    expect(faultList([off])).toEqual([
+      { id: "n1", node: "node-a", port: "eno1", severity: "degraded", vms: 2, stale: true },
+      { id: "n1", node: "node-a", network: LAN, severity: "down", vms: 1, stale: true },
+    ]);
+  });
+
+  it("keeps `other` ports (dummy bond members) and paints their faults", () => {
+    // 실험실의 dummy 본딩(설계 §6): 구성 포트가 서버 종류 `other`
+    const dummy: NodePhysical = {
+      ...NODE_B,
+      ports: [
+        {
+          name: "dummy0",
+          kind: "other",
+          state: "down",
+          carrier: false,
+          role: "uplink",
+          health: "down",
+          master: "bondx",
+        },
+        {
+          name: "dummy1",
+          kind: "other",
+          state: "up",
+          role: "uplink",
+          health: "up",
+          master: "bondx",
+        },
+        {
+          name: "bondx",
+          kind: "bond",
+          state: "up",
+          role: "uplink",
+          health: "degraded",
+          master: "vmbr0",
+        },
+        { name: "ovs-system", kind: "other", state: "down", role: "other", health: "down" },
+      ],
+      bridges: [
+        {
+          name: "vmbr0",
+          uplinks: ["bondx"],
+          vlan_filtering: false,
+          networks: [LAN],
+          vm_nics: 1,
+          health: "degraded",
+        },
+      ],
+      impact: [
+        {
+          port: "dummy0",
+          severity: "degraded",
+          bond: "bondx",
+          bridges: ["vmbr0"],
+          networks: [LAN],
+          vms: 1,
+          vm_ids: [],
+        },
+      ],
+    };
+    const chain = buildChain(dummy, RAILS);
+    const dummy0 = chain.items.find((i) => i.label === "dummy0");
+    expect(dummy0).toMatchObject({ kind: "ethernet", fault: "degraded" });
+    expect(chain.items.find((i) => i.label === "ovs-system")).toBeUndefined();
+    expect(chain.items.find((i) => i.id === `n:${LAN}`)?.fault).toBe("degraded");
+    const vmbr0 = chain.items.find((i) => i.label === "vmbr0")!;
+    expect(lowerPorts(chain, vmbr0.id).map((p) => p.label)).toEqual(["dummy0", "dummy1"]);
+  });
+
+  it("does not call the underlay up when its interface is unknown", () => {
+    const lost = (port?: string): NodePhysical => ({
+      ...NODE_A,
+      underlay: { address: "10.1.0.11", ...(port ? { port } : {}) },
+    });
+    const health = (n: NodePhysical) =>
+      buildChain(n, RAILS).items.find((i) => i.kind === "underlay")?.health;
+    expect(health(lost("eno3"))).toBe("up");
+    // 이름만 남고 목록에 없음(사라짐) → 끊김, 이름도 없음 → 모름
+    expect(health(lost("eno9"))).toBe("down");
+    expect(health(lost())).toBe("unknown");
   });
 });
 
 describe("capacity table", () => {
   it("measures CPU on the shared threads, memory and local pools", () => {
     const a = capacityRow(CAP_A, NODE_A);
-    // 16 − 예약 1 − 전용 8 = 공유 7, 공유 vCPU 14
-    expect(a.cpu).toEqual({ total: 7, allocated: 14, used: expect.closeTo(2.8) });
+    // 16 − 예약 1 − 전용 8 = 공유 7, 공유 vCPU 14. 노드 사용률은 공유 풀 막대에 얹지 않는다(전용 VM 몫이 든다 — 리뷰 1).
+    expect(a.cpu).toEqual({ total: 7, allocated: 14 });
     expect(a.cpuOvercommit).toBe(2);
+    expect(a.cpuUsePct).toBe(40);
+    expect(a.cpuDedicated).toEqual({ used: 2, total: 8 });
+    expect(capacityRow(CAP_C).cpuDedicated).toBeUndefined();
     expect(overflow(a.cpu)).toBe(7);
     expect(a.memory).toEqual({ total: 65536, allocated: 32768, used: 20480 });
     expect(overflow(a.memory)).toBe(0);
     expect(a.storage.allocated).toBe(150 * 1024 ** 3);
-    expect(a.problems).toEqual(["overcommit", "hot", "link"]);
+    // 공유 vCPU ×2는 흔한 정상 운영이라 문제가 아니다(×4 넘음부터). 메모리는 ×1을 넘으면 문제다.
+    expect(a.problems).toEqual(["hot", "link"]);
+    expect(
+      capacityRow({ ...CAP_A, cpu: { ...CAP_A.cpu, overcommit: 4.5 } }, NODE_A).problems,
+    ).toEqual(["overcommit", "hot", "link"]);
     expect(capacityRow(CAP_B).problems).toEqual(["overcommit", "pool"]);
     expect(capacityRow(CAP_C).problems).toEqual([]);
     expect(capacityRow({ ...CAP_C, online: false }).problems).toEqual(["offline"]);
@@ -140,6 +234,10 @@ describe("capacity table", () => {
     // 총이 0인데 할당이 없으면 0(b의 풀은 비었다)
     expect(names({ sort: "storage", desc: true })).toEqual(["node-a", "node-b", "node-c"]);
     expect(names({ problemsOnly: true })).toEqual(["node-a", "node-b"]);
+    // 물리 관계를 받지 못했으면 링크는 "모름"(문제 거르기에는 넣지 않음)
+    const rows = capacityRows(CAPACITY.nodes, undefined);
+    expect(rows.every((r) => r.linkUnknown && !r.problems.includes("link"))).toBe(true);
+    expect(capacityRows(CAPACITY.nodes, PHYSICAL.nodes).some((r) => r.linkUnknown)).toBe(false);
   });
 });
 

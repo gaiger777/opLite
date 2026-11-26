@@ -31,7 +31,7 @@ function Bars({ row, compact }: { row: CapacityRow; compact: boolean }) {
         compact={compact}
         label={t("physical.table.cpuOf", { node: row.node })}
         m={row.cpu}
-        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct)}
+        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
       />
       <UsageBar
         compact={compact}
@@ -49,18 +49,37 @@ function Bars({ row, compact }: { row: CapacityRow; compact: boolean }) {
   );
 }
 
+const COUNT: Partial<Record<CapacityRow["problems"][number], keyof CapacityRow>> = {
+  link: "faults",
+  pool: "poolErrors",
+  unreachable: "unreachable",
+};
+
 function Problems({ row }: { row: CapacityRow }) {
   const { t } = useTranslation();
+  // 물리 관계를 받지 못했으면 "장애 없음"이 아니라 "모름"이다(리뷰 1).
+  const unknown = row.linkUnknown && (
+    <StatusChip tone="neutral">? {t("physical.problem.linkUnknown")}</StatusChip>
+  );
   if (row.problems.length === 0) {
-    return <span className="text-xs text-muted-foreground">{t("physical.table.ok")}</span>;
+    return (
+      unknown || <span className="text-xs text-muted-foreground">{t("physical.table.ok")}</span>
+    );
   }
   return (
     <span className="flex flex-wrap gap-1">
-      {row.problems.map((p) => (
-        <StatusChip key={p} tone={p === "link" || p === "offline" ? "danger" : "warning"}>
-          {t(`physical.problem.${p}`, { count: p === "link" ? row.faults : row.poolErrors })}
-        </StatusChip>
-      ))}
+      {row.problems.map((p) => {
+        const key = COUNT[p];
+        return (
+          <StatusChip
+            key={p}
+            tone={p === "link" || p === "offline" || p === "unreachable" ? "danger" : "warning"}
+          >
+            {t(`physical.problem.${p}`, { count: key ? (row[key] as number) : 0 })}
+          </StatusChip>
+        );
+      })}
+      {unknown}
     </span>
   );
 }
@@ -196,7 +215,7 @@ export function CapacityTable({
                     compact
                     label={t("physical.table.cpuOf", { node: row.node })}
                     m={row.cpu}
-                    text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct)}
+                    text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
                   />
                 </TableCell>
                 <TableCell className="min-w-40">

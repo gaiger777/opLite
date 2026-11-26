@@ -63,8 +63,16 @@ const WEB = vm("web", "running", {
 });
 
 function dashboard({ rules = [] as unknown[] } = {}) {
-  mockLists({ node: [NODE, NODE_B], vm: [DB, WEB], volume: [volume("db-root", "fast")] });
+  const volumes = [volume("db-root", "fast")];
+  mockLists({ node: [NODE, NODE_B], vm: [DB, WEB] });
   server.use(
+    // VM 판은 디스크의 볼륨만 하나씩 묻는다(목록 전체를 지켜보지 않음).
+    http.get(apiUrl("/volumes/:key"), ({ params }) => {
+      const v = volumes.find((x) => x.name === params.key);
+      return v
+        ? HttpResponse.json(v)
+        : HttpResponse.json({ code: "not_found", message: "no" }, { status: 404 });
+    }),
     http.get(apiUrl("/cluster"), () =>
       HttpResponse.json({
         name: "lab",
@@ -132,7 +140,11 @@ it("lays out the map, the details panel and the allocation table on a wide scree
   // 행: 막대(넘침 꼬리), 오버커밋, 문제
   const a = within(table).getByRole("row", { name: /node-a/ });
   const cpu = within(a).getByRole("meter", { name: "CPU of node-a" });
-  expect(cpu).toHaveAttribute("aria-valuetext", "14 vCPU / 7 shared threads · ×2.0 · use 40 %");
+  // 공유 할당과 전용 할당을 따로, 사용률은 노드 전체(공유 풀 막대에 얹지 않음)
+  expect(cpu).toHaveAttribute(
+    "aria-valuetext",
+    "14 shared vCPU / 7 threads · ×2.0 · dedicated 2 / 8 · node use 40 %",
+  );
   expect(cpu.querySelector("[data-part=overflow]")).not.toBeNull();
   expect(
     within(a)
@@ -143,7 +155,8 @@ it("lays out the map, the details panel and the allocation table on a wide scree
     "aria-valuetext",
     "provisioned 150 GiB / 100 GiB · used 95 GiB",
   );
-  expect(a).toHaveTextContent("overcommitted");
+  // 공유 vCPU ×2는 문제가 아니다(×4 넘음부터).
+  expect(a).not.toHaveTextContent("overcommitted");
   expect(a).toHaveTextContent("over 90 %");
   expect(a).toHaveTextContent("1 link fault");
   expect(within(table).getByRole("row", { name: /node-b/ })).toHaveTextContent("1 pool not ready");
@@ -153,6 +166,34 @@ it("lays out the map, the details panel and the allocation table on a wide scree
     ),
   ).toBeInTheDocument();
   await expectNoAxeViolations(container);
+});
+
+it("says the physical state is unknown instead of 'no faults' when it cannot be read", async () => {
+  dashboard();
+  let fail = true;
+  server.use(
+    http.get(apiUrl("/topology/physical"), () =>
+      fail
+        ? HttpResponse.json({ code: "internal", message: "leader changed" }, { status: 500 })
+        : HttpResponse.json(PHYSICAL),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<DashboardPage />);
+  const panel = await screen.findByRole("complementary", { name: "Details" });
+  expect(
+    await within(panel).findByText(/Physical link state unknown/, undefined, { timeout: 5000 }),
+  ).toBeInTheDocument();
+  expect(within(panel).queryByText("No link or bond faults.")).not.toBeInTheDocument();
+  const table = screen.getByRole("table", { name: "Allocation and use by node" });
+  expect(within(table).getByRole("row", { name: /node-c/ })).toHaveTextContent(
+    "link state unknown",
+  );
+  // 배지는 "?"이고 누르면 다시 묻는다.
+  fail = false;
+  await user.click(screen.getByRole("button", { name: /Physical state unknown/ }));
+  expect(await within(panel).findByRole("button", { name: "eno1 on node-a" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "1 physical fault" })).toBeInTheDocument();
 });
 
 it("sorts the table and filters it to the nodes with problems", async () => {

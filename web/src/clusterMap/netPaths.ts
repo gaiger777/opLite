@@ -16,22 +16,25 @@ export interface NetPiece {
    */
   kind:
     "rail" | "wire" | "wireCross" | "bond" | "side" | "top" | "shade" | "hatch" | "cross" | "fault";
-  tone: LinkTone | null;
+  /** 선만 `unknown`(모름 — 회색 점선)이 있다 */
+  tone: LinkTone | "unknown" | null;
   d: string;
   parts: number;
 }
 
 const LINK_TONES: readonly LinkTone[] = ["up", "degraded", "down"];
+const WIRE_TONES: readonly (LinkTone | "unknown")[] = [...LINK_TONES, "unknown"];
 
 /**
  * 포트·본딩 테두리·레일 선의 상태 색과 레일 띠 색(`colors.ts`의 `UPLINK_COLOR`·`RAIL_COLOR`와 같은 값 — 시험이 본다). 이
  * 파일과 그림 조각(`netUi.tsx`)은 지도 조각의 모듈을 실행 때 읽지 않는다: 읽으면 rolldown이 둘이 함께 쓰는 모듈을 공유 조각으로
  * 떼어 지도를 열 때 조각이 하나 더 온다.
  */
-export const NET_COLOR: Record<LinkTone, string> = {
+export const NET_COLOR: Record<LinkTone | "unknown", string> = {
   up: "var(--success)",
   degraded: "var(--warning)",
   down: "var(--danger)",
+  unknown: "var(--muted-foreground)",
 };
 export const NET_RAIL = "var(--chart-1)";
 
@@ -61,7 +64,9 @@ function wirePath(w: RailWire): string {
 }
 
 function wireCross(w: RailWire): string {
-  const c = iso(w.lane, w.to - CUT_AT + CUT_GAP / 2, w.z);
+  // 틈은 `wirePath`와 같은 자리(짧은 선은 꺾는 곳에 맞춰 옮겨짐)
+  const cut = Math.max(Math.min(w.to, w.y + 4), w.to - CUT_AT);
+  const c = iso(w.lane, cut + CUT_GAP / 2, w.z);
   const p = (dx: number, dy: number) => `${round(c.x + dx)},${round(c.y + dy)}`;
   return `M${p(-CUT_X, -CUT_X)}L${p(CUT_X, CUT_X)}M${p(CUT_X, -CUT_X)}L${p(-CUT_X, CUT_X)}`;
 }
@@ -91,7 +96,7 @@ export function netPaths(scene: MapScene, lod: Lod): NetPiece[] {
       parts: rails.length,
     });
   }
-  for (const tone of LINK_TONES) {
+  for (const tone of WIRE_TONES) {
     const list = scene.wires.filter((w) => w.tone === tone);
     if (list.length > 0) {
       out.push({

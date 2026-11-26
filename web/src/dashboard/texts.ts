@@ -6,11 +6,18 @@ import type { Measure } from "@/physical/capacity";
 
 const times = (x: number | undefined) => (x === undefined ? undefined : `×${x.toFixed(1)}`);
 
-/** "공유 vCPU 14 / 스레드 7 · ×2.0 · 사용 40 %" */
-export function cpuText(t: TFunction, m: Measure, overcommit?: number, usePct?: number): string {
+/** "공유 vCPU 14 / 스레드 7 · ×2.0 · 전용 2 / 4 · 노드 사용 40 %" — 사용률은 노드 전체(모든 스레드)다. */
+export function cpuText(
+  t: TFunction,
+  m: Measure,
+  overcommit?: number,
+  usePct?: number,
+  dedicated?: { used: number; total: number },
+): string {
   return [
     t("physical.bar.cpu", { allocated: m.allocated ?? 0, total: m.total }),
     times(overcommit),
+    dedicated ? t("physical.bar.dedicated", dedicated) : undefined,
     usePct === undefined ? undefined : t("physical.bar.use", { pct: Math.round(usePct) }),
   ]
     .filter((x) => x !== undefined)

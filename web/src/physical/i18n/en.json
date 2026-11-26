@@ -2,17 +2,19 @@
   "physical": {
     "badge_one": "{{count}} physical fault",
     "badge_other": "{{count}} physical faults",
+    "badgeUnknown": "Physical state unknown",
     "map": {
       "title": "Infrastructure map",
       "full": "Open the map"
     },
     "bar": {
-      "cpu": "{{allocated}} vCPU / {{total}} shared threads",
-      "use": "use {{pct}} %",
+      "cpu": "{{allocated}} shared vCPU / {{total}} threads",
+      "use": "node use {{pct}} %",
       "allocated": "allocated {{allocated}} / {{total}}",
       "used": "used {{used}}",
       "provisioned": "provisioned {{allocated}} / {{total}}",
-      "noStorage": "no local pools"
+      "noStorage": "no local pools",
+      "dedicated": "dedicated {{used}} / {{total}}"
     },
     "table": {
       "title": "Allocation and use by node",
@@ -38,13 +40,17 @@
       "pool_one": "{{count}} pool not ready",
       "pool_other": "{{count}} pools not ready",
       "link_one": "{{count}} link fault",
-      "link_other": "{{count}} link faults"
+      "link_other": "{{count}} link faults",
+      "linkUnknown": "link state unknown",
+      "unreachable_one": "{{count}} network missing",
+      "unreachable_other": "{{count}} networks missing"
     },
     "health": {
       "up": "up",
       "degraded": "degraded",
       "down": "down",
-      "absent": "not here"
+      "absent": "not here",
+      "unknown": "unknown"
     },
     "chain": {
       "summaryOk_one": "Network chain, {{count}} element, no faults",
@@ -120,14 +126,20 @@
       "rail": "Rail {{name}}",
       "railNodes": "Nodes on {{name}}",
       "gone": "What you picked is gone.",
-      "back": "Show the cluster"
+      "back": "Show the cluster",
+      "physicalUnknown": "Physical link state unknown — the server did not answer.",
+      "retry": "Try again",
+      "stale": "last seen",
+      "unreachableAt": "{{network}} is not on {{node}}",
+      "staleRefresh": "Could not refresh — showing the last answer."
     },
     "rail": {
       "bridge": "bridge",
       "vlan": "VLAN",
       "vxlan": "VXLAN",
       "sdn-overlay": "SDN overlay",
-      "sdn-provider": "SDN provider"
+      "sdn-provider": "SDN provider",
+      "underlay": "Underlay (VXLAN·Geneve)"
     },
     "vm": {
       "path": "Path of this VM",

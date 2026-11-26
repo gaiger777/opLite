@@ -124,7 +124,7 @@ function CpuSection({ cap, vms, nodeName }: { cap: NodeCapacity; vms: Vm[]; node
       <UsageBar
         label={t("physical.table.cpu")}
         m={row.cpu}
-        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct)}
+        text={cpuText(t, row.cpu, row.cpuOvercommit, row.cpuUsePct, row.cpuDedicated)}
       />
       {top.length > 0 && (
         <ul aria-label={t("physical.cpu.vms")} className="flex flex-col gap-0.5 text-xs">
@@ -295,9 +295,25 @@ export function NetworkSection({
     for (const id of nets) counts.set(id, (counts.get(id) ?? 0) + 1);
   }
   const chain = buildChain(node, rails, counts);
+  const names = new Map(rails.map((r) => [r.id, r.name]));
   return (
     <Section title={t("physical.network.title")}>
       {node.legacy && <p className="text-xs text-warning-fg">{t("physical.network.legacy")}</p>}
+      {!node.online && (
+        <p className="text-xs text-muted-foreground">
+          {t("physical.table.offline")} · {t("physical.panel.stale")}
+        </p>
+      )}
+      {(node.unreachable ?? []).map((u) => (
+        <p key={u.network} className="text-xs text-danger-fg">
+          {"× "}
+          {t("physical.panel.unreachableAt", {
+            node: node.node,
+            network: names.get(u.network) ?? u.network,
+          })}{" "}
+          · {t("physical.chain.vms", { count: u.vms })}
+        </p>
+      ))}
       <ChainDiagram chain={chain} highlight={highlight} samples={sample.data?.interfaces} />
     </Section>
   );

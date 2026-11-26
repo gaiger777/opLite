@@ -4,6 +4,8 @@
 import type { NetRail, NodePhysical, PhysicalPort } from "@/physical/api";
 
 export type LinkHealth = "up" | "degraded" | "down";
+/** 칸의 상태: 레일이 이 노드에 없으면 `absent`, 모르면(노드 오프라인·underlay 주인을 못 찾음) `unknown` */
+export type ChainHealth = LinkHealth | "absent" | "unknown";
 export type Fault = "down" | "degraded";
 export type ChainKind = "ethernet" | "bond" | "vlan" | "bridge" | "underlay" | "network";
 
@@ -22,11 +24,11 @@ export interface ChainItem {
   id: string;
   kind: ChainKind;
   label: string;
-  /** 이 노드에서 본 상태. 레일이 이 노드에 없으면 `absent`다. */
-  health: LinkHealth | "absent";
+  /** 이 노드에서 본 상태 */
+  health: ChainHealth;
   /** 장애 포트에서 닿으면 그 심각도(둘이면 `down`) */
   fault?: Fault;
-  /** 포트(이더넷·본딩·VLAN)면 서버 값 */
+  /** 포트(이더넷·그 밖의 물리 장치·본딩·VLAN)면 서버 값 */
   port?: PhysicalPort;
   /** 네트워크면 이 노드에서 NIC가 붙은 VM 수, 브리지면 `vm_nics` */
   vms?: number;
@@ -76,7 +78,9 @@ export function buildChain(
   };
   let unused = 0;
   for (const p of node.ports) {
-    if (p.kind !== "ethernet" && p.kind !== "bond" && p.kind !== "vlan") {
+    // 서버의 `other`(dummy·team 등)는 물리 포트처럼 이더넷 열에 둔다(지도 포트 줄과 같게). 어디에도 묶이지 않은 가상
+    // 장치(`ovs-system` 등 — 역할 `other`)는 그리지 않는다.
+    if (p.kind === "bridge" || (p.kind === "other" && p.role === "other")) {
       continue;
     }
     if (p.role === "unused") {
@@ -85,7 +89,7 @@ export function buildChain(
     }
     add({
       id: iface(p.name),
-      kind: p.kind,
+      kind: p.kind === "other" ? "ethernet" : p.kind,
       label: p.name,
       health: p.health,
       port: p,
@@ -99,11 +103,12 @@ export function buildChain(
   if (node.underlay) {
     const overlays = rails.filter((r) => OVERLAY_KINDS.includes(r.kind));
     const holder = node.underlay.port ? iface(node.underlay.port) : undefined;
+    // 주인을 찾았으면 그 상태, 이름만 남았는데 목록에 없으면(사라짐) 끊김, 이름도 없으면 모름(정상으로 보이지 않게)
     add({
       id: UNDERLAY,
       kind: "underlay",
       label: node.underlay.address,
-      health: holder && has.has(holder) ? healthOf(items, holder) : "up",
+      health: holder ? (has.has(holder) ? healthOf(items, holder) : "down") : "unknown",
       note: node.underlay.port,
     });
     for (const r of overlays) {
@@ -158,7 +163,7 @@ export function buildChain(
   return { items, edges: kept, unused };
 }
 
-function healthOf(items: readonly ChainItem[], id: string): LinkHealth {
+function healthOf(items: readonly ChainItem[], id: string): ChainHealth {
   const h = items.find((i) => i.id === id)?.health;
   return h === "absent" || h === undefined ? "up" : h;
 }
@@ -192,7 +197,7 @@ function markFaults(node: NodePhysical, items: ChainItem[], edges: ChainEdge[]) 
   }
 }
 
-/** 칸 `id` 아래(뒤로 걸어)의 이더넷 포트들 — VM 경로의 "→ 포트". 이름 순. */
+/** 칸 `id` 아래(뒤로 걸어)의 물리 포트들(이더넷 열 — 서버 `other` 포함) — VM 경로의 "→ 포트". 이름 순. */
 export function lowerPorts(chain: Chain, id: string): ChainItem[] {
   const into = new Map<string, string[]>();
   for (const e of chain.edges) {
@@ -223,15 +228,41 @@ export function carrierOf(chain: Chain, networkId: string): ChainItem | undefine
   return chain.items.find((i) => i.id === from);
 }
 
-/** 클러스터의 지금 장애(노드 이름 순, 노드 안은 서버 순서) — "물리 장애 n" 배지 */
-export function faultList(nodes: readonly NodePhysical[]) {
-  return nodes.flatMap((n) =>
-    (n.impact ?? []).map((i) => ({
+/** 장애 하나: 포트·본딩 장애, 또는 이 노드에 없는 네트워크에 붙은 VM NIC(`network`) */
+export interface FaultEntry {
+  id: string;
+  node: string;
+  /** 포트 장애면 포트 이름 */
+  port?: string;
+  /** 노드에 없는 네트워크면 그 id */
+  network?: string;
+  severity: Fault;
+  vms: number;
+  /** 오프라인 노드의 마지막으로 본 값(배지 수에 넣지 않는다) */
+  stale: boolean;
+}
+
+/**
+ * 클러스터의 장애(노드 이름 순, 노드 안은 서버 순서 — 포트 장애 다음 없는 네트워크) — "물리 장애 n" 배지와 요약. 오프라인
+ * 노드의 것은 `stale`(마지막으로 본 값)이다.
+ */
+export function faultList(nodes: readonly NodePhysical[]): FaultEntry[] {
+  return nodes.flatMap((n) => [
+    ...(n.impact ?? []).map((i) => ({
       id: n.id,
       node: n.node,
       port: i.port,
       severity: i.severity,
       vms: i.vms,
+      stale: !n.online,
     })),
-  );
+    ...(n.unreachable ?? []).map((u) => ({
+      id: n.id,
+      node: n.node,
+      network: u.network,
+      severity: "down" as const,
+      vms: u.vms,
+      stale: !n.online,
+    })),
+  ]);
 }

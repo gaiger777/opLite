@@ -23,19 +23,40 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
   const capacity = useCapacity();
   const physical = usePhysicalTopology();
   const [selection, setSelection] = useState<MapSelection | null>(null);
-  const faults = faultList(physical.data?.nodes ?? []);
+  // 배지는 지금 값만 센다(오프라인 노드의 마지막으로 본 장애는 판의 목록에만).
+  const faults = faultList(physical.data?.nodes ?? []).filter((f) => !f.stale);
+  // 물리 관계를 한 번도 받지 못하고 실패했으면 "장애 없음"이 아니라 "모름"이다(리뷰 1). 다시 읽다 실패하면 마지막 값을 쓴다.
+  const physicalUnknown = !physical.data && physical.isError;
   const select = (s: MapSelection | null) => setSelection(s);
+  const first = faults[0];
 
-  const badge = faults.length > 0 && (
+  const badge = physicalUnknown ? (
     <Button
       variant="outline"
       size="sm"
-      className="border-danger text-danger-fg"
-      onClick={() => select({ kind: "port", node: faults[0]!.id, port: faults[0]!.port })}
+      className="text-muted-foreground"
+      onClick={() => void physical.refetch()}
     >
-      <TriangleAlert aria-hidden />
-      {t("physical.badge", { count: faults.length })}
+      <TriangleAlert aria-hidden />? {t("physical.badgeUnknown")}
     </Button>
+  ) : (
+    first && (
+      <Button
+        variant="outline"
+        size="sm"
+        className="border-danger text-danger-fg"
+        onClick={() =>
+          select(
+            first.port !== undefined
+              ? { kind: "port", node: first.id, port: first.port }
+              : { kind: "node", id: first.id },
+          )
+        }
+      >
+        <TriangleAlert aria-hidden />
+        {t("physical.badge", { count: faults.length })}
+      </Button>
+    )
   );
 
   const map = (
@@ -60,7 +81,7 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
   const table = capacity.data ? (
     <CapacityTable
       capacity={capacity.data}
-      physical={physical.data?.nodes}
+      physical={physicalUnknown ? undefined : (physical.data?.nodes ?? [])}
       selected={selection}
       onSelect={select}
       phone={phone}
@@ -74,6 +95,8 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
       selection={selection}
       capacity={capacity.data}
       physical={physical.data}
+      physicalError={physicalUnknown ? physical.error : undefined}
+      onRetry={() => void physical.refetch()}
       onSelect={select}
     />
   ) : (
@@ -91,7 +114,7 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
   if (phone) {
     return (
       <>
-        {badge && <div>{badge}</div>}
+        {top}
         {map}
         {table}
         <Sheet open={selection !== null} onOpenChange={(open) => !open && select(null)}>

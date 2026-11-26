@@ -1187,7 +1187,7 @@ export interface paths {
         /**
          * 노드별 용량: CPU(스레드·예약·전용·vCPU 할당·실행·오버커밋·사용률), 메모리(총·예약·할당·사용·hugepages·오버커밋),
          *     NUMA 노드별, 로컬 풀(총·사용·프로비전 = 볼륨 크기 합·볼륨 수), 공유 풀, 온라인 노드의 합. 사용률·사용 메모리는
-         *     `GET /placement`의 노드 부하이고, 리더에 묻지 못하면 빈다(나머지는 그대로). 루트 `cluster.read`, 모든 노드가
+         *     `GET /placement`의 노드 부하이고, 리더에 묻지 못하면 빈다(나머지는 그대로). 루트 `cluster.read`, 온라인 노드가 모두
          *     `operator-dashboard`를 알아야 한다.
          */
         get: operations["get_capacity"];
@@ -3705,8 +3705,8 @@ export interface paths {
         /**
          * 물리 ↔ 가상 네트워크 관계: 노드마다 포트(본딩·VLAN·LLDP 이웃·역할)·브리지(업링크·네트워크·VM NIC 수)·underlay·
          *     physnet과 포트·본딩 장애의 영향(위 브리지·네트워크·VM), 네트워크마다 노드별 레일 상태(up/degraded/down/absent).
-         *     옛 노드(`legacy`)는 VLAN 아래 장치를 이름(`eno1.100`)으로 추정하고 MTU·LLDP가 빈다. 루트 `cluster.read`, 모든
-         *     노드가 `operator-dashboard`를 알아야 한다.
+         *     옛 노드(`legacy` — 꺼진 옛 노드만 닿는다)는 VLAN 아래 장치를 이름(`eno1.100`)으로 추정하고 MTU·LLDP가 빈다. 루트
+         *     `cluster.read`, 온라인 노드가 모두 `operator-dashboard`를 알아야 한다.
          */
         get: operations["physical_topology"];
         put?: never;
@@ -9091,6 +9091,8 @@ export interface components {
             severity: components["schemas"]["FaultSeverity"];
             /** @description underlay 주소를 가진 인터페이스가 위에 있다(VXLAN·SDN 오버레이가 영향받음). */
             underlay?: boolean;
+            /** @description 끊긴 포트가 실어 나르던 노드 주소의 쓰임(클러스터 링크·관리) */
+            uses?: components["schemas"]["PortUse"][];
             /** @description 그 VM의 id([`MAX_IMPACT_VM_IDS`]개까지, 이름 순) */
             vm_ids: string[];
             /**
@@ -10713,6 +10715,13 @@ export interface components {
                      */
                     underlay?: string;
                     /**
+                     * @description underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
+                     *     NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
+                     */
+                    underlay_ports?: {
+                        [key: string]: string;
+                    };
+                    /**
                      * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
                      *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
                      */
@@ -12057,14 +12066,20 @@ export interface components {
         MemoryCapacity: {
             /**
              * Format: int64
-             * @description 자리 잡은 VM에 할당한 메모리(`memory_mib` 합)
+             * @description 그 가운데 hugepages 풀에서 받는 VM의 몫(계획 75 리뷰 1)
+             */
+            allocated_hugepages_mib?: number;
+            /**
+             * Format: int64
+             * @description 자리 잡은 VM에 할당한 메모리(`memory_mib` 합, hugepages VM 포함)
              */
             allocated_mib: number;
             /** @description 크기마다 hugepages(풀이 있거나 쓰는 크기만) */
             hugepages?: components["schemas"]["HugepageCapacity"][];
             /**
              * Format: double
-             * @description 할당 ÷ 노드 메모리. 노드 메모리를 모르면 없다.
+             * @description 보통 메모리의 오버커밋: hugepages 아닌 VM의 할당 ÷ (노드 메모리 − hugepages 풀). 보통 VM은 그 풀을 쓰지 못한다.
+             *     노드 메모리를 모르면 없다.
              */
             overcommit?: number;
             /**
@@ -12587,6 +12602,11 @@ export interface components {
         NodeInterface: {
             /** @description IP 주소(CIDR, 예: `10.0.0.5/24`) */
             addresses?: string[];
+            /**
+             * @description 관리자가 올렸는지(`ip -j`의 `flags`에 `UP`, 계획 75 리뷰 1). 모르면(옛 노드) 없다. 업링크가 없는 내부 브리지의
+             *     carrier 없음과 `ip link set … down`을 가른다.
+             */
+            admin_up?: boolean;
             /** @description 본딩이면 그 포트 상태 */
             bond?: components["schemas"]["BondStatus"];
             /** @description 링크가 있는지(sysfs `carrier`). 읽지 못했으면 없다. */
@@ -12678,7 +12698,7 @@ export interface components {
             bridges: components["schemas"]["Bridge"][];
             /** Format: uuid */
             id: string;
-            /** @description 지금 장애가 난 포트·본딩마다 영향(포트 순서) */
+            /** @description 지금 장애가 난 포트·본딩마다 영향(포트 순서). 오프라인 노드는 마지막으로 본 상태의 값이다(`online`이 거짓). */
             impact?: components["schemas"]["Impact"][];
             /**
              * @description 옛 노드(기능 `operator-dashboard`를 알리지 않음): `mtu`·`parent`·`lldp`가 없고 VLAN 아래 장치는 이름 규칙
@@ -12694,6 +12714,11 @@ export interface components {
             ports: components["schemas"]["Port"][];
             /** @description VXLAN·Geneve 패킷이 오가는 주소와 그 주소를 가진 인터페이스 */
             underlay?: components["schemas"]["UnderlayLink"];
+            /**
+             * @description 이 노드에서 도는 VM이 NIC를 붙였는데 이 노드에 그 네트워크를 쓸 수단(브리지·physnet·underlay)이 없는 것(이름 순,
+             *     계획 75 리뷰 1). 그 NIC는 끊겨 있다.
+             */
+            unreachable?: components["schemas"]["Unreachable"][];
         };
         /** @description 노드를 뺐지만 손으로 할 일이 남았을 때의 `DELETE /nodes/{key}` 응답 */
         NodeRemoved: {
@@ -12936,6 +12961,13 @@ export interface components {
              *     None).
              */
             underlay?: string;
+            /**
+             * @description underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
+             *     NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
+             */
+            underlay_ports?: {
+                [key: string]: string;
+            };
             /**
              * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
              *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
@@ -13762,7 +13794,7 @@ export interface components {
             /** @description 본딩이면 모드·상태·구성 포트 */
             bond?: components["schemas"]["PortBond"];
             carrier?: boolean;
-            /** @description 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들 */
+            /** @description 이 포트에서 아래로 본 상태: 본딩은 본딩 상태, VLAN은 아래 장치, 브리지는 업링크들(관리자가 내렸으면 down) */
             health: components["schemas"]["LinkHealth"];
             kind: components["schemas"]["PortKind"];
             lldp?: components["schemas"]["LldpNeighbor"];
@@ -13779,6 +13811,8 @@ export interface components {
             speed_mbps?: number;
             /** @description operstate(`up`, `down`, `unknown`, `lowerlayerdown` …) */
             state: string;
+            /** @description 이 포트(또는 그 위)가 가진 주소의 쓰임: 클러스터 링크(`cluster_addresses`)·관리(노드 API 주소) */
+            uses?: components["schemas"]["PortUse"][];
             /** Format: int32 */
             vlan_id?: number;
         };
@@ -13804,12 +13838,17 @@ export interface components {
          * @description 포트가 쓰이는 곳
          * @enum {string}
          */
-        PortRole: "uplink" | "underlay" | "unused" | "other";
+        PortRole: "uplink" | "underlay" | "service" | "unused" | "other";
         /**
          * @description 본딩 포트의 상태
          * @enum {string}
          */
-        PortState: "up" | "down" | "lacp_mismatch" | "speed_mismatch" | "unknown";
+        PortState: "up" | "down" | "lacp_mismatch" | "speed_mismatch" | "missing" | "unknown";
+        /**
+         * @description 주소를 가진 포트의 쓰임
+         * @enum {string}
+         */
+        PortUse: "cluster" | "management";
         /**
          * @description 방법으로 읽은 노드의 전원
          * @enum {string}
@@ -13954,7 +13993,7 @@ export interface components {
          * @description 한 노드에서 본 레일 상태
          * @enum {string}
          */
-        RailState: "up" | "degraded" | "down" | "absent";
+        RailState: "up" | "degraded" | "down" | "absent" | "unknown";
         /** @description 영역이 사용자를 확인하는 방법 */
         RealmBackend: (components["schemas"]["LdapRealm"] & {
             /** @enum {string} */
@@ -15379,6 +15418,13 @@ export interface components {
                  *     None).
                  */
                 underlay?: string;
+                /**
+                 * @description underlay 주소(`underlay`·SDN `encap_ip`) → 마지막으로 그 주소를 가졌던 인터페이스(계획 75 리뷰 1). 링크가 끊길 때
+                 *     NetworkManager가 주소를 떼어도 물리 관계가 그 포트를 계속 본다. 노드가 쓰고, 비면 쓰지 않는다. 옛 노드는 무시한다.
+                 */
+                underlay_ports?: {
+                    [key: string]: string;
+                };
                 /**
                  * @description 이 노드의 APT 업데이트 확인 결과. 업데이트가 켜진 노드는 등록할 때 `Some`(아직 확인 전이면
                  *     빈 값)이고, 꺼진 노드(위트니스, macOS 등)와 옛 노드는 None이다.
@@ -18156,6 +18202,21 @@ export interface components {
             address: string;
             /** @description 그 주소를 가진 인터페이스(못 찾으면 없음) */
             port?: string;
+        };
+        /** @description 이 노드에 없는 네트워크에 붙은 VM NIC */
+        Unreachable: {
+            /**
+             * Format: uuid
+             * @description 네트워크 id
+             */
+            network: string;
+            /** @description 그 VM의 id([`MAX_IMPACT_VM_IDS`]개까지, 이름 순) */
+            vm_ids: string[];
+            /**
+             * Format: int32
+             * @description 이 노드에서 그 네트워크에 NIC가 있는 VM 수
+             */
+            vms: number;
         };
         UpdateAccessRoleRequest: {
             description?: string;

@@ -58,6 +58,9 @@ it("links other targets to their screens", () => {
 it("links alert subjects", () => {
   const s = { id: "x", name: "a b" };
   expect(alertHref({ ...s, kind: "node" })).toBe("/nodes/a%20b");
+  expect(alertHref({ ...s, kind: "node", port: "eno1" })).toBe(
+    "/cluster/map?focus=port%3Aa%20b%2Feno1",
+  );
   expect(alertHref({ ...s, kind: "vm" })).toBe("/vms/a%20b");
   expect(alertHref({ ...s, kind: "pool" })).toBe("/storage-pools?q=a%20b");
   expect(alertHref({ ...s, kind: "backup_job" })).toBe("/backup-jobs");

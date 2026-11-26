@@ -887,6 +887,8 @@ export interface MapSceneProps {
   railName?(rail: { carrier: string; kind: string; networks: number }): string;
   /** 그림 높이(Tailwind 칸) — 홈은 고정 높이 */
   heightClass?: string;
+  /** 한 손가락 세로 쓸기를 쪽 스크롤로 넘긴다(홈 — 묻힌 칸이 쪽 스크롤을 막지 않게, 리뷰 1). 기본은 지도가 모든 끌기를 받는다. */
+  panY?: boolean;
 }
 
 /** 지도 끌어 옮기기에서 쪽이 주는 것 */
@@ -1402,7 +1404,7 @@ export function MapScene(props: MapSceneProps) {
         aria-label={t("clusterMap.pictureLabel")}
         aria-describedby={props.describedBy}
         viewBox={viewBoxAttr(view)}
-        className={`block ${props.heightClass ?? "h-[min(70vh,560px)] min-h-72"} w-full touch-none rounded-lg border bg-gradient-to-b from-surface-1 to-background select-none`}
+        className={`block ${props.heightClass ?? "h-[min(70vh,560px)] min-h-72"} w-full ${props.panY ? "touch-pan-y" : "touch-none"} rounded-lg border bg-gradient-to-b from-surface-1 to-background select-none`}
         {...handlers}
         onPointerDown={(e) => {
           press.current = { x: e.clientX, y: e.clientY };

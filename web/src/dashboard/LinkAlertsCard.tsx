@@ -19,7 +19,8 @@ import { Label } from "@/components/ui/label";
 export function LinkAlertsCard() {
   const { t } = useTranslation();
   const manage = usePermissions().can("write", "alert-rule");
-  const rules = useAlertRules();
+  // 규칙을 바꿀 수 없는 사용자는 묻지도 않는다(홈마다 403을 받지 않게).
+  const rules = useAlertRules(manage);
   const [open, setOpen] = useState(false);
   if (!manage || !rules.data || rules.data.some((r) => isLink(r.spec.condition.kind))) {
     return null;

@@ -52,10 +52,12 @@ export const POOL_COLOR: Record<PoolTone, string> = {
 };
 
 /** 네트워크 띠 */
-export const UPLINK_COLOR: Record<Uplink, string> = {
+export const UPLINK_COLOR: Record<Uplink | "unknown", string> = {
   up: "var(--success)",
   degraded: "var(--warning)",
   down: "var(--danger)",
+  /** 레일 선의 "모름"(계획 75 리뷰 1) */
+  unknown: "var(--muted-foreground)",
 };
 
 /** 꼬리표(알약) 뜻 → 상태 토큰(`--{tone}-soft` 바탕·`--{tone}-fg` 글 — 이미 4.5:1을 시험함) */

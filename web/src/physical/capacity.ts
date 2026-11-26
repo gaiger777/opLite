@@ -5,6 +5,12 @@ import type { NodeCapacity, NodePhysical } from "@/physical/api";
 /** 이만큼(%) 넘게 쓰면 문제다(설계 §4.1 "사용 > 90%") */
 export const HOT_PERCENT = 90;
 
+/**
+ * 공유 vCPU 오버커밋이 이만큼 넘으면 문제다(리뷰 1 — KVM에서 2~4배는 흔한 정상 운영이라 ×1로는 "문제만"이 쓸모없어진다). 설정
+ * 한도가 생기면 그 값으로 바꾼다. 메모리는 ×1을 넘으면 문제다.
+ */
+export const CPU_OVERCOMMIT_LIMIT = 4;
+
 /** 막대 하나의 값: 총(바탕), 할당(테두리 칸), 사용(진한 칸). 모르면 없다. */
 export interface Measure {
   total: number;
@@ -16,10 +22,16 @@ export interface CapacityRow {
   id: string;
   node: string;
   online: boolean;
-  /** 공유 스레드(예약·전용 뺀 것) 위의 공유 vCPU. 사용은 노드 CPU 사용률을 같은 눈금(%)에 둔 값이다. */
+  /**
+   * 공유 스레드(예약·전용 뺀 것) 위의 공유 vCPU(사용 칸 없음 — 노드 사용률은 전용 VM·호스트 몫을 담아 공유 풀의 눈금이 아니다,
+   * 리뷰 1). 노드 사용률은 `cpuUsePct`, 전용 할당은 `cpuDedicated`.
+   */
   cpu: Measure;
   cpuOvercommit?: number;
+  /** 지난 1분 노드 전체(모든 스레드) CPU 사용률 % */
   cpuUsePct?: number;
+  /** 잡힌 전용 CPU / 전용 CPU(전용이 없으면 없음) */
+  cpuDedicated?: { used: number; total: number };
   /** MiB */
   memory: Measure;
   memoryOvercommit?: number;
@@ -27,24 +39,30 @@ export interface CapacityRow {
   storage: Measure;
   poolErrors: number;
   faults: number;
+  /** 도는 VM이 NIC를 붙였는데 이 노드에 없는 네트워크 수 */
+  unreachable: number;
+  /** 물리 관계를 받지 못해 링크 상태를 모름(문제 거르기에는 넣지 않는다 — 모든 노드가 걸린다) */
+  linkUnknown: boolean;
   problems: Problem[];
 }
 
-export type Problem = "offline" | "overcommit" | "hot" | "pool" | "link";
+export type Problem = "offline" | "overcommit" | "hot" | "pool" | "link" | "unreachable";
 
 export type SortKey = "node" | "cpu" | "memory" | "storage";
 
 const pct = (part: number | undefined, total: number) =>
   part === undefined || total <= 0 ? undefined : (part / total) * 100;
 
-/** 행 하나. `physical`은 같은 노드의 물리 관계(없으면 장애 0). */
-export function capacityRow(n: NodeCapacity, physical?: NodePhysical): CapacityRow {
+/**
+ * 행 하나. `physical`은 같은 노드의 물리 관계(없으면 장애 0), `linkKnown`이 거짓이면 물리 관계를 받지 못한 것(링크 "모름").
+ */
+export function capacityRow(
+  n: NodeCapacity,
+  physical?: NodePhysical,
+  linkKnown = true,
+): CapacityRow {
   const shared = Math.max(0, n.cpu.threads - n.cpu.reserved - n.cpu.dedicated_total);
-  const cpu: Measure = {
-    total: shared,
-    allocated: n.cpu.vcpus_shared,
-    used: n.cpu.use_pct === undefined ? undefined : (n.cpu.use_pct / 100) * shared,
-  };
+  const cpu: Measure = { total: shared, allocated: n.cpu.vcpus_shared };
   const memory: Measure = {
     total: n.memory.total_mib,
     allocated: n.memory.allocated_mib,
@@ -57,9 +75,12 @@ export function capacityRow(n: NodeCapacity, physical?: NodePhysical): CapacityR
   };
   const poolErrors = n.storage.filter((p) => !p.ready).length;
   const faults = physical?.impact?.length ?? 0;
+  const unreachable = physical?.unreachable?.length ?? 0;
   const problems: Problem[] = [];
   if (!n.online) problems.push("offline");
-  if ((n.cpu.overcommit ?? 0) > 1 || (n.memory.overcommit ?? 0) > 1) problems.push("overcommit");
+  if ((n.cpu.overcommit ?? 0) > CPU_OVERCOMMIT_LIMIT || (n.memory.overcommit ?? 0) > 1) {
+    problems.push("overcommit");
+  }
   const hot = [
     n.cpu.use_pct,
     pct(memory.used, memory.total),
@@ -68,6 +89,7 @@ export function capacityRow(n: NodeCapacity, physical?: NodePhysical): CapacityR
   if (hot.some((v) => v !== undefined && v > HOT_PERCENT)) problems.push("hot");
   if (poolErrors > 0) problems.push("pool");
   if (faults > 0) problems.push("link");
+  if (unreachable > 0) problems.push("unreachable");
   return {
     id: n.id,
     node: n.node,
@@ -75,11 +97,17 @@ export function capacityRow(n: NodeCapacity, physical?: NodePhysical): CapacityR
     cpu,
     cpuOvercommit: n.cpu.overcommit,
     cpuUsePct: n.cpu.use_pct,
+    cpuDedicated:
+      n.cpu.dedicated_total > 0
+        ? { used: n.cpu.dedicated_used, total: n.cpu.dedicated_total }
+        : undefined,
     memory,
     memoryOvercommit: n.memory.overcommit,
     storage,
     poolErrors,
     faults,
+    unreachable,
+    linkUnknown: !linkKnown,
     problems,
   };
 }
@@ -93,7 +121,7 @@ function load(m: Measure): number {
   return a / m.total;
 }
 
-/** 표의 행: 거르고(문제만) 정렬한다. 수치 열이 같으면 이름 순이다. */
+/** 표의 행: 거르고(문제만) 정렬한다. 수치 열이 같으면 이름 순이다. `physical`이 없으면 링크 "모름"이다. */
 export function capacityRows(
   nodes: readonly NodeCapacity[],
   physical: readonly NodePhysical[] | undefined,
@@ -109,7 +137,7 @@ export function capacityRows(
 ): CapacityRow[] {
   const byId = new Map((physical ?? []).map((p) => [p.id, p]));
   const rows = nodes
-    .map((n) => capacityRow(n, byId.get(n.id)))
+    .map((n) => capacityRow(n, byId.get(n.id), physical !== undefined))
     .filter((r) => !problemsOnly || r.problems.length > 0);
   const sign = desc ? -1 : 1;
   const name = (a: CapacityRow, b: CapacityRow) => a.node.localeCompare(b.node);

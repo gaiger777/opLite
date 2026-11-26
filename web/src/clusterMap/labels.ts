@@ -131,6 +131,9 @@ function railText(t: Translate, rail: RailItem): string {
   if (rail.degraded > 0) {
     parts.push(t(`${L}.railDegraded`, { count: rail.degraded }));
   }
+  if (rail.unknown > 0) {
+    parts.push(t(`${L}.railUnknown`, { count: rail.unknown }));
+  }
   return parts.join(", ");
 }
 

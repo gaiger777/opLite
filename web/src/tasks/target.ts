@@ -103,13 +103,16 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
 }
 
 /**
- * 경보 대상의 화면: 노드·VM은 상세, 풀은 목록 검색, 백업 작업·Task는 그 목록, 라우터·부하 분산기는 그 서랍을 연 목록,
+ * 경보 대상의 화면: 노드·VM은 상세(포트가 있는 노드 경보는 지도의 그 포트), 풀은 목록 검색, 백업 작업·Task는 그 목록, 라우터·부하 분산기는 그 서랍을 연 목록,
  * SDN은 SDN 보기(계획 67), 백업은 목록 검색, 백업 저장소는 그 서랍을 연 저장소 목록(계획 68)
  */
 export function alertHref(subject: AlertSubject): string {
   switch (subject.kind) {
     case "node":
-      return `/nodes/${enc(subject.name)}`;
+      // 링크 경보(계획 75 리뷰 1)는 지도의 그 포트로
+      return subject.port
+        ? `/cluster/map?focus=${enc(`port:${subject.name}/${subject.port}`)}`
+        : `/nodes/${enc(subject.name)}`;
     case "vm":
       return `/vms/${enc(subject.name)}`;
     case "pool":

@@ -48,7 +48,7 @@ import { DndProvider } from "@/dnd/DndProvider";
 import i18n from "@/i18n";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 import { useNodeActions } from "@/nodes/NodeActions";
-import { usePhysicalTopology } from "@/physical/api";
+import { isUnavailable, usePhysicalTopology } from "@/physical/api";
 
 export type { MapSelection } from "@/clusterMap/selection";
 
@@ -228,7 +228,8 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
   const netShown = layers.includes("network") || wantsNet;
   // 물리 관계(계획 75): 네트워크 레이어를 켰고 루트 읽기가 있을 때만. 403·409(섞인 판)면 지금 업링크 띠 하나 그대로.
   const physical = usePhysicalTopology(netShown && perms.has("cluster.read"));
-  const physicalData = physical.isError ? null : (physical.data ?? null);
+  // 403·409면 없음. 그 밖의 실패(다시 읽다 한 번 실패)는 받아 둔 마지막 값을 그대로 쓴다(그림이 접혔다 펴지지 않게 — 리뷰 1).
+  const physicalData = isUnavailable(physical.error) ? null : (physical.data ?? null);
   // 포트·레일 카드와 서랍 몸통은 네트워크 레이어를 켤 때 늦게 받는다(오기 전에는 화면 읽기 글이 카드)
   const [netUi, setNetUi] = useState<typeof import("@/clusterMap/netUi") | null>(null);
   useEffect(() => {
@@ -322,6 +323,11 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
   /** 홈: 요청으로 맞춘 원소(화면 초점이 없어도 밝힘) */
   const [focusLit, setFocusLit] = useState<string | null>(null);
   const waitNet = wantsNet && physical.isPending && perms.has("cluster.read");
+  // 요청이 사라지면(고른 것이 노드·VM·없음) 밝힘과 맞춘 기억을 지운다 — 같은 포트를 다시 고르면 다시 옮긴다(리뷰 1).
+  if (!focusParam && (applied !== null || focusLit !== null)) {
+    setApplied(null);
+    setFocusLit(null);
+  }
   if (model && scene && focusTarget && focusParam && applied !== focusParam && !waitNet) {
     setApplied(focusParam);
     const f = focusOf(focusTarget, model, scene);
@@ -694,7 +700,8 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp }: InfraMa
                 selected={selectedKey}
                 onBlank={onSelect ? () => onSelect(null) : undefined}
                 railName={railTag}
-                heightClass={home ? "h-[26rem]" : undefined}
+                heightClass={home ? (phone ? "h-64" : "h-[26rem]") : undefined}
+                panY={home}
                 scene={s}
                 nodes={nodesByKey}
                 labels={labels}

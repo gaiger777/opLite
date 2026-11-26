@@ -120,3 +120,23 @@ it("finds a provider network's port through the node's physnet bridge", () => {
   );
   expect(net.carriers).toEqual({ phys1: ["eno1", "eno2"] });
 });
+
+it("puts address-only (service) ports in the row and keeps an unknown rail state", () => {
+  const np = physicalTopology([A]).nodes[0]!;
+  np.ports = [...np.ports, port("ens1f0", { role: "service", uses: ["cluster"] })];
+  const net = nodeNet(np, []);
+  expect(net.ports.find((p) => p.name === "ens1f0")?.role).toBe("service");
+  // 모름은 정상보다 나쁘고 저하·끊김보다 낫다(가장 나쁜 것으로 묶을 때)
+  const rail = (states: ("up" | "unknown" | "degraded")[]) =>
+    railsOf(
+      states.map((state, i) => ({
+        id: `x${i}`,
+        name: `x${i}`,
+        kind: "bridge" as const,
+        carrier: "vmbr0",
+        nodes: [{ node: "n1", state }],
+      })),
+    )[0]!.states.get("n1");
+  expect(rail(["up", "unknown"])).toBe("unknown");
+  expect(rail(["unknown", "degraded"])).toBe("degraded");
+});

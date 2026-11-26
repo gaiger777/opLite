@@ -1,5 +1,5 @@
 // 지도의 네트워크 층(계획 75 §2·§4.2): 서버의 물리 관계(`GET /topology/physical`)를 지도가 그릴 꼴로 바꾸는 순수 함수.
-// 노드마다 포트 줄(업링크·underlay의 물리 포트 — 본딩 구성 포트는 붙여서), 본딩 묶음, 장애 수, 그리고 레일(네트워크를
+// 노드마다 포트 줄(업링크·underlay·주소를 가진 물리 포트 — 본딩 구성 포트는 붙여서), 본딩 묶음, 장애 수, 그리고 레일(네트워크를
 // 실어 나르는 것 — 브리지·physnet·underlay — 마다 하나, 그 위 네트워크들)과 레일마다 노드의 상태.
 import type { Impact, NetRail, NodePhysical, PhysicalPort, PhysicalTopology } from "@/physical/api";
 
@@ -9,14 +9,18 @@ const naturalCompare = (a: string, b: string) =>
   collator.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0);
 
 export type LinkTone = "up" | "degraded" | "down";
-/** 레일 위 노드 상태(`absent`는 그 노드에 그 네트워크를 쓸 수단이 없음 — 선을 긋지 않는다) */
-export type RailTone = LinkTone | "absent";
+/**
+ * 레일 위 노드 상태(`absent`는 그 노드에 그 네트워크를 쓸 수단이 없음 — 선을 긋지 않는다, `unknown`은 모름 — 노드 오프라인·
+ * underlay 주인을 못 찾음, 회색 점선)
+ */
+export type RailTone = LinkTone | "absent" | "unknown";
 
 /** 포트 줄의 포트 하나 */
 export interface MapPort {
   name: string;
   health: LinkTone;
-  role: "uplink" | "underlay";
+  /** `service`는 주소를 가진 포트(스토리지·클러스터 링크·관리망, 리뷰 1) */
+  role: "uplink" | "underlay" | "service";
   /** 이 포트를 묶은 본딩(줄에서 이웃으로 붙고 묶음 테두리를 같이 쓴다) */
   bond: string | null;
   /** 이 포트의 장애(영향) */
@@ -56,7 +60,7 @@ export interface MapRail {
   states: Map<string, RailTone>;
 }
 
-const WORSE: Record<RailTone, number> = { absent: 0, up: 1, degraded: 2, down: 3 };
+const WORSE: Record<RailTone, number> = { absent: 0, up: 1, unknown: 2, degraded: 3, down: 4 };
 
 function worse(a: RailTone, b: RailTone): RailTone {
   return WORSE[b] > WORSE[a] ? b : a;
@@ -88,7 +92,8 @@ export function leafPorts(ports: readonly PhysicalPort[], name: string, depth = 
 }
 
 const isRowPort = (p: PhysicalPort) =>
-  (p.role === "uplink" || p.role === "underlay") && (p.kind === "ethernet" || p.kind === "other");
+  (p.role === "uplink" || p.role === "underlay" || p.role === "service") &&
+  (p.kind === "ethernet" || p.kind === "other");
 
 /** 레일의 열쇠가 이 노드에서 닿는 인터페이스: 브리지 이름, physnet의 브리지, `underlay`면 underlay 포트 */
 function carrierTop(np: NodePhysical, rail: Pick<NetRail, "kind" | "carrier">): string | null {
@@ -120,7 +125,7 @@ export function nodeNet(np: NodePhysical, rails: readonly MapRail[]): NodeNet {
       ports.push({
         name: g.name,
         health: tone(g.health),
-        role: g.role === "underlay" ? "underlay" : "uplink",
+        role: g.role === "underlay" || g.role === "service" ? g.role : "uplink",
         bond: bond ? p.master! : null,
         fault: faultOf(g.name),
       });
