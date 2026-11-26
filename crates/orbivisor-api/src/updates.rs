@@ -45,6 +45,8 @@ const CHECK_BUSY: &str = "another update check is running";
 const CHECK_LOCK_TIMEOUT: &str = "DPkg::Lock::Timeout=60";
 /// 오류에 담는 명령 stderr의 끝 줄 수
 const ERROR_LINES: usize = 5;
+/// 이어 보기 첫머리에서 업그레이드 유닛의 상태를 다시 읽어 보는 횟수(폴링 간격마다 — 기본 2초면 2분)
+const KNOWN_STATE_TRIES: u32 = 60;
 /// 설정 구독을 하지 못했을 때 다시 해 보는 간격
 const RESUBSCRIBE: Duration = Duration::from_secs(10);
 /// 업그레이드 셸이 로그 끝에 남기는 종료 상태 줄의 앞부분. `--collect`로 유닛이 사라진 뒤에도 결과를 안다.
@@ -224,12 +226,27 @@ impl Updates {
     async fn run_upgrade(&self, task: Uuid, resume: bool) -> Result<(), String> {
         let mut unit = upgrade_unit(task);
         // 이름 바꾸기(계획 74) 앞의 데몬이 띄운 유닛(`opl-upgrade-…`)을 이어 본다 — 업그레이드가 그 데몬을 이 판으로
-        // 바꾼다. 새 이름의 유닛이 없고 옛 이름의 유닛이 있으면 그것이다. 상태를 읽지 못하면 읽을 때까지 다시 본다(한 번
-        // 못 읽었다고 옛 유닛을 놓치면 돌고 있는 apt를 끊긴 것으로 판정한다 — 리뷰 1).
-        if resume && self.known_state(&unit).await? == UnitState::Gone {
-            let legacy = legacy_upgrade_unit(task);
-            if self.known_state(&legacy).await? != UnitState::Gone {
-                unit = legacy;
+        // 바꾼다. 새 이름의 유닛이 없고 옛 이름의 유닛이 있으면 그것이다. 상태를 읽지 못하면 다시 본다(한 번 못 읽었다고
+        // 옛 유닛을 놓치면 돌고 있는 apt를 끊긴 것으로 판정한다 — 리뷰 1). 끝내 읽지 못하면(리뷰 2 — Task가 끝나지 않게)
+        // 새 이름으로 이어 보고 경고한다.
+        if resume {
+            let unread = |name: &str| {
+                tracing::warn!(
+                    unit = name,
+                    "cannot read the upgrade unit state; watching the upgrade unit by its current name"
+                )
+            };
+            match self.known_state(&unit).await? {
+                Some(UnitState::Gone) => {
+                    let legacy = legacy_upgrade_unit(task);
+                    match self.known_state(&legacy).await? {
+                        Some(UnitState::Gone) => {}
+                        Some(_) => unit = legacy,
+                        None => unread(&legacy),
+                    }
+                }
+                Some(_) => {}
+                None => unread(&unit),
             }
         }
         let mut log = self.config.log_dir.join(format!("upgrade-{task}.log"));
@@ -304,13 +321,15 @@ impl Updates {
     }
 
     /// [`Self::unit_state`]를 읽을 때까지(`systemctl`이 실패하면 [`UpdatesConfig::poll`]마다 다시) 본다.
-    async fn known_state(&self, unit: &str) -> Result<UnitState, String> {
-        loop {
+    /// [`KNOWN_STATE_TRIES`]번 못 읽으면 `None`이다(systemd가 망가진 노드에서 Task가 끝나지 않게).
+    async fn known_state(&self, unit: &str) -> Result<Option<UnitState>, String> {
+        for _ in 0..KNOWN_STATE_TRIES {
             if let Some(state) = self.unit_state(unit).await? {
-                return Ok(state);
+                return Ok(Some(state));
             }
             tokio::time::sleep(self.config.poll).await;
         }
+        Ok(None)
     }
 
     /// `systemctl show`로 읽은 유닛 상태. `systemctl`이 실패하면(systemd 자신을 올리는 중 등) `None`이다

@@ -945,6 +945,49 @@ async fn an_unreadable_unit_state_does_not_skip_the_old_named_unit() {
     assert_eq!(done["status"]["state"], "succeeded", "{done}");
 }
 
+/// 새 이름 유닛의 상태를 끝내 읽지 못하면(systemd가 계속 답하지 않음) 상한(60번) 뒤 옛 이름을 찾지 않고 새 이름으로
+/// 이어 본다(리뷰 2: 이어 보기 첫머리에서 끝없이 기다리지 않음). 그 뒤 새 이름이 없다고 읽히면 그대로 판정한다 —
+/// 상한이 없으면 그때 옛 이름 유닛을 찾아 지켜본다.
+#[tokio::test]
+async fn an_unit_state_that_stays_unreadable_falls_back_to_the_current_name() {
+    let apt = FakeApt::new();
+    let new = std::cell::OnceCell::new();
+    let (env, task) = resume_upgrade(&apt, |id| {
+        let unit = format!("unit.state.orbivisor-upgrade-{}.service", id.simple());
+        apt.set(&unit, "error");
+        new.set(unit).unwrap();
+        apt.set(
+            &format!("unit.state.opl-upgrade-{}.service", id.simple()),
+            "active",
+        );
+        write_log(&apt, id, "opl-upgrade: start\n");
+    })
+    .await;
+    let admin = env.admin().await;
+    let id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+    let probe = format!(
+        "show -p ActiveState -p Result -p LoadState orbivisor-upgrade-{}.service",
+        id.simple()
+    );
+    eventually("the new unit to be polled past the retry limit", || {
+        (apt.lines("systemctl.calls")
+            .iter()
+            .filter(|c| **c == probe)
+            .count()
+            > 65)
+            .then_some(())
+    })
+    .await;
+    apt.set(new.get().unwrap(), "gone");
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "failed", "{done}");
+    let old = format!(
+        "show -p ActiveState -p Result -p LoadState opl-upgrade-{}.service",
+        id.simple()
+    );
+    assert!(!apt.lines("systemctl.calls").contains(&old));
+}
+
 /// 셸이 시작했는데 종료 상태 줄 없이 사라졌으면(apt가 도중에 끊겼다) dpkg가 깨끗해도 실패다.
 #[tokio::test]
 async fn a_vanished_unit_without_an_exit_status_was_interrupted() {
