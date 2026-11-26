@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# 시험용 가짜 S3 서버(axum). orbivisor-api·opld 시험이 켠다.
+# 시험용 가짜 S3 서버(axum). orbivisor-api·orbivisord 시험이 켠다.
 fake-s3 = ["dep:axum"]
-# 시험 도움(디스크 이미지를 저장소 백업으로 쓰기). orbivisor-driver·opld 시험이 켠다.
+# 시험 도움(디스크 이미지를 저장소 백업으로 쓰기). orbivisor-driver·orbivisord 시험이 켠다.
 test-util = []
 # qemu-img·qemu-io·qemu-nbd로 NBD 클라이언트·서버가 QEMU와 맞는지 보는 시험(macOS: brew install qemu,
 # Debian/Ubuntu: apt install qemu-utils).

@@ -29,7 +29,7 @@ use crate::state::AppState;
 
 pub const SESSION_COOKIE: &str = "orbivisor_session";
 /// 옛 세션 쿠키 이름. 계획 74: 한 릴리스 동안 옛 판 노드와 세션을 나눈다(다음 판에서 뺌) — 새 이름과 함께
-/// 쓰고, 새 이름이 없을 때 읽는다.
+/// 쓰고, 새 이름이 없거나 값이 다를 때 읽는다([`session_cookies`]).
 pub const LEGACY_SESSION_COOKIE: &str = "opl_session";
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// 세션의 마지막 사용 시각을 다시 적기까지의 간격. 요청마다 Raft에 쓰지 않으려고 묶는다.

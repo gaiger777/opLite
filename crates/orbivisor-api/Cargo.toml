@@ -13,7 +13,7 @@ storage-it = []
 # 실제 OpenLDAP(slapd)로 LDAP 영역을 확인하는 테스트. 디렉터리는 .github/scripts/ldap-setup.sh가 만들고
 # ORBIVISOR_TEST_LDAP_* 환경 변수로 알린다.
 ldap-it = []
-# 시험·데모용 가짜 vSphere(vCenter·ESXi SOAP·데이터스토어 `/folder`·호스트 티켓, 계획 72). orbivisor-api·opld 시험과 실행 파일
+# 시험·데모용 가짜 vSphere(vCenter·ESXi SOAP·데이터스토어 `/folder`·호스트 티켓, 계획 72). orbivisor-api·orbivisord 시험과 실행 파일
 # `fake-vsphere`가 켠다. 배포 빌드에는 없다.
 fake-vsphere = []
 # govmomi vcsim(GitHub `vmware-sim` 작업)을 상대로 SOAP 꼴을 보는 시험. vcsim 주소는 ORBIVISOR_TEST_VCSIM으로 알린다.

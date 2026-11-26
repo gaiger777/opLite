@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# 크레이트·라이브러리 이름(oplctl)은 두고 바이너리 이름만 제품 이름으로 한다(옛 이름 oplctl은 패키지의 링크).
+# 바이너리는 아래 [[bin]]에 적은 것만 만든다(옛 이름 oplctl은 패키지의 링크).
 autobins = false
 
 [[bin]]
