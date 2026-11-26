@@ -242,7 +242,7 @@ if [ -n "$IMAGE_DEB" ]; then
 fi
 
 # 지금 노드에 깔린 판(계획 43~73의 orbivisor) → 받은 판(리뷰 2): 받은 판을 지우고 옛 배치로 되돌린 뒤 V1 고정물을 설치한다.
-apt-get purge -y orbivisor ${IMAGE_DEB:+orbivisor-restore-image}
+apt-get purge -y orbivisor ${IMAGE_DEB:+"orbivisor-restore-image"}
 rm -rf /etc/orbivisor /etc/opl /var/lib/orbivisor /var/lib/opl /run/orbivisor /run/opl /var/log/orbivisor /var/log/opl
 V1="$VERSION~p43"
 P="$WORK/orbivisor-v1"
