@@ -178,7 +178,25 @@ async fn physical_topology_follows_the_chain_and_caches_until_the_input_changes(
     );
     assert_eq!(nobody.get("/capacity").await.0, StatusCode::FORBIDDEN);
 
-    // 기능: 옛 노드가 있으면 409 `cluster_upgrading`
+    // 기능: 꺼진 옛 노드는 막지 않고(리뷰 1) `legacy`로 보이며, 온라인 옛 노드가 있으면 409 `cluster_upgrading`
+    let mut dead = node_status(Vec::new());
+    dead.features.retain(|f| f != OPERATOR_DASHBOARD);
+    dead.online = false;
+    add_node(&env, "dead", dead).await;
+    let (status, body) = admin.get("/topology/physical").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dead = body["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node"] == "dead")
+        .unwrap();
+    assert_eq!(
+        (&dead["legacy"], &dead["online"]),
+        (&json!(true), &json!(false)),
+        "{dead}"
+    );
+    assert_eq!(admin.get("/capacity").await.0, StatusCode::OK);
     let mut old = node_status(Vec::new());
     old.features.retain(|f| f != OPERATOR_DASHBOARD);
     add_node(&env, "old", old).await;
