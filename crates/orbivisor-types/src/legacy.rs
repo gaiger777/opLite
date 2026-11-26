@@ -10,7 +10,7 @@ pub const NEW_PREFIX: &str = "ORBIVISOR_";
 /// 옛 이름 접두사
 pub const OLD_PREFIX: &str = "OPL_";
 
-/// 실행 때 읽어 옛 이름도 받는 환경 변수(접두사 뺀 이름). orbivisorctl·orbivisor-devserver가 읽고,
+/// 실행 때 읽어 옛 이름도 받는 환경 변수(접두사 뺀 이름). orbivisorctl·orbivisor-devserver·시험이 읽고,
 /// Terraform 공급자(Go)는 `SERVER`·`TOKEN`·`CA_PEM`·`CA_FINGERPRINT`를 같은 규칙으로 읽는다.
 pub const RUNTIME_ENV: &[&str] = &[
     "CONFIG",
@@ -63,10 +63,17 @@ fn pick(name: &str, get: impl Fn(&str) -> Option<OsString>) -> (Option<OsString>
     }
 }
 
-/// clap의 `env = "ORBIVISOR_X"`가 옛 이름도 받게, 새 이름이 없고 옛 이름이 있는 [`RUNTIME_ENV`] 변수마다
-/// (새 이름, 값, 경고)를 돌려준다. 부르는 쪽(main 맨 앞)이 프로세스 환경에 새 이름을 넣고 경고를 낸다.
-pub fn promotions(get: impl Fn(&str) -> Option<OsString>) -> Vec<(String, OsString, String)> {
-    RUNTIME_ENV
+/// orbivisorctl이 clap `env = "ORBIVISOR_X"`로 읽는 변수(나머지는 쓰는 곳에서 [`env`]로 읽어, 쓸 때만 경고한다)
+pub const CLAP_ENV: &[&str] = &["CONFIG", "SERVER", "SOCKET"];
+
+/// clap의 `env = "ORBIVISOR_X"`가 옛 이름도 받게, `names`(접두사 뺀 이름 — [`CLAP_ENV`]) 가운데 새 이름이 없고 옛 이름이
+/// 있는 변수마다 (새 이름, 값, 경고)를 돌려준다. 부르는 쪽(main 맨 앞)이 프로세스 환경에 새 이름을 넣고 경고를 낸다.
+/// 읽지 않는 변수까지 넣으면 쓰지도 않는 옛 이름마다 경고한다(리뷰 1).
+pub fn promotions(
+    names: &[&str],
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(String, OsString, String)> {
+    names
         .iter()
         .filter_map(|name| match pick(name, &get) {
             (Some(v), Some(w)) => Some((format!("{NEW_PREFIX}{name}"), v, w)),
@@ -138,12 +145,19 @@ mod tests {
 
     #[test]
     fn promotions_cover_only_old_names_of_runtime_vars() {
-        let got = promotions(vars(&[
-            ("OPL_SERVER", "https://old"),
-            ("ORBIVISOR_CONFIG", "/new.json"),
-            ("OPL_CONFIG", "/old.json"),
-            ("OPL_TEST_LVM", "vg/tp"),
-        ]));
+        assert!(CLAP_ENV.iter().all(|n| RUNTIME_ENV.contains(n)));
+        let got = promotions(
+            CLAP_ENV,
+            vars(&[
+                ("OPL_SERVER", "https://old"),
+                ("ORBIVISOR_CONFIG", "/new.json"),
+                ("OPL_CONFIG", "/old.json"),
+                ("OPL_TEST_LVM", "vg/tp"),
+                // orbivisorctl이 clap으로 읽지 않는 것(쓰는 곳에서 읽음)
+                ("OPL_QEMU_SHARE", "/q"),
+                ("OPL_ESXI_PASSWORD", "x"),
+            ]),
+        );
         assert_eq!(
             got,
             vec![(

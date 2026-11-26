@@ -1,5 +1,6 @@
 //! 로그인 정보(서버 주소, API 토큰)를 담는 파일. 기본 위치는 `~/.config/orbivisor/orbivisorctl.json`이다. 그 파일이
-//! 없으면 이름 바꾸기 앞의 `~/.config/opl/oplctl.json`을 읽고, 저장은 새 파일에 한다(옛 파일은 그대로 둔다).
+//! 없으면 이름 바꾸기 앞의 `~/.config/opl/oplctl.json`을 읽고, 저장은 새 파일에 한다. 옛 파일은 남기되 `login`·`logout`이
+//! 그 안의 토큰을 지운다(로그아웃한 토큰이 옛 파일에 평문으로 남지 않게 — 리뷰 1 M3).
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -26,10 +27,28 @@ pub fn default_paths() -> (PathBuf, PathBuf) {
     paths_in(Path::new(&home))
 }
 
+/// 기본 위치의 옛 파일에서 토큰을 지운다(옛 파일이 없거나 토큰이 없으면 그대로).
+pub fn clear_legacy_token() -> anyhow::Result<()> {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    clear_legacy_token_in(Path::new(&home))
+}
+
+fn clear_legacy_token_in(home: &Path) -> anyhow::Result<()> {
+    let old = home.join(LEGACY_FILE);
+    let mut config = CliConfig::load(&old)?;
+    if config.token.take().is_some() {
+        config.save(&old)?;
+    }
+    Ok(())
+}
+
+/// 이름 바꾸기 앞의 로그인 파일(홈에서)
+const LEGACY_FILE: &str = ".config/opl/oplctl.json";
+
 /// 홈 디렉터리 `home`에서의 (읽을 파일, 저장할 파일). 새 파일이 없고 옛 파일이 있으면 옛 파일을 읽는다.
 fn paths_in(home: &Path) -> (PathBuf, PathBuf) {
     let new = home.join(".config/orbivisor/orbivisorctl.json");
-    let old = home.join(".config/opl/oplctl.json");
+    let old = home.join(LEGACY_FILE);
     let read = if !new.exists() && old.exists() {
         old
     } else {
@@ -94,6 +113,29 @@ mod tests {
         CliConfig::default().save(&write).unwrap();
         assert_eq!(paths_in(home.path()), (new.clone(), new));
         assert_eq!(CliConfig::load(&old).unwrap(), config);
+    }
+
+    #[test]
+    fn clears_the_token_in_the_old_file() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join(LEGACY_FILE);
+        // 옛 파일이 없으면 만들지 않는다.
+        clear_legacy_token_in(home.path()).unwrap();
+        assert!(!old.exists());
+        let config = CliConfig {
+            server: Some("https://a:8006".into()),
+            token: Some("opl_x_y".into()),
+            ..CliConfig::default()
+        };
+        config.save(&old).unwrap();
+        clear_legacy_token_in(home.path()).unwrap();
+        assert_eq!(
+            CliConfig::load(&old).unwrap(),
+            CliConfig {
+                token: None,
+                ..config
+            }
+        );
     }
 
     #[test]

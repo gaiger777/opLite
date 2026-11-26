@@ -20,7 +20,7 @@ use crate::client::{
     ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
     UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header, warning_header,
 };
-use crate::config::{CliConfig, default_paths};
+use crate::config::{CliConfig, clear_legacy_token, default_paths};
 use crate::cpu::{CpuArgs, CpuCmd, cpu, cpu_lines, migrate_warnings, node_cpu, vm_cpu};
 use crate::firmware::{
     FirmwareArgs, FirmwareCmd, GuestArgs, Preset, WINDOWS11_CORES, WINDOWS11_MEMORY,
@@ -6312,6 +6312,12 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         config.ca_pem = ca_pem.clone();
         config.system_ca = system_ca;
         config.save(&config_path)?;
+        // 기본 위치면 옛 로그인 파일(`~/.config/opl/oplctl.json`)의 이전 토큰도 지운다(리뷰 1 M3).
+        if cli.config.is_none()
+            && let Err(e) = clear_legacy_token()
+        {
+            eprintln!("warning: cannot clear the token in the old login file: {e:#}");
+        }
         // 새 토큰을 저장한 뒤, 같은 서버에 다시 로그인했으면 이전 토큰은 서버에서도 지운다(실패해도 무시).
         // 새 토큰과 같으면 두고, 이 CLI의 login이 만든 토큰(`oplctl-…`)만 지운다(`--token-file`로 넣은
         // 토큰은 사용자가 웹 UI에서 만든 것이다).
@@ -6347,6 +6353,10 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             };
             config.token = None;
             config.save(&config_path)?;
+            // 기본 위치면 옛 로그인 파일의 토큰도 지운다(새 파일만 비우면 옛 파일에 평문으로 남는다 — 리뷰 1 M3).
+            if cli.config.is_none() {
+                clear_legacy_token()?;
+            }
             writeln!(out, "logged out")?;
             if kept {
                 writeln!(
