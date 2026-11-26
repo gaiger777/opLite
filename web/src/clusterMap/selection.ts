@@ -1,5 +1,5 @@
 // 지도에서 고른 것(계획 75 §4): 홈의 자세히 판과 지도가 주고받는 모양, `?focus=` 글, 장면 열쇠 사이의 바꿈(순수).
-// 홈(`dashboard/selection.ts`)도 같은 모양을 둔다 — 합칠 때 하나로 모은다.
+// 홈(`dashboard/selection.ts`)도 이 모양을 다시 내보내 쓴다.
 import type { Focus } from "@/clusterMap/keys";
 import type { MapScene } from "@/clusterMap/layout";
 import type { ClusterModel } from "@/clusterMap/model";

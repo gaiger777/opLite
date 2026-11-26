@@ -4,8 +4,7 @@
     "badge_other": "물리 장애 {{count}}",
     "map": {
       "title": "인프라 지도",
-      "full": "지도 열기",
-      "open": "인프라 지도 열기"
+      "full": "지도 열기"
     },
     "bar": {
       "cpu": "vCPU {{allocated}} / 공유 스레드 {{total}}",

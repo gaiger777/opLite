@@ -4,8 +4,7 @@
     "badge_other": "{{count}} physical faults",
     "map": {
       "title": "Infrastructure map",
-      "full": "Open the map",
-      "open": "Open the infrastructure map"
+      "full": "Open the map"
     },
     "bar": {
       "cpu": "{{allocated}} vCPU / {{total}} shared threads",
