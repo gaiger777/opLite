@@ -76,9 +76,16 @@ PhysicalTopology { nodes: [NodePhysical {
 - 영향: 포트 down(carrier 없음)·본딩 down·관리자가 내린 브리지(`admin_up` 거짓) → 그 위 브리지·네트워크·이 노드의 VM 수 "down", 본딩 degraded·
   포트 down이지만 본딩은 up → "degraded"(이중화 잃음). `uplink`·`underlay`·`service` 포트만 영향을 낸다. 도는 VM의 NIC 네트워크를 이 노드에서 쓸
   수단이 없으면 `unreachable`.
-- underlay 주인: 주소를 가진 인터페이스, 없으면(NetworkManager가 carrier를 잃은 장치의 주소를 뗌) 노드가 마지막으로 본 이름(`NodeStatus.underlay_ports`).
-  그 이름이 목록에서도 사라졌으면 끊김, 이름도 없으면 레일은 `unknown`.
-- 본딩 구성 포트가 사라짐(PCIe 장애·unbind·핫플러그): 노드가 본딩마다 본 적 있는 구성 포트를 기억해 `missing`으로 남기고 본딩을 degraded로 본다.
+- 기억하는 포트(리뷰 2): 노드 수집이 역할이 업링크·underlay·service였던 이더넷·그 밖·VLAN·본딩을 이름으로 기억한다
+  (`NodeStatus.known_ports: [KnownPort{name, kind, role, addresses(스스로 가진 마지막 전역 주소), bond, bridges(위 브리지), missing, last_seen_ms}]`,
+  지난 기억에서 이어 감 — 다시 시작해도 남음, 64개). 장애 순간 주소가 떨어져도(NetworkManager·networkd) 그 포트와 그 아래는 기억한 역할 그대로이고,
+  기억한 주소를 아무 인터페이스도 갖지 않으면 링크가 살아도 끊김(주소 잃음 — 다른 인터페이스로 옮겨 갔으면 아님)이다. 목록에서 사라진 이더넷·
+  그 밖은 `missing`(포트 목록 끝에 `state: missing`·down, 본딩의 구성 포트 `missing`, 본딩 밖 업링크면 그 브리지가 그 업링크를 잃음)이고 VLAN·
+  본딩은 사라지면 잊는다(지우지 않는 한 사라지지 않음). 잊는 때: 감시 밖 역할로 다시 나타남, 본딩에 새 이름의 구성 포트(그 본딩의 사라진 구성 포트),
+  `POST /nodes/{key}/forget-ports`(리더가 노드 상태의 기억에서 지움 — 노드의 다음 수집은 그 상태에서 이어 가므로 다시 넣지 않는다). 한 번 본딩
+  상태를 못 읽어도 기억은 남는다(지난 `bond`도 둔다). 이것이 리뷰 1의 `underlay_ports`·사라진 구성 포트 기억을 대신한다.
+- underlay 주인: 주소를 가진 인터페이스, 없으면 그 주소를 기억한 포트(끊김 — 아무도 그 주소를 갖지 않으면 VTEP 원본 주소가 없다), 기억도 없으면
+  레일은 `unknown`.
 - 레일 상태: 노드마다 그 네트워크의 사슬이 끝까지 up이면 up, 본딩 degraded면 degraded, 끊기면 down, 그 노드에 그 네트워크를 쓸 수단이 없으면 absent,
   노드가 오프라인이거나 underlay 주인을 모르면 unknown(낡은 상태·모르는 것을 끊김·정상으로 그리지 않는다). 오프라인 노드의 `impact`는 마지막으로
   본 값이고 화면은 그렇게 적는다(배지 수에는 넣지 않는다).
@@ -104,10 +111,13 @@ Capacity { nodes: [NodeCapacity{ node, online,
 - `AlertCondition::NodeLinkDown{ ports: Option<String>(글롭), role: uplink|any }`, `AlertCondition::BondDegraded{}`. 리더 경보 엔진의 이벤트 조건 방식(노드 상태 바뀜을 봄), 메시지는
   `physical::describe`로 "eno1 down on svc01: bond0 degraded — vmbr0, 3 networks, 12 VMs". 해소되면 resolved. 권하는 묶음은 SDN 묶음과 따로
   `link_default_rules`(`POST /alert-rules/link-defaults`, 심각도 critical/warning — SDN 없는 클러스터에서도 켤 수 있게).
-- 본딩(리뷰 1): 구성 포트가 끊기고 본딩은 흐르면 `bond_degraded`(warning) 하나만, 본딩이 끊기면 본딩 이름으로 `node_link_down`(critical) 하나 —
-  구성 포트는 따로 울리지 않는다. 저하 → 끊김은 새 알림(`node_link_down`)이고 저하 경보는 풀린다. `role: any`는 이더넷·VLAN과 묶인 포트까지
+- 본딩(리뷰 1·2): 구성 포트가 끊기고 본딩은 흐르면 `bond_degraded`(warning) 하나만, 본딩이 끊기면 본딩 이름으로 `node_link_down`(critical) 하나 —
+  구성 포트는 기본 규칙에서 따로 울리지 않는다(`ports` 글롭 규칙은 구성 포트도 본다). 저하 → 끊김은 새 알림(`node_link_down`)이고 이미 울린
+  저하 경보는 풀지 않고 그대로 둔다(문구 `bond0 down on svc01 (eno1 down, eno2 down) — …`), 다시 저하가 되면 `node_link_down`만 풀린다. 본딩
+  경보 문구는 본딩과 이상한 구성 포트(`eno2 missing`·`LACP mismatch`)다. 관리자가 내린 브리지는 네트워크가 실릴 때만 장애다. `role: any`는 이더넷·VLAN과 묶인 포트까지
   보되 어디에도 묶이지 않은 가상 장치(`ovs-system`·`br-int`)는 보지 않는다.
-- 경보가 난 포트가 노드의 인터페이스 목록에서 사라지면 풀지 않고 "사라짐"으로 둔다(다시 나타나 살아 있으면 풀림). 오프라인·유지보수 노드의 링크
+- 기억 포트의 주소 잃음·사라짐은 장애로 나오므로 pending이 firing으로 이어지고 firing은 풀리지 않는다(다시 나타나 살아 있거나 잊으면 풀림).
+  기억에도 목록에도 없는 이름(지운 본딩·VLAN, 잊은 포트)의 경보는 해제 규칙대로 풀린다. 오프라인·유지보수 노드의 링크
   경보는 새로 내지도·풀지도·되풀이하지도 않는다. 알림 본문에 지도 경로 `/cluster/map?focus=port:<노드>/<포트>`를 붙인다.
 - 기능 `link-alerts` — 섞인 판에서 새 조건 만들기는 409 `cluster_upgrading`.
 
