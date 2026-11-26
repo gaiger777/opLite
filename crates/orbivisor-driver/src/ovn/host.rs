@@ -25,7 +25,8 @@ use super::status::{
     parse_interfaces, parse_ssl, parse_table, parse_version,
 };
 use super::units::{
-    Db, NORTHD_UNIT, db_unit, is_managed, legacy_unit, northd_unit, remotes, sb_config, ssl_addr,
+    Db, LEGACY_UNIT_PREFIX, NORTHD_UNIT, UNIT_PREFIX, db_unit, is_managed, legacy_unit,
+    northd_unit, remotes, sb_config, ssl_addr,
 };
 use crate::ceph::runner::{Cmd, CmdOutput, CommandRunner};
 use crate::error::DriverError;
@@ -748,25 +749,28 @@ impl OvnHost {
                 )));
             }
         }
-        // 설정 파일을 단위보다 먼저 쓴다(바뀐 단위로 다시 뜨는 서버가 새 파일을 읽게).
+        // 설정 파일을 단위보다 먼저 쓴다(바뀐 단위로 다시 뜨는 서버가 새 파일을 읽게). 옛 판이 쓴 글과 옛 디렉터리·단위
+        // 이름만 다르면 새 글로 쓰되 바뀐 것으로 보지 않는다(이름 바꾸기 뒤 다시 시작하지 않음 — 리뷰 1 I1. 옛 이름은 링크로
+        // 같은 곳이고, 다음 정상 재시작 때 새 글로 뜬다).
         let config = self.paths.sb_config();
         let config_changed = if me_locked {
-            write_file(&config, sb_config(address, &self.paths).as_bytes(), 0o600)?
+            write_meaning(&config, &sb_config(address, &self.paths), 0o600)?.1
         } else {
             false
         };
+        let mut written = false;
         for (unit, text) in files {
             let path = self.paths.unit_file(&unit);
-            if write_file(&path, text.as_bytes(), 0o644)?
-                || (config_changed && unit == Db::Sb.unit())
-            {
+            let (wrote, meaning) = write_meaning(&path, &text, 0o644)?;
+            written |= wrote;
+            if meaning || (config_changed && unit == Db::Sb.unit()) {
                 changed.push(unit);
             }
         }
         if !me_locked && config.exists() {
             remove_file(&config)?;
         }
-        if !changed.is_empty() {
+        if written {
             self.run_ok(&Cmd::new("systemctl", &["daemon-reload"]))
                 .await?;
         }
@@ -1348,6 +1352,15 @@ impl OvnHost {
             ca_cert: Some(path_str(&self.paths.tls_ca())),
         };
         if ssl != want_ssl {
+            // 옛 판이 둔 옛 디렉터리 이름의 같은 파일이면 새 이름으로 바꿔 두되 바뀐 것으로 보지 않는다(리뷰 1 I1과 같은 규칙).
+            let renamed = |have: &Option<String>, want: &Option<String>| {
+                have.as_deref()
+                    .map(orbivisor_types::layout::text_to_current)
+                    == *want
+            };
+            let only_renamed = renamed(&ssl.private_key, &want_ssl.private_key)
+                && renamed(&ssl.certificate, &want_ssl.certificate)
+                && renamed(&ssl.ca_cert, &want_ssl.ca_cert);
             self.run_ok(&Cmd::new(
                 "ovs-vsctl",
                 &[
@@ -1358,7 +1371,7 @@ impl OvnHost {
                 ],
             ))
             .await?;
-            changed = true;
+            changed = !only_renamed;
         }
         // SSL을 먼저 둔다(ovn-controller가 `ssl:` 원격을 보자마자 붙을 수 있게).
         let want = chassis_ids(chassis, &self.tag);
@@ -1663,6 +1676,20 @@ fn temp_path(path: &Path) -> PathBuf {
 }
 
 /// 파일을 임시 파일 → fsync → rename으로 바꾼다(부모 디렉터리도 만든다). 내용과 모드가 같으면 그대로 두고 `false`다.
+/// 글 `text`를 쓰고 (썼는지, 뜻이 바뀌었는지)를 돌려준다. 있던 글이 옛 디렉터리·단위 이름만 다르면(계획 74 앞의 판이 쓴
+/// 글) 뜻은 같다.
+fn write_meaning(path: &Path, text: &str, mode: u32) -> Result<(bool, bool), OvnError> {
+    let before = read_optional(path)?;
+    let wrote = write_file(path, text.as_bytes(), mode)?;
+    let renamed = before.is_some_and(|b| b != text && only_renamed(&b, text));
+    Ok((wrote, wrote && !renamed))
+}
+
+/// `old`가 `new`와 옛 디렉터리 이름(`/etc/opl` 등)·옛 단위 이름(`opl-ovn-`)만 다른지
+fn only_renamed(old: &str, new: &str) -> bool {
+    orbivisor_types::layout::text_to_current(old).replace(LEGACY_UNIT_PREFIX, UNIT_PREFIX) == new
+}
+
 fn write_file(path: &Path, content: &[u8], mode: u32) -> Result<bool, OvnError> {
     if let Ok(meta) = std::fs::metadata(path)
         && meta.permissions().mode() & 0o7777 == mode

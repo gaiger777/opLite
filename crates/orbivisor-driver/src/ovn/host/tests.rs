@@ -747,6 +747,68 @@ async fn legacy_units_become_aliases() {
     );
 }
 
+/// 옛 판(계획 74 앞)의 단위 글: 새 글과 디렉터리 이름(`/etc/opl` 등)·단위 이름(`opl-ovn-`)만 다르다.
+fn legacy_text(text: &str) -> String {
+    let mut text = text.replace(UNIT_PREFIX, LEGACY_UNIT_PREFIX);
+    for (old, new) in orbivisor_types::layout::LAYOUT {
+        text = text.replace(new, old);
+    }
+    text
+}
+
+/// 옛 판이 쓴 단위·SB 설정 글이 이름만 다르면 옮긴 뒤 새 글로 쓰되 바뀐 것으로 보지 않아 다시 시작하지 않는다
+/// (리뷰 1 I1 — 이름 바꾸기 뒤 NB·SB·northd가 다시 뜨지 않음).
+#[tokio::test]
+async fn units_that_differ_only_by_old_names_are_not_restarted() {
+    let env = Env::new();
+    let me = ip("10.0.0.1");
+    let centrals = [me];
+    for locked in [false, true] {
+        let env = Env::new();
+        let locks: &[IpAddr] = if locked { &centrals } else { &[] };
+        let paths = env.host.paths().clone();
+        let mut files: Vec<(String, String)> = Db::ALL
+            .iter()
+            .map(|db| (db.unit(), db_unit(*db, me, locked, &paths)))
+            .collect();
+        files.push((NORTHD_UNIT.into(), northd_unit(&centrals, locks, &paths)));
+        for (unit, text) in &files {
+            env.write(
+                &format!("etc/systemd/system/{}", legacy_unit(unit).unwrap()),
+                &legacy_text(text),
+            );
+        }
+        if locked {
+            let config = paths.sb_config();
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, legacy_text(&sb_config(me, &paths))).unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let changed = env.host.write_units(me, &centrals, locks).await.unwrap();
+        assert!(changed.is_empty(), "locked {locked}: {changed:?}");
+        // 파일은 새 글이다(다음 정상 재시작 때 새 글로 뜬다).
+        for (unit, text) in &files {
+            assert_eq!(
+                std::fs::read_to_string(env.path(&format!("etc/systemd/system/{unit}"))).unwrap(),
+                *text
+            );
+        }
+        env.host.start_central(&changed).await.unwrap();
+        assert!(
+            env.calls_of("systemctl restart").is_empty(),
+            "{:?}",
+            env.calls()
+        );
+    }
+    // 이름 말고 다른 것이 다르면 그대로 바뀐 것이다.
+    env.write(
+        "etc/systemd/system/opl-ovn-nb.service",
+        &legacy_text(&db_unit(Db::Nb, ip("10.0.0.9"), false, env.host.paths())),
+    );
+    let changed = env.host.write_units(me, &centrals, &[]).await.unwrap();
+    assert!(changed.contains(&Db::Nb.unit()), "{changed:?}");
+}
+
 /// 잠금(계획 67 §10.2): 이 노드가 `locked`에 들면 `sb.json`(0600)을 쓰고 SB 단위가 그것으로 뜨며 northd는 잠긴 중앙의
 /// SB에 6645로 붙는다. 다시 풀면 설정 파일을 치우고 단위가 계획 66 글로 돌아간다.
 #[tokio::test]
@@ -1188,6 +1250,22 @@ async fn chassis_configuration() {
         "{:?}",
         env2.calls()
     );
+    // 옛 판이 둔 옛 디렉터리 이름의 SSL: 새 이름으로 바꿔 두되 바뀐 것으로 보지 않는다(리뷰 1 I1과 같은 규칙).
+    let env4 = Env::new();
+    env4.ids(&pairs);
+    let old = |rel: &str| legacy_text(&env4.p(rel));
+    env4.fake().reply(
+        "ovs-vsctl get-ssl",
+        CmdOutput::ok(format!(
+            "Private key: {}\nCertificate: {}\nCA Certificate: {}\nBootstrap: false\n",
+            old("etc/orbivisor/ovn/node.key"),
+            old("etc/orbivisor/ovn/node.crt"),
+            old("etc/orbivisor/ovn/ca.crt")
+        )),
+    );
+    env4.write("etc/openvswitch/system-id.conf", &format!("{NODE}\n"));
+    assert!(!env4.host.reconcile_chassis(&chassis).await.unwrap());
+    assert_eq!(env4.calls_of("ovs-vsctl set-ssl").len(), 1);
     // 에이전트의 맞추기: 중앙이 바뀌면 ovn-remote만 바꾸고 단위는 건드리지 않는다.
     let one = [ip("10.0.0.1")];
     let fewer = Chassis {

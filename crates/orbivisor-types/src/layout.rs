@@ -57,6 +57,29 @@ pub fn same_path(a: &str, b: &str) -> bool {
     to_current(a) == to_current(b)
 }
 
+/// 글(단위 파일, 설정 글) 안의 옛 디렉터리 이름을 모두 새 이름으로 바꾼다. 이름 뒤가 경로 조각을 잇는 글자(영숫자·`-`·`_`·
+/// `.`)이면 다른 이름(`/etc/oplite`)이라 그대로 둔다. 옛 판이 쓴 글이 이름만 다른지 견줄 때 쓴다.
+pub fn text_to_current(text: &str) -> String {
+    let mut out = text.to_string();
+    for (old, new) in LAYOUT {
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(old) {
+            let after = &rest[i + old.len()..];
+            let joined = after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            result.push_str(&rest[..i]);
+            result.push_str(if joined { old } else { new });
+            rest = after;
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +137,21 @@ mod tests {
         ));
         assert!(same_path("/srv/a", "/srv/a"));
         assert!(!same_path("/etc/opl/ceph/a", "/etc/orbivisor/ceph/b"));
+    }
+
+    #[test]
+    fn rewrites_old_names_in_text() {
+        assert_eq!(
+            text_to_current(
+                "ExecStart=/usr/sbin/ovsdb-server /var/lib/opl/ovn/nb.db --log-file=/var/log/opl/ovn-nb.log\n\
+                 ExecStartPre=/bin/mkdir -p /run/opl/ovn /var/log/opl\n\"/etc/opl\""
+            ),
+            "ExecStart=/usr/sbin/ovsdb-server /var/lib/orbivisor/ovn/nb.db --log-file=/var/log/orbivisor/ovn-nb.log\n\
+             ExecStartPre=/bin/mkdir -p /run/orbivisor/ovn /var/log/orbivisor\n\"/etc/orbivisor\""
+        );
+        assert_eq!(
+            text_to_current("/etc/oplite /etc/opl.d x"),
+            "/etc/oplite /etc/opl.d x"
+        );
     }
 }
