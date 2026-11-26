@@ -979,7 +979,9 @@ pub(crate) mod tests {
                 "declarative",
                 "config-history",
                 "acme",
-                "orbivisor-layout"
+                "orbivisor-layout",
+                "operator-dashboard",
+                "link-alerts"
             ])
         );
         update_node_status(&cluster, |status| {
@@ -1034,7 +1036,9 @@ pub(crate) mod tests {
                 "declarative",
                 "config-history",
                 "acme",
-                "orbivisor-layout"
+                "orbivisor-layout",
+                "operator-dashboard",
+                "link-alerts"
             ])
         );
         cluster.shutdown().await.unwrap();
@@ -1108,7 +1112,9 @@ pub(crate) mod tests {
                 "declarative",
                 "config-history",
                 "acme",
-                "orbivisor-layout"
+                "orbivisor-layout",
+                "operator-dashboard",
+                "link-alerts"
             ])
         );
         cluster.shutdown().await.unwrap();
@@ -1190,6 +1196,10 @@ pub(crate) mod tests {
             error: Some("ipmi: timed out".into()),
         };
         let interfaces = vec![orbivisor_types::node::NodeInterface {
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
             name: "eno1".into(),
             kind: orbivisor_types::node::InterfaceKind::Ethernet,
             state: "up".into(),
@@ -1357,6 +1367,8 @@ pub(crate) mod tests {
                     "config-history",
                     "acme",
                     "orbivisor-layout",
+                    "operator-dashboard",
+                    "link-alerts",
                 ]),
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

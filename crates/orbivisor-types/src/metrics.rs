@@ -26,6 +26,32 @@ pub struct NodeSample {
     /// 데이터 디렉터리가 있는 파일 시스템
     pub fs_used_mib: Option<u64>,
     pub fs_total_mib: Option<u64>,
+    /// 인터페이스별 트래픽·오류(계획 75 — 물리·본딩·VLAN·브리지만, 노드당 [`MAX_IFACE_SAMPLES`]개까지). 실시간 표본에만
+    /// 있고 기록(RRD)에는 두지 않는다. 비면(옛 노드·macOS) 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub interfaces: Vec<IfaceSample>,
+}
+
+/// 표본 하나에 담는 인터페이스 수의 상한
+pub const MAX_IFACE_SAMPLES: usize = 64;
+
+/// 인터페이스 하나의 표본(계획 75, `/sys/class/net/<if>/statistics`의 직전 표본과의 차). 첫 표본·카운터가 되감긴
+/// 표본은 값이 없다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct IfaceSample {
+    pub name: String,
+    /// 받기 바이트/초
+    pub rx_bps: Option<f64>,
+    /// 보내기 바이트/초
+    pub tx_bps: Option<f64>,
+    /// 직전 표본 뒤 늘어난 받기 오류 수
+    pub rx_errors: Option<u64>,
+    pub tx_errors: Option<u64>,
+    /// 직전 표본 뒤 늘어난 버린 패킷 수
+    pub rx_dropped: Option<u64>,
+    pub tx_dropped: Option<u64>,
 }
 
 /// VM 점 하나
@@ -237,6 +263,7 @@ impl NodeSample {
             net_tx_bps: v(6).map(f64::from),
             fs_used_mib: v(7).map(to_mib),
             fs_total_mib: v(8).map(to_mib),
+            interfaces: Vec::new(),
         }
     }
 }
@@ -677,6 +704,32 @@ mod tests {
         assert_eq!(MetricField::PoolUsed.as_str(), "pool_used");
     }
 
+    /// 계획 75: 인터페이스 표본이 없으면 옛 노드 점 JSON 그대로, 있으면 그대로 오가고 기록 칸에는 들지 않는다.
+    #[test]
+    fn node_sample_interfaces_are_written_only_when_present() {
+        let old = r#"{"t":1,"cpu":2.0,"mem_used_mib":3,"mem_total_mib":4,"disk_read_bps":null,"disk_write_bps":null,"net_rx_bps":5.0,"net_tx_bps":6.0,"fs_used_mib":null,"fs_total_mib":null}"#;
+        let n: NodeSample = serde_json::from_str(old).unwrap();
+        assert!(n.interfaces.is_empty());
+        assert_eq!(serde_json::to_string(&n).unwrap(), old);
+        let with = NodeSample {
+            interfaces: vec![IfaceSample {
+                name: "eno1".into(),
+                rx_bps: Some(1250.0),
+                tx_bps: Some(10.0),
+                rx_errors: Some(0),
+                tx_errors: Some(2),
+                rx_dropped: None,
+                tx_dropped: None,
+            }],
+            ..n.clone()
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["interfaces"][0]["name"], "eno1");
+        assert_eq!(json["interfaces"][0]["tx_errors"], 2);
+        assert_eq!(serde_json::from_value::<NodeSample>(json).unwrap(), with);
+        assert_eq!(with.values(), n.values());
+    }
+
     #[test]
     fn sample_values_follow_field_order() {
         let n = NodeSample {
@@ -690,6 +743,7 @@ mod tests {
             net_tx_bps: None,
             fs_used_mib: Some(8),
             fs_total_mib: Some(9),
+            interfaces: Vec::new(),
         };
         assert_eq!(
             n.values(),
@@ -751,6 +805,7 @@ mod tests {
             net_tx_bps: Some(3.0),
             fs_used_mib: Some(7),
             fs_total_mib: None,
+            interfaces: Vec::new(),
         };
         assert_eq!(NodeSample::from_values(5_000, &n.values()), n);
         let v = VmSample {

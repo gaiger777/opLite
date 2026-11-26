@@ -1965,6 +1965,10 @@ mod tests {
 
     fn iface(name: &str, kind: InterfaceKind, addresses: &[&str]) -> NodeInterface {
         NodeInterface {
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
             name: name.into(),
             kind,
             state: "up".into(),

@@ -62,6 +62,7 @@ fn node_sample(t: i64) -> NodeSample {
         net_tx_bps: Some(20.0),
         fs_used_mib: Some(1),
         fs_total_mib: Some(2),
+        interfaces: Vec::new(),
     }
 }
 

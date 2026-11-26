@@ -499,6 +499,7 @@ mod tests {
             net_tx_bps: Some(f64::NAN),
             fs_used_mib: Some(1),
             fs_total_mib: Some(2),
+            interfaces: Vec::new(),
         }
     }
 

@@ -501,6 +501,10 @@ pub fn interfaces(net: &NetFs, ip_json: &str) -> Result<Vec<NodeInterface>, Stri
         .into_iter()
         .filter(reported)
         .map(|l| NodeInterface {
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
             kind: interface_kind(&l),
             name: l.name,
             state: l.state,

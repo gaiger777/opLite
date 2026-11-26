@@ -519,6 +519,10 @@ mod tests {
             interfaces: interfaces
                 .iter()
                 .map(|(name, addresses)| NodeInterface {
+                    mtu: None,
+                    parent: None,
+                    vlan_id: None,
+                    lldp: None,
                     name: name.to_string(),
                     kind: InterfaceKind::Ethernet,
                     state: "up".into(),

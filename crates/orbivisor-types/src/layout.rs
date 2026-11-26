@@ -105,7 +105,12 @@ mod tests {
     #[test]
     fn stores_old_names_until_every_node_has_the_new_layout() {
         let conf = "/etc/orbivisor/ceph/ceph.conf";
-        let old = node(&FEATURES[..FEATURES.len() - 1]);
+        let without: Vec<&str> = FEATURES
+            .iter()
+            .copied()
+            .filter(|f| *f != ORBIVISOR_LAYOUT)
+            .collect();
+        let old = node(&without);
         assert!(!old.status.features.iter().any(|f| f == ORBIVISOR_LAYOUT));
         assert_eq!(
             stored(conf, &[node(FEATURES), old]),

@@ -43,6 +43,7 @@ impl MetricsSource for NowMetrics {
                         net_tx_bps: Some(200.0),
                         fs_used_mib: Some(1),
                         fs_total_mib: Some(2),
+                        interfaces: Vec::new(),
                     }],
                 }),
                 vms: vec![],

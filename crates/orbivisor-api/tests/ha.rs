@@ -2875,6 +2875,10 @@ async fn vm_net_node(env: &Env, name: &str, memory_mib: u64) -> Uuid {
         }];
         n.status.interfaces = vec![
             NodeInterface {
+                mtu: None,
+                parent: None,
+                vlan_id: None,
+                lldp: None,
                 name: "eth0".into(),
                 kind: InterfaceKind::Ethernet,
                 state: "up".into(),
@@ -2886,6 +2890,10 @@ async fn vm_net_node(env: &Env, name: &str, memory_mib: u64) -> Uuid {
                 bond: None,
             },
             NodeInterface {
+                mtu: None,
+                parent: None,
+                vlan_id: None,
+                lldp: None,
                 name: "vmbr0".into(),
                 kind: InterfaceKind::Bridge,
                 state: "up".into(),

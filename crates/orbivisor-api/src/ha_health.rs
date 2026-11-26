@@ -1223,6 +1223,10 @@ mod tests {
         addresses: &[&str],
     ) -> NodeInterface {
         NodeInterface {
+            mtu: None,
+            parent: None,
+            vlan_id: None,
+            lldp: None,
             name: name.into(),
             kind,
             state: "up".into(),

@@ -309,6 +309,7 @@ mod tests {
             net_tx_bps: None,
             fs_used_mib: None,
             fs_total_mib: None,
+            interfaces: Vec::new(),
         }
     }
 

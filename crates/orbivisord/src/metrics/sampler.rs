@@ -148,6 +148,7 @@ fn node_sample(
         net_tx_bps: rate(second(prev.nic), second(now.nic), secs)?,
         fs_used_mib: fs.map(|f| f.0),
         fs_total_mib: fs.map(|f| f.1),
+        interfaces: Vec::new(),
     })
 }
 

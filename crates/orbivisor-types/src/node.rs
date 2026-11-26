@@ -311,6 +311,49 @@ pub struct NodeInterface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub bond: Option<BondStatus>,
+    /// MTU(계획 75). 모르면(옛 노드) 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub mtu: Option<u32>,
+    /// VLAN·macvlan의 아래 장치(`ip -j -d`의 `link`, 계획 75). 없으면(옛 노드·아래 장치 없음) 쓰지 않는다 — 물리
+    /// 관계는 VLAN 이름 규칙(`eno1.100`)으로 추정한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub parent: Option<String>,
+    /// VLAN 인터페이스의 VLAN id(계획 75)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub vlan_id: Option<u16>,
+    /// 이 포트 건너편 스위치(lldpd가 있을 때 `lldpcli`로 읽음, 계획 75). 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub lldp: Option<LldpNeighbor>,
+}
+
+/// LLDP 이웃(스위치) 하나(`lldpcli -f json show neighbors`, 계획 75). 모르는 칸은 없다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LldpNeighbor {
+    /// 스위치 이름(sysName)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub chassis_name: Option<String>,
+    /// 섀시 id(보통 MAC)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub chassis_id: Option<String>,
+    /// 스위치 포트 id(예: `Gi1/0/12`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub port_id: Option<String>,
+    /// 스위치 포트 설명
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub port_descr: Option<String>,
+    /// 스위치 관리 주소
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub mgmt_ip: Option<String>,
 }
 
 /// 인터페이스 종류(`ip -d`의 `info_kind`, 없으면 이더넷)
@@ -427,7 +470,18 @@ pub const FEATURES: &[&str] = &[
     CONFIG_HISTORY,
     ACME,
     ORBIVISOR_LAYOUT,
+    OPERATOR_DASHBOARD,
+    LINK_ALERTS,
 ];
+
+/// 운영자 대시보드(계획 75): `GET /topology/physical`·`GET /capacity`, `NodeInterface`의 `mtu`·`parent`·`vlan_id`·
+/// `lldp`와 `NodeSample.interfaces` 쓰기. 저장하는 것은 새 칸뿐이지만 옛 노드의 상태에는 그 칸이 없어 섞인 판에서는
+/// 웹이 지금 홈을 보이고, 끝점은 모든 노드가 알릴 때만 받는다.
+pub const OPERATOR_DASHBOARD: &str = "operator-dashboard";
+
+/// 링크 경보(계획 75): 경보 조건 `node_link_down`·`bond_degraded`. 옛 노드는 새 조건을 풀지 못하므로(`AlertCondition`은
+/// `deny_unknown_fields`·태그) 모든 노드가 알릴 때만 쓴다.
+pub const LINK_ALERTS: &str = "link-alerts";
 
 /// 디렉터리 배치 이름 바꾸기(계획 74): 이 노드에는 `/etc/orbivisor` 등 새 이름의 디렉터리가 있다(옛 이름은 링크).
 /// 다른 노드가 여는 경로(RBD 풀의 관리 conf)를 새 이름으로 적고 ACME 훅 경로에 새 디렉터리를 받는 것은 모든 노드가
@@ -816,6 +870,10 @@ mod tests {
         let status = NodeStatus {
             interfaces: vec![
                 NodeInterface {
+                    mtu: None,
+                    parent: None,
+                    vlan_id: None,
+                    lldp: None,
                     name: "bond0".into(),
                     kind: InterfaceKind::Bond,
                     state: "up".into(),
@@ -844,6 +902,10 @@ mod tests {
                     }),
                 },
                 NodeInterface {
+                    mtu: None,
+                    parent: None,
+                    vlan_id: None,
+                    lldp: None,
                     name: "eno3".into(),
                     kind: InterfaceKind::Ethernet,
                     state: "down".into(),
@@ -889,6 +951,44 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PortState::SpeedMismatch).unwrap(),
             "speed_mismatch"
+        );
+    }
+
+    /// 계획 75: MTU·아래 장치·VLAN id·LLDP가 없으면 옛 인터페이스 JSON이 바이트까지 같고, 있으면 그대로 오간다.
+    #[test]
+    fn interface_link_fields_round_trip_and_old_json_is_unchanged() {
+        let old =
+            r#"{"name":"eno1.100","kind":"vlan","state":"up","carrier":true,"master":"vmbr100"}"#;
+        let i: NodeInterface = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            (i.mtu, &i.parent, i.vlan_id, &i.lldp),
+            (None, &None, None, &None)
+        );
+        assert_eq!(serde_json::to_string(&i).unwrap(), old);
+        let i = NodeInterface {
+            mtu: Some(9000),
+            parent: Some("eno1".into()),
+            vlan_id: Some(100),
+            lldp: Some(LldpNeighbor {
+                chassis_name: Some("tor-a".into()),
+                port_id: Some("Gi1/0/12".into()),
+                ..Default::default()
+            }),
+            ..i
+        };
+        let json = serde_json::to_value(&i).unwrap();
+        assert_eq!(json["mtu"], 9000);
+        assert_eq!(json["parent"], "eno1");
+        assert_eq!(json["vlan_id"], 100);
+        assert_eq!(
+            json["lldp"],
+            serde_json::json!({ "chassis_name": "tor-a", "port_id": "Gi1/0/12" })
+        );
+        assert_eq!(serde_json::from_value::<NodeInterface>(json).unwrap(), i);
+        // 칸이 빈 이웃은 `{}`이다.
+        assert_eq!(
+            serde_json::to_value(LldpNeighbor::default()).unwrap(),
+            serde_json::json!({})
         );
     }
 
@@ -1052,7 +1152,9 @@ mod tests {
                 "declarative",
                 "config-history",
                 "acme",
-                "orbivisor-layout"
+                "orbivisor-layout",
+                "operator-dashboard",
+                "link-alerts"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1271,7 +1373,7 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&ORBIVISOR_LAYOUT));
+        assert_eq!(FEATURES.last(), Some(&LINK_ALERTS));
     }
 
     /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.
