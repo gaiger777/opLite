@@ -197,7 +197,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         for (name, value) in [
             (AUTHORIZATION, "Bearer opl_local"),
-            (COOKIE, "opl_session=s3cret"),
+            (COOKIE, "orbivisor_session=s3cret"),
             (ORIGIN, "https://here"),
             (HOST, "here"),
             (CONTENT_TYPE, "application/json"),

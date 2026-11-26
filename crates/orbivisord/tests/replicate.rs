@@ -72,7 +72,7 @@ async fn operator_token(dr: &Daemon, prod: &Daemon) -> String {
     ])
     .await
     .unwrap();
-    // admin의 로그인 정보(`oplctl.json`)와 따로 둔다.
+    // admin의 로그인 정보 파일과 따로 둔다.
     let config = dr.path("repl.json");
     let config = config.to_str().unwrap();
     let server = dr.server();

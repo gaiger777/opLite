@@ -17772,7 +17772,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 });
                 let body = reply(&path).to_string();
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nset-cookie: opl_session=s1; Path=/\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nset-cookie: orbivisor_session=s1; Path=/\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 sock.write_all(resp.as_bytes()).await.unwrap();

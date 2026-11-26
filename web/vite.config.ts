@@ -7,7 +7,7 @@ import { defineConfig } from "vite";
 
 // 개발 서버는 /api(WebSocket 포함)를 opld로 넘긴다. opld의 인증서는 클러스터 CA가 서명했으므로
 // 검증하지 않는다. Host를 바꾸지 않아야(changeOrigin 없음) 쿠키 요청의 Origin 검사를 통과한다.
-const opld = process.env.OPLD_URL ?? "https://localhost:8006";
+const opld = process.env.ORBIVISOR_URL ?? "https://localhost:8006";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],

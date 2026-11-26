@@ -1,5 +1,5 @@
 #!/bin/bash
-# 설치 ISO의 orbivisor-setup.sh 함수(interfaces 바꾸기, 주소 찾기, opld.toml·issue 쓰기, 설치 환경·대상
+# 설치 ISO의 orbivisor-setup.sh 함수(interfaces 바꾸기, 주소 찾기, orbivisord.toml·issue 쓰기, 설치 환경·대상
 # 두 곳의 interfaces)를 견본과 비교한다. bash만 있으면 되고 macOS에서도 돈다.
 # 함수는 셸 ORBIVISOR_SH(기본 sh)로 source해 부른다. 설치 프로그램 환경과 같게 보려면(CI):
 #   ORBIVISOR_SH="busybox sh" ORBIVISOR_AWK="busybox awk" bash packaging/tests/setup-test.sh
@@ -92,15 +92,15 @@ for n in "" -a a- My-Host my_host my.host "$(printf 'a%.0s' $(seq 64))"; do
 	if lib valid_name "$n"; then fail "valid_name '$n' 참"; else ok "valid_name '$n' 거짓"; fi
 done
 
-# opld.toml: 정적 주소, DHCP 주소, 규칙에 맞지 않는 이름, 주소 없음(그 줄은 주석)
+# orbivisord.toml: 정적 주소, DHCP 주소, 규칙에 맞지 않는 이름, 주소 없음(그 줄은 주석)
 lib write_opld_toml "$WORK/opld-static.toml" node1 192.168.10.21
-same "opld.toml 정적" "$FIXTURES/opld-static.toml" "$WORK/opld-static.toml"
+same "orbivisord.toml 정적" "$FIXTURES/opld-static.toml" "$WORK/opld-static.toml"
 lib write_opld_toml "$WORK/opld-dhcp.toml" opl-ci 10.0.2.15 dhcp
-same "opld.toml DHCP" "$FIXTURES/opld-dhcp.toml" "$WORK/opld-dhcp.toml"
+same "orbivisord.toml DHCP" "$FIXTURES/opld-dhcp.toml" "$WORK/opld-dhcp.toml"
 lib write_opld_toml "$WORK/opld-badname.toml" my_host 192.168.10.21
-same "opld.toml 이름 규칙 밖" "$FIXTURES/opld-badname.toml" "$WORK/opld-badname.toml"
+same "orbivisord.toml 이름 규칙 밖" "$FIXTURES/opld-badname.toml" "$WORK/opld-badname.toml"
 lib write_opld_toml "$WORK/opld-noaddr.toml" node1 "" dhcp
-same "opld.toml 주소 없음" "$FIXTURES/opld-noaddr.toml" "$WORK/opld-noaddr.toml"
+same "orbivisord.toml 주소 없음" "$FIXTURES/opld-noaddr.toml" "$WORK/opld-noaddr.toml"
 
 # 콘솔 로그인 화면: agetty 이스케이프 \4{vmbr0}가 그대로 남아야 한다.
 lib write_issue "$WORK/orbivisor.issue"

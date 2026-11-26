@@ -406,7 +406,7 @@ mod tests {
         let mut ask = |_: &str| -> anyhow::Result<String> { Ok(answers.pop().unwrap()) };
         let mut err = Vec::new();
         let prompt = json!({ "methods": ["totp", "recovery"], "enroll": false });
-        second_step(&client, "opl_session=x", &prompt, None, &mut ask, &mut err)
+        second_step(&client, "orbivisor_session=x", &prompt, None, &mut ask, &mut err)
             .await
             .unwrap();
         let seen = seen.lock().unwrap();

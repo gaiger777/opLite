@@ -45,7 +45,7 @@ RULES=(
 	'crates/orbivisorctl/src/cli.rs|"oplite"|client id: oplite'
 	'web/src/realms/RealmsPage.test.tsx|"oplite"'
 	# 옛 경로 짝(/etc/opl)이 이름이 비슷한 /etc/oplite를 옛 경로로 보지 않는지 보는 시험 자료(계획 74)
-	'crates/orbivisor-types/src/layout.rs|"/etc/oplite/a"'
+	'crates/orbivisor-types/src/layout.rs|"/etc/oplite/a"|\(`/etc/oplite`\)|/etc/oplite /etc/opl\.d x'
 	'crates/orbivisord/src/layout.rs|# /etc/oplite'
 	# 전환 패키지를 만들고 시험하는 파일에만 있는 모양(전환 패키지의 문서 디렉터리, 옛 V0 트리 등)
 	'packaging/deb/build-deb.sh|usr/share/doc/oplite'
@@ -223,6 +223,9 @@ if [ "$left" -eq 0 ]; then ok "이름에 oplite가 있는 파일은 전환 contr
 W='([^A-Za-z0-9_]|$)'
 OLD_RE="/etc/opl$W|/var/lib/opl$W|/run/opl$W|/var/log/opl$W|opld\.service|opl-ovn-|(^|[^A-Za-z0-9_])OPL_[A-Z]"
 OLD_RE+="|opl[-_](types|api|cluster|driver|peer|qemu|reconciler|restore|store)$W|crates/opl(d|ctl)?$W"
+# 계획 74가 바꾼 나머지(리뷰 1): 소켓·설정·잠금·CLI 로그인 파일, 일시 유닛 접두사, 쿠키, 크레이트 인자·경로, 개발 변수
+OLD_RE+="|opld\.(sock|toml|lock)|oplctl\.json|\.config/opl$W|opl-(upgrade|bkserve|fr)-|opl_(session|oidc)$W"
+OLD_RE+="|-p (opld|oplctl)$W|opl-devserver|(^|[^A-Za-z0-9_])OPLD_[A-Z]|(^|[^A-Za-z0-9_])(opld|oplctl)::|(^|[^A-Za-z0-9_./-])opld/[a-z]"
 
 # 통째로 허용하는 파일: 옛 이름을 다루는 것이 일인 호환 코드와 유지 스크립트, 그것을 시험하는 패키징 시험
 OLD_EXCLUDE=(
@@ -235,14 +238,7 @@ OLD_EXCLUDE=(
 	':!crates/orbivisord/src/layout.rs'
 	# OVN 유닛 옛 이름을 별칭 링크로 바꾸기
 	':!crates/orbivisor-driver/src/ovn/units.rs'
-	# enable 링크·덮어쓰기 옮기기, 지울 때 옛 이름 링크
-	':!packaging/deb/postinst'
-	':!packaging/deb/postrm'
-	# 옛 판에서 올리기를 시험하는 패키징 시험과 옛 판(V0) 픽스처
-	':!packaging/tests/build-deb-test.sh'
-	':!packaging/tests/deb-test.sh'
-	':!packaging/tests/maint-test.sh'
-	':!packaging/tests/repo-test.sh'
+	# 옛 판(V0) 픽스처(옛 판 그대로의 파일)
 	':!packaging/tests/fixtures/oplite-v0'
 )
 
@@ -266,7 +262,7 @@ OLD_RULES=(
 	'crates/orbivisor-types/src/subscription.rs|OPL_LICENSE_KEYS'
 	'crates/orbivisord/tests/version.rs|OPL_VERSION'
 	'crates/orbivisorctl/tests/version.rs|OPL_VERSION'
-	'packaging/deb/build-deb.sh|OPL_LICENSE_KEYS'
+	'packaging/deb/build-deb.sh|OPL_(LICENSE_KEYS|APT_KEY|BIN_DIR)'
 	# 옛 실행 변수 받기와 그 시험
 	'crates/orbivisorctl/src/main.rs|옛 이름 OPL_X'
 	'crates/orbivisorctl/tests/legacy_env.rs|OPL_(SERVER|CONFIG)'
@@ -284,6 +280,36 @@ OLD_RULES=(
 	'docs/architecture.md|옛 (이름 )?(링크 )?(디렉터리\()?`[^`]*`(·`[^`]*`)*|별칭 링크 `opld\.service`|`[|]/etc/opl/opld\.toml`|덮어쓰기\(`opld\.service\.d`\)'
 	# 시작하기의 설치 안내: 패키지가 까는 별칭
 	'docs/guide/getting-started.md|별칭 `opld\.service`'
+	# 쿠키·잠금·일시 유닛의 옛 이름을 받는 코드(리뷰 1 — 새 이름을 쓰는 줄은 그대로 걸린다)
+	'crates/orbivisor-api/src/auth.rs|"opl_session"|cookies\("[^"]*"\)'
+	'crates/orbivisor-api/src/oidc.rs|"opl_oidc"'
+	'crates/orbivisor-api/src/oidc_login.rs|옛 이름 `opl_oidc`도'
+	'web/src/api/schema.d.ts|옛 이름 `opl_oidc`도'
+	'crates/orbivisor-api/tests/auth.rs|opl_session'
+	'crates/orbivisor-api/tests/oidc_login.rs|opl_(session|oidc)'
+	'crates/orbivisor-api/src/updates.rs|`opl-upgrade-…`|format!\("opl-upgrade-\{\}", task\.simple\(\)\)|"opl-upgrade-[0-9a-f]{32}"'
+	'crates/orbivisor-api/tests/updates.rs|opl-upgrade-'
+	'crates/orbivisor-driver/src/backup_serve.rs|format!\("opl-bkserve-\{id\}"\)'
+	'crates/orbivisor-driver/src/file_restore.rs|"opl-fr-"|옛 `opl-fr-<id>(\.scope)?`'
+	'crates/orbivisor-driver/src/file_restore/tests.rs|opl-fr-'
+	'crates/orbivisor-driver/src/ovn/host.rs|옛 디렉터리 이름\(`/etc/opl` 등\)·옛 단위 이름\(`opl-ovn-`\)'
+	'crates/orbivisor-driver/src/ovn/host/tests.rs|디렉터리 이름\(`/etc/opl` 등\)'
+	'crates/orbivisord/src/*|옛 이름 (링크 ?)?\(?`opld\.(sock|lock)`|\(`opld\.lock`만 잠금\)'
+	# 옛 로그인 파일 받기와 그 시험
+	'crates/orbivisorctl/src/*|~/\.config/opl/oplctl\.json|"\.config/opl/oplctl\.json"'
+	# 시험이 임시 디렉터리에 두는 파일 이름(그 자리의 설정·소켓·로그인 파일)과 옛 잠금 파일
+	'crates/*|\.(path|join)\("(sub/)?(opld\.(toml|sock|lock)|oplctl\.json)"\)'
+	# 구조·안내 문서의 옛 이름 쿠키·잠금
+	'docs/*|옛 이름 `opl_(session|oidc)`도|같은 값의 `opl_session`도|, `opld\.lock`'
+	# 유지 스크립트(postinst·postrm): 옛 이름 유닛 파일·enable 링크·덮어쓰기의 경로와 그 안내(옛 이름을 systemctl에
+	# 넘기는 줄은 걸린다)
+	'packaging/deb/postinst|/opld\.service(\.d)?|\(opld\.service\.d\)|opld\.service는 그 별칭|/etc의 (진짜 )?opld\.service|돌고 있는 opld\.service가|the old opld\.service unit|opld\.service is masked|옛 /etc/opl/opld\.toml'
+	'packaging/deb/postrm|/opld\.service"|\(옛 이름 링크 /var/lib/opl·/etc/opl\)'
+	# 패키징 시험: 옛 판 배치·옛 유닛 경로를 만들거나 없음을 확인하는 줄
+	'packaging/tests/build-deb-test.sh|OPL_(LICENSE_KEYS|APT_KEY|BIN_DIR)|"\$UNIT_DIR/opld\.service"|ConditionPathExists=[|]/etc/opl/opld\.toml|별칭 링크 opld\.service|! -e "\$T/usr/share/orbivisor/opld\.toml\.example"|옛 이름\(/var/lib/opl,|^# /run/opl — '
+	'packaging/tests/deb-test.sh|=/usr/lib/systemd/system/opld\.service|! -e /usr/share/orbivisor/opld\.toml\.example|ConditionPathExists=[|]/etc/opl/opld\.toml|! -e /etc/systemd/system/multi-user\.target\.wants/opld\.service'
+	'packaging/tests/maint-test.sh|/opld\.service(\.d)?|\(opld\.service\)|진짜 opld\.service|opld\.service는 그 링크'
+	'packaging/tests/repo-test.sh|/(etc|var/lib)/opl(/[A-Za-z0-9._-]*)?|/opld\.(service|toml|sock)(\.example)?|옛 이름 opld\.service는 별칭|/etc/orbivisor/opld\.toml|/run/orbivisor/opld\.sock|"opld\.toml이 링크가 아님"'
 )
 
 # 시작하기의 두 "이름 바꾸기" 절(계획 43·74)은 옛 이름을 설명한다: 첫 절 머리부터 둘째 절 다음 머리 앞까지
@@ -336,6 +362,23 @@ expect_old clean packaging/deb/orbivisord.service 'ConditionPathExists=|/etc/opl
 expect_old left packaging/deb/orbivisord.service 'ExecStart=/usr/bin/opld --config /etc/opl/opld.toml'
 expect_old clean crates/orbivisor-types/src/version.rs '    _ => match option_env!("OPL_VERSION") {'
 expect_old left crates/orbivisor-types/src/version.rs 'option_env!("OPL_SOCKET")'
+# 계획 74 리뷰 1: 넓힌 옛 이름과 줄 모양 허용
+expect_old left crates/orbivisor-api/src/auth.rs '    let c = format!("opl_session={value}; Path=/");'
+expect_old left crates/orbivisor-api/src/updates.rs '    format!("opl-upgrade-{}", task)'
+expect_old left crates/orbivisor-driver/src/backup_serve.rs '    format!("opl-bkserve-{}", id)'
+expect_old left crates/orbivisorctl/src/cli.rs 'let path = home.join(".config/opl/x.json");'
+expect_old left crates/orbivisord/src/main.rs 'socket.with_file_name("opld.sock")'
+expect_old left docs/guide/cluster.md 'cargo test -p opld --features opld/qemu-it'
+expect_old left docs/guide/development.md 'OPLD_URL=https://x pnpm -C web dev'
+expect_old left docs/architecture.md 'opld::config, oplctl::cli'
+expect_old left docs/guide/cluster.md 'cargo run --bin opl-devserver'
+expect_old left packaging/deb/postinst '		systemctl restart opld.service || true'
+expect_old left packaging/deb/postinst '		systemctl enable opld.service'
+expect_old clean packaging/deb/postinst '		ln -s orbivisord.service.d "$SYSTEMD_ETC/opld.service.d" || return 2'
+expect_old left packaging/tests/maint-test.sh 'restart opld.service" postinst configure 0.1.0'
+expect_old clean packaging/tests/maint-test.sh 'ln -sf /usr/lib/systemd/system/opld.service "$WANTS/opld.service"'
+expect_old clean crates/orbivisord/tests/smoke.rs '        .arg(d.path("opld.toml"))'
+expect_old clean crates/orbivisor-api/src/updates.rs '    format!("opl-upgrade-{}", task.simple())'
 
 range=$(rename_range)
 if [ -n "$range" ]; then ok "시작하기의 이름 바꾸기 절: 줄 $range"; else fail "시작하기에서 두 이름 바꾸기 절을 찾지 못함"; fi

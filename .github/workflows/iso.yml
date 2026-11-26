@@ -174,7 +174,7 @@ jobs:
       - name: orbivisorctl login, node list, node get
         timeout-minutes: 8
         env:
-          ORBIVISOR_CONFIG: ${{ runner.temp }}/oplctl.json
+          ORBIVISOR_CONFIG: ${{ runner.temp }}/orbivisorctl.json
         run: |
           oplctl=target/release/orbivisorctl
           # init 직후 API가 HTTPS로 다시 열릴 때까지 잠깐 걸릴 수 있다.
