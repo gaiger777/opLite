@@ -110,8 +110,11 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     // 배치 맞추기(계획 74 설계 §3.4)는 설정을 읽기 전에 한다 — 옛 설정 파일도 새 자리로 옮긴다.
-    let migrate =
-        layout::should_migrate(rustix::process::geteuid().is_root(), args.config.as_deref());
+    let is_root = rustix::process::geteuid().is_root();
+    let migrate = layout::should_migrate(is_root, args.config.as_deref());
+    if let Some(warning) = layout::not_migrated_warning(is_root, args.config.as_deref(), root) {
+        tracing::warn!("{warning}");
+    }
     if migrate {
         let notes = layout::migrate(root);
         if let Some(stop) = layout::fatal(&notes).cloned() {

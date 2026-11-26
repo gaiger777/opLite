@@ -37,6 +37,8 @@ const DIRS: [(&str, &str); 4] = [
 
 /// 데이터 디렉터리 짝의 새 이름(이 짝을 맞추지 못하면 시작하지 않는다)
 const DATA_DIR: &str = "var/lib/orbivisor";
+/// 런타임 디렉터리 짝의 새 이름
+const RUN_DIR: &str = "run/orbivisor";
 
 /// 설정 파일 짝(새 디렉터리 안). 디렉터리를 옮긴 뒤 `opld.toml`을 `orbivisord.toml`로 맞바꾼다.
 const CONFIG_FILES: (&str, &str) = ("etc/orbivisor/opld.toml", "etc/orbivisor/orbivisord.toml");
@@ -105,11 +107,15 @@ impl fmt::Display for Note {
                     old.display()
                 )?;
                 if *mount {
+                    // 마운트 지점을 옮기는 절차(리뷰 2 N4). fstab만 고치면 systemd가 링크를 따라 옛 자리에 다시 마운트한다.
                     write!(
                         f,
-                        ". {} is a mount point: change its mount point (fstab, systemd mount unit) to {} and restart orbivisord to finish",
-                        old.display(),
-                        new.display()
+                        ". {old} is a mount point; leaving {new} as a link works. To finish the rename, stop the VMs on \
+                         this node and orbivisord, remove the link {new}, create the directory {new}, move the mount \
+                         (fstab, systemd mount unit) to {new} and mount it there, then start orbivisord: it replaces the \
+                         empty {old} with a link. Changing only fstab mounts it at {old} again through the link",
+                        old = old.display(),
+                        new = new.display()
                     )?;
                 }
                 Ok(())
@@ -260,11 +266,29 @@ fn align(
         return;
     }
     if real(old) && real(new) {
+        // 옛 것이 빈 디렉터리이고 마운트 지점이 아니면(마운트 지점을 새 이름으로 옮긴 뒤 남은 것 — 리뷰 2 N4) 지우고
+        // 옛 이름 링크를 둔다. 남겨 두면 옛 경로(옛 접두사로 저장한 경로, 설정의 `data_dir = "/var/lib/opl"`)가 빈
+        // 디렉터리로 풀린다.
+        if dir && is_empty_dir(old) && !is_mount_point(old) && std::fs::remove_dir(old).is_ok() {
+            notes.push(match ln(Path::new(new_name), old) {
+                Ok(()) => Note::Linked {
+                    old: old.to_path_buf(),
+                    new: new.to_path_buf(),
+                },
+                Err(e) => failed(e.to_string()),
+            });
+            return;
+        }
         notes.push(Note::BothReal {
             old: old.to_path_buf(),
             new: new.to_path_buf(),
         });
     }
+}
+
+/// `p`가 빈 디렉터리인지
+fn is_empty_dir(p: &Path) -> bool {
+    std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_none())
 }
 
 /// 디렉터리 `p`가 마운트 지점인지(부모와 장치가 다름)
@@ -286,7 +310,9 @@ pub fn fatal(notes: &[Note]) -> Option<&Note> {
 }
 
 /// 기본 경로 `path`(새 이름 아래)를 이 노드에서 쓸 자리로 바꾼다: 그 경로가 든 새 디렉터리가 없고 옛 디렉터리가
-/// 있으면(배치를 맞추지 않았거나 못 맞춘 노드 — root가 아님, 기본이 아닌 `--config`) 옛 이름 아래로. 그 밖에는 그대로.
+/// 있으면(배치를 맞추지 않았거나 못 맞춘 노드 — root가 아님, 기본이 아닌 `--config`) 옛 이름 아래로. 런타임 짝
+/// (`/run`)은 둘 다 진짜 디렉터리여도 옛 이름 아래로 — 옛 판으로 되돌렸다가 다시 올린 노드에서는 옛 데몬이 띄운 VM의
+/// QMP·swtpm 소켓이 옛 디렉터리에 있다(리뷰 2 N1, 다음 부팅에 `/run`이 비면 맞춰진다). 그 밖에는 그대로.
 /// 설정 파일에 적은 값에는 쓰지 않는다(기본값만).
 pub fn existing(path: &Path) -> PathBuf {
     existing_in(Path::new("/"), path)
@@ -297,8 +323,10 @@ fn existing_in(root: &Path, path: &Path) -> PathBuf {
         let Ok(rest) = path.strip_prefix(Path::new("/").join(new)) else {
             continue;
         };
+        let real = |p: &str| std::fs::symlink_metadata(root.join(p)).is_ok_and(|m| m.is_dir());
         let missing = std::fs::symlink_metadata(root.join(new)).is_err();
-        if missing && std::fs::metadata(root.join(old)).is_ok_and(|m| m.is_dir()) {
+        let both_run = new == RUN_DIR && real(old) && real(new);
+        if (missing || both_run) && std::fs::metadata(root.join(old)).is_ok_and(|m| m.is_dir()) {
             let old = Path::new("/").join(old);
             return if rest.as_os_str().is_empty() {
                 old
@@ -359,6 +387,25 @@ fn exchange(a: &Path, b: &Path) -> io::Result<()> {
 /// 디렉터리를 옮기지 않게).
 pub fn should_migrate(euid_is_root: bool, config: Option<&Path>) -> bool {
     euid_is_root && config.is_none_or(|c| c == Path::new(CONFIG) || c == Path::new(LEGACY_CONFIG))
+}
+
+/// root인데 기본이 아닌 `--config`라 배치를 맞추지 않았고 배치가 맞지 않을 때의 경고(리뷰 2). 그런 노드는 기능
+/// `orbivisor-layout`을 알리지 않아 클러스터가 계속 옛 접두사로 적으므로(안전한 쪽) 운영자가 까닭을 알 수 있게 한다.
+pub fn not_migrated_warning(
+    euid_is_root: bool,
+    config: Option<&Path>,
+    root: &Path,
+) -> Option<String> {
+    let config = config?;
+    if !euid_is_root || should_migrate(euid_is_root, Some(config)) || aligned(root) {
+        return None;
+    }
+    Some(format!(
+        "the old directories (/etc/opl, /var/lib/opl) are not moved to the orbivisor names because --config {} is not \
+         a default path ({CONFIG} or {LEGACY_CONFIG}); the node keeps the old layout and the cluster keeps writing \
+         the old path prefixes. Start orbivisord once without --config (or with a default path) to move them",
+        config.display()
+    ))
 }
 
 /// 읽을 설정 파일과 안내(경고). `--config`가 있으면 그것, 없으면 새 경로, 그것이 없고 옛 경로가 있으면 옛 경로.
@@ -573,6 +620,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("var/lib/opl")).unwrap();
+        std::fs::write(root.join("var/lib/opl/node-id"), "x").unwrap();
         std::fs::create_dir_all(root.join("var/lib/orbivisor")).unwrap();
         let notes = migrate(root);
         assert_eq!(
@@ -585,6 +633,91 @@ mod tests {
         assert!(notes[0].is_warning());
         assert!(
             is_real_dir(&root.join("var/lib/opl")) && is_real_dir(&root.join("var/lib/orbivisor"))
+        );
+    }
+
+    #[test]
+    fn an_empty_old_directory_next_to_a_real_new_one_becomes_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // 마운트 지점을 /var/lib/orbivisor로 옮긴 뒤(링크를 지우고 디렉터리를 만들어 거기에 마운트) 남은 빈 옛 디렉터리
+        std::fs::create_dir_all(root.join("var/lib/opl")).unwrap();
+        std::fs::create_dir_all(root.join("var/lib/orbivisor")).unwrap();
+        std::fs::write(root.join("var/lib/orbivisor/node-id"), "x").unwrap();
+        // 내용이 있는 옛 디렉터리는 그대로(둘 다 진짜)
+        std::fs::create_dir_all(root.join("var/log/opl")).unwrap();
+        std::fs::write(root.join("var/log/opl/a.log"), "").unwrap();
+        std::fs::create_dir_all(root.join("var/log/orbivisor")).unwrap();
+        let notes = migrate(root);
+        assert_eq!(
+            notes,
+            vec![
+                Note::Linked {
+                    old: root.join("var/lib/opl"),
+                    new: root.join("var/lib/orbivisor")
+                },
+                Note::BothReal {
+                    old: root.join("var/log/opl"),
+                    new: root.join("var/log/orbivisor")
+                },
+            ]
+        );
+        assert_eq!(
+            link_target(&root.join("var/lib/opl")),
+            Path::new("orbivisor")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("var/lib/opl/node-id")).unwrap(),
+            "x"
+        );
+        assert!(aligned(root));
+    }
+
+    #[test]
+    fn the_mount_point_advice_moves_the_mount_and_says_why_fstab_alone_is_not_enough() {
+        let note = Note::LinkedNew {
+            old: PathBuf::from("/var/lib/opl"),
+            new: PathBuf::from("/var/lib/orbivisor"),
+            reason: "Device or resource busy".into(),
+            mount: true,
+        }
+        .to_string();
+        for part in [
+            "leaving /var/lib/orbivisor as a link works",
+            "remove the link /var/lib/orbivisor, create the directory /var/lib/orbivisor",
+            "replaces the empty /var/lib/opl with a link",
+            "Changing only fstab mounts it at /var/lib/opl again",
+        ] {
+            assert!(note.contains(part), "{part}: {note}");
+        }
+    }
+
+    #[test]
+    fn runtime_paths_stay_in_the_old_directory_when_both_are_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // 옛 판으로 되돌렸다가 다시 올린 노드: 옛 데몬이 /run/opl을 진짜로 만들었고(VM 소켓이 그 안에) 새 이름 단위가
+        // /run/orbivisor도 만들었다.
+        std::fs::create_dir_all(root.join("run/opl/vm/1")).unwrap();
+        std::fs::create_dir_all(root.join("run/orbivisor/ovn")).unwrap();
+        assert_eq!(
+            existing_in(root, Path::new("/run/orbivisor/vm")),
+            Path::new("/run/opl/vm")
+        );
+        // 데이터 짝은 둘 다 진짜면 새 이름 그대로(맞바꿈 규칙과 같음)
+        std::fs::create_dir_all(root.join("var/lib/opl")).unwrap();
+        std::fs::create_dir_all(root.join("var/lib/orbivisor")).unwrap();
+        assert_eq!(
+            existing_in(root, Path::new("/var/lib/orbivisor")),
+            Path::new("/var/lib/orbivisor")
+        );
+        // 맞춘 /run(옛 이름이 링크)은 새 이름
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("run/orbivisor")).unwrap();
+        std::os::unix::fs::symlink("orbivisor", dir.path().join("run/opl")).unwrap();
+        assert_eq!(
+            existing_in(dir.path(), Path::new("/run/orbivisor/x")),
+            Path::new("/run/orbivisor/x")
         );
     }
 
@@ -781,6 +914,30 @@ mod tests {
         assert!(should_migrate(true, Some(Path::new(LEGACY_CONFIG))));
         assert!(!should_migrate(true, Some(Path::new("/tmp/x.toml"))));
         assert!(!should_migrate(false, None));
+    }
+
+    #[test]
+    fn warns_when_a_custom_config_keeps_the_old_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let custom = Path::new("/etc/opl/node.toml");
+        // 새로 설치(옛 이름 없음)·root가 아님·--config 없음·기본 경로면 경고 없음
+        assert_eq!(not_migrated_warning(true, Some(custom), root), None);
+        old_layout(root);
+        assert_eq!(not_migrated_warning(false, Some(custom), root), None);
+        assert_eq!(not_migrated_warning(true, None, root), None);
+        assert_eq!(
+            not_migrated_warning(true, Some(Path::new(CONFIG)), root),
+            None
+        );
+        let warning = not_migrated_warning(true, Some(custom), root).unwrap();
+        assert!(
+            warning.contains("--config /etc/opl/node.toml is not a default path"),
+            "{warning}"
+        );
+        // 맞춘 뒤면 경고 없음
+        migrate(root);
+        assert_eq!(not_migrated_warning(true, Some(custom), root), None);
     }
 
     #[test]
