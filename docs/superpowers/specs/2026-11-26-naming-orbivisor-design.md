@@ -17,8 +17,8 @@
 | 데이터·런타임·로그 | `/var/lib/opl`, `/run/opl`, `/var/log/opl` | `/var/lib/orbivisor`, `/run/orbivisor`, `/var/log/orbivisor` | 디렉터리 심볼릭 링크(영구) |
 | 제어 소켓·잠금 | `/run/opl/opld.sock`, `{data_dir}/opld.lock` | `/run/orbivisor/orbivisord.sock`, `{data_dir}/orbivisord.lock` | 소켓은 링크 `opld.sock`(영구) |
 | CLI 로그인 정보 | `~/.config/opl/oplctl.json` | `~/.config/orbivisor/orbivisorctl.json` | 새 파일이 없으면 옛 파일을 읽음(한 릴리스) |
-| 환경 변수 | `OPL_*`(실행 때 읽는 것 16개 + 빌드·시험) | `ORBIVISOR_*` | 실행 때 읽는 것만 옛 이름도 받고 경고(한 릴리스) |
-| 웹 쿠키 | `opl_session`, `opl_oidc` | `orbivisor_session`, `orbivisor_oidc` | 둘 다 쓰고 새 것 먼저 읽음(한 릴리스) |
+| 환경 변수 | `OPL_*`(실행 때 읽는 것 12개 + 빌드·시험) | `ORBIVISOR_*` | 실행 때 읽는 것만 옛 이름도 받고 경고(한 릴리스) |
+| 웹 쿠키 | `opl_session`, `opl_oidc` | `orbivisor_session`, `orbivisor_oidc` | 둘 다 쓰고, 값이 다르면 옛 이름(더 나중의 로그인) 먼저 읽음(한 릴리스, §3.6) |
 | 크레이트 | `opl-*`, `opld`, `oplctl` | `orbivisor-*`, `orbivisord`, `orbivisorctl` | 없음(사용자에게 보이는 것은 로그 target뿐) |
 | 보조 바이너리 | `opl-devserver` | `orbivisor-devserver` | 없음(개발용) |
 
@@ -96,13 +96,17 @@ orbivisord·devserver, Terraform 공급자 Go 코드 — Go 쪽은 같은 규칙
   1. 옛 것이 진짜 디렉터리이고 새 것이 없음 → `ln -s <새 이름의 basename> <새>`(자기 링크) 뒤 `renameat2(옛, 새, RENAME_EXCHANGE)`.
      결과: 새 = 진짜 디렉터리, 옛 = 새를 가리키는 상대 링크. 맞바꿈이 안 되면(마운트 지점 EBUSY, 맞바꿈을 받지 않는 파일
      시스템 EINVAL, 옛 것이 다른 곳으로의 링크 — 리뷰 1 S1) 자기 링크를 지우고 거꾸로 새 이름을 옛 이름으로의 상대 링크
-     (`orbivisor → opl`)로 만든 뒤 경고(마운트면 fstab을 새 이름으로 옮기라는 안내). 그것도 못 하면 데이터 디렉터리 짝은
+     (`orbivisor → opl`)로 만든 뒤 경고(링크로 둬도 된다. 마운트 지점이면 끝내는 절차를 안내 — 링크를 지우고 디렉터리를 만들어
+     마운트를 옮김. fstab만 고치면 systemd가 링크를 따라 옛 자리에 다시 마운트한다, 리뷰 2 N4). 그것도 못 하면 데이터 디렉터리 짝은
      시작을 거부하고(빈 새 디렉터리로 새 노드가 되지 않게) 나머지 짝은 경고. 맞바꿈 직전에 멈춰 남은 자기 링크는 다음 시작에서
      지우고 다시 한다.
   2. 새 것이 진짜이고 옛 것이 없음(새로 설치) → 옛 이름 링크를 만든다(저장된 옛 경로·옛 스크립트가 풀리게).
-  3. 둘 다 진짜 → 손대지 않고 경고.
+  3. 둘 다 진짜 → 손대지 않고 경고. 다만 옛 것이 빈 디렉터리이고 마운트 지점이 아니면(마운트 지점을 새 이름으로 옮긴 뒤 남은
+     것 — 리뷰 2) 지우고 옛 이름 링크를 만든다. 런타임 짝(`/run`)이 둘 다 진짜면 기본 경로는 옛 자리다(옛 판으로 되돌렸다가
+     다시 올린 노드에서 옛 데몬이 띄운 VM의 소켓이 옛 디렉터리에 있다 — 다음 부팅에 `/run`이 비면 맞춰진다).
   그다음 `/etc/orbivisor/opld.toml`이 진짜 파일이고 `orbivisord.toml`이 없으면 같은 방식으로 맞바꿔 `opld.toml → orbivisord.toml`
   링크를 남긴다. 소켓: 데몬이 `orbivisord.sock`을 열고 `opld.sock → orbivisord.sock` 링크를 만든다(옛 CLI·스크립트).
+- root인데 기본이 아닌 `--config`라 맞추기를 건너뛰었고 배치가 맞지 않으면 시작 로그에 그 까닭을 경고한다(리뷰 2).
 - 맞추기를 건너뛰는 노드(root가 아님, 기본이 아닌 `--config`)와 맞추기 앞의 `--release-vips`: 경로 기본값(data·run·log·
   Ceph `client_dir`·OVN·ACME 훅 자리)은 새 디렉터리가 없고 옛 디렉터리가 있으면 옛 자리다(`layout::existing`). 설정 파일에 적은
   값은 그대로. 기능 `orbivisor-layout`은 `/etc`·`/var/lib` 짝이 같은 곳으로 풀리거나 옛 이름이 없을 때만 알린다.
@@ -131,7 +135,10 @@ orbivisord·devserver, Terraform 공급자 Go 코드 — Go 쪽은 같은 규칙
 ### 3.6 쿠키(4단계)
 
 `SESSION_COOKIE=orbivisor_session`, `STATE_COOKIE=orbivisor_oidc`. 로그인·OIDC는 새 이름과 옛 이름을 같은 값·속성으로 둘 다
-`Set-Cookie`하고, 읽기는 새 것 → 옛 것. 로그아웃·만료는 넷 다 지운다. CSRF 등 다른 쿠키가 있으면 같은 규칙.
+`Set-Cookie`한다. 읽기는 두 값이 같거나 하나만 있으면 그것, 다르면 옛 이름 → 새 이름(새 판 노드는 두 이름에 같은 값을 쓰므로
+다른 값은 그 뒤 옛 판 노드에서 한 로그인 — 리뷰 1 M2). 고른 세션이 끝났거나 쓸 수 없으면(비밀번호 세대, 영역) 다른 이름을 본다.
+옛 이름 쪽을 고르면 그 응답에서 새 이름 쿠키를 같은 값·속성으로 고쳐 쓴다(리뷰 2). OIDC 상태 쿠키는 새 이름 → 옛 이름 차례로
+검증해 처음 맞는 것. 로그아웃·만료는 넷 다 지우고, 로그아웃 감사 주체는 인증과 같은 차례로 고른다.
 
 ### 3.7 문서·안내·이름 시험(4단계)
 
@@ -153,7 +160,6 @@ orbivisord·devserver, Terraform 공급자 Go 코드 — Go 쪽은 같은 규칙
 ### 4.2 postinst(유닛 부분)
 
 ```
-daemon-reload
 if [ -L $ETC/multi-user.target.wants/opld.service ]; then
     rm -f  $ETC/multi-user.target.wants/opld.service
     ln -s /usr/lib/systemd/system/orbivisord.service $ETC/multi-user.target.wants/orbivisord.service
@@ -161,10 +167,22 @@ fi
 if [ -d $ETC/opld.service.d ] && [ ! -L $ETC/opld.service.d ] && [ ! -e $ETC/orbivisord.service.d ]; then
     mv $ETC/opld.service.d $ETC/orbivisord.service.d && ln -s orbivisord.service.d $ETC/opld.service.d
 fi
-daemon-reload
+daemon-reload    # 옮긴 뒤 한 번(리뷰 2 N3 — 옮기기 앞에 reload하면 /etc의 진짜 opld.service와 새 실제 파일이 두 단위가 된다)
 is-enabled orbivisord → restart orbivisord / first → enable --now(설정 없으면 조건이 건너뜀)
 ```
 systemd가 돌지 않을 때(chroot)는 링크만. 옛 oplite V0에서 바로 넘어오는 길(계획 43 §4)도 같은 규칙으로 덮인다(`maint-test.sh`에 줄을 더함).
+swtpm AppArmor의 새 경로 규칙은 conffile 밖 `local/usr.bin.swtpm`에도 한 줄씩 한 번만 더한다(옛 판으로 되돌리거나 conffile을 고친
+노드 — 리뷰 2 N2). purge는 그 줄들을 뺀다.
+
+### 4.3 옛 판으로 되돌리기(리뷰 2 N1)
+
+dpkg는 옛 판을 푼 뒤 새 판의 `postrm upgrade <옛 판>`을 부른다. 풀린 판의 `/usr/lib/systemd/system/opld.service`가 진짜 파일(이름
+바꾸기 앞)이면 OVN 중앙 단위를 거꾸로 옮긴다: `orbivisor-ovn-*.service`(Orbivisor 표시, 옛 이름이 그것으로의 링크이거나 없음)를
+옛 이름으로, 새 이름은 옛 이름으로의 링크로, enable 링크도 옛 이름으로, `daemon-reload` 한 번 — 옮길 때와 같은 합치기 전이라 도는
+ovsdb·northd가 멈추지 않는다. 그러지 않으면 옛 데몬이 옛 이름 링크 자리에 진짜 파일을 써서 같은 DB를 쥔 단위가 둘이 된다. 옛
+데몬은 단위 글을 옛 경로로 다시 쓰고 중앙을 한 번 다시 시작한다(받아들임). 다시 올리면 새 데몬의 adopt가 새 이름 링크를 진짜
+파일로 바꾼 뒤 옛 이름을 링크로 둔다(서로 가리키는 링크가 되지 않게). 데몬 배치(디렉터리 링크)는 옛 판이 링크로 풀어 쓰므로
+그대로 둔다.
 
 ## 5. 시험
 
@@ -175,9 +193,11 @@ systemd가 돌지 않을 때(chroot)는 링크만. 옛 oplite V0에서 바로 �
 - 소켓 링크, `--config` 없음/옛/새, `--release-vips`가 새·옛 배치에서.
 - OVN 유닛 바꾸기(가짜 systemctl), 일시 유닛 두 접두사 찾기.
 - 쿠키: 로그인 응답에 넷, 옛 쿠키만으로 인증됨, 로그아웃이 넷 다 지움, OIDC 콜백이 옛 state 쿠키로도 됨.
-- 패키징: `build-deb-test.sh`(새 유닛·별칭·예시 파일), `maint-test.sh`(enable 링크·덮어쓰기 옮기기, 이미 옮김, chroot), `deb-test.sh`·
-  `repo-test.sh`(옛 판 설치 → 새 판 업그레이드 뒤 `systemctl is-enabled orbivisord`, 새 경로가 진짜·옛 경로가 링크, VM 역할 프로세스가
-  같은 PID) — GitHub `package` 작업.
+- 패키징: `build-deb-test.sh`(새 유닛·별칭·예시 파일), `maint-test.sh`(enable 링크·덮어쓰기 옮기기, 이미 옮김, chroot, 옮긴 뒤
+  reload 한 번, 되돌리기의 OVN 단위, swtpm local 규칙), `deb-test.sh`·`repo-test.sh`(옛 oplite V0와 계획 43~73의 orbivisor —
+  `fixtures/orbivisor-v1` — 설치 → 새 판 업그레이드 뒤 `systemctl is-enabled orbivisord`, 유닛 파일·덮어쓰기, 새 경로가 진짜·옛
+  경로가 링크) — GitHub `package` 작업. 컨테이너에서는 systemd가 돌지 않으므로 "VM 역할 프로세스가 같은 PID"와 "daemon-reload에서
+  두 이름이 합쳐짐(MainPID 그대로)"은 실제 배포에서 확인한다.
 - 실제: svc02 → svc01 배포를 업그레이드 길 그대로(옛 배치의 노드에서 새 바이너리·유닛) — test-vm PID 그대로, `/var/lib/opl`이 링크,
   `systemctl status orbivisord`, `journalctl -u orbivisord`, OVN 유닛 이름, 옛 쿠키 세션 유지, `OPL_SERVER`로 CLI 경고.
 
@@ -186,8 +206,11 @@ systemd가 돌지 않을 때(chroot)는 링크만. 옛 oplite V0에서 바로 �
 - `journalctl -u opld`는 이름 바꾸기 앞의 로그만 보인다(유닛의 원래 이름이 바뀌었다). 새 로그는 `-u orbivisord`. 안내에 적는다.
 - 노드 위에 `opl`로 시작하는 이름이 남는다: VM 스코프, 브리지·탭, LVM·RBD 이름, nft 표, 옛 경로 링크. §1 "그대로 둠"과 안내 절이 까닭을 적는다.
 - 섞인 기간에 한 브라우저에서 로그아웃 없이 사용자를 바꾸는 경우(리뷰 1 compat M2): 옛 노드는 옛 이름 쿠키만 쓰고 지운다.
-  새 노드는 두 이름의 값이 다르면 더 나중의 로그인인 옛 이름을 먼저 보므로 노드마다 다른 사용자가 되지는 않지만, 그 뒤 새 노드를
-  거치지 않고 옛 노드에서만 로그아웃하면 새 이름 쿠키에 앞 사용자의 세션이 남는다. 옛 노드의 협조 없이는 막을 수 없어 받아들이고
-  안내에 "섞인 기간에는 사용자를 바꿀 때 먼저 로그아웃"을 적는다(한 릴리스 동안의 일).
+  새 노드는 두 이름의 값이 다르면 더 나중의 로그인인 옛 이름을 먼저 보고 그 응답에서 새 이름 쿠키를 그 값으로 고쳐 쓰므로(리뷰 2),
+  새 노드를 한 번이라도 거친 뒤에는 옛 노드에서 로그아웃해도 앞 사용자의 세션이 남지 않는다. 남는 빈틈은 로그인부터 로그아웃까지
+  옛 노드만 거친 경우다 — 그때는 새 이름 쿠키에 앞 사용자의 세션이 남는다. 받아들이고 안내에 "섞인 기간에는 사용자를 바꿀 때 먼저
+  로그아웃"을 적는다(한 릴리스 동안의 일).
+- 옛 판으로 되돌리면 옛 데몬이 OVN 중앙 단위 글을 옛 경로로 다시 쓰고 중앙을 한 번 다시 시작한다(§4.3). postrm이 되돌리지 못하면
+  안내의 손 절차.
 - 옛 이름 받기(환경 변수·쿠키·CLI 로그인 파일·일시 유닛 접두사)는 다음 판에서 뺀다 — 그때 이 설계의 §1 "옛 이름" 열을 따른다. 경로 링크와
   유닛 별칭은 저장된 경로·운영 스크립트 때문에 없애지 않는다.

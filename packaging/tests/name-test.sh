@@ -308,6 +308,8 @@ OLD_RULES=(
 	# 디렉터리(`dir.path()`) 아래만 — 데몬의 `self.run_dir.join("opld.sock")` 같은 줄은 걸린다(리뷰 2).
 	'crates/*/tests/*|\.(path|join)\("(sub/)?(opld\.(toml|sock|lock)|oplctl\.json)"\)'
 	'crates/*/src/*|dir\.path\(\)\.join\("(sub/)?(opld\.(toml|sock)|oplctl\.json)"\)'
+	# 지난 계획·설계 문서는 고치지 않으므로 그 파일 이름(`plan2-opl-driver.md` 등)으로의 링크도 그대로다(리뷰 2 — 바꾸면 링크가 깨진다).
+	'docs/index.md|\]\(superpowers/(plans|specs)/[A-Za-z0-9._-]+\.md\)'
 	# 구조·안내 문서의 옛 이름 쿠키·잠금
 	'docs/*|옛 이름 `opl_(session|oidc)`도|같은 값의 `opl_session`도|, `opld\.lock`'
 	# 유지 스크립트(postinst·postrm): 옛 이름 유닛 파일·enable 링크·덮어쓰기의 경로와 그 안내(옛 이름을 systemctl에
@@ -409,6 +411,8 @@ expect_old clean crates/orbivisord/tests/release_vips.rs '    let lock = std::fs
 expect_old left crates/orbivisor-driver/src/backup_serve.rs '    format!("opl-bkserve-{id}")'
 expect_old clean crates/orbivisor-driver/src/backup_serve.rs 'const LEGACY_BACKUP_SERVE_PREFIX: &str = "opl-bkserve-";'
 expect_old left crates/orbivisor-driver/src/file_restore.rs 'pub const UNIT_PREFIX: &str = "opl-fr-";'
+expect_old clean docs/index.md '- [계획 2: 하이퍼바이저·스토리지 드라이버](superpowers/plans/2026-10-20-plan2-opl-driver.md)'
+expect_old left docs/index.md '- 크레이트 opl-driver가 드라이버를 맡는다(superpowers/plans/2026-10-20-plan2-opl-driver.md)'
 
 range=$(rename_range)
 if [ -n "$range" ]; then ok "시작하기의 이름 바꾸기 절: 줄 $range"; else fail "시작하기에서 두 이름 바꾸기 절을 찾지 못함"; fi

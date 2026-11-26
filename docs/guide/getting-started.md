@@ -338,8 +338,10 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
 제품 이름이 계획 43에서 Orbivisor로 바뀌었다. 바뀐 것은 사람이 보는 이름(패키지, 바이너리, 웹, ISO, CLI 도움말과
 메시지)뿐이고, 노드에 저장된 상태와 노드 사이에 주고받는 이름은 그대로다. 그래서 이미 설치한 노드도 보통의 업그레이드
 (`orbivisorctl node upgrade`, 웹 "업그레이드" — 위 "업데이트")로 한 노드씩 넘어가고, 버전이 섞인 채로도 돈다.
-이 절은 계획 43 때의 기록이다. 그 뒤 계획 74가 유닛·경로·환경 변수·쿠키·크레이트 이름도 바꿨다 — 아래 표의 유닛·예시 설정과
-"유닛 이름은 `opld`다", "그대로 둔 내부 이름"의 경로·쿠키·업그레이드 유닛은 [이름 바꾸기 2](#이름-바꾸기-2-계획-74)가 대신한다.
+이 절은 계획 43 때의 기록이다. 그 뒤 계획 74가 유닛·경로·환경 변수·쿠키·크레이트 이름도 바꿨다 — 아래 표의 유닛·예시 설정,
+"옛 이름도 된다"의 로그인 파일·`OPL_*` 환경 변수(계획 74부터 옛 로그인 파일은 새 파일이 없을 때만 읽고, 옛 환경 변수는 실행 때
+읽는 열둘만 한 릴리스 동안 받는다), "유닛 이름은 `opld`다", "그대로 둔 내부 이름"의 경로·쿠키·업그레이드 유닛은
+[이름 바꾸기 2](#이름-바꾸기-2-계획-74)가 대신한다.
 
 | 무엇 | 옛 이름 | 지금 |
 |---|---|---|
@@ -405,7 +407,7 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
 | 예시 설정 | `/usr/share/orbivisor/opld.toml.example` | `/usr/share/orbivisor/orbivisord.toml.example` | 없음 |
 | CLI 로그인 정보 | `~/.config/opl/oplctl.json` | `~/.config/orbivisor/orbivisorctl.json` | 새 파일이 없으면 읽음(한 릴리스) |
 | 환경 변수 | `OPL_*` | `ORBIVISOR_*` | 실행 때 읽는 것만 받고 경고(한 릴리스) |
-| 웹 쿠키 | `opl_session`, `opl_oidc` | `orbivisor_session`, `orbivisor_oidc` | 둘 다 씀, 새 것 먼저 읽음(한 릴리스) |
+| 웹 쿠키 | `opl_session`, `opl_oidc` | `orbivisor_session`, `orbivisor_oidc` | 둘 다 씀, 값이 다르면 옛 이름(더 나중의 로그인) 먼저 읽음(한 릴리스) |
 | 일시 유닛 | `opl-upgrade-*`, `opl-bkserve-*`, `opl-fr-*` | `orbivisor-upgrade-*`, `orbivisor-bkserve-*`, `orbivisor-fr-*` | 찾기·치우기는 두 접두사(한 릴리스) |
 | 크레이트·로그 대상 | `opl-*`, `opld`, `oplctl`(`opl_api::…`) | `orbivisor-*`, `orbivisord`, `orbivisorctl`(`orbivisor_api::…`) | 없음 |
 
@@ -422,9 +424,12 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
     된다). 결과는 새 이름이 진짜 디렉터리, 옛 이름이 그것을 가리키는 링크다. 같은 방식으로 `opld.toml`을 `orbivisord.toml`로
     바꾸고 링크를 남긴다. 시작 로그에 `moved /var/lib/opl to /var/lib/orbivisor and left /var/lib/opl as a link`처럼 남는다.
     새로 설치한 노드에도 옛 이름 링크를 만든다. 옛 이름과 새 이름이 둘 다 진짜 디렉터리면 손대지 않고 경고한다(손으로 하나로
-    합치고 옛 이름을 링크로 만든다). 맞바꾸지 못하면(옛 디렉터리가 마운트 지점, 맞바꿈을 받지 않는 파일 시스템, 옛 이름이
+    합치고 옛 이름을 링크로 만든다) — 다만 옛 디렉터리가 비었고 마운트 지점이 아니면 지우고 옛 이름 링크를 만든다. 맞바꾸지 못하면(옛 디렉터리가 마운트 지점, 맞바꿈을 받지 않는 파일 시스템, 옛 이름이
     다른 곳으로의 링크) 거꾸로 새 이름을 옛 디렉터리로의 링크(`/var/lib/orbivisor → opl`)로 만들고 경고한다 — 데이터는 옛
-    자리 그대로다. 마운트 지점이면 경고대로 fstab(또는 마운트 유닛)의 마운트 지점을 새 이름으로 바꾸고 다시 시작하면 끝난다.
+    자리 그대로다. 이 상태(새 이름이 옛 이름으로의 링크)는 그대로 둬도 된다. 마운트 지점을 새 이름으로 옮겨 끝내려면 그 노드의 VM과
+    orbivisord를 멈추고, 링크 `/var/lib/orbivisor`를 지우고 디렉터리를 만들어, fstab(또는 마운트 유닛)의 마운트 지점을 새
+    이름으로 바꿔 거기에 마운트한 뒤 orbivisord를 시작한다 — 빈 `/var/lib/opl`은 데몬이 링크로 바꾼다. 링크를 둔 채 fstab만
+    고치면 systemd가 링크를 따라 옛 자리에 다시 마운트해 아무것도 바뀌지 않는다.
     그 링크도 못 만들면 데이터 디렉터리는 데몬이 시작하지 않는다(빈 새 디렉터리로 다른 노드가 되지 않게). 맞추기를 하지 않는
     경우(root가 아님, 기본이 아닌 `--config`)에는 기본 경로가 새 디렉터리가 없고 옛 디렉터리가 있으면 옛 자리다.
   - 맞바꾼 뒤 `/etc/opl/opld.toml`은 `orbivisord.toml`로의 링크다. 옛 경로를 `sed -i`·Ansible `copy`처럼 바꿔 넣는 도구로
@@ -436,9 +441,26 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
     — 도는 ovsdb·northd는 멈추지 않는다. 단위 글이 옛 경로·옛 유닛 이름만 다르면 새 글로 쓰되 다시 시작하지 않는다(다음
     정상 재시작 때 새 글로 뜬다).
   - 웹 로그인은 두 이름의 쿠키를 함께 받으므로 VIP·프록시 뒤에서 옛 노드와 새 노드를 번갈아 만나도 세션이 이어진다. 로그아웃은
-    넷 다 지운다. 버전이 섞인 동안 한 브라우저에서 사용자를 바꿀 때는 먼저 로그아웃한다: 옛 노드는 옛 이름 쿠키만 쓰고
-    지우므로, 로그아웃 없이 옛 노드에서 다른 사용자로 로그인한 뒤 옛 노드에서 로그아웃하면 새 이름 쿠키의 앞 사용자 세션이 남을
-    수 있다(새 노드는 두 쿠키가 다르면 더 나중의 로그인인 옛 이름 쪽을 본다).
+    넷 다 지운다. 두 쿠키의 값이 다르면(새 노드에서 로그인한 뒤 같은 브라우저로 옛 노드에서 다른 사용자로 로그인) 새 노드는 더
+    나중의 로그인인 옛 이름 쪽을 보고, 그 응답에서 새 이름 쿠키를 같은 값으로 고쳐 쓴다. 남는 빈틈은 로그인부터 로그아웃까지 옛
+    노드만 거친 경우다: 옛 노드는 옛 이름 쿠키만 지우므로 새 이름 쿠키의 앞 사용자 세션이 남는다. 그래서 버전이 섞인 동안 한
+    브라우저에서 사용자를 바꿀 때는 먼저 로그아웃한다.
+- **옛 판으로 되돌리기.** 이름 바꾸기 앞의 판을 다시 깔아도(`apt install orbivisor=<옛 판>`) 노드는 돈다: 디렉터리·설정·잠금·
+  소켓은 옛 이름 링크로 풀리고, `opld.service`는 옛 판의 진짜 유닛이 된다(enable 링크 `orbivisord.service`는 같은 파일을 가리킨다).
+  새 판의 postrm이 OVN 중앙 단위를 되돌린다: `orbivisor-ovn-*.service`(Orbivisor 표시)를 `opl-ovn-*.service`로 옮기고 새 이름은
+  그것으로의 링크, enable 링크도 옛 이름으로 바꾼 뒤 `daemon-reload`(도는 ovsdb·northd는 멈추지 않는다). 옛 데몬은 단위 글을 옛
+  경로로 다시 쓰고 OVN 중앙을 한 번 다시 시작한다. postrm이 되돌리지 못했다고 알리면 중앙 노드에서 손으로 한다(단위마다,
+  `db`는 `nb`·`sb`·`northd`): `cd /etc/systemd/system && rm opl-ovn-<db>.service && mv orbivisor-ovn-<db>.service
+  opl-ovn-<db>.service && ln -s opl-ovn-<db>.service orbivisor-ovn-<db>.service`, enable 링크
+  `multi-user.target.wants/orbivisor-ovn-<db>.service`를 지우고 `systemctl enable opl-ovn-<db>.service`, 끝으로
+  `systemctl daemon-reload`. swtpm AppArmor의 새 경로 규칙은 `/etc/apparmor.d/local/usr.bin.swtpm`에도 있어 옛 판의 conffile이
+  깔려도 도는 vTPM VM의 상태 쓰기가 막히지 않는다. 되돌린 뒤 다시 올리면 새 데몬이 OVN 단위를 다시 옮긴다. 그사이 재부팅해
+  옛 데몬이 `/run/opl`을 진짜 디렉터리로 만들었고 `/run/orbivisor`도 있으면, 새 데몬은 VM 소켓이 있는 `/run/opl` 쪽을 쓴다(다음
+  재부팅에 맞춰진다).
+- **기본이 아닌 `--config`.** 덮어쓰기로 `ExecStart=… --config /etc/opl/node.toml`처럼 기본이 아닌 설정 경로를 준 노드는 배치를
+  옮기지 않고(옛 이름 그대로 돈다) 시작 로그에 그 까닭을 경고한다. 그런 노드가 있는 동안 클러스터는 다른 노드가 여는 경로를 옛
+  이름으로 적는다. 옮기려면 설정을 `/etc/orbivisor/orbivisord.toml`(또는 `/etc/opl/opld.toml`)에 두고 `--config` 없이 한 번
+  시작한다.
 - **옛 이름은 언제까지.** 경로 링크, `opld.service` 별칭, `opld.sock` 링크, OVN 유닛 링크는 없애지 않는다(저장된 경로와 운영
   스크립트가 쓴다). 실행 때 읽는 환경 변수의 옛 이름(`OPL_CONFIG`, `OPL_SOCKET`, `OPL_SERVER`, `OPL_TOKEN`, `OPL_CA_PEM`,
   `OPL_CA_FINGERPRINT`, `OPL_ACME_DNS_SECRET`, `OPL_ACME_EAB_HMAC`, `OPL_ESXI_PASSWORD`, `OPL_VMWARE_PASSWORD`, `OPL_LOG`,

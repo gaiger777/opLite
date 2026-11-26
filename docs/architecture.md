@@ -171,11 +171,11 @@ graph LR
 
 `orbivisord`의 인자는 `--config`(기본 `/etc/orbivisor/orbivisord.toml`, 없고 옛 `/etc/opl/opld.toml`이 있으면 그것)와 `--release-vips`, 그리고
 데몬이 띄우는 헬퍼용 하위 명령 `backup-serve`다(`crates/orbivisord/src/main.rs:69-91`). `--release-vips`는 systemd `ExecStopPost`가 부르는 VIP 떼기 전용이다
-(`main.rs:436-460`). 노드의 성격은 설정과 저장소가 정한다.
+(`main.rs:439-463`). 노드의 성격은 설정과 저장소가 정한다.
 
 | 상태 | 정하는 것 | 도는 것 |
 |---|---|---|
-| 초기화 전 노드 | `{data_dir}/pki`가 없음 | 제어 소켓만 열고 `init`·`join`을 기다린다(`main.rs:141-161`) |
+| 초기화 전 노드 | `{data_dir}/pki`가 없음 | 제어 소켓만 열고 `init`·`join`을 기다린다(`main.rs:219-243`) |
 | 일반 멤버 | 기본 | 전부(API, reconciler, Task, 리더 루프 …) |
 | 위트니스 | 설정 `witness = true`(`crates/orbivisord/src/config.rs:34-37`) | Raft 저장소와 노드 간 서버, 생존 리스만. API·QEMU·리더 루프 없음(`member.rs:999-1052`). 투표는 하지만 후보가 되지 않는다 |
 | 관찰 노드 | 저장소에 기록된 모드(`RoleKeeper`가 바꿈) | Raft 밖에서 투표 멤버 하나를 따라가며 상태를 받는 일반 노드(§3.5) |
@@ -196,7 +196,7 @@ API 폭주나 느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦�
 | OS 스레드 | `opl-audit` | 1 | 감사 로그 쓰기(`crates/orbivisor-api/src/audit.rs:126`) |
 
 배치는 `member.rs:331-334`에서 정하고 각 spawn이 `on(&rt.core, …)`/`on(&rt.work, …)`으로 실행기를 고른다.
-`main`은 `runtimes.core.block_on(run)`으로 돈다(`main.rs:90-101`).
+`main`은 `runtimes.core.block_on(run)`으로 돈다(`main.rs:93-158`).
 
 **systemd watchdog.** 유닛은 `Type=notify`, `WatchdogSec=30s`, `WatchdogSignal=SIGKILL`이다
 (`packaging/deb/orbivisord.service`). `orbivisor-notify`가 `WATCHDOG_USEC/3`(1~10초, 기본 10초)마다 세 실행기에 빈 작업을
@@ -204,23 +204,23 @@ API 폭주나 느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦�
 경고만 남기고 계속 보낸다(`notify.rs:1-39,137-150`). sd_notify 크레이트 없이 `$NOTIFY_SOCKET`에 직접 쓴다
 (`notify.rs:47-77`). `KillMode=process`라 데몬이 죽어도 QEMU는 그대로 돌고, 다시 뜬 데몬이 다시 붙는다(§8.2).
 
-`READY=1`은 세 곳에서 보낸다: 초기화 전 노드가 제어 소켓을 열었을 때(`main.rs:143`), 멤버가 Task 실행기의 고아
+`READY=1`은 세 곳에서 보낸다: 초기화 전 노드가 제어 소켓을 열었을 때(`main.rs:227`), 멤버가 Task 실행기의 고아
 정리 직전(`member.rs:833-836`, 정족수가 없으면 고아 정리가 오래 걸려 시작 제한에 걸리지 않게), 시작을 마쳤을 때
-(`main.rs:165`).
+(`main.rs:249`).
 
 HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는 [§5.3](#53-자기-펜싱-watchdog)과
 [클러스터 운영 안내](guide/cluster.md#제어부-가용성)에 있다.
 
 ### 2.3 디렉터리와 파일
 
-설정은 TOML이고 모르는 키를 거부한다(`config.rs:25-27`). 기본 경로(`config.rs:1329-1349`):
+설정은 TOML이고 모르는 키를 거부한다(`config.rs:25-27`). 기본 경로(`config.rs:1476-1478,1598-1604`):
 
 | 키 | 기본값 | 뜻 |
 |---|---|---|
 | `listen` | `0.0.0.0:8006` | HTTPS API·웹 |
 | `cluster_listen` | `0.0.0.0:8007` | 노드 간 gRPC(`listen`과 달라야 함, `config.rs:1548`) |
 | `cluster_addresses` | 비면 `address` 하나 | 다중 링크(§6.7) |
-| `data_dir` | `/var/lib/orbivisor` | 영속 데이터(0700으로 만듦, `main.rs:380-391`) |
+| `data_dir` | `/var/lib/orbivisor` | 영속 데이터(0700으로 만듦, `main.rs:465-478`) |
 | `run_dir` | `/run/orbivisor` | 소켓·pid 파일 |
 | `control_socket` | `{run_dir}/orbivisord.sock` | 로컬 제어 소켓(0600, 기본 자리면 옆에 옛 이름 링크 `opld.sock`) |
 | `[migration] ports` | `60000-60099` | QEMU 마이그레이션·NBD(`config.rs:1812`) |
@@ -233,7 +233,7 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 
 | 경로 | 내용 | 인용 |
 |---|---|---|
-| `orbivisord.lock`, `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock(옛 이름도 잠가 옛 판 데몬과도 막음) | `main.rs:477-502` |
+| `orbivisord.lock`, `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock(옛 이름도 잠가 옛 판 데몬과도 막음) | `main.rs:480-508` |
 | `node-id` | 노드 UUID | `crates/orbivisord/src/bootstrap.rs:27` |
 | `pki/` | `ca.crt`, `node.crt`, `node.key`(0600) | `crates/orbivisor-peer/src/pki.rs:31-35` |
 | `cluster/cluster.redb` | Raft 로그 + 상태 머신 + 스냅샷 | `crates/orbivisor-cluster/src/cluster.rs:46` |
@@ -287,7 +287,7 @@ sequenceDiagram
   end
 ```
 
-근거: `main.rs:76-212`, `member.rs:346-935`.
+근거: `main.rs:93-321`, `member.rs:346-935`.
 
 ---
 
@@ -834,10 +834,10 @@ SSE는 없다. WebSocket 둘이다.
 | OIDC | code flow + PKCE S256 + nonce. 로그인 상태는 클러스터 CA 키에서 HKDF로 뽑은 키로 서명한 쿠키라 어느 노드든 콜백을 받음. RS256·ES256 | `oidc_login.rs:1-210` |
 | API 토큰 | `opl_<uuid>_<secret>`, SHA-256만 저장, 상수 시간 비교. 선택 `scope`(권한 × 대상)로 주인 권한과 교집합 | `auth.rs:155-176,591-611`, `crates/orbivisor-types/src/auth.rs:142-150` |
 | 2단계 인증 | TOTP(SHA-1), 복구 코드 10개(SHA-256), 패스키(직접 쓴 최소 WebAuthn 검증기, attestation none). 대기 세션 300초. 역할·영역별 강제, OIDC 사용자는 제외. **API 토큰은 2FA를 건너뜀** | `two_factor.rs`, `webauthn.rs:1-8`, `auth.rs:795` |
-| 세션 | 쿠키 `orbivisor_session`(HttpOnly, SameSite=Strict, Secure — 옛 판 노드와 섞여도 되게 같은 값의 `opl_session`도 쓰고, 읽기는 새 것 먼저), 12시간. 모든 노드가 `shared-sessions`를 알리면 Raft `Session`(쿠키의 SHA-256이 이름)에, 아니면 노드 메모리에. 사용자마다 32개, 마지막 사용은 60초에 한 번 씀. 비밀번호를 바꾸면 `session_epoch`가 올라 모든 노드의 세션이 끝남 | `auth.rs:28-38,356-541,634-639` |
+| 세션 | 쿠키 `orbivisor_session`(HttpOnly, SameSite=Strict, Secure — 옛 판 노드와 섞여도 되게 같은 값의 `opl_session`도 쓰고, 두 값이 다르면 옛 이름 쪽 — 더 나중의 로그인 — 을 먼저 읽고 응답에서 새 이름을 그 값으로 고쳐 씀), 12시간. 모든 노드가 `shared-sessions`를 알리면 Raft `Session`(쿠키의 SHA-256이 이름)에, 아니면 노드 메모리에. 사용자마다 32개, 마지막 사용은 60초에 한 번 씀. 비밀번호를 바꾸면 `session_epoch`가 올라 모든 노드의 세션이 끝남 | `auth.rs:30-34,321-364,409-622,673-711` |
 
 - **CSRF.** 쿠키 요청은 `Origin`이 `Host`와 같거나 허용한 `web_origins`여야 한다(아니면 403 `cross_origin`). CSRF 토큰은
-  없다(`auth.rs:329-344,692-718`).
+  없다(`auth.rs:378-393,763-785`).
 - **로그인 제한.** 노드 메모리. (사용자, IP)는 연속 5번, IP는 20번 실패하면 30초부터 두 배씩 15분까지 잠그고 429와
   `Retry-After`를 준다. IPv6는 /64로 센다(`crates/orbivisor-api/src/limit.rs:1-25`). 2FA 실패는 노드 메모리와 Raft
   `TwoFactorStatus` 둘에서 센다.
