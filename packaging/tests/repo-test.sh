@@ -165,7 +165,7 @@ check_moved() {
 	[ "$(readlink /usr/bin/opld)" = orbivisord ] || fail "$1: /usr/bin/opld: $(ls -l /usr/bin/opld 2>&1)"
 	[ "$(readlink /usr/bin/oplctl)" = orbivisorctl ] || fail "$1: /usr/bin/oplctl: $(ls -l /usr/bin/oplctl 2>&1)"
 	[ "$(opld --version)" = "orbivisord $VERSION" ] || fail "$1: opld --version: $(opld --version)"
-	[ -f "$UNIT" ] && [ ! -L "$UNIT" ] || fail "$1: 유닛 파일 없음"
+	{ [ -f "$UNIT" ] && [ ! -L "$UNIT" ]; } || fail "$1: 유닛 파일 없음"
 	grep -qx 'ExecStart=/usr/bin/orbivisord' "$UNIT" || fail "$1: 옛 유닛 파일"
 	[ "$(readlink /usr/lib/systemd/system/opld.service)" = orbivisord.service ] || fail "$1: 별칭 링크 없음"
 	[ -L "$LINK" ] || fail "$1: enable 링크 없음"
@@ -190,10 +190,10 @@ check_layout() {
 	done
 	[ -S /run/orbivisor/orbivisord.sock ] || fail "$1: 새 데몬의 제어 소켓 없음: $(cat "$WORK/daemon.log")"
 	for d in /etc /var/lib /run; do
-		[ -d "$d/orbivisor" ] && [ ! -L "$d/orbivisor" ] || fail "$1: $d/orbivisor가 진짜 디렉터리가 아님: $(ls -la "$d")"
+		{ [ -d "$d/orbivisor" ] && [ ! -L "$d/orbivisor" ]; } || fail "$1: $d/orbivisor가 진짜 디렉터리가 아님: $(ls -la "$d")"
 		[ "$(readlink "$d/opl")" = orbivisor ] || fail "$1: $d/opl이 링크가 아님: $(ls -la "$d")"
 	done
-	[ -f /etc/orbivisor/orbivisord.toml ] && [ ! -L /etc/orbivisor/orbivisord.toml ] || fail "$1: orbivisord.toml이 진짜 파일이 아님"
+	{ [ -f /etc/orbivisor/orbivisord.toml ] && [ ! -L /etc/orbivisor/orbivisord.toml ]; } || fail "$1: orbivisord.toml이 진짜 파일이 아님"
 	[ "$(readlink /etc/orbivisor/opld.toml)" = orbivisord.toml ] || fail "$1: opld.toml이 링크가 아님"
 	[ "$(cat /var/lib/opl/repo-test.marker)" = keep ] || fail "$1: 옛 경로로 데이터를 읽지 못함"
 	[ "$(readlink /run/orbivisor/opld.sock)" = orbivisord.sock ] || fail "$1: 옛 이름 소켓 링크 없음"
@@ -284,12 +284,12 @@ printf 'name = "repo-test"\naddress = "127.0.0.1"\n' >/etc/opl/opld.toml
 echo keep >/var/lib/opl/repo-test.marker
 apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold "$DEB"
 [ "$(dpkg-query -W -f '${Version}' orbivisor)" = "$VERSION" ] || fail "V1에서 올린 버전: $(dpkg-query -W -f '${Version}' orbivisor)"
-[ -f "$UNIT" ] && [ ! -L "$UNIT" ] || fail "V1에서 올린 뒤: 유닛 파일이 진짜 파일이 아님: $(ls -l "$UNIT")"
+{ [ -f "$UNIT" ] && [ ! -L "$UNIT" ]; } || fail "V1에서 올린 뒤: 유닛 파일이 진짜 파일이 아님: $(ls -l "$UNIT")"
 [ "$(readlink /usr/lib/systemd/system/opld.service)" = orbivisord.service ] || fail "V1에서 올린 뒤: 옛 이름 opld.service는 별칭 링크가 아님"
 [ "$(readlink "$LINK")" = "$UNIT" ] || fail "V1에서 올린 뒤: enable 링크: $(ls -l "$LINK" 2>&1)"
 if [ -e "$OLD_LINK" ] || [ -L "$OLD_LINK" ]; then fail "V1에서 올린 뒤: 옛 이름 enable 링크가 남음"; fi
 [ "$(systemctl is-enabled orbivisord.service)" = enabled ] || fail "V1에서 올린 뒤: is-enabled orbivisord: $(systemctl is-enabled orbivisord.service 2>&1)"
-[ -f /etc/systemd/system/orbivisord.service.d/override.conf ] && [ ! -L /etc/systemd/system/orbivisord.service.d ] ||
+{ [ -f /etc/systemd/system/orbivisord.service.d/override.conf ] && [ ! -L /etc/systemd/system/orbivisord.service.d ]; } ||
 	fail "V1에서 올린 뒤: 덮어쓰기가 새 이름 디렉터리에 없음: $(ls -la /etc/systemd/system)"
 [ "$(readlink "$DROPIN")" = orbivisord.service.d ] || fail "V1에서 올린 뒤: 옛 이름 덮어쓰기가 링크가 아님"
 [ ! -e /usr/share/orbivisor/opld.toml.example ] || fail "V1에서 올린 뒤: 옛 예시 설정이 남음"

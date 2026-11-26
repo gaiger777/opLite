@@ -54,7 +54,7 @@ revert_ovn_units() {
 		old_name="opl-ovn-$db.service"
 		new="$SYSTEMD_ETC/$new_name"
 		old="$SYSTEMD_ETC/$old_name"
-		[ -f "$new" ] && [ ! -L "$new" ] && [ "$(head -n 1 "$new")" = "$OVN_MARK" ] || continue
+		{ [ -f "$new" ] && [ ! -L "$new" ] && [ "$(head -n 1 "$new")" = "$OVN_MARK" ]; } || continue
 		if [ -L "$old" ]; then
 			[ "$(readlink "$old")" = "$new_name" ] || continue
 		elif [ -e "$old" ]; then
