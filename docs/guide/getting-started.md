@@ -369,7 +369,7 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
   지우면서 opld를 멈추고 opld가 쓴 소스 파일(`oplite.sources`)을 지운다 — 데몬은 다시 켜지지만 그동안 멈춘다.
   그렇게 해서(또는 `apt remove`로) 옛 패키지가 `rc` 상태로 남았으면 purge하지 않는다(`apt purge`, `apt autoremove --purge`,
   `dpkg --purge` 정리 포함): 옛 `postrm purge`가 opld를 disable하고 enable 링크를 지워 다음 재부팅에 orbivisord가
-  시작하지 않는다. `dpkg -l oplite`가 `rc`면 그대로 두고, 이미 purge했다면 `sudo systemctl enable opld`를 한다.
+  시작하지 않는다. `dpkg -l oplite`가 `rc`면 그대로 두고, 이미 purge했다면 `sudo systemctl enable orbivisord`를 한다(계획 74부터 `opld`는 별칭이라 enable할 수 없다).
 - **전환 패키지 지우기.** 넘어간 뒤 `apt-get remove oplite`는 안전하다(파일·유지 스크립트가 없고 `orbivisor`가 의존하지
   않는다). `apt autoremove`가 전환 패키지를 스스로 지울 수도 있는데 이것도 안전하다. 저장소에는 판마다 `orbivisor`와
   함께 낸다(`build-repo.sh`에 둘 다 — 위 "저장소 만들기").
@@ -413,26 +413,40 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
   - postinst가 옛 enable 링크(`multi-user.target.wants/opld.service`)를 `orbivisord.service`로 옮기고, 덮어쓰기 디렉터리
     `/etc/systemd/system/opld.service.d/`를 `orbivisord.service.d/`로 옮긴 뒤 옛 이름을 링크로 남긴다. `daemon-reload`에서
     돌고 있는 `opld.service`가 별칭으로 `orbivisord.service`에 합쳐지고(MainPID 그대로) 다시 시작된다. chroot(systemd가 돌지
-    않음)에서는 링크만 옮긴다.
+    않음)에서는 링크만 옮긴다. `/etc/systemd/system/opld.service`가 진짜 파일(`systemctl edit --full opld`)이면
+    `orbivisord.service`로 옮기고(내용 그대로) 옛 이름을 링크로 남긴다. `systemctl mask opld`(→ `/dev/null`)였으면
+    `orbivisord.service`도 mask한 채 시작하지 않는다. 옮기지 못하면(읽기 전용 등) 알리고 패키지 설정을 실패로 끝낸다 — 옛
+    데몬은 그대로 돌고, 고친 뒤 `dpkg --configure -a`.
   - 새 orbivisord는 설정을 읽기 전에(root이고 `--config`가 없거나 기본 두 경로 중 하나일 때) 옛 디렉터리를 새 이름으로
     **맞바꾼다**(`renameat2(RENAME_EXCHANGE)` — 옛 경로가 풀리지 않는 순간이 없어 도는 QEMU·swtpm·ovsdb가 옛 경로로 열어도
     된다). 결과는 새 이름이 진짜 디렉터리, 옛 이름이 그것을 가리키는 링크다. 같은 방식으로 `opld.toml`을 `orbivisord.toml`로
     바꾸고 링크를 남긴다. 시작 로그에 `moved /var/lib/opl to /var/lib/orbivisor and left /var/lib/opl as a link`처럼 남는다.
     새로 설치한 노드에도 옛 이름 링크를 만든다. 옛 이름과 새 이름이 둘 다 진짜 디렉터리면 손대지 않고 경고한다(손으로 하나로
-    합치고 옛 이름을 링크로 만든다). 맞바꿈을 못 하는 파일 시스템이면 그대로 두고 경고한다.
+    합치고 옛 이름을 링크로 만든다). 맞바꾸지 못하면(옛 디렉터리가 마운트 지점, 맞바꿈을 받지 않는 파일 시스템, 옛 이름이
+    다른 곳으로의 링크) 거꾸로 새 이름을 옛 디렉터리로의 링크(`/var/lib/orbivisor → opl`)로 만들고 경고한다 — 데이터는 옛
+    자리 그대로다. 마운트 지점이면 경고대로 fstab(또는 마운트 유닛)의 마운트 지점을 새 이름으로 바꾸고 다시 시작하면 끝난다.
+    그 링크도 못 만들면 데이터 디렉터리는 데몬이 시작하지 않는다(빈 새 디렉터리로 다른 노드가 되지 않게). 맞추기를 하지 않는
+    경우(root가 아님, 기본이 아닌 `--config`)에는 기본 경로가 새 디렉터리가 없고 옛 디렉터리가 있으면 옛 자리다.
+  - 맞바꾼 뒤 `/etc/opl/opld.toml`은 `orbivisord.toml`로의 링크다. 옛 경로를 `sed -i`·Ansible `copy`처럼 바꿔 넣는 도구로
+    고치면 링크 자리에 파일이 생겨 두 파일이 된다 — 데몬은 더 늦게 고친 쪽을 읽고 경고한다. 새 경로를 고친다.
   - 설정 파일에 옛 경로(`data_dir = "/var/lib/opl"` 등)가 적혀 있어도 링크라 그대로 돈다(시작 로그에 한 번 안내). 다른 노드가 여는
     경로(RBD 풀의 conf 등)는 모든 노드가 새 판(기능 `orbivisor-layout`)일 때까지 옛 이름으로 적는다. 이름 바꾸기 앞에 저장한
     ACME 훅 경로(`/etc/opl/acme-hooks/…`)도 받는다(같은 곳이다).
   - OVN 중앙 노드는 orbivisord가 `opl-ovn-*.service`(Orbivisor 표시가 있는 파일)를 새 이름 파일로 옮기고 옛 이름을 링크로 바꾼다
-    — 도는 ovsdb·northd는 멈추지 않는다.
+    — 도는 ovsdb·northd는 멈추지 않는다. 단위 글이 옛 경로·옛 유닛 이름만 다르면 새 글로 쓰되 다시 시작하지 않는다(다음
+    정상 재시작 때 새 글로 뜬다).
   - 웹 로그인은 두 이름의 쿠키를 함께 받으므로 VIP·프록시 뒤에서 옛 노드와 새 노드를 번갈아 만나도 세션이 이어진다. 로그아웃은
-    넷 다 지운다.
+    넷 다 지운다. 버전이 섞인 동안 한 브라우저에서 사용자를 바꿀 때는 먼저 로그아웃한다: 옛 노드는 옛 이름 쿠키만 쓰고
+    지우므로, 로그아웃 없이 옛 노드에서 다른 사용자로 로그인한 뒤 옛 노드에서 로그아웃하면 새 이름 쿠키의 앞 사용자 세션이 남을
+    수 있다(새 노드는 두 쿠키가 다르면 더 나중의 로그인인 옛 이름 쪽을 본다).
 - **옛 이름은 언제까지.** 경로 링크, `opld.service` 별칭, `opld.sock` 링크, OVN 유닛 링크는 없애지 않는다(저장된 경로와 운영
   스크립트가 쓴다). 실행 때 읽는 환경 변수의 옛 이름(`OPL_CONFIG`, `OPL_SOCKET`, `OPL_SERVER`, `OPL_TOKEN`, `OPL_CA_PEM`,
   `OPL_CA_FINGERPRINT`, `OPL_ACME_DNS_SECRET`, `OPL_ACME_EAB_HMAC`, `OPL_ESXI_PASSWORD`, `OPL_VMWARE_PASSWORD`, `OPL_LOG`,
-  `OPL_QEMU_SHARE` — orbivisorctl, Terraform 공급자는 그중 넷)은 "warning: environment variable OPL_SERVER is deprecated; use
-  ORBIVISOR_SERVER"처럼 경고하고 받는다. 둘 다 있으면 새 것이다. 빌드 변수(`ORBIVISOR_VERSION` 등)도 옛 이름으로 빌드한 파이프라인이
-  값을 잃지 않게 옛 이름을 받는다. 옛 이름 받기(환경 변수, 쿠키, CLI 로그인 파일, 일시 유닛 옛 접두사)는 **다음 판에서 뺀다** —
+  `OPL_QEMU_SHARE` — orbivisorctl·orbivisor-devserver(`OPL_LOG`)·시험(`OPL_QEMU_SHARE`)이 받고, Terraform 공급자는 그중 넷)은 "warning: environment variable OPL_SERVER is deprecated; use
+  ORBIVISOR_SERVER"처럼 경고하고 받는다. 둘 다 있으면 새 것이다. 옛 이름으로 빌드한 파이프라인이 값을 잃지 않게
+  바이너리에 넣는 빌드 변수(`ORBIVISOR_VERSION`·`ORBIVISOR_APT_URL`·`ORBIVISOR_TELEMETRY_URL`·`ORBIVISOR_LICENSE_KEYS`)와
+  `build-deb.sh`의 `ORBIVISOR_LICENSE_KEYS`·`ORBIVISOR_APT_KEY`·`ORBIVISOR_BIN_DIR`도 옛 이름을 받는다(나머지 빌드·시험 변수는
+  받지 않는다). `orbivisorctl login`·`logout`은 옛 로그인 파일(`~/.config/opl/oplctl.json`)의 토큰도 지운다. 옛 이름 받기(환경 변수, 쿠키, CLI 로그인 파일, 일시 유닛 옛 접두사)는 **다음 판에서 뺀다** —
   스크립트·CI는 지금 `ORBIVISOR_*`로 바꾼다.
 - **로그.** 유닛의 원래 이름이 바뀌었으므로 `journalctl -u opld`는 **바꾸기 앞의 로그만** 보인다. 새 로그는
   `journalctl -u orbivisord`다(OVN은 `-u orbivisor-ovn-nb` 등). `RUST_LOG`의 대상도 크레이트 이름을 따라 `opl_api=debug`가

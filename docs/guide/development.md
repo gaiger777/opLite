@@ -6,6 +6,8 @@
 
 Linux에서 빌드하려면 `libssl-dev`와 `pkg-config`가 필요하다(클라이언트 TLS가 native-tls다).
 
+시험·빌드 환경 변수는 계획 74에서 이름이 바뀌었다(`ORBIVISOR_TEST_*` 등 — 옛 이름은 받지 않으므로 시험 서버의 셸 설정도 바꾼다).
+
 ```bash
 cargo test --workspace                                              # 단위 테스트
 brew install qemu                                                   # macOS 통합 테스트용 (Linux: 위 apt 패키지)
@@ -444,7 +446,7 @@ SHA-256 핀, setup-go 1.26.11, staticcheck v0.8.2, govulncheck v1.9.0)이 `orbiv
 
 ```bash
 pnpm -C web install
-pnpm -C web dev              # http://localhost:5173, /api는 OPLD_URL(기본 https://localhost:8006)로 넘긴다
+pnpm -C web dev              # http://localhost:5173, /api는 ORBIVISOR_URL(기본 https://localhost:8006)로 넘긴다
 pnpm -C web test             # 단위·컴포넌트 테스트 (Vitest) — axe 접근성 검사와 색 토큰 대비 시험 포함
 pnpm -C web test src/tokens.test.ts   # 색 토큰 대비만: index.css의 밝음·어두움 oklch 값으로 글 4.5:1, 상태 칩 4.5:1, 포커스 링·차트 3:1
 pnpm -C web test src/cpu           # CPU 모델 고르기·플래그 칩·보류 표시·설정의 CPU 칸(msw)

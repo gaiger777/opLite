@@ -169,9 +169,9 @@ graph LR
 
 ### 2.1 실행 모드
 
-`orbivisord`에는 하위 명령이 없다. 인자는 `--config`(기본 `/etc/orbivisor/orbivisord.toml`, 없고 옛 `/etc/opl/opld.toml`이 있으면 그것)와 `--release-vips`뿐이다
-(`crates/orbivisord/src/main.rs:66-73`). `--release-vips`는 systemd `ExecStopPost`가 부르는 VIP 떼기 전용이다
-(`main.rs:354-376`). 노드의 성격은 설정과 저장소가 정한다.
+`orbivisord`의 인자는 `--config`(기본 `/etc/orbivisor/orbivisord.toml`, 없고 옛 `/etc/opl/opld.toml`이 있으면 그것)와 `--release-vips`, 그리고
+데몬이 띄우는 헬퍼용 하위 명령 `backup-serve`다(`crates/orbivisord/src/main.rs:69-91`). `--release-vips`는 systemd `ExecStopPost`가 부르는 VIP 떼기 전용이다
+(`main.rs:436-460`). 노드의 성격은 설정과 저장소가 정한다.
 
 | 상태 | 정하는 것 | 도는 것 |
 |---|---|---|
@@ -233,7 +233,7 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 
 | 경로 | 내용 | 인용 |
 |---|---|---|
-| `orbivisord.lock`, `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock(옛 이름도 잠가 옛 판 데몬과도 막음) | `main.rs:393-411` |
+| `orbivisord.lock`, `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock(옛 이름도 잠가 옛 판 데몬과도 막음) | `main.rs:477-502` |
 | `node-id` | 노드 UUID | `crates/orbivisord/src/bootstrap.rs:27` |
 | `pki/` | `ca.crt`, `node.crt`, `node.key`(0600) | `crates/orbivisor-peer/src/pki.rs:31-35` |
 | `cluster/cluster.redb` | Raft 로그 + 상태 머신 + 스냅샷 | `crates/orbivisor-cluster/src/cluster.rs:46` |
@@ -250,7 +250,7 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 
 `run_dir/vm/<id>/`에는 `qmp.sock`, `vnc.sock`, `qga.sock`, `tpm.sock`, `qemu.pid`, `swtpm.pid`, `cidata.iso`가 있다
 (`crates/orbivisor-qemu/src/paths.rs:35-46`). 파일 복원 세션은 `run_dir/file-restore/<세션 id>/`에 `ctl.sock`(에이전트 채널)·`nbd.sock`(저장소
-백업 원본)·`qemu.pid`를 둔다(계획 69). `/etc/orbivisor/orbivisord.toml`(또는 옛 `/etc/opl/opld.toml`)이 유닛의 `ConditionPathExists`다. 데몬은 시작할 때 옛 디렉터리(`/etc/opl`·`/var/lib/opl`·`/run/opl`·`/var/log/opl`)를 새 이름으로 맞바꿔 옮기고 옛 이름을 링크로 남긴다(`crates/orbivisord/src/layout.rs`, 계획 74).
+백업 원본)·`qemu.pid`를 둔다(계획 69). `/etc/orbivisor/orbivisord.toml`(또는 옛 `/etc/opl/opld.toml`)이 유닛의 `ConditionPathExists`다. 데몬은 시작할 때 옛 디렉터리(`/etc/opl`·`/var/lib/opl`·`/run/opl`·`/var/log/opl`)를 새 이름으로 맞바꿔 옮기고 옛 이름을 링크로 남긴다. 맞바꾸지 못하면(마운트 지점 등) 새 이름을 옛 디렉터리로의 링크로 만들고, 그것도 못 하면 데이터 디렉터리는 시작하지 않는다. 맞추지 않은 노드(root가 아님, 기본이 아닌 `--config`)의 기본 경로는 옛 디렉터리다(`crates/orbivisord/src/layout.rs`, 계획 74).
 
 ### 2.4 시작 순서
 
