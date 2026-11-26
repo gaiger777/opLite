@@ -406,9 +406,16 @@ mod tests {
         let mut ask = |_: &str| -> anyhow::Result<String> { Ok(answers.pop().unwrap()) };
         let mut err = Vec::new();
         let prompt = json!({ "methods": ["totp", "recovery"], "enroll": false });
-        second_step(&client, "orbivisor_session=x", &prompt, None, &mut ask, &mut err)
-            .await
-            .unwrap();
+        second_step(
+            &client,
+            "orbivisor_session=x",
+            &prompt,
+            None,
+            &mut ask,
+            &mut err,
+        )
+        .await
+        .unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].body, json!({ "totp": "111111" }));
         assert_eq!(seen[1].body, json!({ "recovery": "abcd-efgh-ijkl-mnop" }));
