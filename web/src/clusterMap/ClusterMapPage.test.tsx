@@ -1,15 +1,26 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
+import { useState } from "react";
 
 import type { AlertView } from "@/alerts/alerts";
 import { listKey } from "@/api/live";
 import type { Task } from "@/api/types";
 import { ClusterMapPage } from "@/clusterMap/ClusterMapPage";
+import InfraMap, { type MapSelection } from "@/clusterMap/InfraMap";
 import { AppLayout } from "@/layout/AppLayout";
 import { PLACEMENT_KEY } from "@/placement/balance";
 import { expectNoAxeViolations } from "@/test/axe";
-import { layerStatus, load, mapNode, mapPool, mapVm, placement, vmId } from "@/test/clusterMap";
+import {
+  layerStatus,
+  load,
+  mapNode,
+  mapPool,
+  mapVm,
+  physicalTopology,
+  placement,
+  vmId,
+} from "@/test/clusterMap";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -100,6 +111,7 @@ function mockCluster({
   stage = "copying-disks",
   vms = VMS,
   limited = false,
+  physicalStatus = 200,
 }: {
   placementStatus?: number;
   clusterStatus?: number;
@@ -107,6 +119,8 @@ function mockCluster({
   stage?: string;
   vms?: typeof VMS;
   limited?: boolean;
+  /** `GET /topology/physical`(계획 75): 200이면 n1의 eno1이 끊긴 자료, 아니면 그 상태(409 `cluster_upgrading`·403) */
+  physicalStatus?: number;
 } = {}) {
   mockLists({
     node: [A, B, C, W],
@@ -145,8 +159,25 @@ function mockCluster({
     http.get(apiUrl("/alerts"), () =>
       HttpResponse.json({ alerts: [ALERT], unreachable: [], unsupported: [] }),
     ),
+    http.get(apiUrl("/topology/physical"), () => {
+      physicalCalls += 1;
+      return physicalStatus === 200
+        ? HttpResponse.json(physicalTopology([A, B, C, W], { n1: ["eno1"] }))
+        : HttpResponse.json(
+            {
+              code: physicalStatus === 409 ? "cluster_upgrading" : "forbidden",
+              message: "no",
+            },
+            { status: physicalStatus },
+          );
+    }),
   );
 }
+
+let physicalCalls = 0;
+beforeEach(() => {
+  physicalCalls = 0;
+});
 
 const pref = (key: string) => localStorage.getItem(`opl.${ADMIN.user}.clusterMap.${key}`);
 
@@ -735,4 +766,163 @@ it("keeps [ for the map while it has focus and for the sidebar elsewhere", async
   expect(await screen.findByText(/^Node n1, group a/, { selector: "p" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Expand sidebar" })).toBeNull();
+});
+
+it("reads the physical topology only with the network layer on", async () => {
+  mockCluster();
+  const { unmount } = renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  await within(map).findByRole("button", { name: /^Node n1,/ });
+  expect(physicalCalls).toBe(0);
+  expect(within(map).queryByText(/^vmbr0 · /)).toBeNull();
+  unmount();
+
+  localStorage.setItem(`opl.${ADMIN.user}.clusterMap.layers`, "load,network");
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const net = await picture();
+  // 판마다 레일(브리지 vmbr0의 lan·v100, underlay), 장애 꼬리표, 범례의 포트·레일
+  expect(await within(net).findAllByText("vmbr0 · 2 networks")).toHaveLength(2);
+  expect(within(net).getAllByText("Underlay (VXLAN) · 1 network")).toHaveLength(2);
+  expect(within(net).getByText("link ✕ 1")).toBeInTheDocument();
+  expect(
+    within(net).getByRole("button", { name: /^Node n1, .*, 1 link fault$/ }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("list", { name: "Legend" })).toHaveTextContent("Network rail");
+});
+
+it("focuses the port named in ?focus=port: and opens its sheet with the impact", async () => {
+  mockCluster();
+  renderPage(<ClusterMapPage />, {
+    path: "/cluster/map",
+    url: "/cluster/map?focus=port:n1/eno1",
+  });
+  const map = await picture();
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  // 네트워크 레이어를 (기억하지 않고) 켜고 물리 관계가 온 뒤 그 포트로
+  await waitFor(() => expect(document.activeElement).toBe(n1));
+  const card = await screen.findByText("Port eno1 on n1");
+  expect(card.closest("[data-map-card]")).toHaveTextContent(
+    "Affected: no redundancy for networks 2, VMs 3",
+  );
+  expect(pref("layers")).toBeNull();
+  expect(screen.queryByRole("dialog")).toBeNull();
+  fireEvent.keyDown(n1, { key: "Enter" });
+  const sheet = await screen.findByRole("dialog", { name: "Port eno1 on n1" });
+  expect(within(sheet).getByText("Switch: sw1 · Gi1/0/1")).toBeVisible();
+  expect(within(sheet).getByText("Bridges: vmbr0")).toBeVisible();
+  expect(within(sheet).getByText("lan, v100")).toBeVisible();
+  // 다음 포트 eno2는 LLDP가 없다 — lldpd 안내
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(n1));
+  fireEvent.keyDown(n1, { key: "ArrowRight" });
+  fireEvent.keyDown(n1, { key: "Enter" });
+  const next = await screen.findByRole("dialog", { name: "Port eno2 on n1" });
+  expect(within(next).getByText("Install lldpd to see the switch port.")).toBeVisible();
+});
+
+it.each([409, 403])(
+  "keeps the single uplink band when the physical topology answers %i",
+  async (status) => {
+    localStorage.setItem(`opl.${ADMIN.user}.clusterMap.layers`, "load,network");
+    mockCluster({ physicalStatus: status });
+    renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+    const map = await picture();
+    await within(map).findByRole("button", { name: /^Node n1,/ });
+    await waitFor(() => expect(physicalCalls).toBe(1));
+    expect(within(map).queryByText(/networks?$/)).toBeNull();
+    expect(screen.getByRole("list", { name: "Legend" })).toHaveTextContent("Uplinks up");
+    expect(screen.getByRole("list", { name: "Legend" })).not.toHaveTextContent("Network rail");
+    // 다시 묻지 않는다(403·409)
+    await new Promise((r) => setTimeout(r, 50));
+    expect(physicalCalls).toBe(1);
+  },
+);
+
+describe("home variant", () => {
+  it("reports selections instead of opening a sheet, with the legend folded", async () => {
+    mockCluster();
+    const onSelect = vi.fn();
+    renderPage(<InfraMap variant="home" onSelect={onSelect} />, { path: "/" });
+    const map = await picture();
+    // 홈은 쪽 머리글 없이, 기본 레이어에 네트워크(물리 관계를 읽음)
+    expect(screen.queryByRole("heading", { name: "Map" })).toBeNull();
+    expect(await within(map).findAllByText("vmbr0 · 2 networks")).toHaveLength(2);
+    expect(map.getAttribute("class")).toContain("h-[26rem]");
+    const legend = screen.getByText("Legend", { selector: "summary" });
+    expect(legend.closest("details")).not.toHaveAttribute("open");
+    // 도구 띠는 보기 설정 단추 하나로 접힘
+    expect(screen.queryByLabelText("Group by")).toBeNull();
+    expect(screen.getByRole("button", { name: "View settings" })).toBeVisible();
+
+    const n1 = within(map).getByRole("button", { name: /^Node n1,/ });
+    fireEvent.click(n1);
+    expect(onSelect).toHaveBeenLastCalledWith({ kind: "node", id: A.id });
+    act(() => n1.focus());
+    fireEvent.keyDown(n1, { key: "p" });
+    fireEvent.keyDown(n1, { key: "Enter" });
+    expect(onSelect).toHaveBeenLastCalledWith({ kind: "port", node: A.id, port: "eno1" });
+    fireEvent.keyDown(n1, { key: "ArrowDown" });
+    fireEvent.keyDown(n1, { key: "Enter" });
+    expect(onSelect).toHaveBeenLastCalledWith({ kind: "rail", id: "vmbr0" });
+    fireEvent.keyDown(n1, { key: "Escape" });
+    fireEvent.keyDown(n1, { key: "]" });
+    fireEvent.keyDown(n1, { key: "Enter" });
+    expect(onSelect).toHaveBeenLastCalledWith({ kind: "vm", id: vmId(2) });
+    // 빈 곳을 누르면 고른 것을 푼다
+    fireEvent.click(map);
+    expect(onSelect).toHaveBeenLastCalledWith(null);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("lights the selected element and moves to the focus without taking the page's focus", async () => {
+    mockCluster();
+    function Harness() {
+      const [selected, setSelected] = useState<MapSelection | undefined>({
+        kind: "node",
+        id: B.id,
+      });
+      const [focus, setFocus] = useState<string | undefined>();
+      return (
+        <>
+          <button onClick={() => setSelected({ kind: "rail", id: "vmbr0" })}>rail</button>
+          <button
+            onClick={() => {
+              setSelected(undefined);
+              setFocus("port:n1/eno1");
+            }}
+          >
+            port
+          </button>
+          <InfraMap variant="home" selected={selected} focus={focus} />
+        </>
+      );
+    }
+    renderPage(<Harness />, { path: "/" });
+    const map = await picture();
+    await within(map).findByRole("button", { name: /^Node n2,/ });
+    const css = () => map.querySelector("style")!.textContent!;
+    expect(css()).toContain(`g[data-key="node:${B.id}"]`);
+    expect(css()).toContain("{opacity:.35}");
+    // 레일을 고르면 그 레일을 쓰는 노드(증인 아님)를 밝힌다
+    fireEvent.click(screen.getByRole("button", { name: "rail" }));
+    await waitFor(() => expect(css()).toContain(`g[data-key="node:${C.id}"]`));
+    expect(css()).not.toContain(`g[data-key="node:${W.id}"]`);
+    const port = screen.getByRole("button", { name: "port" });
+    act(() => port.focus());
+    fireEvent.click(port);
+    expect(await screen.findByText("Port eno1 on n1")).toBeInTheDocument();
+    expect(document.activeElement).toBe(port);
+  });
+
+  it("has no axe violations in the home variant", async () => {
+    mockCluster();
+    const { container } = renderPage(<InfraMap variant="home" onSelect={() => {}} />, {
+      path: "/",
+    });
+    const map = await picture();
+    await within(map).findAllByText("vmbr0 · 2 networks");
+    await expectNoAxeViolations(container, { disable: ["region"] });
+  });
 });

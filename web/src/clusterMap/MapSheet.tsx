@@ -45,7 +45,9 @@ export type SheetTarget =
   | { kind: "vm"; id: string }
   /** 노드의 VM 목록("+N"·요약 단계의 `]`). `node`가 `null`이면 배치 안 됨 */
   | { kind: "vms"; node: string | null }
-  | { kind: "move"; key: string };
+  | { kind: "move"; key: string }
+  /** 포트·레일(계획 75): 쪽이 주는 몸통(`info`) — 카드와 같은 글 */
+  | { kind: "info"; key: string; title: string };
 
 const PHASE_TONE = {
   running: "success",
@@ -330,6 +332,7 @@ export function MapSheet({
   beforeReturn,
   onTarget,
   onClose,
+  info,
 }: {
   target: SheetTarget | null;
   phone: boolean;
@@ -343,6 +346,8 @@ export function MapSheet({
   beforeReturn?(): void;
   onTarget(target: SheetTarget): void;
   onClose(): void;
+  /** `info` 서랍의 몸통(포트·레일) */
+  info?(key: string): React.ReactNode;
 }) {
   const { t } = useTranslation();
   const nodeName = (id?: string | null) => nodes.find((n) => n.id === id)?.name ?? "—";
@@ -392,6 +397,16 @@ export function MapSheet({
         nodeName={linkName}
         onApplied={onClose}
       />
+    );
+  } else if (target?.kind === "info") {
+    const content = info?.(target.key);
+    body = content && (
+      <>
+        <SheetHeader>
+          <SheetTitle>{target.title}</SheetTitle>
+        </SheetHeader>
+        <div className="px-4 pb-6 text-sm">{content}</div>
+      </>
     );
   }
   return (
