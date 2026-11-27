@@ -2452,7 +2452,12 @@
     "ringing": "경보 보기",
     "failedCount": "실패 {{count}}",
     "clusterHidden": "노드·용량·클러스터 차트는 클러스터를 읽을 권한이 있어야 보입니다.",
-    "boardAfterUpgrade": "모든 노드를 업그레이드하면 운영자 대시보드(지도·자세히 판·노드별 할당)가 보입니다."
+    "boardAfterUpgrade": "모든 노드를 업그레이드하면 운영자 대시보드(지도·자세히 판·노드별 할당)가 보입니다.",
+    "more": {
+      "label": "위젯 더 보기",
+      "show": "위젯 더 보기",
+      "hide": "위젯 접기"
+    }
   },
   "settings": {
     "updates": "업데이트",
@@ -3579,7 +3584,9 @@
     "open": "열기",
     "addresses": "주소",
     "viewDeleted": "보기 {{name}}을(를) 지웠습니다.",
-    "noMatch": "검색·거름에 맞는 것이 없습니다."
+    "noMatch": "검색·거름에 맞는 것이 없습니다.",
+    "details": "{{name}} 자세히 펼치기",
+    "more": "자세히"
   },
   "impact": {
     "vmsAssigned": "배정된 VM: {{count}}개",

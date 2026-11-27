@@ -310,3 +310,75 @@ it("shows the empty state for an empty list and a no-match line for a filtered o
   expect(await screen.findByText("Nothing matches the search or filter.")).toBeInTheDocument();
   expect(screen.queryByText("No demos yet.")).not.toBeInTheDocument();
 });
+
+it("shows the columns a narrow screen hides in an expanded row (plan 77-6)", async () => {
+  const { container } = renderPage(<Harness />);
+  const table = await screen.findByRole("table", { name: "Demo" });
+  const toggle = within(table).getByRole("button", { name: "Show details for alpha" });
+  // 가장 늦게 숨는 열(종류, 1280px 밑)에 맞춰 단추도 그 폭에서만 보인다.
+  expect(toggle.closest("td")).toHaveClass("xl:hidden");
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await userEvent.click(toggle);
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  const detail = document.getElementById(toggle.getAttribute("aria-controls")!)!;
+  expect(within(detail).getByText("Size").closest("div")).toHaveClass("lg:hidden");
+  expect(within(detail).getByText("Kind").closest("div")).toHaveClass("xl:hidden");
+  expect(detail).toHaveTextContent("3 GiB");
+  await expectNoAxeViolations(container, { disable: ["region"] });
+  await userEvent.click(toggle);
+  expect(document.getElementById(toggle.getAttribute("aria-controls")!)).toBeNull();
+});
+
+it("keeps detail-only columns out of the table and in the expanded row", async () => {
+  const columns: Column<Row>[] = [
+    { id: "name", header: "Name", cell: (r) => r.name },
+    { id: "kind", header: "Kind", cell: (r) => `kind ${r.kind}`, priority: 4 },
+  ];
+  renderPage(
+    <DataTable
+      id="d4"
+      rows={ROWS}
+      columns={columns}
+      rowId={(r) => r.id}
+      rowName={(r) => r.name}
+      empty="-"
+    />,
+  );
+  expect(await screen.findByRole("columnheader", { name: "Kind" })).toHaveClass("hidden");
+  const toggle = screen.getByRole("button", { name: "Show details for beta" });
+  expect(toggle.closest("td")).not.toHaveClass("xl:hidden");
+  await userEvent.click(toggle);
+  const detail = document.getElementById(toggle.getAttribute("aria-controls")!)!;
+  expect(within(detail).getByText("kind b").closest("div")).not.toHaveClass("hidden");
+});
+
+it("splits a long list into pages and keeps selections from other pages", async () => {
+  const many: Row[] = Array.from({ length: 7 }, (_, i) => ({
+    id: String(i),
+    name: `vm-${i}`,
+    size: i,
+    kind: "a",
+  }));
+  const columns: Column<Row>[] = [{ id: "name", header: "Name", cell: (r) => r.name }];
+  renderPage(
+    <DataTable
+      id="paged"
+      rows={many}
+      columns={columns}
+      rowId={(r) => r.id}
+      rowName={(r) => r.name}
+      empty="-"
+      pageSize={3}
+      bulk={(chosen) => <span>bulk:{chosen.map((r) => r.name).join(",")}</span>}
+    />,
+  );
+  const table = await screen.findByRole("table");
+  expect(within(table).getAllByRole("row")).toHaveLength(4);
+  expect(screen.getByRole("navigation", { name: "Pages" })).toHaveTextContent("1–3 of 7");
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select vm-0" }));
+  await userEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(within(table).getByText("vm-3")).toBeInTheDocument();
+  expect(within(table).queryByText("vm-0")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  expect(screen.getByText("bulk:vm-0,vm-3,vm-4,vm-5")).toBeInTheDocument();
+});

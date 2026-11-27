@@ -137,7 +137,7 @@ it("does not offer a delete without the volumes", async () => {
   renderPage(<PoolsPage />);
   const local = (await screen.findByText("local")).closest("tr")!;
   expect(within(local).getByRole("button", { name: "Delete local" })).toBeDisabled();
-  expect(within(local).getAllByRole("cell").at(-2)).toHaveTextContent("—");
+  expect(within(local).getAllByRole("cell").at(-3)).toHaveTextContent("—");
 });
 
 it("creates a pool on the chosen nodes", async () => {

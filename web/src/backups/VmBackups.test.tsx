@@ -120,7 +120,12 @@ it("hides backup changes from viewers", async () => {
   const table = await screen.findByRole("table", { name: "Backups" });
   await within(table).findByText("web-20261104-030000");
   expect(screen.queryByRole("button", { name: "Back up now" })).not.toBeInTheDocument();
-  expect(within(table).queryByRole("button")).not.toBeInTheDocument();
+  // 펼침 단추(숨은 열 보기, 계획 77-6) 말고는 단추가 없다.
+  expect(
+    within(table)
+      .queryAllByRole("button")
+      .filter((b) => !b.hasAttribute("aria-expanded")),
+  ).toEqual([]);
 });
 
 it("asks for an incremental backup when chosen", async () => {

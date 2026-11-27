@@ -2452,7 +2452,12 @@
     "ringing": "View alerts",
     "failedCount": "{{count}} failed",
     "clusterHidden": "Nodes, capacity and cluster charts need permission to read the cluster.",
-    "boardAfterUpgrade": "Upgrade every node to see the operator dashboard (map, details and allocation by node)."
+    "boardAfterUpgrade": "Upgrade every node to see the operator dashboard (map, details and allocation by node).",
+    "more": {
+      "label": "More widgets",
+      "show": "Show more widgets",
+      "hide": "Hide widgets"
+    }
   },
   "settings": {
     "updates": "Updates",
@@ -3579,7 +3584,9 @@
     "open": "Open",
     "addresses": "Addresses",
     "viewDeleted": "View {{name}} deleted.",
-    "noMatch": "Nothing matches the search or filter."
+    "noMatch": "Nothing matches the search or filter.",
+    "details": "Show details for {{name}}",
+    "more": "Details"
   },
   "impact": {
     "vmsAssigned": "VMs assigned to it: {{count}}",

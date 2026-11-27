@@ -7,8 +7,17 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { cn } from "cn";
-import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
-import { type HTMLAttributes, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronRight } from "lucide-react";
+import {
+  Fragment,
+  type HTMLAttributes,
+  type ReactNode,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
@@ -16,6 +25,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { ColumnMenu, ViewMenu } from "@/components/data-table/Toolbar";
 import { readCols, type TableState, type View, writeCols } from "@/components/data-table/state";
 import { ACTION_ICONS } from "@/components/icons";
+import { Pager, usePage } from "@/components/Pager";
 import { tableMessage, TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -43,8 +53,11 @@ export interface Column<T> {
   value?(row: T): string | number;
   /** 칸의 클래스(행에 따라 다르면 함수) */
   className?: string | ((row: T) => string | undefined);
-  /** 1(늘), 2(1024px 미만에서 숨김), 3(1280px 미만에서 숨김). 휴대폰 카드는 1만 보인다. */
-  priority?: 1 | 2 | 3;
+  /**
+   * 1(늘), 2(1024px 미만에서 숨김), 3(1280px 미만에서 숨김), 4(열로는 안 보이고 펼침 행에만). 숨은 열은 행의 펼침 단추(▸)로
+   * 행 아래에 보인다(계획 77-6 — 넓은 화면에서도 가로 스크롤 없이). 휴대폰 카드는 1만 보이고 나머지는 "자세히"로 편다.
+   */
+  priority?: 1 | 2 | 3 | 4;
   /** 행 동작(머리 글은 화면 읽기에만, 카드에서는 오른쪽 위). 숨기거나 정렬하지 않는다. */
   actions?: boolean;
 }
@@ -57,7 +70,9 @@ export interface Filter<T> {
   test(row: T, value: string): boolean;
 }
 
-const PRIORITY_CLASS = { 1: "", 2: "max-lg:hidden", 3: "max-xl:hidden" } as const;
+const PRIORITY_CLASS = { 1: "", 2: "max-lg:hidden", 3: "max-xl:hidden", 4: "hidden" } as const;
+/** 펼침 행 안에서 그 열이 보일 폭(표에 열로 보이는 폭에서는 감춘다) */
+const DETAIL_CLASS = { 1: "hidden", 2: "lg:hidden", 3: "xl:hidden", 4: "" } as const;
 const PHONE = "(max-width: 767px)";
 /** 목록 쿼리를 주지 않은 표 */
 const NO_QUERY = { isPending: false, isError: false, error: null };
@@ -110,6 +125,8 @@ interface Props<T> {
   rowProps?(row: T, selected: readonly T[]): HTMLAttributes<HTMLTableRowElement> & { id?: string };
   /** 도구 줄 끝에 더할 것 */
   toolbar?: ReactNode;
+  /** 주면 이만큼씩 페이지를 나눈다(계획 77-6 — 긴 목록을 한 쪽에 다 그리지 않게). 단축키·고르기는 지금 페이지 안에서다. */
+  pageSize?: number;
 }
 
 /**
@@ -129,6 +146,9 @@ export function DataTable<T>(props: Props<T>) {
   // 고른 행의 id(행이 바뀌거나 다시 정렬돼도 같은 행을 가리킨다)
   const [active, setActive] = useState<string | null>(null);
   const [peekOpen, setPeekOpen] = useState(false);
+  // 펼친 행의 id(숨은 열을 행 아래에 보인다)
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  const detailId = useId();
   // Shift 범위의 기준 행 id(색인을 두면 정렬·거름·상태가 바뀐 뒤 다른 행을 가리킨다)
   const anchor = useRef<string | null>(null);
   const rowEls = useRef(new Map<number, HTMLElement>());
@@ -199,12 +219,14 @@ export function DataTable<T>(props: Props<T>) {
     // 되풀이하고 화면이 바뀌지 않는다(브라우저에서 사이드바를 눌러도 주소만 바뀜).
     autoResetAll: false,
   });
-  const rows = table.getRowModel().rows.map((r) => r.original);
+  const sortedRows = table.getRowModel().rows.map((r) => r.original);
+  const paged = usePage(sortedRows, props.pageSize ?? Math.max(sortedRows.length, 1));
+  const rows = paged.pageItems;
   const visible = allColumns.filter((c) => !hidden.includes(c.id));
   const byId = new Map(allColumns.map((c) => [c.id, c]));
 
   // 거름·검색으로 보이지 않게 된 행은 고르기에서 뺀다(보이지 않는 VM에 일괄 동작이 가지 않게).
-  const visibleKey = rows.map(rowId).join("\n");
+  const visibleKey = sortedRows.map(rowId).join("\n");
   useEffect(() => {
     const shown = new Set(visibleKey.split("\n"));
     setSelected((prev) => {
@@ -212,7 +234,8 @@ export function DataTable<T>(props: Props<T>) {
       return next.size === prev.size ? prev : next;
     });
   }, [visibleKey]);
-  const chosen = rows.filter((row) => selected.has(rowId(row)));
+  // 다른 페이지에서 고른 행도 일괄 동작에 든다.
+  const chosen = sortedRows.filter((row) => selected.has(rowId(row)));
   const found = active === null ? -1 : rows.findIndex((row) => rowId(row) === active);
   const current = found >= 0 ? found : null;
   const activeRow = current !== null ? rows[current] : undefined;
@@ -314,15 +337,65 @@ export function DataTable<T>(props: Props<T>) {
       }}
     />
   );
-  const all = rows.length > 0 && chosen.length === rows.length;
+  const onPage = rows.filter((row) => selected.has(rowId(row))).length;
+  const all = rows.length > 0 && onPage === rows.length;
   const selectAll = (
     <Checkbox
       aria-label={t("table.selectAll")}
-      checked={all || (chosen.length > 0 && "indeterminate")}
-      onCheckedChange={(v) => setSelected(v === true ? new Set(rows.map(rowId)) : new Set())}
+      checked={all || (onPage > 0 && "indeterminate")}
+      onCheckedChange={(v) => {
+        const next = new Set(selected);
+        for (const row of rows) {
+          if (v === true) {
+            next.add(rowId(row));
+          } else {
+            next.delete(rowId(row));
+          }
+        }
+        setSelected(next);
+      }}
     />
   );
-  const colSpan = visible.length + (selectable ? 1 : 0);
+  // 이 폭에서 열로 안 보이는 것(펼침 행에 보일 것). 가장 늦게 숨는 열이 펼침 단추를 보일 폭을 정한다.
+  const detailCols = visible.filter((c) => !c.actions && (c.priority ?? 1) > 1);
+  const deepest = Math.max(1, ...detailCols.map((c) => c.priority ?? 1)) as 1 | 2 | 3 | 4;
+  const expandable = detailCols.length > 0;
+  const expandClass = DETAIL_CLASS[deepest];
+  const toggleExpanded = (row: T) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(rowId(row))) {
+        next.add(rowId(row));
+      }
+      return next;
+    });
+  const expandButton = (row: T, open: boolean, controls: string) => (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      aria-expanded={open}
+      aria-controls={controls}
+      aria-label={t("table.details", { name: rowName(row) })}
+      onClick={() => toggleExpanded(row)}
+    >
+      <ChevronRight aria-hidden className={cn("transition-transform", open && "rotate-90")} />
+    </Button>
+  );
+  /** 숨은 열을 이름·값으로(넓은 화면에서 열로 보이는 것은 그 폭에서 감춘다) */
+  const detailList = (row: T, phoneCard: boolean) => (
+    <dl className="grid grid-cols-[repeat(auto-fill,minmax(12rem,1fr))] gap-x-6 gap-y-2 text-sm">
+      {detailCols.map((c) => (
+        <div
+          key={c.id}
+          className={cn("flex min-w-0 flex-col", !phoneCard && DETAIL_CLASS[c.priority ?? 1])}
+        >
+          <dt className="text-xs text-muted-foreground">{c.header}</dt>
+          <dd className="min-w-0 break-words whitespace-normal">{c.cell(row)}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+  const colSpan = visible.length + (selectable ? 1 : 0) + (expandable ? 1 : 0);
   const loading = props.query?.isPending === true && props.rows.length === 0;
   const hideable = props.columns.filter((c, i) => i > 0 && !c.actions);
   const rowState = (row: T, index: number) => ({
@@ -425,6 +498,8 @@ export function DataTable<T>(props: Props<T>) {
           )}
           {rows.map((row, index) => {
             const [first, ...rest] = visible.filter((c) => !c.actions);
+            const open = expanded.has(rowId(row));
+            const controls = `${detailId}-${index}`;
             return (
               <li
                 key={rowId(row)}
@@ -450,6 +525,26 @@ export function DataTable<T>(props: Props<T>) {
                       </div>
                     ))}
                 </dl>
+                {expandable && (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="self-start"
+                      aria-expanded={open}
+                      aria-controls={controls}
+                      aria-label={t("table.details", { name: rowName(row) })}
+                      onClick={() => toggleExpanded(row)}
+                    >
+                      <ChevronRight
+                        aria-hidden
+                        className={cn("transition-transform", open && "rotate-90")}
+                      />
+                      {t("table.more")}
+                    </Button>
+                    {open && <div id={controls}>{detailList(row, true)}</div>}
+                  </>
+                )}
               </li>
             );
           })}
@@ -495,6 +590,11 @@ export function DataTable<T>(props: Props<T>) {
                   </TableHead>
                 );
               })}
+              {expandable && (
+                <TableHead className={cn("w-8", expandClass)}>
+                  <span className="sr-only">{t("table.more")}</span>
+                </TableHead>
+              )}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -522,34 +622,61 @@ export function DataTable<T>(props: Props<T>) {
             )}
             {rows.map((row, index) => {
               const extra = props.rowProps?.(row, chosen);
+              const open = expandable && expanded.has(rowId(row));
+              const controls = `${detailId}-${index}`;
               return (
-                <TableRow
-                  key={rowId(row)}
-                  {...extra}
-                  {...rowState(row, index)}
-                  className={cn(
-                    "outline-none focus-visible:bg-muted/50 data-active:bg-muted/50",
-                    extra?.className,
-                  )}
-                >
-                  {selectable && <TableCell>{selectBox(row, index)}</TableCell>}
-                  {visible.map((c) => (
-                    <TableCell
-                      key={c.id}
-                      className={cn(
-                        PRIORITY_CLASS[c.priority ?? 1],
-                        c.actions && "text-right whitespace-nowrap",
-                        typeof c.className === "function" ? c.className(row) : c.className,
-                      )}
+                <Fragment key={rowId(row)}>
+                  <TableRow
+                    {...extra}
+                    {...rowState(row, index)}
+                    className={cn(
+                      "outline-none focus-visible:bg-muted/50 data-active:bg-muted/50",
+                      extra?.className,
+                    )}
+                  >
+                    {selectable && <TableCell>{selectBox(row, index)}</TableCell>}
+                    {visible.map((c) => (
+                      <TableCell
+                        key={c.id}
+                        className={cn(
+                          PRIORITY_CLASS[c.priority ?? 1],
+                          c.actions && "text-right whitespace-nowrap",
+                          typeof c.className === "function" ? c.className(row) : c.className,
+                        )}
+                      >
+                        {c.cell(row)}
+                      </TableCell>
+                    ))}
+                    {expandable && (
+                      <TableCell className={expandClass}>
+                        {expandButton(row, open, controls)}
+                      </TableCell>
+                    )}
+                  </TableRow>
+                  {open && (
+                    <TableRow
+                      id={controls}
+                      className={cn("h-auto bg-surface-1 hover:bg-surface-1", expandClass)}
                     >
-                      {c.cell(row)}
-                    </TableCell>
-                  ))}
-                </TableRow>
+                      <TableCell colSpan={colSpan} className="px-4 py-3 whitespace-normal">
+                        {detailList(row, false)}
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </Fragment>
               );
             })}
           </TableBody>
         </Table>
+      )}
+      {props.pageSize !== undefined && paged.pageCount > 1 && (
+        <Pager
+          page={paged.page}
+          pageCount={paged.pageCount}
+          setPage={paged.setPage}
+          pageSize={props.pageSize}
+          total={sortedRows.length}
+        />
       )}
       {props.peek && (
         <Sheet open={peekOpen && activeRow !== undefined} onOpenChange={setPeekOpen}>
