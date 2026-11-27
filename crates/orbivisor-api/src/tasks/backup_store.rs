@@ -27,7 +27,8 @@ use orbivisor_store::nbd::export::{ChunkCache, StoreExport};
 use orbivisor_store::nbd::{BASE_ALLOCATION, NbdClient, NbdServer, STATE_DIRTY, STATE_ZERO};
 use orbivisor_types::backup::{
     Backup, BackupDisk, BackupPhase, BackupSource, BackupSourceKind, BackupSpec, BackupStatus,
-    BackupTarget, StoreBackupStats, VerifyState, backup_dir, bitmap_name, is_backup_bitmap,
+    BackupTarget, RestoreRemap, StoreBackupStats, VerifyState, backup_dir, bitmap_name,
+    is_backup_bitmap,
 };
 use orbivisor_types::backup_store::{
     BackupStore, BackupStoreSpec, BackupStoreStatus, CHUNK_BYTES, ChunkId, StorePhase, ZERO_CHUNK,
@@ -40,8 +41,8 @@ use orbivisor_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 use super::backup::{
-    VARS_FILE, available_media, backup_root, get_backup, read_chain, read_manifest, ready_pool,
-    regular_file,
+    VARS_FILE, apply_remap, available_media, backup_root, get_backup, read_chain, read_manifest,
+    ready_pool, regular_file,
 };
 use super::clone::{create_vm, made, volume_name};
 use super::firmware::{current_tpm, place_private_bytes};
@@ -1161,6 +1162,7 @@ pub(super) async fn read_snapshot(
 ///
 /// `live`(계획 68 §11.3)면 디스크를 읽어 넣지 않고 빈 대상 볼륨만 만들고 새 VM을 라이브 복원 상태로 만든다(풀 백업
 /// 복원과 같다 — [`super::backup::restore`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn restore(
     ctx: &Ctx,
     task: &Task,
@@ -1168,6 +1170,7 @@ pub(super) async fn restore(
     name: &str,
     pool: &str,
     folder: Option<Uuid>,
+    remap: Option<&RestoreRemap>,
     live: bool,
 ) -> Result<Option<String>, String> {
     let store_name = backup.spec.store.clone().unwrap_or_default();
@@ -1239,6 +1242,7 @@ pub(super) async fn restore(
     let mut new: Vm = Resource::new(name, backup.spec.vm_spec.clone());
     new.id = task.spec.target;
     new.spec.folder = folder;
+    let strict = apply_remap(ctx, &mut new.spec, remap)?;
     let (store_ref, m_ref, sn) = (&store, &m, &store_name);
     let blob = |n: &'static str| async move {
         store_ref
@@ -1295,7 +1299,7 @@ pub(super) async fn restore(
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
     let node = super::live_restore::begin(ctx, task, &mut new, backup.id, live);
-    create_vm(ctx, task, new, node, live, false, &mut warnings).await?;
+    create_vm(ctx, task, new, node, live, strict, &mut warnings).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 

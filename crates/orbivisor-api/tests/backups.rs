@@ -1271,12 +1271,13 @@ async fn viewers_read_backups_and_operators_manage_them() {
 }
 
 /// 계획 76 §3.3: 복원 맵(`networks`·`security_groups`·`cloud_init_networks`·`cloud_init_dns`)은 모든 노드가 `restore-remap`을
-/// 알아야 받는다(409 `cluster_upgrading`). 1단계에는 아무 노드도 알리지 않으므로 늘 409이고, 맵이 없는 복원은 그대로다.
+/// 알아야 받는다(409 `cluster_upgrading`). 모르는 옛 노드가 온라인이면 409이고, 맵이 없는 복원은 그대로다.
 #[tokio::test]
 async fn restore_maps_wait_for_restore_remap() {
     let env = env().await;
     let admin = env.admin().await;
     ready_backup(&env, &admin).await;
+    other_node(&env, "old").await;
     for extra in [
         json!({ "networks": { "lan": "dr-lan" } }),
         json!({ "security_groups": { "web": "dr-web" } }),
@@ -1299,6 +1300,145 @@ async fn restore_maps_wait_for_restore_remap() {
         &admin,
         "b1",
         json!({ "name": "web-2", "pool": "local", "networks": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+}
+
+/// 백업 `b1`의 VM 스펙 NIC를 `lan`(그룹 `web`)과 `db` 둘로 바꾸고, 네트워크 `lan`·`db`·`dr-lan`(브리지), 보안 그룹
+/// `web`·`dr-web`을 저장소에 만든다.
+async fn remap_backup(env: &Env, admin: &Client) -> Uuid {
+    let id = ready_backup(env, admin).await;
+    for name in ["lan", "db", "dr-lan"] {
+        let net: orbivisor_types::network::Network = Resource::new(
+            name,
+            serde_json::from_value(json!({ "bridge": "vmbr0" })).unwrap(),
+        );
+        env.cluster.create(&net).await.unwrap();
+    }
+    for name in ["web", "dr-web"] {
+        let g: orbivisor_types::security_group::SecurityGroup =
+            Resource::new(name, serde_json::from_value(json!({})).unwrap());
+        env.cluster.create(&g).await.unwrap();
+    }
+    let b = env.cluster.get::<BackupSpec>(id).unwrap().unwrap();
+    let mut spec = b.spec.clone();
+    spec.vm_spec.nics = serde_json::from_value(json!([
+        { "network": "lan", "model": "virtio", "security_groups": ["web"] },
+        { "network": "db", "model": "virtio" }
+    ]))
+    .unwrap();
+    env.cluster
+        .update_spec(id, None, b.labels.clone(), &spec)
+        .await
+        .unwrap();
+    id
+}
+
+/// 계획 76 §3.3: 맵은 Task(`remap`)에 실리고 라이브 복원도 같다. 빈 맵은 싣지 않는다(옛 Task JSON 그대로).
+#[tokio::test]
+async fn restore_maps_ride_on_the_task() {
+    let env = env().await;
+    let admin = env.admin().await;
+    remap_backup(&env, &admin).await;
+    let map = json!({
+        "networks": { "lan": "dr-lan" },
+        "security_groups": { "web": "dr-web" },
+        "cloud_init_networks": [ { "ipv4": { "mode": "static", "address": "10.0.0.5/24" } } ],
+        "cloud_init_dns": { "servers": ["10.0.0.1"] }
+    });
+    for (live, kind) in [(false, "backup-restore"), (true, "backup-live-restore")] {
+        let mut body = map.clone();
+        body["name"] = json!(format!("web-{live}"));
+        body["pool"] = json!("local");
+        body["live"] = json!(live);
+        let (status, task) = restore(&admin, "b1", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        assert_eq!(task["spec"]["op"]["kind"], kind);
+        assert_eq!(task["spec"]["op"]["remap"], map, "{task}");
+    }
+    let (status, task) = restore(
+        &admin,
+        "b1",
+        json!({ "name": "web-3", "pool": "local", "networks": {}, "security_groups": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert!(task["spec"]["op"].get("remap").is_none(), "{task}");
+}
+
+/// 계획 76 §3.3: 맵의 원본 이름은 백업에 있어야 하고 대상 네트워크·보안 그룹은 이 클러스터에 있어야 한다(400). 맵에 없는
+/// 이름은 지금처럼 같은 이름이어야 한다. cloud-init 주소 설정은 NIC 수를 넘지 못하고 모양이 맞아야 한다.
+#[tokio::test]
+async fn restore_maps_are_checked() {
+    let env = env().await;
+    let admin = env.admin().await;
+    remap_backup(&env, &admin).await;
+    for (extra, want) in [
+        (
+            json!({ "networks": { "wan": "dr-lan" } }),
+            "no NIC on network \"wan\"",
+        ),
+        (
+            json!({ "networks": { "lan": "nowhere" } }),
+            "network \"nowhere\" not found",
+        ),
+        (
+            json!({ "security_groups": { "ssh": "dr-web" } }),
+            "no NIC in security group \"ssh\"",
+        ),
+        (
+            json!({ "security_groups": { "web": "nobody" } }),
+            "security group \"nobody\" not found",
+        ),
+        (
+            json!({ "cloud_init_networks": [{}, {}, {}] }),
+            "3 entries but the backed-up VM has 2 NICs",
+        ),
+        (
+            json!({ "cloud_init_networks": [ { "ipv4": { "mode": "static", "address": "10.0.0.5" } } ] }),
+            "cloud_init",
+        ),
+    ] {
+        let mut body = json!({ "name": "web-2", "pool": "local" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let got = restore(&admin, "b1", body).await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+        let message = got.1["message"].as_str().unwrap();
+        assert!(message.contains(want), "{want}: {message}");
+    }
+    // 맵이 없으면 `lan`·`db`는 같은 이름 그대로 있어야 한다: `db`를 지우면 거절된다.
+    let db = env
+        .cluster
+        .get_by_name::<orbivisor_types::network::NetworkSpec>("db")
+        .unwrap()
+        .unwrap();
+    env.cluster
+        .delete::<orbivisor_types::network::NetworkSpec>(db.id, None)
+        .await
+        .unwrap();
+    let got = restore(
+        &admin,
+        "b1",
+        json!({ "name": "web-2", "pool": "local", "networks": { "lan": "dr-lan" } }),
+    )
+    .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    assert!(
+        got.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("network \"db\" not found"),
+        "{}",
+        got.1
+    );
+    // `db`도 맵으로 옮기면 된다.
+    let (status, task) = restore(
+        &admin,
+        "b1",
+        json!({ "name": "web-2", "pool": "local", "networks": { "lan": "dr-lan", "db": "dr-lan" } }),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");

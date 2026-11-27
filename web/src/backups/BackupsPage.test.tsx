@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import { BackupsPage } from "@/backups/BackupsPage";
 import { resetTasks } from "@/tasks/tasks";
-import { backup, backupJob, pool, remote, task, vm } from "@/test/fixtures";
+import { backup, backupJob, pool, remote, sdnNetwork, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -209,6 +209,52 @@ it("restores a backup as a new VM", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
   expect(await screen.findByText("Restore old-1 as old2")).toBeInTheDocument();
   expect(body).toEqual({ name: "old2", pool: "fast" });
+});
+
+it("maps the networks of the backed-up VM when restoring", async () => {
+  // 계획 76 §3.3: 같은 이름이 있으면 기본으로 고르고, 없으면 꼭 고른다. 바꾼 것만 `networks`로 보낸다(user는 묻지 않는다).
+  const withNets = vm("db", "stopped", {
+    spec: {
+      ...gone.spec,
+      nics: [
+        { network: "lan", model: "virtio" },
+        { network: "lan", model: "virtio" },
+        { network: "dmz", model: "virtio" },
+        { network: "user", model: "virtio" },
+      ],
+    },
+  });
+  const ofNets = backup("db-1", withNets, 5);
+  mockLists({
+    vm: [web],
+    backup: [ofNets],
+    "storage-pool": [pool("local")],
+    network: [sdnNetwork("lan"), sdnNetwork("dr-dmz")],
+  });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/backups/${ofNets.id}/restore`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "backup-restore", "new-vm"), { status: 202 });
+    }),
+  );
+  renderPage(<BackupsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Restore db-1" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore db-1" });
+  await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-dr");
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Storage pool for the disks"),
+    "local",
+  );
+  expect(await within(dialog).findByLabelText("Network for lan")).toHaveValue("lan");
+  expect(within(dialog).getByLabelText("Network for dmz")).toHaveValue("");
+  expect(within(dialog).queryByLabelText("Network for user")).not.toBeInTheDocument();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
+  expect(within(dialog).getByText("Choose a network.")).toBeVisible();
+  await userEvent.selectOptions(within(dialog).getByLabelText("Network for dmz"), "dr-dmz");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
+  expect(await screen.findByText("Restore db-1 as db-dr")).toBeInTheDocument();
+  expect(body).toEqual({ name: "db-dr", pool: "local", networks: { dmz: "dr-dmz" } });
 });
 
 it("deletes a backup after confirming", async () => {

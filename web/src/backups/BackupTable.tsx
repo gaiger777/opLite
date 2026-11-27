@@ -651,7 +651,8 @@ export function BackupTable({
 
 /**
  * 백업에서 새 VM을 만드는 대화상자. 열 때만 그린다. 보통은 꺼진 VM이고, "라이브 복원"(계획 68 §11)이면 디스크를 다 받기 전에
- * VM을 켜고 뒤에서 옮긴다(새 폴더의 `vm.power`도 든다 — 없으면 스위치를 보이지 않는다).
+ * VM을 켜고 뒤에서 옮긴다(새 폴더의 `vm.power`도 든다 — 없으면 스위치를 보이지 않는다). 백업의 네트워크마다 이 클러스터의
+ * 네트워크를 고른다(기본은 같은 이름 — 계획 76 §3.3). 바꾼 것만 `networks` 맵으로 보낸다(아무것도 바꾸지 않으면 옛 서버도 받는다).
  */
 function RestoreDialog({
   backup,
@@ -666,11 +667,19 @@ function RestoreDialog({
   const perms = usePermissions();
   const vms = useList("vm");
   const pools = useList("storage-pool");
+  const networks = useList("network");
   const [name, setName] = useState("");
   const [pool, setPool] = useState("");
   const [live, setLive] = useState(false);
   const canLive = perms.anywhere("vm.power");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // 백업 VM이 쓰는 네트워크(user 네트워크는 노드 안 NAT라 바꿀 것이 없다)와 고른 대상(없으면 같은 이름)
+  const sources = [...new Set((backup.spec.vm_spec.nics ?? []).map((n) => n.network))].filter(
+    (n) => n !== "user",
+  );
+  const [targets, setTargets] = useState<Record<string, string>>({});
+  const known = new Set((networks.data ?? []).map((n) => n.name));
+  const targetOf = (from: string) => targets[from] ?? (known.has(from) ? from : "");
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -682,15 +691,28 @@ function RestoreDialog({
     if (pool === "") {
       found.pool = "backups.errors.pool";
     }
+    for (const from of sources) {
+      if (targetOf(from) === "") {
+        found[`net-${from}`] = "backups.errors.network";
+      }
+    }
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return false;
     }
+    const map = Object.fromEntries(
+      sources.filter((from) => targetOf(from) !== from).map((from) => [from, targetOf(from)]),
+    );
     const task = await call(
       api.POST("/backups/{key}/restore", {
         params: { path: { key: backup.id } },
-        // 라이브는 청할 때만 보낸다(옛 서버는 모르는 필드를 거절한다).
-        body: { name, pool, ...(live && { live: true }) },
+        // 라이브·네트워크 맵은 청할 때만 보낸다(옛 서버는 모르는 필드를 거절한다).
+        body: {
+          name,
+          pool,
+          ...(live && { live: true }),
+          ...(Object.keys(map).length > 0 && { networks: map }),
+        },
       }),
     );
     trackTask(
@@ -737,6 +759,38 @@ function RestoreDialog({
           </NativeSelect>
         )}
       </Field>
+      {sources.length > 0 && (
+        <fieldset className="flex flex-col gap-2">
+          <legend className="text-sm font-medium">{t("backups.networkMap")}</legend>
+          <p className="text-xs text-muted-foreground">{t("backups.networkMapHint")}</p>
+          {!networks.isSuccess && <ListPending error={networks.error} />}
+          {sources.map((from, i) => (
+            <Field
+              key={from}
+              id={`restore-net-${i}`}
+              label={t("backups.networkFor", { name: from })}
+              error={errors[`net-${from}`]}
+            >
+              {(a11y) => (
+                <NativeSelect
+                  id={`restore-net-${i}`}
+                  className="w-full"
+                  value={targetOf(from)}
+                  onChange={(e) => setTargets({ ...targets, [from]: e.target.value })}
+                  {...a11y}
+                >
+                  <NativeSelectOption value="">{t("backups.chooseNetwork")}</NativeSelectOption>
+                  {(networks.data ?? []).map((n) => (
+                    <NativeSelectOption key={n.id} value={n.name}>
+                      {n.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
+            </Field>
+          ))}
+        </fieldset>
+      )}
       {canLive && (
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center gap-2">

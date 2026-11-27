@@ -268,7 +268,7 @@ pub(crate) enum MigrationCmd {
     },
 }
 
-fn parse_pair(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_pair(s: &str) -> Result<(String, String), String> {
     // 원본 이름에 `=`가 있을 수 있다. 우리 이름에는 없다.
     match s.rsplit_once('=') {
         Some((from, to)) if !from.is_empty() && !to.is_empty() => Ok((from.into(), to.into())),

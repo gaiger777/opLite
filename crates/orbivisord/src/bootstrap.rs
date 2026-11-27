@@ -982,7 +982,8 @@ pub(crate) mod tests {
                 "acme",
                 "orbivisor-layout",
                 "operator-dashboard",
-                "link-alerts"
+                "link-alerts",
+                "restore-remap"
             ])
         );
         update_node_status(&cluster, |status| {
@@ -1039,7 +1040,8 @@ pub(crate) mod tests {
                 "acme",
                 "orbivisor-layout",
                 "operator-dashboard",
-                "link-alerts"
+                "link-alerts",
+                "restore-remap"
             ])
         );
         cluster.shutdown().await.unwrap();
@@ -1115,7 +1117,8 @@ pub(crate) mod tests {
                 "acme",
                 "orbivisor-layout",
                 "operator-dashboard",
-                "link-alerts"
+                "link-alerts",
+                "restore-remap"
             ])
         );
         cluster.shutdown().await.unwrap();
@@ -1371,6 +1374,7 @@ pub(crate) mod tests {
                     "orbivisor-layout",
                     "operator-dashboard",
                     "link-alerts",
+                    "restore-remap",
                 ]),
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

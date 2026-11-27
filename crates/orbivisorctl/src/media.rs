@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
-use orbivisor_types::cloud_init::{IpConfig, is_crypt_hash};
+use orbivisor_types::cloud_init::{CloudInitDns, CloudInitNet, IpConfig, is_crypt_hash};
+use orbivisor_types::dr::{DrIpRule, cloud_init_networks};
 use orbivisor_types::vm::effective_boot;
 use reqwest::Method;
 use serde_json::{Map, Value, json};
@@ -517,6 +518,100 @@ fn parse_ci_ip4(s: &str) -> Result<(Option<usize>, IpConfig), String> {
 
 fn parse_ci_ip6(s: &str) -> Result<(Option<usize>, IpConfig), String> {
     parse_ci_ip(s, true)
+}
+
+/// `backup restore --ip` 하나(계획 76 §3.3): `N=dhcp` 또는 `N=ADDRESS/PREFIX[,gw=GATEWAY][,dns=IP]…`(N은 NIC 순번,
+/// `nicN=`도 된다). 주소 모양은 `--ci-ip`·`--ci-ip6`과 같고 체계는 주소로 고른다. DNS는 VM 전체로 모은다.
+pub(crate) fn parse_restore_ip(s: &str) -> Result<DrIpRule, String> {
+    let bad =
+        || format!("invalid --ip {s:?}: use N=dhcp or N=ADDRESS/PREFIX[,gw=GATEWAY][,dns=IP]");
+    let (nic, value) = s.split_once('=').ok_or_else(bad)?;
+    let nic: u32 = nic
+        .strip_prefix("nic")
+        .unwrap_or(nic)
+        .parse()
+        .map_err(|_| bad())?;
+    let mut dns = Vec::new();
+    let mut rest = Vec::new();
+    for part in value.split(',') {
+        match part.strip_prefix("dns=") {
+            Some(ip) => dns.push(ip.parse::<IpAddr>().map_err(|_| bad())?),
+            None => rest.push(part),
+        }
+    }
+    let rest = rest.join(",");
+    let ipv6 = rest
+        .split('/')
+        .next()
+        .and_then(|a| a.parse::<IpAddr>().ok())
+        .is_some_and(|a| a.is_ipv6());
+    let (_, config) = parse_ci_ip(&rest, ipv6)
+        .map_err(|e| e.replace("--ci-ip6", "--ip").replace("--ci-ip", "--ip"))?;
+    let (address, gateway, dhcp) = match config {
+        IpConfig::Dhcp => (None, None, true),
+        IpConfig::Static { address, gateway } => (Some(address), gateway, false),
+        IpConfig::Slaac => return Err(bad()),
+    };
+    Ok(DrIpRule {
+        nic,
+        address,
+        gateway,
+        dns,
+        dhcp,
+    })
+}
+
+/// `backup restore`의 복원 맵(계획 76 §3.3): 네트워크·보안 그룹 바꾸기와 NIC 주소(cloud-init)
+#[derive(Debug, Default, Clone, PartialEq, Eq, Args)]
+pub(crate) struct RestoreMapArgs {
+    /// 백업의 네트워크 → 이 클러스터의 네트워크(여러 번). 주지 않은 네트워크는 같은 이름이어야 한다.
+    #[arg(long = "network", value_name = "OLD=NEW", value_parser = crate::vmware::parse_pair)]
+    pub networks: Vec<(String, String)>,
+    /// 백업의 보안 그룹 → 이 클러스터의 보안 그룹(여러 번)
+    #[arg(long = "security-group", value_name = "OLD=NEW", value_parser = crate::vmware::parse_pair)]
+    pub security_groups: Vec<(String, String)>,
+    /// NIC의 주소를 cloud-init으로 바꾼다(여러 번): `N=dhcp` 또는 `N=ADDRESS/PREFIX[,gw=GATEWAY][,dns=IP]`. 준 NIC·주소
+    /// 체계만 바꾸고 나머지는 백업의 cloud-init 그대로다(없던 cloud-init은 새로 붙는다). 게스트에 cloud-init이 있어야 한다.
+    #[arg(long = "ip", value_name = "N=dhcp|ADDR/PFX[,gw=GW][,dns=IP]", value_parser = parse_restore_ip)]
+    pub ips: Vec<DrIpRule>,
+}
+
+impl RestoreMapArgs {
+    /// 복원 요청 `body`에 맵을 넣는다. 주지 않은 칸은 보내지 않는다(옛 서버는 모르는 필드를 거절한다). `--ip`는 백업
+    /// `backup`의 cloud-init 주소 설정과 합친다.
+    pub(crate) async fn fill(
+        &self,
+        client: &Client,
+        backup: &str,
+        body: &mut Value,
+    ) -> anyhow::Result<()> {
+        let map = |pairs: &[(String, String)]| -> Map<String, Value> {
+            pairs.iter().map(|(k, v)| (k.clone(), json!(v))).collect()
+        };
+        if !self.networks.is_empty() {
+            body["networks"] = Value::Object(map(&self.networks));
+        }
+        if !self.security_groups.is_empty() {
+            body["security_groups"] = Value::Object(map(&self.security_groups));
+        }
+        if self.ips.is_empty() {
+            return Ok(());
+        }
+        let b = client.get(&format!("/backups/{}", seg(backup))).await?;
+        let ci = &b["spec"]["vm_spec"]["cloud_init"];
+        let base: Vec<CloudInitNet> =
+            serde_json::from_value(ci["networks"].clone()).unwrap_or_default();
+        let (nets, dns) = cloud_init_networks(&base, &self.ips);
+        body["cloud_init_networks"] = json!(nets);
+        if let Some(mut dns) = dns {
+            // 검색 도메인은 백업의 것 그대로
+            if let Ok(old) = serde_json::from_value::<CloudInitDns>(ci["dns"].clone()) {
+                dns.search = old.search;
+            }
+            body["cloud_init_dns"] = json!(dns);
+        }
+        Ok(())
+    }
 }
 
 /// `vm create|set`의 cloud-init 값. 하나라도 주면 cloud-init을 켠다. `vm set`은 준 값만 바꾼다.
@@ -1360,5 +1455,88 @@ mod tests {
             Some("downloading 0.3 GiB")
         );
         assert_eq!(download_progress(&Value::Null, &mut shown), None);
+    }
+
+    /// 계획 76 §3.3: `backup restore --ip`는 `N=dhcp`·`N=주소/접두[,gw=…][,dns=…]`(`nicN=`도)이고 slaac·모양이 틀린 값은
+    /// 받지 않는다.
+    #[test]
+    fn parses_restore_addresses() {
+        assert_eq!(
+            parse_restore_ip("0=10.0.0.5/24,gw=10.0.0.1,dns=1.1.1.1"),
+            Ok(DrIpRule {
+                nic: 0,
+                address: Some("10.0.0.5/24".into()),
+                gateway: Some("10.0.0.1".into()),
+                dns: vec!["1.1.1.1".parse().unwrap()],
+                dhcp: false,
+            })
+        );
+        assert_eq!(
+            parse_restore_ip("nic1=dhcp"),
+            Ok(DrIpRule {
+                nic: 1,
+                address: None,
+                gateway: None,
+                dns: vec![],
+                dhcp: true,
+            })
+        );
+        let v6 = parse_restore_ip("2=2001:db8::5/64,gw=2001:db8::1").unwrap();
+        assert_eq!(v6.address.as_deref(), Some("2001:db8::5/64"));
+        for bad in [
+            "10.0.0.5/24",
+            "x=dhcp",
+            "0=slaac",
+            "0=10.0.0.5",
+            "0=10.0.0.5/24,gw=2001:db8::1",
+            "0=dhcp,dns=nope",
+        ] {
+            let err = parse_restore_ip(bad).unwrap_err();
+            assert!(err.contains("--ip"), "{bad}: {err}");
+        }
+    }
+
+    /// `backup restore`의 맵: `--network`·`--security-group`은 그대로 맵이 되고, `--ip`는 백업의 cloud-init 주소와
+    /// 합친다(준 NIC만 바꿈, DNS 검색 도메인은 백업 그대로). 아무것도 주지 않으면 본문에 칸이 없고 백업을 읽지 않는다.
+    #[tokio::test]
+    async fn restore_map_fills_the_request() {
+        let (client, seen) = crate::fake_api::fake_api(|method, path| match (method, path) {
+            ("GET", "/api/v1/backups/b1") => (
+                200,
+                json!({ "spec": { "vm_spec": { "cloud_init": {
+                    "networks": [ {}, { "ipv4": { "mode": "static", "address": "192.168.1.9/24" } } ],
+                    "dns": { "servers": ["192.168.1.1"], "search": ["corp"] }
+                } } } }),
+            ),
+            _ => (404, json!({ "code": "not_found", "message": "no" })),
+        })
+        .await;
+        let mut body = json!({ "name": "web-2" });
+        RestoreMapArgs::default()
+            .fill(&client, "b1", &mut body)
+            .await
+            .unwrap();
+        assert_eq!(body, json!({ "name": "web-2" }));
+        assert!(seen.lock().unwrap().is_empty());
+
+        let args = RestoreMapArgs {
+            networks: vec![("lan".into(), "dr-lan".into())],
+            security_groups: vec![("web".into(), "dr-web".into())],
+            ips: vec![parse_restore_ip("0=10.0.0.5/24,gw=10.0.0.1,dns=1.1.1.1").unwrap()],
+        };
+        args.fill(&client, "b1", &mut body).await.unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "name": "web-2",
+                "networks": { "lan": "dr-lan" },
+                "security_groups": { "web": "dr-web" },
+                "cloud_init_networks": [
+                    { "ipv4": { "mode": "static", "address": "10.0.0.5/24", "gateway": "10.0.0.1" } },
+                    { "ipv4": { "mode": "static", "address": "192.168.1.9/24" } }
+                ],
+                "cloud_init_dns": { "servers": ["1.1.1.1"], "search": ["corp"] }
+            })
+        );
     }
 }

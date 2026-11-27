@@ -2829,6 +2829,8 @@ enum BackupCmd {
         /// 라이브 복원이 다 옮기고 갈아탈 때까지 기다린다(보통 복원은 늘 기다린다).
         #[arg(long, requires = "live")]
         wait: bool,
+        #[command(flatten)]
+        map: crate::media::RestoreMapArgs,
     },
     /// 저장소 백업을 지금 검증한다(청크를 읽어 맞춰 봄).
     Verify {
@@ -7119,12 +7121,14 @@ async fn backup(
             node,
             live,
             wait,
+            map,
         } => {
             let mut body = json!({ "name": name, "pool": pool, "node": node });
             // 청하지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
             if live {
                 body["live"] = json!(true);
             }
+            map.fill(client, &backup, &mut body).await?;
             let task = client
                 .post(&format!("/backups/{}/restore", seg(&backup)), &body)
                 .await?;
@@ -12118,8 +12122,9 @@ mod tests {
         assert!(matches!(
             parse(&["restore", "web-1", "--name", "web2", "--pool", "local", "--node", "n1"])
                 .unwrap(),
-            BackupCmd::Restore { backup, name, pool, node: Some(node), live: false, wait: false }
+            BackupCmd::Restore { backup, name, pool, node: Some(node), live: false, wait: false, map }
                 if backup == "web-1" && name == "web2" && pool == "local" && node == "n1"
+                    && map == crate::media::RestoreMapArgs::default()
         ));
         assert!(matches!(
             parse(&["replicate", "web-1", "--remote", "dr", "--pool", "bk"]).unwrap(),
@@ -12139,6 +12144,61 @@ mod tests {
             .unwrap(),
             BackupCmd::Replicate { wait: true, .. }
         ));
+        // 복원 맵(계획 76 §3.3): `--network`·`--security-group`·`--ip`는 여러 번 준다.
+        match parse(&[
+            "restore",
+            "web-1",
+            "--name",
+            "web2",
+            "--pool",
+            "local",
+            "--network",
+            "lan=dr-lan",
+            "--network",
+            "db=dr-db",
+            "--security-group",
+            "web=dr-web",
+            "--ip",
+            "0=10.0.0.5/24,gw=10.0.0.1",
+            "--ip",
+            "1=dhcp",
+        ])
+        .unwrap()
+        {
+            BackupCmd::Restore { map, .. } => {
+                assert_eq!(
+                    map.networks,
+                    [
+                        ("lan".to_string(), "dr-lan".to_string()),
+                        ("db".to_string(), "dr-db".to_string())
+                    ]
+                );
+                assert_eq!(
+                    map.security_groups,
+                    [("web".to_string(), "dr-web".to_string())]
+                );
+                assert_eq!(map.ips.len(), 2);
+                assert!(map.ips[1].dhcp);
+            }
+            _ => panic!("not a restore"),
+        }
+        for args in [
+            &[
+                "restore",
+                "web-1",
+                "--name",
+                "w",
+                "--pool",
+                "p",
+                "--network",
+                "lan",
+            ][..],
+            &[
+                "restore", "web-1", "--name", "w", "--pool", "p", "--ip", "0=bad",
+            ],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
         // 백업 풀과 복원의 새 이름·풀, 복제할 원격·풀은 꼭 준다.
         for args in [
             &["create", "web"][..],

@@ -2,11 +2,13 @@
 //! qcow2(`disk{i}.qcow2`), UEFI 변수(`vars.fd`), 매니페스트(`manifest.json`)를 둔다. 백업 저장소(계획 68,
 //! [`crate::backup_store`])의 백업은 `spec.store`를 쓰고 데이터는 저장소의 청크·인덱스·매니페스트 v3에 있다.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cloud_init::{CloudInitDns, CloudInitNet};
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::vm::VmSpec;
 
@@ -392,6 +394,93 @@ pub fn default_backup_name(vm_name: &str, at: u64) -> String {
 /// 풀 루트 아래 백업 하나의 디렉터리 `{root}/backups/{id}`
 pub fn backup_dir(pool_root: &Path, backup: Uuid) -> PathBuf {
     pool_root.join("backups").join(backup.to_string())
+}
+
+/// 복원 맵(계획 76 §3.3): 복원 Task가 새 VM을 만들기 전에 백업의 VM 스펙에 쓴다. 복원 요청의 같은 이름 칸에서 오고
+/// Task(`backup-restore`·`backup-live-restore`)에 실린다. 모든 노드가 `restore-remap`을 알 때만 쓴다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RestoreRemap {
+    /// 백업의 네트워크 이름 → 새 VM의 네트워크 이름. 맵에 없는 이름은 그대로다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub networks: BTreeMap<String, String>,
+    /// 백업의 보안 그룹 이름 → 새 VM의 보안 그룹 이름. 맵에 없는 이름은 그대로다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub security_groups: BTreeMap<String, String>,
+    /// 주면 새 VM의 cloud-init `networks`를 이것으로 바꾼다(cloud-init이 없던 백업이면 새로 붙인다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cloud_init_networks: Option<Vec<CloudInitNet>>,
+    /// 주면 새 VM의 cloud-init `dns`를 이것으로 바꾼다(cloud-init이 없던 백업이면 새로 붙인다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cloud_init_dns: Option<CloudInitDns>,
+}
+
+impl RestoreRemap {
+    /// 아무것도 바꾸지 않는지
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 백업의 VM 스펙 `spec`에 맞는지: 맵의 원본 이름은 그 VM의 NIC가 쓰는 네트워크·보안 그룹이어야 하고, cloud-init
+    /// 주소 설정은 NIC 수를 넘지 않아야 한다. 대상 이름이 이 클러스터에 있는지는 부르는 쪽이 바꾼 스펙으로 본다.
+    pub fn check(&self, spec: &VmSpec) -> Result<(), String> {
+        for from in self.networks.keys() {
+            if !spec.nics.iter().any(|n| &n.network == from) {
+                return Err(format!(
+                    "networks: the backed-up VM has no NIC on network {from:?}"
+                ));
+            }
+        }
+        for from in self.security_groups.keys() {
+            if !spec.nics.iter().any(|n| n.security_groups.contains(from)) {
+                return Err(format!(
+                    "security_groups: the backed-up VM has no NIC in security group {from:?}"
+                ));
+            }
+        }
+        if let Some(nets) = &self.cloud_init_networks
+            && nets.len() > spec.nics.len()
+        {
+            return Err(format!(
+                "cloud_init_networks: {} entries but the backed-up VM has {} NICs",
+                nets.len(),
+                spec.nics.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// 스펙 `spec`의 NIC 네트워크·보안 그룹을 맵대로 바꾸고 cloud-init 주소·DNS를 넣는다. 두 원본 그룹이 같은 대상으로
+    /// 가면 NIC에 한 번만 둔다.
+    pub fn apply(&self, spec: &mut VmSpec) {
+        for nic in &mut spec.nics {
+            if let Some(to) = self.networks.get(&nic.network) {
+                nic.network.clone_from(to);
+            }
+            let mut groups: Vec<String> = Vec::with_capacity(nic.security_groups.len());
+            for g in &nic.security_groups {
+                let g = self.security_groups.get(g).unwrap_or(g);
+                if !groups.contains(g) {
+                    groups.push(g.clone());
+                }
+            }
+            nic.security_groups = groups;
+        }
+        if self.cloud_init_networks.is_some() || self.cloud_init_dns.is_some() {
+            let ci = spec.cloud_init.get_or_insert_with(Default::default);
+            if let Some(nets) = &self.cloud_init_networks {
+                ci.networks.clone_from(nets);
+            }
+            if let Some(dns) = &self.cloud_init_dns {
+                ci.dns = Some(dns.clone());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1028,5 +1117,65 @@ mod tests {
             status
         );
         assert_eq!(TPM_STATE_FILE, "tpm2-00.permall");
+    }
+
+    /// 계획 76 §3.3: 복원 맵은 NIC 네트워크·보안 그룹을 바꾸고(맵에 없는 이름은 그대로, 같은 대상은 한 번), cloud-init
+    /// 주소·DNS를 넣는다(없던 cloud-init은 새로). 원본 이름이 백업에 없거나 주소 설정이 NIC보다 많으면 거절한다.
+    #[test]
+    fn restore_remap_rewrites_nics_and_cloud_init() {
+        let mut spec: VmSpec = serde_json::from_value(serde_json::json!({
+            "cpu": { "cores": 1 },
+            "memory_mib": 512,
+            "machine": "virt",
+            "nics": [
+                { "network": "lan", "model": "virtio", "security_groups": ["web", "ssh"] },
+                { "network": "db", "model": "virtio", "security_groups": ["ssh"] }
+            ]
+        }))
+        .unwrap();
+        let remap: RestoreRemap = serde_json::from_value(serde_json::json!({
+            "networks": { "lan": "dr-lan" },
+            "security_groups": { "web": "dr-ssh", "ssh": "dr-ssh" },
+            "cloud_init_networks": [ { "ipv4": { "mode": "static", "address": "10.0.0.5/24" } } ],
+            "cloud_init_dns": { "servers": ["1.1.1.1"] }
+        }))
+        .unwrap();
+        assert!(!remap.is_empty());
+        assert!(RestoreRemap::default().is_empty());
+        remap.check(&spec).unwrap();
+        assert!(spec.cloud_init.is_none());
+        remap.apply(&mut spec);
+        let nets: Vec<&str> = spec.nics.iter().map(|n| n.network.as_str()).collect();
+        assert_eq!(nets, ["dr-lan", "db"]);
+        assert_eq!(spec.nics[0].security_groups, ["dr-ssh"]);
+        assert_eq!(spec.nics[1].security_groups, ["dr-ssh"]);
+        let ci = spec.cloud_init.as_ref().unwrap();
+        assert_eq!(ci.networks, remap.cloud_init_networks.clone().unwrap());
+        assert_eq!(ci.dns, remap.cloud_init_dns);
+        // 빈 칸은 쓰지 않는다(Task JSON).
+        assert_eq!(
+            serde_json::to_value(RestoreRemap::default()).unwrap(),
+            serde_json::json!({})
+        );
+
+        let spec = vm_spec();
+        for (remap, want) in [
+            (
+                serde_json::json!({ "networks": { "nope": "x" } }),
+                "no NIC on network \"nope\"",
+            ),
+            (
+                serde_json::json!({ "security_groups": { "nope": "x" } }),
+                "no NIC in security group \"nope\"",
+            ),
+            (
+                serde_json::json!({ "cloud_init_networks": [{}, {}] }),
+                "2 entries but the backed-up VM has 0 NICs",
+            ),
+        ] {
+            let remap: RestoreRemap = serde_json::from_value(remap).unwrap();
+            let err = remap.check(&spec).unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
     }
 }

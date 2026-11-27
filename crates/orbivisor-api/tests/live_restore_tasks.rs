@@ -184,6 +184,7 @@ async fn start_live_restore(env: &Env, backup: Uuid, name: &str) -> (Uuid, Uuid)
         name: name.into(),
         pool: "local".into(),
         folder: None,
+        remap: None,
     };
     let t = create_task(op, target, env.node);
     env.cluster.create(&t).await.unwrap();

@@ -2,8 +2,9 @@
 //! 스냅샷·복제 Task와 차례로 돌고, 지우기와 복원은 백업의 줄에 선다. API가 확인한 뒤 줄에서 기다리는
 //! 사이 VM이나 풀이 바뀌었을 수 있으므로 다시 확인한다.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsStr;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use orbivisor_cluster::ClusterError;
@@ -11,9 +12,11 @@ use orbivisor_cluster::types::Rejection;
 use orbivisor_driver::{BackupTarget, Quiesced, check_pool_root, tpm_state_path, uefi_vars_path};
 use orbivisor_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupPhase, BackupSpec, BackupStatus, MANIFEST_FILE,
-    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, TPM_STATE_FILE, backup_dir, bitmap_name,
-    is_backup_bitmap,
+    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, RestoreRemap, TPM_STATE_FILE, backup_dir,
+    bitmap_name, is_backup_bitmap,
 };
+use orbivisor_types::cloud_init::{CloudInitNet, IpConfig};
+use orbivisor_types::network::NetworkSpec;
 use orbivisor_types::node::NodeSpec;
 use orbivisor_types::resource::Resource;
 use orbivisor_types::runtime::ImageFormat;
@@ -25,7 +28,7 @@ use orbivisor_types::task::Task;
 use orbivisor_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
-use super::clone::{copy_format, create_vm, made, volume_name};
+use super::clone::{StrictIps, copy_format, create_vm, made, volume_name};
 use super::firmware::{current_tpm, place_private};
 use super::snapshot::{
     check_local, check_settled, copy_file, fetch_vars, get_vm, is_down, now_secs, ready_disks,
@@ -986,6 +989,7 @@ pub(super) async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, Stri
 ///
 /// `live`(계획 68 §11.3)면 디스크를 읽어 넣지 않고 빈 대상 볼륨만 만들며, 새 VM은 이 노드에서 켜진 채(`running`)
 /// 라이브 복원 상태(`Starting`)로 만든다 — 라이브 복원 Task가 배선을 둔 뒤 reconciler가 켠다.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn restore(
     ctx: &Ctx,
     task: &Task,
@@ -993,6 +997,7 @@ pub(super) async fn restore(
     name: &str,
     pool: &str,
     folder: Option<Uuid>,
+    remap: Option<&RestoreRemap>,
     live: bool,
 ) -> Result<Option<String>, String> {
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
@@ -1009,7 +1014,7 @@ pub(super) async fn restore(
     }
     if backup.spec.store.is_some() {
         return Box::pin(super::backup_store::restore(
-            ctx, task, backup, name, pool, folder, live,
+            ctx, task, backup, name, pool, folder, remap, live,
         ))
         .await;
     }
@@ -1097,6 +1102,7 @@ pub(super) async fn restore(
     new.id = task.spec.target;
     // 폴더는 API가 정했다(백업한 VM의 폴더가 지워졌으면 루트).
     new.spec.folder = folder;
+    let strict = apply_remap(ctx, &mut new.spec, remap)?;
     if manifest.uefi_vars
         && let Some(state) = &ctx.config.state_dir
     {
@@ -1144,8 +1150,67 @@ pub(super) async fn restore(
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
     // SDN 주소(계획 65 §9): 원래 주소가 비어 있으면 그대로, 아니면 새로 받고 경고에 적는다.
     let node = super::live_restore::begin(ctx, task, &mut new, id, live);
-    create_vm(ctx, task, new, node, live, false, &mut warnings).await?;
+    create_vm(ctx, task, new, node, live, strict, &mut warnings).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+}
+
+/// 복원 맵(계획 76 §3.3)을 새 VM 스펙 `spec`에 쓴다: NIC 네트워크·보안 그룹을 바꾸고 cloud-init 주소·DNS를 넣는다(없던
+/// cloud-init은 새로 — 씨앗은 켤 때 지금처럼 만든다). SDN 네트워크의 NIC는 cloud-init이 아니라 IPAM이 주소를 주므로, 그 NIC에
+/// 준 고정 주소는 IPAM 주소(`ips`)로 옮기고 cloud-init 항목은 비운다(게이트웨이는 네트워크의 것). 그 NIC들은
+/// [`StrictIps::Nics`]라 그 주소를 잡지 못하면(다른 VM·라우터가 씀, 서브넷 밖) Task가 실패한다. 다른 NIC는 지금처럼
+/// (있던 주소는 비어 있으면 그대로, 아니면 새로 받음).
+pub(super) fn apply_remap(
+    ctx: &Ctx,
+    spec: &mut VmSpec,
+    remap: Option<&RestoreRemap>,
+) -> Result<StrictIps, String> {
+    let Some(remap) = remap else {
+        return Ok(StrictIps::None);
+    };
+    remap.apply(spec);
+    let Some(nets) = &remap.cloud_init_networks else {
+        return Ok(StrictIps::None);
+    };
+    let (_, networks) = ctx
+        .cluster
+        .list::<NetworkSpec>()
+        .map_err(|e| e.to_string())?;
+    let mut fixed = BTreeSet::new();
+    for (i, nic) in spec.nics.iter_mut().enumerate() {
+        let Some(entry) = nets.get(i) else {
+            continue;
+        };
+        if !networks
+            .iter()
+            .any(|n| n.name == nic.network && n.spec.is_sdn())
+        {
+            continue;
+        }
+        let ips: Vec<IpAddr> = [&entry.ipv4, &entry.ipv6]
+            .into_iter()
+            .flatten()
+            .filter_map(|c| match c {
+                IpConfig::Static { address, .. } => address.split('/').next()?.parse().ok(),
+                _ => None,
+            })
+            .collect();
+        if !ips.is_empty() {
+            nic.ips = ips;
+            fixed.insert(i);
+        }
+        if let Some(e) = spec
+            .cloud_init
+            .as_mut()
+            .and_then(|ci| ci.networks.get_mut(i))
+        {
+            *e = CloudInitNet::default();
+        }
+    }
+    Ok(if fixed.is_empty() {
+        StrictIps::None
+    } else {
+        StrictIps::Nics(fixed)
+    })
 }
 
 /// 풀 백업 `backup`(디렉터리 `dir`, 매니페스트 `manifest`)의 디스크마다 읽을 qcow2 파일 체인(자식부터 — 전체 백업이면 하나).

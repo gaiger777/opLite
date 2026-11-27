@@ -24,7 +24,7 @@ use orbivisor_driver::{
     create_overlay, start_backup_serve, stop_backup_serve, vm_state_dir,
 };
 use orbivisor_store::nbd::serve::ServeConfig;
-use orbivisor_types::backup::{Backup, backup_dir};
+use orbivisor_types::backup::{Backup, RestoreRemap, backup_dir};
 use orbivisor_types::backup_store::{LiveRestore, LiveRestorePhase};
 use orbivisor_types::resource::Resource;
 use orbivisor_types::storage::VolumeSpec;
@@ -71,6 +71,7 @@ pub(super) fn begin(
 
 /// `backup-live-restore` Task. 대상(새 VM)이 아직 없으면 만들고, 라이브 복원 중이면 그 걸음에서 잇는다(`resume` — opld가
 /// 다시 떴다 — 이거나 취소·다시 하기로 새로 만든 Task).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     ctx: &Ctx,
     task: &Task,
@@ -78,6 +79,7 @@ pub(super) async fn run(
     name: &str,
     pool: &str,
     folder: Option<Uuid>,
+    remap: Option<&RestoreRemap>,
     resume: bool,
 ) -> Result<Option<String>, String> {
     let id = task.spec.target;
@@ -94,7 +96,7 @@ pub(super) async fn run(
         }
         None => {
             warning = Box::pin(super::backup::restore(
-                ctx, task, backup, name, pool, folder, true,
+                ctx, task, backup, name, pool, folder, remap, true,
             ))
             .await?;
         }
@@ -570,6 +572,8 @@ pub async fn request_cancel(cluster: &Cluster, vm: Uuid) -> Result<Uuid, String>
             name: v.name.clone(),
             pool: String::new(),
             folder: None,
+            // 다시 하기는 VM이 이미 있어 맵이 쓰이지 않는다.
+            remap: None,
         };
         let mut t: Task = Resource::new(
             "",

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use orbivisor_types::backup::{Backup, BackupPhase, BackupSpec, BackupStatus, default_backup_name};
+use orbivisor_types::backup::{
+    Backup, BackupPhase, BackupSpec, BackupStatus, RestoreRemap, default_backup_name,
+};
 use orbivisor_types::backup_store::{BackupStore, BackupStoreSpec, StoreBackend, StorePhase};
 use orbivisor_types::cloud_init::{CloudInitDns, CloudInitNet};
 use orbivisor_types::network::{NetworkSpec, USER_NETWORK};
@@ -820,7 +822,7 @@ pub async fn restore_backup(
     principal: Principal,
     audit: crate::audit::AuditNote,
     Path(key): Path<String>,
-    Json(req): Json<RestoreRequest>,
+    Json(mut req): Json<RestoreRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     // 백업의 `backup.restore`는 경로표가 봤다. 새 VM의 폴더·풀·네트워크는 아래에서 본다.
     if req.live {
@@ -834,6 +836,27 @@ pub async fn restore_backup(
     }
     check_name(&req.name)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    // 복원 맵(계획 76 §3.3): 원본 이름은 백업에 있어야 한다. 아래 검사(네트워크·보안 그룹이 있는지, 권한)는 맵을 쓴
+    // 스펙으로 본다.
+    let remap = RestoreRemap {
+        networks: std::mem::take(&mut req.networks),
+        security_groups: std::mem::take(&mut req.security_groups),
+        cloud_init_networks: req.cloud_init_networks.take(),
+        cloud_init_dns: req.cloud_init_dns.take(),
+    };
+    remap
+        .check(&backup.spec.vm_spec)
+        .map_err(ApiError::bad_request)?;
+    let mut remapped = backup.spec.vm_spec.clone();
+    remap.apply(&mut remapped);
+    if let Some(ci) = remapped
+        .cloud_init
+        .as_ref()
+        .filter(|_| remap.cloud_init_networks.is_some() || remap.cloud_init_dns.is_some())
+    {
+        ci.validate(remapped.nics.len())
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
     // 새 VM의 폴더: 요청의 폴더, 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트(설계 §12)
     let folder = match req.folder {
         Some(folder) => Some(folder),
@@ -862,10 +885,9 @@ pub async fn restore_backup(
     )?;
     crate::numa::require_numa_feature(&state.cluster, &backup.spec.vm_spec)?;
     state.authz.require_pool(&principal, &req.pool)?;
-    state.authz.require_networks(
-        &principal,
-        backup.spec.vm_spec.nics.iter().map(|n| n.network.as_str()),
-    )?;
+    state
+        .authz
+        .require_networks(&principal, remapped.nics.iter().map(|n| n.network.as_str()))?;
     // 폴더 할당량: 되살릴 VM과 디스크(백업한 가상 크기)
     let bytes = backup
         .status
@@ -897,7 +919,7 @@ pub async fn restore_backup(
     if backup_tasks(&state, backup.id)?.contains(&"being deleted") {
         return Err(backup_busy(&backup, "being deleted"));
     }
-    let spec = &backup.spec.vm_spec;
+    let spec = &remapped;
     // TPM 상태·TPM·Secure Boot·게스트 에이전트가 든 VM은 옛 노드가 풀지 못한다. 버리지 않고 거절한다(계획 59 §10).
     if backup.status.tpm_state || spec.tpm || spec.secure_boot {
         require_feature(&state.cluster, VTPM)?;
@@ -998,12 +1020,14 @@ pub async fn restore_backup(
         req.name,
         if req.live { " (live)" } else { "" }
     ));
+    let remap = (!remap.is_empty()).then_some(remap);
     let op = if req.live {
         TaskOp::BackupLiveRestore {
             backup: backup.id,
             name: req.name,
             pool: target.name,
             folder,
+            remap,
         }
     } else {
         TaskOp::BackupRestore {
@@ -1011,6 +1035,7 @@ pub async fn restore_backup(
             name: req.name,
             pool: target.name,
             folder,
+            remap,
         }
     };
     let task = create_task(&state.cluster, op, Uuid::now_v7(), node).await?;

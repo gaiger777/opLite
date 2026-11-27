@@ -1206,8 +1206,19 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             name,
             pool,
             folder,
+            remap,
         } => {
-            return backup::restore(ctx, task, *backup, name, pool, *folder, false).await;
+            return backup::restore(
+                ctx,
+                task,
+                *backup,
+                name,
+                pool,
+                *folder,
+                remap.as_ref(),
+                false,
+            )
+            .await;
         }
         TaskOp::BackupReplicate { remote, pool } => {
             replicate::replicate(ctx, id, remote, pool).await
@@ -1299,9 +1310,17 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             name,
             pool,
             folder,
+            remap,
         } => {
             return Box::pin(live_restore::run(
-                ctx, task, *backup, name, pool, *folder, resume,
+                ctx,
+                task,
+                *backup,
+                name,
+                pool,
+                *folder,
+                remap.as_ref(),
+                resume,
             ))
             .await;
         }

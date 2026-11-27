@@ -16362,6 +16362,24 @@ export interface components {
             /** @description 이 시각(유닉스 밀리초 또는 RFC 3339) */
             time: string;
         };
+        /**
+         * @description 복원 맵(계획 76 §3.3): 복원 Task가 새 VM을 만들기 전에 백업의 VM 스펙에 쓴다. 복원 요청의 같은 이름 칸에서 오고
+         *     Task(`backup-restore`·`backup-live-restore`)에 실린다. 모든 노드가 `restore-remap`을 알 때만 쓴다.
+         */
+        RestoreRemap: {
+            /** @description 주면 새 VM의 cloud-init `dns`를 이것으로 바꾼다(cloud-init이 없던 백업이면 새로 붙인다). */
+            cloud_init_dns?: components["schemas"]["CloudInitDns"];
+            /** @description 주면 새 VM의 cloud-init `networks`를 이것으로 바꾼다(cloud-init이 없던 백업이면 새로 붙인다). */
+            cloud_init_networks?: components["schemas"]["CloudInitNet"][];
+            /** @description 백업의 네트워크 이름 → 새 VM의 네트워크 이름. 맵에 없는 이름은 그대로다. */
+            networks?: {
+                [key: string]: string;
+            };
+            /** @description 백업의 보안 그룹 이름 → 새 VM의 보안 그룹 이름. 맵에 없는 이름은 그대로다. */
+            security_groups?: {
+                [key: string]: string;
+            };
+        };
         RestoreRequest: {
             cloud_init_dns?: components["schemas"]["CloudInitDns"] | null;
             /**
@@ -17693,6 +17711,8 @@ export interface components {
             kind: "backup-restore";
             name: string;
             pool: string;
+            /** @description 복원 맵(계획 76 §3.3 — 네트워크·보안 그룹·cloud-init). 없으면 쓰지 않아 옛 노드도 푼다. */
+            remap?: components["schemas"]["RestoreRemap"];
         } | {
             /** @enum {string} */
             kind: "backup-replicate";
@@ -17855,6 +17875,8 @@ export interface components {
             kind: "backup-live-restore";
             name: string;
             pool: string;
+            /** @description 복원 맵(지금 복원과 같다). 없으면 쓰지 않는다. */
+            remap?: components["schemas"]["RestoreRemap"];
         } | {
             /** Format: uuid */
             backup: string;

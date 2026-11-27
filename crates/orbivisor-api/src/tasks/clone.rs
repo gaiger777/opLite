@@ -479,6 +479,22 @@ pub(super) fn identity_warning(what: &str, spec: &VmSpec) -> Option<String> {
     })
 }
 
+/// [`create_vm`]이 요청이 준 SDN 주소(스펙의 `ips`)를 바꿔 주지 않을 NIC. 바꿔야 하면(그새 쓰였거나 서브넷 밖) 실패다.
+pub(super) enum StrictIps {
+    /// 바꿔 주고 경고에 적는다.
+    None,
+    /// 모든 NIC(복제·배포·가져오기의 `ips`)
+    All,
+    /// 이 순번의 NIC만(복원 맵의 고정 주소 — 계획 76 §3.3)
+    Nics(BTreeSet<usize>),
+}
+
+impl From<bool> for StrictIps {
+    fn from(strict: bool) -> Self {
+        if strict { Self::All } else { Self::None }
+    }
+}
+
 /// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, SDN NIC의 보안 그룹·cloud-init 주소
 /// 항목을 빼고, SDN NIC 주소를 채우며(스펙에 있던 주소는 비어 있으면 그대로, 아니면 새로 받고 `warnings`에 적는다 —
 /// 계획 65 §9), 예약 없는 VM이다. 노드는 `node`이고
@@ -491,9 +507,10 @@ pub(super) async fn create_vm(
     mut new: Vm,
     node: Option<Uuid>,
     start: bool,
-    strict_ips: bool,
+    strict_ips: impl Into<StrictIps>,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
+    let strict_ips = strict_ips.into();
     let name = new.name.clone();
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
     let mut used: BTreeSet<MacAddr> = vms
@@ -576,11 +593,36 @@ pub(super) async fn create_vm(
         let notes = crate::ipam::assign_new(&mut new.spec, &others, &networks, &held)
             .map_err(|e| format!("cannot give the VM addresses: {e}"))?;
         // 요청이 준 주소(복제·배포·가져오기의 `ips`)는 바꿔 주지 않는다: 그새 쓰였으면 실패다.
-        if strict_ips && !notes.is_empty() {
-            return Err(format!(
-                "cannot give the VM the requested addresses: {}",
-                notes.join("; ")
-            ));
+        match &strict_ips {
+            StrictIps::All if !notes.is_empty() => {
+                return Err(format!(
+                    "cannot give the VM the requested addresses: {}",
+                    notes.join("; ")
+                ));
+            }
+            StrictIps::Nics(nics) => {
+                for &i in nics {
+                    let (Some(want), Some(got)) = (wanted.get(i), new.spec.nics.get(i)) else {
+                        continue;
+                    };
+                    let missing: Vec<String> = want
+                        .ips
+                        .iter()
+                        .map(|ip| ip.to_canonical())
+                        .filter(|ip| !got.ips.contains(ip))
+                        .map(|ip| ip.to_string())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(format!(
+                            "cannot give NIC {i} the requested address {} on network {:?}: it is \
+                             taken by another VM or router, or outside the network's subnets",
+                            missing.join(", "),
+                            want.network
+                        ));
+                    }
+                }
+            }
+            _ => {}
         }
         // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
         match ctx.cluster.create(&new).await {

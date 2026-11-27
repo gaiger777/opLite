@@ -487,6 +487,7 @@ pub const FEATURES: &[&str] = &[
     ORBIVISOR_LAYOUT,
     OPERATOR_DASHBOARD,
     LINK_ALERTS,
+    RESTORE_REMAP,
 ];
 
 /// 운영자 대시보드(계획 75): `GET /topology/physical`·`GET /capacity`, `NodeInterface`의 `mtu`·`parent`·`vlan_id`·
@@ -504,7 +505,7 @@ pub const LINK_ALERTS: &str = "link-alerts";
 pub const DR_PLANS: &str = "dr-plans";
 
 /// 복원 맵(계획 76 §3.3): 복원 요청의 `networks`·`security_groups`·`cloud_init_networks`·`cloud_init_dns`. 옛 노드의 복원
-/// Task는 맵을 모르므로 모든 노드가 알릴 때만 받는다. 복원 Task가 맵을 쓰는 단계에서 [`FEATURES`]에 넣는다.
+/// Task는 맵을 모르므로 모든 노드가 알릴 때만 받는다.
 pub const RESTORE_REMAP: &str = "restore-remap";
 
 /// 디렉터리 배치 이름 바꾸기(계획 74): 이 노드에는 `/etc/orbivisor` 등 새 이름의 디렉터리가 있다(옛 이름은 링크).
@@ -1180,7 +1181,8 @@ mod tests {
                 "acme",
                 "orbivisor-layout",
                 "operator-dashboard",
-                "link-alerts"
+                "link-alerts",
+                "restore-remap"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1399,16 +1401,16 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&LINK_ALERTS));
+        assert_eq!(FEATURES.last(), Some(&RESTORE_REMAP));
     }
 
-    /// 계획 76 1단계: DR 기능 이름은 상수뿐이고 아직 알리지 않는다(API가 없는 기능을 알리지 않게).
+    /// 계획 76: 복원 맵은 2단계로 다 되어 알린다. 복구 계획(`dr-plans`)은 API·엔진이 다 될 때까지 알리지 않는다.
     #[test]
     fn dr_features_are_not_announced_yet() {
         assert_eq!(DR_PLANS, "dr-plans");
         assert_eq!(RESTORE_REMAP, "restore-remap");
         assert!(!FEATURES.contains(&DR_PLANS));
-        assert!(!FEATURES.contains(&RESTORE_REMAP));
+        assert!(FEATURES.contains(&RESTORE_REMAP));
     }
 
     /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

@@ -139,6 +139,10 @@ pub enum TaskOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
         folder: Option<Uuid>,
+        /// 복원 맵(계획 76 §3.3 — 네트워크·보안 그룹·cloud-init). 없으면 쓰지 않아 옛 노드도 푼다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        remap: Option<crate::backup::RestoreRemap>,
     },
     /// 대상 백업(`ready`)을 원격 `remote`의 백업 풀 `pool`에 사본으로 보낸다. 백업 풀을 읽을 수 있는
     /// 노드에서 돈다.
@@ -332,6 +336,10 @@ pub enum TaskOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
         folder: Option<Uuid>,
+        /// 복원 맵(지금 복원과 같다). 없으면 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        remap: Option<crate::backup::RestoreRemap>,
     },
     /// 파일 복원 세션(계획 69 §10): 백업 `backup`을 일회용 도우미 VM에 읽기 전용으로 붙여 열고, 유휴·최대 시간·닫기
     /// 요청까지 기다린 뒤 치운다. 대상은 세션 id(새 UUID — 같은 백업의 세션 둘이 줄 서지 않게). 이어 가지 않는다.
@@ -623,6 +631,7 @@ mod tests {
                     name: "web-2".into(),
                     pool: "local".into(),
                     folder: None,
+                    remap: None,
                 },
                 serde_json::json!({ "kind": "backup-live-restore", "backup": backup, "name": "web-2", "pool": "local" }),
             ),
@@ -632,8 +641,12 @@ mod tests {
                     name: "web-2".into(),
                     pool: "local".into(),
                     folder: Some(folder),
+                    remap: Some(crate::backup::RestoreRemap {
+                        networks: [("lan".to_string(), "dr-lan".to_string())].into(),
+                        ..Default::default()
+                    }),
                 },
-                serde_json::json!({ "kind": "backup-live-restore", "backup": backup, "name": "web-2", "pool": "local", "folder": folder }),
+                serde_json::json!({ "kind": "backup-live-restore", "backup": backup, "name": "web-2", "pool": "local", "folder": folder, "remap": { "networks": { "lan": "dr-lan" } } }),
             ),
         ];
         for (op, json) in cases {
@@ -1095,6 +1108,7 @@ mod tests {
                     name: "web-2".into(),
                     pool: "local".into(),
                     folder: None,
+                    remap: None,
                 },
                 serde_json::json!({
                     "kind": "backup-restore",

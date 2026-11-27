@@ -973,7 +973,7 @@
     "restore": "Restore",
     "restoreNamed": "Restore {{name}}",
     "restoreTitle": "Restore {{name}}",
-    "restoreDescription": "Makes a new stopped VM from the backup with copies of its disks. It gets new MAC addresses and the same networks and security groups.",
+    "restoreDescription": "Makes a new stopped VM from the backup with copies of its disks. It gets new MAC addresses and the same security groups.",
     "newName": "New VM name",
     "diskPool": "Storage pool for the disks",
     "choosePool": "Choose a pool",
@@ -994,7 +994,8 @@
       "vmExists": "A VM with this name already exists.",
       "pool": "Choose a storage pool.",
       "remote": "Choose a remote cluster.",
-      "store": "Choose a backup store."
+      "store": "Choose a backup store.",
+      "network": "Choose a network."
     },
     "target": "Target",
     "targetHint": "A backup pool keeps a qcow2 file per disk. A store keeps each changed chunk once.",
@@ -1027,7 +1028,11 @@
     "incrementalStoreHint": "Reads only the blocks changed since the last backup of this VM in the store. Every backup still has a complete index, so any backup can be restored or deleted on its own.",
     "browse": "Browse files",
     "browseNamed": "Browse files of {{name}}",
-    "browseUnavailable": "Browsing files needs the orbivisor-restore-image package on at least one node."
+    "browseUnavailable": "Browsing files needs the orbivisor-restore-image package on at least one node.",
+    "networkMap": "Networks",
+    "networkMapHint": "Choose the network of this cluster for each network of the backed-up VM. The same name is chosen when it exists here.",
+    "networkFor": "Network for {{name}}",
+    "chooseNetwork": "Choose a network"
   },
   "backupJobs": {
     "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
