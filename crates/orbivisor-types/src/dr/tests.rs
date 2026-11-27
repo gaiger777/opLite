@@ -1838,3 +1838,36 @@ fn protection_flags_a_newest_copy_that_failed_verification() {
             .contains("web1 newest copy failed verification")
     );
 }
+
+/// 취소한 계획된 이전: 끈 운영 VM을 다시 켜되, 운영 쪽에 닿지 않으면 한 번만 해 보고 기다리지 않는다(재해로 넘어가야 한다).
+#[test]
+fn a_cancelled_planned_failover_restarts_once() {
+    let now = 10_000;
+    let spec = run_spec(
+        DrRunKind::FailoverPlanned,
+        plan(vec![group("db", &["db1"])]),
+    );
+    let s0 = DrRunStatus::start(&spec, &[], Some(CA), now);
+    let mut w = World::new(now);
+    let mut src = SourceObservation::default();
+    src.vms.insert("db1".into(), false);
+    w.obs.source = Some(src);
+    let (mut s, _) = w.tick(&spec, &s0);
+    assert!(s.steps[0].prepare.as_ref().unwrap().stopped);
+    s.cancel_requested = true;
+    w.obs.now += 5;
+    let (mut s, a) = advance(&spec, &s, &w.obs);
+    assert_eq!(
+        a,
+        vec![DrAction::StartSource {
+            step: 0,
+            vm: "db1".into()
+        }]
+    );
+    s.record(&a[0], DrResult::Retry("timed out".into()), w.obs.now);
+    assert!(s.steps[0].prepare.as_ref().unwrap().restarted);
+    let (s, a) = advance(&spec, &s, &w.obs);
+    assert!(a.is_empty());
+    assert_eq!(s.state, DrRunState::Cancelled);
+    assert!(s.steps[0].notes[0].contains("could not restart"));
+}

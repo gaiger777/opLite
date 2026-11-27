@@ -1605,6 +1605,7 @@ impl DrRunStatus {
             set_phase(step, DrPhase::Failed, now);
             step.error = Some(e);
         };
+        let cancelled = self.cancel_requested;
         match action {
             DrAction::CreateBubble { bubble, .. } | DrAction::DeleteNetwork { bubble, .. } => {
                 let Some(b) = self.bubbles.get_mut(*bubble) else {
@@ -1669,6 +1670,12 @@ impl DrRunStatus {
                 };
                 let Some(p) = &mut st.prepare else { return };
                 match result {
+                    // 취소한 실행(prod가 죽어 disaster로 가려는 경우가 많다)은 한 번만 해 보고 기다리지 않는다.
+                    DrResult::Retry(e) if cancelled => {
+                        p.restarted = true;
+                        st.notes
+                            .push(format!("could not restart the source VM {vm}: {e}"));
+                    }
                     DrResult::Retry(e) => {
                         st.retrying(format!("restarting the source VM {vm}: {e}"), now);
                     }
