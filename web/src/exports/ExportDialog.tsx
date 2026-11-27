@@ -136,6 +136,7 @@ export function ExportDialog({ vm, onClose }: { vm: Vm; onClose(): void }) {
         label={t("vmExports.dialog.hwVersion")}
         error={errors.hwVersion}
         help={t("vmExports.dialog.hwVersionHint")}
+        info="vmExports.hwVersion"
       >
         {(a11y) => (
           <Input

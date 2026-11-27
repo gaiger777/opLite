@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { FormDialog } from "@/components/FormDialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -233,15 +234,15 @@ export function SourceDialog({
     >
       {step === "form" && (
         <>
-          {!editing && field("name", t("common.name"))}
+          {!editing && field("name", t("common.name"), {}, t("vmware.help.name"))}
           {field("host", t("vmware.source.host"), {}, t("vmware.source.hostHint"))}
-          {field("port", t("vmware.source.port"), { inputMode: "numeric" })}
-          {field("user", t("vmware.source.user"), { autoComplete: "off" })}
+          {field("port", t("vmware.source.port"), { inputMode: "numeric" }, t("vmware.help.port"))}
+          {field("user", t("vmware.source.user"), { autoComplete: "off" }, t("vmware.help.user"))}
           {field(
             "password",
             t("vmware.source.password"),
             { type: "password", autoComplete: "new-password" },
-            editing ? t("vmware.source.passwordKeep") : undefined,
+            editing ? t("vmware.source.passwordKeep") : t("vmware.help.password"),
           )}
           {field(
             "datacenter",
@@ -257,7 +258,14 @@ export function SourceDialog({
               aria-describedby="vmware-source-vddk-hint"
             />
             <div className="flex flex-col gap-1">
-              <Label htmlFor="vmware-source-vddk">{t("vmware.source.vddk")}</Label>
+              <div className="flex items-center gap-1">
+                <Label htmlFor="vmware-source-vddk">{t("vmware.source.vddk")}</Label>
+                <InfoButton
+                  topic="vmwareSources.vddk"
+                  label={t("vmware.source.vddk")}
+                  line={t("vmware.source.vddkHint")}
+                />
+              </div>
               <p id="vmware-source-vddk-hint" className="text-xs text-muted-foreground">
                 {t("vmware.source.vddkHint")}
               </p>

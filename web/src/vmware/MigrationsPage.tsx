@@ -83,7 +83,8 @@ export function MigrationsPage() {
       <PageHeader
         id="vmware-migrations-title"
         title={t("nav.vmwareMigrations")}
-        description={t("vmware.migrations.title")}
+        help="vmwareMigrations"
+        intro={t("vmware.help.migrationsIntro")}
         actions={items.length > 0 && newButton}
       />
       {migrations.data === undefined ? (
@@ -92,7 +93,8 @@ export function MigrationsPage() {
         <EmptyState
           icon={ArrowRightLeft}
           title={t("vmware.migrations.empty")}
-          description={t("vmware.migrations.emptyHint")}
+          description={t("vmware.help.migrationsEmpty")}
+          help="vmwareMigrations.page"
           action={newButton}
         />
       ) : (

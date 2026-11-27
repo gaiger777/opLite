@@ -101,7 +101,7 @@ export function UploadDialog({
         id="upload-file"
         label={t("uploads.file")}
         error={errors.file}
-        help={file ? formatBytes(file.size) : undefined}
+        help={file ? formatBytes(file.size) : t("help.uploads.file")}
       >
         {(a11y) => (
           <Input
@@ -113,7 +113,12 @@ export function UploadDialog({
           />
         )}
       </Field>
-      <Field id="upload-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="upload-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.uploads.name")}
+      >
         {(a11y) => (
           <Input
             id="upload-name"
@@ -131,7 +136,7 @@ export function UploadDialog({
         help={
           usable.length === 0 && serving && pools.isSuccess
             ? t(iso ? "uploads.noIsoPool" : "uploads.noPool")
-            : undefined
+            : t("help.uploads.pool")
         }
       >
         {(a11y) => (
@@ -153,31 +158,46 @@ export function UploadDialog({
       </Field>
       {!iso && (
         <div className="grid grid-cols-2 gap-4">
-          <Field id="upload-source" label={t("uploads.sourceFormat")}>
-            <NativeSelect
-              id="upload-source"
-              className="w-full"
-              value={sourceFormat}
-              onChange={(e) => setSourceFormat(e.target.value as typeof sourceFormat)}
-            >
-              <NativeSelectOption value="vmdk">vmdk</NativeSelectOption>
-              <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
-              <NativeSelectOption value="raw">raw</NativeSelectOption>
-            </NativeSelect>
+          <Field
+            id="upload-source"
+            label={t("uploads.sourceFormat")}
+            help={t("help.uploads.sourceFormat")}
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="upload-source"
+                className="w-full"
+                value={sourceFormat}
+                onChange={(e) => setSourceFormat(e.target.value as typeof sourceFormat)}
+                {...a11y}
+              >
+                <NativeSelectOption value="vmdk">vmdk</NativeSelectOption>
+                <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
+                <NativeSelectOption value="raw">raw</NativeSelectOption>
+              </NativeSelect>
+            )}
           </Field>
-          <Field id="upload-format" label={t("volumes.format")}>
-            <NativeSelect
-              id="upload-format"
-              className="w-full"
-              value={format}
-              onChange={(e) => setFormat(e.target.value as typeof format)}
-            >
-              {formats.map((f) => (
-                <NativeSelectOption key={f} value={f}>
-                  {f}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+          <Field
+            id="upload-format"
+            label={t("volumes.format")}
+            help={t("help.volumes.format")}
+            info="volumes.format"
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="upload-format"
+                className="w-full"
+                value={format}
+                onChange={(e) => setFormat(e.target.value as typeof format)}
+                {...a11y}
+              >
+                {formats.map((f) => (
+                  <NativeSelectOption key={f} value={f}>
+                    {f}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
         </div>
       )}

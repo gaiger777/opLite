@@ -270,4 +270,16 @@ describe("exports view", () => {
     expect(screen.queryByRole("button", { name: /^Download/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^Delete/ })).not.toBeInTheDocument();
   });
+
+  it("explains an empty export list with a link to the VMs and more help", async () => {
+    mockLists({ vm: [WEB] });
+    server.use(
+      http.get(apiUrl("/vm-exports"), () => HttpResponse.json({ revision: 1, items: [] })),
+    );
+    renderPage(<ExportsPage />, { path: "/vm-exports" });
+    expect(await screen.findByText("No exports")).toBeVisible();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open the VM list" })).toHaveAttribute("href", "/vms");
+  });
 });

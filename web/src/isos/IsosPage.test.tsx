@@ -150,3 +150,14 @@ it("uploads an ISO as raw with the iso content", async () => {
   );
   await waitFor(() => expect(checked?.get("content")).toBe("iso"));
 });
+
+it("explains an empty ISO library with upload and download buttons and more help", async () => {
+  mockLists({ node: [NODE], volume: [volume("disk0", "local")] });
+  renderPage(<IsosPage />);
+  expect(await screen.findByText("No ISO images.")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  const [, upload] = screen.getAllByRole("button", { name: "Upload ISO" });
+  await userEvent.click(upload!);
+  expect(await screen.findByRole("dialog", { name: "Upload an ISO image" })).toBeInTheDocument();
+});

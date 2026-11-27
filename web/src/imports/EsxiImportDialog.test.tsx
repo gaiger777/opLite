@@ -338,7 +338,9 @@ it("shows a taken name on the name field", async () => {
   await userEvent.click(await within(dialog).findByRole("button", { name: "Create" }));
   const name = within(dialog).getByLabelText("Name");
   await vi.waitFor(() =>
-    expect(name).toHaveAccessibleDescription("An import with this name already exists."),
+    expect(name).toHaveAccessibleDescription(
+      expect.stringContaining("An import with this name already exists."),
+    ),
   );
   expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
 });

@@ -126,3 +126,14 @@ it("uploads an OVA under a name taken from the file", async () => {
   );
   expect(await screen.findByText(/^Uploading web-server-2019: 0%/)).toBeInTheDocument();
 });
+
+it("explains an empty import list with upload and ESXi buttons and more help", async () => {
+  mockLists({ "vm-import": [], node: [NODE] });
+  renderPage(<ImportsPage />, { as: ADMIN });
+  expect(await screen.findByText("No imports.")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  const [, upload] = screen.getAllByRole("button", { name: "Upload OVA" });
+  await userEvent.click(upload!);
+  expect(await screen.findByRole("dialog", { name: "Upload an OVA" })).toBeInTheDocument();
+});

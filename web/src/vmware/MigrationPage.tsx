@@ -193,6 +193,7 @@ export function MigrationPage() {
       <PageHeader
         id="vmware-migration-title"
         title={migration.name}
+        help="vmwareMigrations"
         description={
           <span className="flex flex-wrap items-center gap-2">
             <MigrationPhaseChip phase={phase} />

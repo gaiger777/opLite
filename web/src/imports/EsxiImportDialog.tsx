@@ -220,7 +220,12 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
       )}
       {step === "connect" && (
         <>
-          <Field id="esxi-host" label={t("imports.host")} error={errors.host}>
+          <Field
+            id="esxi-host"
+            label={t("imports.host")}
+            error={errors.host}
+            help={t("help.imports.esxiHost")}
+          >
             {(a11y) => (
               <Input
                 id="esxi-host"
@@ -230,7 +235,12 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="esxi-port" label={t("imports.port")} error={errors.port}>
+          <Field
+            id="esxi-port"
+            label={t("imports.port")}
+            error={errors.port}
+            help={t("help.imports.esxiPort")}
+          >
             {(a11y) => (
               <Input
                 id="esxi-port"
@@ -241,7 +251,12 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="esxi-user" label={t("imports.user")} error={errors.user}>
+          <Field
+            id="esxi-user"
+            label={t("imports.user")}
+            error={errors.user}
+            help={t("help.imports.esxiUser")}
+          >
             {(a11y) => (
               <Input
                 id="esxi-user"
@@ -252,14 +267,21 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="esxi-password" label={t("imports.password")}>
-            <Input
-              id="esxi-password"
-              type="password"
-              autoComplete="new-password"
-              value={form.password}
-              onChange={(e) => set({ password: e.target.value })}
-            />
+          <Field
+            id="esxi-password"
+            label={t("imports.password")}
+            help={t("help.imports.esxiPassword")}
+          >
+            {(a11y) => (
+              <Input
+                id="esxi-password"
+                type="password"
+                autoComplete="new-password"
+                value={form.password}
+                onChange={(e) => set({ password: e.target.value })}
+                {...a11y}
+              />
+            )}
           </Field>
           <Field
             id="esxi-datacenter"
@@ -377,7 +399,12 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
             <dt className="text-muted-foreground">{t("imports.chosenVm")}</dt>
             <dd className="break-all">{`${row.datastore} / ${row.vm.vmx}`}</dd>
           </dl>
-          <Field id="esxi-name" label={t("common.name")} error={errors.name}>
+          <Field
+            id="esxi-name"
+            label={t("common.name")}
+            error={errors.name}
+            help={t("help.imports.esxiName")}
+          >
             {(a11y) => (
               <Input
                 id="esxi-name"

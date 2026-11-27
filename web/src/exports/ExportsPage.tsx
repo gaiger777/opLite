@@ -112,7 +112,8 @@ export function ExportsPage() {
       <PageHeader
         id="vm-exports-title"
         title={t("nav.vmExports")}
-        description={t("vmExports.pageHint")}
+        help="vmExports"
+        intro={t("vmExports.help.intro")}
       />
       {exports.data === undefined ? (
         <ListPending error={exports.error} />
@@ -120,7 +121,13 @@ export function ExportsPage() {
         <EmptyState
           icon={PackageOpen}
           title={t("vmExports.empty")}
-          description={t("vmExports.emptyHint")}
+          description={t("vmExports.help.emptyHint")}
+          help="vmExports.page"
+          action={
+            <Button variant="outline" asChild>
+              <Link to="/vms">{t("vmExports.help.openVms")}</Link>
+            </Button>
+          }
         />
       ) : (
         <div className="overflow-x-auto">

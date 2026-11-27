@@ -25,7 +25,7 @@ function mockSources(items = [VC1, ESX]) {
 it("lists the saved connections without passwords and passes axe", async () => {
   mockSources();
   const { container } = renderPage(<SourcesPage />, { path: "/vmware-sources" });
-  const table = await screen.findByRole("table", { name: "VMware sources" });
+  const table = await screen.findByRole("table", { name: "Connected vCenter & ESXi" });
   const vc = within(table).getByRole("row", { name: /vc1/ });
   expect(vc).toHaveTextContent("vc1.example.com");
   expect(vc).toHaveTextContent("vCenter 8.0.2");
@@ -59,8 +59,8 @@ it("asks to trust the certificate and sends the fingerprint with the password", 
     }),
   );
   const { queryClient } = renderPage(<SourcesPage />, { path: "/vmware-sources" });
-  await user.click(await screen.findByRole("button", { name: "Add source" }));
-  const dialog = screen.getByRole("dialog", { name: "Add a VMware source" });
+  await user.click(await screen.findByRole("button", { name: "Connect vCenter or ESXi" }));
+  const dialog = screen.getByRole("dialog", { name: "Connect a vCenter or ESXi" });
   // 빈 칸은 보내지 않는다
   await user.click(within(dialog).getByRole("button", { name: "Connect" }));
   expect(within(dialog).getByText("Enter the host.")).toBeInTheDocument();
@@ -110,7 +110,7 @@ it("shows the upgrade notice when a node does not know VMware migration", async 
     ),
   );
   renderPage(<SourcesPage />, { path: "/vmware-sources" });
-  await user.click(await screen.findByRole("button", { name: "Add source" }));
+  await user.click(await screen.findByRole("button", { name: "Connect vCenter or ESXi" }));
   const dialog = screen.getByRole("dialog");
   await user.type(within(dialog).getByLabelText("Name"), "vc2");
   await user.type(within(dialog).getByLabelText("Host"), "vc2.example.com");
@@ -185,7 +185,7 @@ it("keeps the saved password when only other fields change", async () => {
   renderPage(<SourcesPage />, { path: "/vmware-sources" });
   await user.click(await screen.findByRole("button", { name: "Change vc1" }));
   const dialog = screen.getByRole("dialog", { name: "Change vc1" });
-  await user.type(within(dialog).getByLabelText("Datacenter hint"), "dc1");
+  await user.type(within(dialog).getByLabelText("Datacenter (optional)"), "dc1");
   await user.click(within(dialog).getByRole("button", { name: "Save" }));
   await waitFor(() => expect(patch).toEqual({ datacenter_hint: "dc1" }));
 });
@@ -210,8 +210,18 @@ it("explains a source that migrations still use", async () => {
 it("shows no buttons to users without cluster.admin", async () => {
   mockSources();
   renderPage(<SourcesPage />, { path: "/vmware-sources", as: { ...ADMIN, role: "viewer" } });
-  await screen.findByRole("table", { name: "VMware sources" });
-  expect(screen.queryByRole("button", { name: "Add source" })).not.toBeInTheDocument();
+  await screen.findByRole("table", { name: "Connected vCenter & ESXi" });
+  expect(screen.queryByRole("button", { name: "Connect vCenter or ESXi" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Change vc1" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Delete vc1" })).not.toBeInTheDocument();
+});
+
+it("explains an empty connection list with a connect button and more help", async () => {
+  mockSources([]);
+  renderPage(<SourcesPage />, { path: "/vmware-sources" });
+  expect(await screen.findByText("No vCenter or ESXi connected")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Connected vCenter & ESXi" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Connect vCenter or ESXi" }));
+  expect(screen.getByRole("dialog", { name: "Connect a vCenter or ESXi" })).toBeInTheDocument();
 });

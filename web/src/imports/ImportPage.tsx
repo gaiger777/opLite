@@ -362,24 +362,29 @@ function RunSection({
     value: string,
     options: readonly string[],
     onChange: (value: string) => void,
+    help: string,
+    info?: string,
   ) => (
-    <Field id={id} label={label}>
-      <NativeSelect
-        id={id}
-        className="w-full"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      >
-        {options.map((o) => (
-          <NativeSelectOption key={o} value={o}>
-            {o}
-          </NativeSelectOption>
-        ))}
-      </NativeSelect>
+    <Field id={id} label={label} help={help} info={info}>
+      {(a11y) => (
+        <NativeSelect
+          id={id}
+          className="w-full"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          {...a11y}
+        >
+          {options.map((o) => (
+            <NativeSelectOption key={o} value={o}>
+              {o}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      )}
     </Field>
   );
   const number = (id: string, label: string, field: "sockets" | "cores" | "memory") => (
-    <Field id={id} label={label} error={errors[field]}>
+    <Field id={id} label={label} error={errors[field]} help={t(`help.imports.${field}`)}>
       {(a11y) => (
         <Input
           id={id}
@@ -406,6 +411,7 @@ function RunSection({
               label={t("imports.vmName")}
               error={errors.name}
               errorValues={{ message: taken }}
+              help={t("help.imports.vmName")}
             >
               {(a11y) => (
                 <Input
@@ -443,8 +449,13 @@ function RunSection({
             {number("run-sockets", t("imports.sockets"), "sockets")}
             {number("run-cores", t("imports.cores"), "cores")}
             {number("run-memory", t("vmForm.memory"), "memory")}
-            {select("run-firmware", t("vms.firmware"), form.firmware, ["uefi", "bios"], (v) =>
-              set({ firmware: v as RunForm["firmware"] }),
+            {select(
+              "run-firmware",
+              t("vms.firmware"),
+              form.firmware,
+              ["uefi", "bios"],
+              (v) => set({ firmware: v as RunForm["firmware"] }),
+              t("help.imports.firmware"),
             )}
             {select(
               "run-disk-bus",
@@ -452,6 +463,8 @@ function RunSection({
               form.diskBus,
               ["virtio-blk", "sata"],
               (v) => set({ diskBus: v as RunForm["diskBus"] }),
+              t("help.imports.diskBus"),
+              "imports.devices",
             )}
             {select(
               "run-nic-model",
@@ -459,6 +472,8 @@ function RunSection({
               form.nicModel,
               ["virtio", "e1000e"],
               (v) => set({ nicModel: v as RunForm["nicModel"] }),
+              t("help.imports.nicModel"),
+              "imports.devices",
             )}
             <div className="sm:col-span-2">
               <CpuChoice
@@ -496,6 +511,7 @@ function RunSection({
                   id={`run-network-${i}`}
                   label={source}
                   error={errors[`networks.${source}`]}
+                  help={t("help.imports.network")}
                 >
                   {(a11y) => (
                     <NativeSelect

@@ -1,4 +1,3 @@
-import { Database } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -26,7 +25,7 @@ export function CephPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title={t("nav.ceph")} description={t("ceph.pageHint")} />
+      <PageHeader title={t("nav.ceph")} help="ceph" intro={t("help.ceph.intro")} />
       {ceph.data === undefined ? (
         <ListPending error={ceph.error} />
       ) : inWizard || (ceph.data === null && opened && admin) ? (
@@ -37,7 +36,8 @@ export function CephPage() {
         />
       ) : ceph.data === null ? (
         <EmptyState
-          icon={Database}
+          diagram="storageSharing"
+          help="ceph.page"
           title={t("ceph.empty.title")}
           description={t(admin ? "ceph.empty.admin" : "ceph.none")}
           action={admin && <Button onClick={() => setOpened(true)}>{t("ceph.empty.start")}</Button>}

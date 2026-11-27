@@ -242,7 +242,7 @@ it("grows a volume and follows its task", async () => {
   await userEvent.type(within(dialog).getByLabelText("New size (GiB)"), "16");
   await userEvent.click(within(dialog).getByRole("button", { name: "Resize" }));
   expect(within(dialog).getByLabelText("New size (GiB)")).toHaveAccessibleDescription(
-    "Enter a size larger than the current size.",
+    expect.stringContaining("Enter a size larger than the current size."),
   );
   expect(body).toBeUndefined();
 
@@ -386,7 +386,7 @@ it("shows linked clones' bases and flattens a stopped VM's disk", async () => {
   const table = await screen.findByRole("table", { name: "Volumes" });
   const baseColumn = within(table)
     .getAllByRole("columnheader")
-    .findIndex((h) => h.textContent === "Base");
+    .findIndex((h) => h.textContent === "Clone source (template)");
   const tmplRow = (await within(table).findByRole("button", { name: "Resize tmpl-root" })).closest(
     "tr",
   )!;
@@ -409,4 +409,21 @@ it("shows linked clones' bases and flattens a stopped VM's disk", async () => {
   await user.click(within(dialog).getByRole("button", { name: "Flatten" }));
   await waitFor(() => expect(flattened).toBe(true));
   expect(await screen.findByText("Flatten volume web-1-root")).toBeInTheDocument();
+});
+
+it("explains an empty volume list with a create button and more help", async () => {
+  mockLists({ node: [NODE], volume: [] });
+  renderPage(<VolumesPage />);
+  expect(await screen.findByText("No volumes.")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Create an empty volume" }));
+  expect(await screen.findByRole("dialog", { name: "Create an empty volume" })).toBeInTheDocument();
+});
+
+it("keeps the table when only ISO images are hidden", async () => {
+  mockLists({ node: [NODE], volume: [isoVolume("alpine.iso", "local")] });
+  renderPage(<VolumesPage />);
+  expect(await screen.findByRole("button", { name: "Show ISO images" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Learn more" })).not.toBeInTheDocument();
 });

@@ -48,3 +48,14 @@ it("offers no new migration without vm.create", async () => {
   expect(await screen.findByText("No VMware migrations")).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "New migration" })).not.toBeInTheDocument();
 });
+
+it("explains an empty migration list with a new-migration link and more help", async () => {
+  setup([]);
+  renderPage(<MigrationsPage />, { path: "/vmware-migrations" });
+  expect(await screen.findByText("No VMware migrations")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "New migration" })).toHaveAttribute(
+    "href",
+    "/vmware-migrations/-new",
+  );
+});

@@ -30,7 +30,7 @@ function setup(hosts: number | undefined) {
 it("creates a pool with three copies when three hosts have OSDs", async () => {
   const { sent, user } = setup(4);
   expect(await screen.findByLabelText("Copies (size)")).toHaveValue("3");
-  expect(screen.getByText(/4 hosts have OSDs that are up/)).toBeInTheDocument();
+  expect(screen.getByText(/4 nodes have Ceph disks up/)).toBeInTheDocument();
   await user.type(screen.getByLabelText("Name"), "vms");
   await user.click(screen.getByRole("button", { name: "Create" }));
   expect(
