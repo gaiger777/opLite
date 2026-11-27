@@ -1362,6 +1362,58 @@ fn cleanup_deletes_vms_then_bubbles() {
     assert_eq!(s.steps[0].phase, DrPhase::Failed);
 }
 
+/// 뒷정리(4단계 엔진): 켜진 VM은 끄는 Task를 내고, 끝나 꺼지면 같은 할 일을 다시 받아 지운다. 곧바로 지우면(`Done`)
+/// `deleted`이고, Task 없이 `deleting`인데 VM이 없어졌어도 `deleted`다.
+#[test]
+fn cleanup_stops_running_vms_before_deleting_them() {
+    let now = 10_000;
+    let mut spec = run_spec(DrRunKind::Cleanup, plan(vec![group("web", &["web1"])]));
+    spec.cleanup = Some(DrCleanupTarget {
+        run: Uuid::now_v7(),
+        vms: vec!["web1-drt".into(), "web2-drt".into()],
+        networks: vec![],
+    });
+    let s0 = DrRunStatus::start(&spec, &[], None, now);
+    let mut obs = DrObservation {
+        now,
+        ..Default::default()
+    };
+    let on = VmObservation {
+        running: true,
+        ..Default::default()
+    };
+    obs.vms.insert("web1-drt".into(), on);
+    obs.vms.insert("web2-drt".into(), VmObservation::default());
+    let (mut s, a) = advance(&spec, &s0, &obs);
+    assert_eq!(a.len(), 2);
+    // web1: 끄는 Task, web2: 곧바로 지움
+    let stop = Uuid::now_v7();
+    s.record(&a[0], DrResult::Task(stop), now);
+    s.record(&a[1], DrResult::Done, now);
+    assert_eq!(s.steps[1].phase, DrPhase::Deleted);
+    obs.vms.remove("web2-drt");
+    obs.tasks.insert(stop, TaskOutcome::Succeeded);
+    obs.vms.get_mut("web1-drt").unwrap().running = false;
+    obs.now += 5;
+    let (mut s, a) = advance(&spec, &s, &obs);
+    assert_eq!(
+        a,
+        vec![DrAction::DeleteVm {
+            step: 0,
+            vm: "web1-drt".into()
+        }]
+    );
+    assert_eq!(s.steps[0].phase, DrPhase::Deleting);
+    // 지우는 데 Task가 없었고(디스크 없음) 그사이 리더가 바뀌어 결과를 적지 못했어도 VM이 없으면 `deleted`
+    obs.vms.remove("web1-drt");
+    s.steps[0].task = None;
+    obs.now += 5;
+    let (s, a) = advance(&spec, &s, &obs);
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(s.steps[0].phase, DrPhase::Deleted);
+    assert_eq!(s.state, DrRunState::Succeeded);
+}
+
 #[test]
 fn restore_failure_is_recorded() {
     let now = 10_000;

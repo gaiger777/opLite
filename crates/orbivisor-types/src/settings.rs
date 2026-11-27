@@ -98,6 +98,13 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub acme: Option<AcmeSettings>,
+    /// DR 실행 하나가 동시에 진행하는 복원·시작 수(계획 76, 1~32). 없으면 4이고 쓰지 않는다(기능 `dr-plans`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(nullable = false, default, minimum = 1, maximum = 32)
+    )]
+    pub dr_max_parallel: Option<u8>,
 }
 
 /// ACME 동작 설정(계획 73 §11.3)
@@ -267,6 +274,9 @@ impl HaReserve {
 /// 대상 노드당 동시 시작 수의 기본값과 최댓값
 pub const DEFAULT_HA_START_CONCURRENCY: u8 = 4;
 pub const MAX_HA_START_CONCURRENCY: u8 = 32;
+/// DR 실행의 동시 복원·시작 수 기본값과 상한(계획 76 — `dr::DEFAULT_MAX_PARALLEL`·`dr::MAX_PARALLEL`과 같다)
+pub const DEFAULT_DR_PARALLEL: u8 = 4;
+pub const MAX_DR_PARALLEL: u8 = 32;
 
 /// 노드 정상 종료 정책(설계 §8). `systemctl stop`·업그레이드 재시작이 아니라 호스트가 꺼지는 중일 때만 쓴다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +328,14 @@ impl SettingsSpec {
             .ha_start_concurrency
             .filter(|n| (1..=MAX_HA_START_CONCURRENCY).contains(n));
         usize::from(n.unwrap_or(DEFAULT_HA_START_CONCURRENCY))
+    }
+
+    /// DR 실행의 동시 복원·시작 수(계획 76). 없거나 범위 밖이면 기본값(4)이다.
+    pub fn dr_max_parallel(&self) -> u32 {
+        let n = self
+            .dr_max_parallel
+            .filter(|n| (1..=MAX_DR_PARALLEL).contains(n));
+        u32::from(n.unwrap_or(DEFAULT_DR_PARALLEL))
     }
 
     /// Prometheus 끝점이 켜져 있는지(없으면 꺼짐)
@@ -485,6 +503,7 @@ mod tests {
             cpu: None,
             history: None,
             acme: None,
+            dr_max_parallel: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),

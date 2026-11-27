@@ -1,6 +1,7 @@
 //! DR 오케스트레이션 API(계획 76 3단계): 복구 계획 CRUD·권한·기능·검사, 보호 상태(리더 반복 작업 — 사본 있음·없음·
 //! 나이·다른 클러스터, 바뀔 때만 쓰기), 보고, 실행 기록 읽기(직접 넣은 실행), 실행 끝점의 검사·409들·실행 리소스, 계획된
-//! 이전의 원격 확인(원격 역할의 두 번째 `Env`), reprotect. 실행을 진행시키는 엔진은 4단계라 Task는 돌지 않는다.
+//! 이전의 원격 확인(원격 역할의 두 번째 `Env`), reprotect. 4단계 실행 엔진(`DrScheduler`): 시험 끝까지·뒷정리, on_timeout
+//! stop, 취소 뒤 뒷정리, 재해 장애 조치(이름·라벨·네트워크 맵·IP, 이름 겹침), 리더 바뀜, 계획된 이전(운영 쪽 정지·백업·복제).
 
 mod common;
 
@@ -13,7 +14,8 @@ use orbivisor_cluster::types::Rejection;
 use orbivisor_types::backup::{Backup, BackupOrigin, BackupPhase, BackupSpec, BackupStatus};
 use orbivisor_types::backup_job::{BackupJobSpec, VmSelector};
 use orbivisor_types::dr::{
-    DR_LABEL, DR_TEST_LABEL, DrRun, DrRunKind, DrRunSpec, DrRunState, DrRunStatus, RecoveryPlanSpec,
+    DR_LABEL, DR_TEST_LABEL, DrPhase, DrRun, DrRunKind, DrRunSpec, DrRunState, DrRunStatus,
+    RecoveryPlanSpec,
 };
 use orbivisor_types::node::{DR_PLANS, NodeSpec};
 use orbivisor_types::remote::RemoteSpec;
@@ -39,7 +41,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// 이 노드가 `dr-plans`를 알리는지 바꾼다(4단계가 `FEATURES`에 넣기 전까지 시험이 켠다).
+/// 이 노드가 `dr-plans`를 알리는지 바꾼다(`FEATURES`에 있어 켜져 있다 — 섞인 판 시험이 끈다).
 async fn set_dr(env: &Env, on: bool) {
     let mut status = env
         .cluster
@@ -983,4 +985,719 @@ async fn reprotect_makes_a_replicating_backup_job_for_recovered_vms() {
     assert_eq!(again["id"], job["id"]);
     assert_eq!(again["spec"]["schedule"]["at"], "04:30");
     assert_eq!(env.cluster.list::<BackupJobSpec>().unwrap().1.len(), 1);
+}
+
+// ---- 4단계: 실행 엔진 ----
+
+/// 게스트 에이전트: `answer`가 켜져 있으면 모든 VM이 `10.20.0.9`를 알린다.
+#[derive(Default)]
+struct Agent {
+    answer: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl orbivisor_peer::GuestAgentSource for Agent {
+    async fn info(&self, _vm: Uuid, _refresh: bool) -> orbivisor_types::guest::GuestInfoResponse {
+        let answer = self.answer.load(std::sync::atomic::Ordering::SeqCst);
+        serde_json::from_value(if answer {
+            json!({ "state": "answered", "info": { "collected_at": 1, "interfaces": [
+                { "name": "eth0", "addresses": [ { "ip": "10.20.0.9", "prefix": 24 } ] } ] } })
+        } else {
+            json!({ "state": "no_agent" })
+        })
+        .unwrap()
+    }
+
+    async fn set_password(
+        &self,
+        _vm: Uuid,
+        _user: &str,
+        _password: &str,
+    ) -> Result<(), orbivisor_peer::GuestAgentError> {
+        Ok(())
+    }
+}
+
+/// 가짜 OVN 실행기(태그만 쓴다)
+fn ovn_host(dir: &std::path::Path) -> std::sync::Arc<orbivisor_driver::ovn::OvnHost> {
+    use orbivisor_driver::ovn::{FakeRunner, OvnHost, OvnOptions, OvnPaths};
+    let paths = OvnPaths {
+        etc: dir.join("etc"),
+        var_lib: dir.join("var"),
+        run: dir.join("run"),
+        log: dir.join("log"),
+        systemd: dir.join("systemd"),
+        pki: dir.join("pki"),
+        schemas: dir.join("schemas"),
+        distro_nb_db: dir.join("nb.db"),
+        ovs_system_id: dir.join("system-id.conf"),
+    };
+    std::sync::Arc::new(OvnHost::new(
+        std::sync::Arc::new(FakeRunner::new()),
+        paths,
+        OvnOptions::default(),
+        "abcdef012345".into(),
+    ))
+}
+
+/// 이 노드에서 준비된 dir 풀
+async fn ready_pool(env: &Env, name: &str, backups: bool) {
+    let path = env.dir.path().join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    let pool = Resource::new(
+        name,
+        StoragePoolSpec {
+            backend: PoolBackend::Dir { path },
+            nodes: vec![],
+            shared: false,
+            backups,
+            folder: None,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready(name).await;
+}
+
+/// 엔진 시험의 DR 쪽: 파일 없는 스토리지·가짜 OVN으로 VM을 켜는 노드(chassis), 세운 SDN, 풀 `dr-pool`·백업 풀 `bk`, 원격
+/// `prod`, 같은 이름의 SDN 네트워크 `lan`(10.20.0.0/24)과 `dr-lan`(10.30.0.0/24), 게스트 에이전트 `agent`
+async fn engine_env(agent: std::sync::Arc<Agent>) -> Env {
+    use orbivisor_types::node::NodeHotplug;
+    use orbivisor_types::sdn::{ChassisState, NodeSdn};
+    let mut env = Box::pin(Env::start_with_state(move |s| s.guest = Some(agent))).await;
+    env.stop_runner().await;
+    let host = ovn_host(&env.dir.path().join("ovn"));
+    Box::pin(env.start_runner_config(
+        std::sync::Arc::new(common::FakeStorage::default()),
+        move |c| c.sdn = Some(host),
+    ))
+    .await;
+    let mut me = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    me.status.hotplug = Some(NodeHotplug::default());
+    me.status.sdn = Some(NodeSdn {
+        chassis: ChassisState::Ready,
+        ..NodeSdn::default()
+    });
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &me.status)
+        .await
+        .unwrap();
+    let mut sdn: orbivisor_types::sdn::Sdn = Resource::new(
+        orbivisor_types::sdn::SDN_NAME,
+        orbivisor_types::sdn::SdnSpec::default(),
+    );
+    sdn.status.phase = orbivisor_types::sdn::SdnPhase::Ready;
+    sdn.status.centrals = vec![orbivisor_types::sdn::SdnCentral {
+        node: env.node,
+        address: "10.1.0.5".parse().unwrap(),
+    }];
+    env.cluster.create(&sdn).await.unwrap();
+    set_dr(&env, true).await;
+    ready_pool(&env, "dr-pool", false).await;
+    ready_pool(&env, "bk", true).await;
+    remote(&env, "prod", CA).await;
+    for (name, cidr) in [("lan", "10.20.0.0/24"), ("dr-lan", "10.30.0.0/24")] {
+        let net: orbivisor_types::network::Network = Resource::new(
+            name,
+            serde_json::from_value(json!({ "sdn": {}, "subnets": [ { "cidr": cidr } ] })).unwrap(),
+        );
+        env.cluster.create(&net).await.unwrap();
+    }
+    env
+}
+
+/// 운영 클러스터(`CA`)에서 온, 되살릴 수 있는 사본(리소스와 백업 풀 `bk`의 매니페스트, 디스크 없음). `agent`면 게스트
+/// 에이전트 채널이 있는 VM이다.
+async fn restorable(env: &Env, name: &str, vm: &str, agent: bool) -> Uuid {
+    use orbivisor_types::backup::{BackupManifest, MANIFEST_FILE, MANIFEST_VERSION, backup_dir};
+    let mut vm_spec = vm_spec(&["lan"]);
+    if agent {
+        vm_spec.guest_agent = Some(serde_json::from_value(json!({})).unwrap());
+    }
+    let source = Uuid::now_v7();
+    let mut b: Backup = Resource::new(
+        name,
+        BackupSpec {
+            vm: source,
+            vm_name: vm.into(),
+            pool: "bk".into(),
+            store: None,
+            source: None,
+            vm_spec: vm_spec.clone(),
+            job: None,
+            origin: Some(BackupOrigin {
+                cluster: "prod".into(),
+                ca_fingerprint: CA.into(),
+                backup: Uuid::now_v7(),
+                job: None,
+            }),
+            incremental: false,
+            max_chain: None,
+        },
+    );
+    b.status = BackupStatus {
+        phase: BackupPhase::Ready,
+        created_at: Some(now() - 600),
+        node: Some(env.node),
+        ..Default::default()
+    };
+    env.cluster.create(&b).await.unwrap();
+    let dir = backup_dir(&env.dir.path().join("bk"), b.id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = BackupManifest {
+        version: MANIFEST_VERSION,
+        backup: b.id,
+        parent: None,
+        vm: source,
+        vm_name: vm.into(),
+        vm_spec,
+        disks: vec![],
+        uefi_vars: false,
+        created_at: now() - 600,
+        tpm_state: false,
+    };
+    std::fs::write(
+        dir.join(MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    b.id
+}
+
+/// 그룹 둘(`db`는 게스트 에이전트를 기다림, `web`은 고정 IP)의 계획 `spec`
+fn engine_plan() -> Value {
+    json!({
+        "source": "prod",
+        "pool": "dr-pool",
+        "groups": [
+            { "name": "db", "wait": "guest", "timeout_secs": 60, "vms": [ { "vm": "db1" } ] },
+            { "name": "web", "delay_secs": 1, "vms": [ { "vm": "web1", "ip": [ { "nic": 0, "address": "10.20.0.5/24", "gateway": "10.20.0.1" } ] } ] }
+        ]
+    })
+}
+
+fn scheduler(env: &Env) -> orbivisor_api::DrScheduler {
+    orbivisor_api::DrScheduler::spawn(
+        env.state.clone(),
+        orbivisor_api::DrSchedulerConfig {
+            tick: Duration::from_millis(50),
+        },
+    )
+}
+
+/// 엔진 시험의 기다림(Task·VM 켜기가 여러 걸음이라 길게)
+async fn until_long(why: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{why}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn run_of(env: &Env, id: &Value) -> DrRun {
+    let id: Uuid = id.as_str().unwrap().parse().unwrap();
+    env.cluster.get::<DrRunSpec>(id).unwrap().unwrap()
+}
+
+async fn finished(env: &Env, id: &Value) -> DrRun {
+    until_long("the DR run did not finish", || {
+        run_of(env, id).status.state.is_finished()
+    })
+    .await;
+    run_of(env, id)
+}
+
+fn vm_named(env: &Env, name: &str) -> Option<orbivisor_types::vm::Vm> {
+    env.cluster.get_by_name::<VmSpec>(name).unwrap()
+}
+
+/// 계획 상태(끝난 실행을 계획에 적기 — `status.run` 비우기 — 를 기다린 뒤)
+async fn settled(env: &Env, name: &str) -> orbivisor_types::dr::RecoveryPlanStatus {
+    until_long("the plan still points at the finished run", || {
+        plan_status(env, name).run.is_none()
+    })
+    .await;
+    plan_status(env, name)
+}
+
+fn plan_status(env: &Env, name: &str) -> orbivisor_types::dr::RecoveryPlanStatus {
+    env.cluster
+        .get_by_name::<RecoveryPlanSpec>(name)
+        .unwrap()
+        .unwrap()
+        .status
+}
+
+/// `name`으로 되살리는 복원 Task들
+fn restore_tasks(env: &Env, name: &str) -> Vec<orbivisor_types::task::Task> {
+    use orbivisor_types::task::{TaskOp, TaskSpec};
+    env.cluster
+        .list::<TaskSpec>()
+        .unwrap()
+        .1
+        .into_iter()
+        .filter(|t| matches!(&t.spec.op, TaskOp::BackupRestore { name: n, .. } if n == name))
+        .collect()
+}
+
+fn start_tasks(env: &Env, vm: Uuid) -> usize {
+    use orbivisor_types::task::{TaskOp, TaskSpec};
+    env.cluster
+        .list::<TaskSpec>()
+        .unwrap()
+        .1
+        .iter()
+        .filter(|t| t.spec.target == vm && t.spec.op == TaskOp::VmStart)
+        .count()
+}
+
+/// 시험 장애 조치를 끝까지: 그룹 차례(db가 게스트 에이전트에 답한 뒤 web), 거품 네트워크(DR `lan`의 서브넷)를 만들고 NIC가
+/// 거기 붙음(web1의 고정 IP는 그 서브넷의 IPAM 주소), 시험 이름·폴더·라벨, RTO·계획의 `last_test`. 그 뒤 뒷정리가 VM과
+/// 거품 네트워크를 지운다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_run_recovers_groups_in_a_bubble_and_cleanup_removes_them() {
+    let agent = std::sync::Arc::new(Agent::default());
+    let env = engine_env(agent.clone()).await;
+    let admin = env.admin().await;
+    restorable(&env, "db1-c", "db1", true).await;
+    restorable(&env, "web1-c", "web1", false).await;
+    let (status, body) = admin
+        .post(
+            "/dr-plans",
+            json!({ "name": "web-tier", "spec": engine_plan() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, run) = admin
+        .post("/dr-plans/web-tier/actions/test", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    assert_eq!(
+        run["status"]["bubbles"][0]["name"], "drt-web-tier-1",
+        "{run}"
+    );
+    let looper = scheduler(&env);
+
+    // db1-drt가 켜졌어도 게스트 에이전트가 답할 때까지 web은 시작하지 않는다.
+    until_long("db1-drt never started", || {
+        vm_named(&env, "db1-drt")
+            .is_some_and(|v| v.status.phase == orbivisor_types::vm::VmPhase::Running)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        run_of(&env, &run["id"]).status.steps[0].phase,
+        DrPhase::Waiting
+    );
+    assert!(vm_named(&env, "web1-drt").is_none());
+    assert!(restore_tasks(&env, "web1-drt").is_empty());
+    agent
+        .answer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let done = finished(&env, &run["id"]).await;
+    assert_eq!(
+        done.status.state,
+        DrRunState::Succeeded,
+        "{:?}",
+        done.status
+    );
+    let rto = done.status.rto_secs.expect("rto");
+    assert!(rto < 60, "{rto}");
+    let db_ready = done.status.steps[0].at;
+    assert!(done.status.steps.iter().all(|s| s.phase == DrPhase::Ready));
+    // web은 db가 준비된 뒤에(1초 쉼) 복원했다.
+    let web_restore = restore_tasks(&env, "web1-drt");
+    assert_eq!(web_restore.len(), 1);
+    let made = web_restore[0].id.get_timestamp().unwrap().to_unix().0;
+    assert!(made >= db_ready, "{made} < {db_ready}");
+    // 거품 네트워크: SDN, 라우터 없음, DR `lan`의 서브넷, 시험 라벨
+    let bubble = env
+        .cluster
+        .get_by_name::<orbivisor_types::network::NetworkSpec>("drt-web-tier-1")
+        .unwrap()
+        .expect("bubble");
+    assert!(bubble.spec.is_sdn());
+    assert_eq!(bubble.spec.subnets[0].cidr.to_string(), "10.20.0.0/24");
+    assert_eq!(bubble.labels[DR_TEST_LABEL], "web-tier");
+    for name in ["db1-drt", "web1-drt"] {
+        let vm = vm_named(&env, name).unwrap();
+        assert_eq!(vm.labels[DR_TEST_LABEL], "web-tier", "{name}");
+        assert!(!vm.labels.contains_key(DR_LABEL));
+        assert_eq!(vm.spec.nics[0].network, "drt-web-tier-1", "{name}");
+        assert!(vm.spec.ha.is_none());
+        let folder = env
+            .cluster
+            .get::<orbivisor_types::folder::FolderSpec>(vm.spec.folder.expect("folder"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(folder.spec.name, "web-tier");
+        let parent = env
+            .cluster
+            .get::<orbivisor_types::folder::FolderSpec>(folder.spec.parent.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.spec.name, "dr-test");
+    }
+    assert_eq!(
+        vm_named(&env, "web1-drt").unwrap().spec.nics[0].ips,
+        ["10.20.0.5".parse::<std::net::IpAddr>().unwrap()]
+    );
+    // 계획: 지금 실행 없음, 마지막 시험
+    let st = settled(&env, "web-tier").await;
+    assert_eq!(st.run, None);
+    let last = st.last_test.expect("last_test");
+    assert_eq!(last.run, done.id);
+    assert_eq!(last.result, DrRunState::Succeeded);
+    assert_eq!(last.rto_secs, Some(rto));
+
+    // 뒷정리: 켜진 시험 VM을 끄고 지운 뒤 거품 네트워크
+    let (status, cleanup) = admin
+        .post("/dr-plans/web-tier/actions/cleanup", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{cleanup}");
+    assert_eq!(
+        cleanup["spec"]["cleanup"]["networks"],
+        json!(["drt-web-tier-1"])
+    );
+    let done = finished(&env, &cleanup["id"]).await;
+    assert_eq!(
+        done.status.state,
+        DrRunState::Succeeded,
+        "{:?}",
+        done.status
+    );
+    assert!(vm_named(&env, "db1-drt").is_none());
+    assert!(vm_named(&env, "web1-drt").is_none());
+    assert!(
+        env.cluster
+            .get_by_name::<orbivisor_types::network::NetworkSpec>("drt-web-tier-1")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(settled(&env, "web-tier").await.run, None);
+    // 시험 결과는 뒷정리가 바꾸지 않는다.
+    assert_eq!(
+        plan_status(&env, "web-tier").last_test.unwrap().result,
+        DrRunState::Succeeded
+    );
+    looper.shutdown().await;
+}
+
+async fn make_plan(admin: &common::Client, spec: Value) {
+    let (status, body) = admin
+        .post("/dr-plans", json!({ "name": "web-tier", "spec": spec }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// `on_timeout: stop`: 앞 그룹의 VM이 실패하면(복구 지점의 파일이 없어 복원 Task 실패) 남은 VM은 `skipped`이고 실행은
+/// `failed`(준비된 VM 없음). 시험 VM이 없어도 계획의 `last_test`에 남는다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_timeout_stop_skips_the_rest_after_a_failure() {
+    let env = engine_env(std::sync::Arc::new(Agent::default())).await;
+    let admin = env.admin().await;
+    let db = restorable(&env, "db1-c", "db1", true).await;
+    restorable(&env, "web1-c", "web1", false).await;
+    std::fs::remove_dir_all(orbivisor_types::backup::backup_dir(
+        &env.dir.path().join("bk"),
+        db,
+    ))
+    .unwrap();
+    let mut spec = engine_plan();
+    spec["on_timeout"] = json!("stop");
+    spec["test_networks"] = json!({ "lan": "dr-lan" });
+    make_plan(&admin, spec).await;
+    let (status, run) = admin
+        .post("/dr-plans/web-tier/actions/test", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let looper = scheduler(&env);
+    let done = finished(&env, &run["id"]).await;
+    assert_eq!(done.status.state, DrRunState::Failed, "{:?}", done.status);
+    assert_eq!(done.status.steps[0].phase, DrPhase::Failed);
+    assert!(done.status.steps[0].error.is_some());
+    assert_eq!(done.status.steps[1].phase, DrPhase::Skipped);
+    assert!(restore_tasks(&env, "web1-drt").is_empty());
+    assert!(done.status.bubbles.is_empty(), "test_networks map lan");
+    let st = settled(&env, "web-tier").await;
+    assert_eq!(st.run, None);
+    assert_eq!(st.last_test.unwrap().result, DrRunState::Failed);
+    looper.shutdown().await;
+}
+
+/// 시험을 취소하면 진행 중인 단계 뒤에 멈추고(기다리던 db1은 `skipped`, web은 시작하지 않음) 끝난 상태를 저장한 뒤 뒷정리
+/// 실행이 시험 VM과 거품 네트워크를 지운다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_test_cleans_up_after_it() {
+    let env = engine_env(std::sync::Arc::new(Agent::default())).await;
+    let admin = env.admin().await;
+    restorable(&env, "db1-c", "db1", true).await;
+    restorable(&env, "web1-c", "web1", false).await;
+    make_plan(&admin, engine_plan()).await;
+    let (_, run) = admin
+        .post("/dr-plans/web-tier/actions/test", json!({}))
+        .await;
+    let looper = scheduler(&env);
+    // 게스트 에이전트가 답하지 않아 db1은 기다린다.
+    until_long("db1 never waited", || {
+        run_of(&env, &run["id"]).status.steps[0].phase == DrPhase::Waiting
+    })
+    .await;
+    let (status, body) = admin
+        .post("/dr-plans/web-tier/actions/cancel", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let done = finished(&env, &run["id"]).await;
+    assert_eq!(
+        done.status.state,
+        DrRunState::Cancelled,
+        "{:?}",
+        done.status
+    );
+    assert!(
+        done.status
+            .steps
+            .iter()
+            .all(|s| s.phase == DrPhase::Skipped)
+    );
+    assert!(vm_named(&env, "web1-drt").is_none());
+    // 뒷정리 실행이 생겨 끝까지 간다.
+    until_long("no cleanup run", || {
+        env.cluster
+            .list::<DrRunSpec>()
+            .unwrap()
+            .1
+            .iter()
+            .any(|r| r.spec.kind == DrRunKind::Cleanup && r.status.state == DrRunState::Succeeded)
+    })
+    .await;
+    looper.shutdown().await;
+    let cleanup = env
+        .cluster
+        .list::<DrRunSpec>()
+        .unwrap()
+        .1
+        .into_iter()
+        .find(|r| r.spec.kind == DrRunKind::Cleanup)
+        .unwrap();
+    assert_eq!(cleanup.spec.cleanup.as_ref().unwrap().run, done.id);
+    assert!(vm_named(&env, "db1-drt").is_none());
+    assert!(
+        env.cluster
+            .get_by_name::<orbivisor_types::network::NetworkSpec>("drt-web-tier-1")
+            .unwrap()
+            .is_none()
+    );
+    let st = settled(&env, "web-tier").await;
+    assert_eq!(st.run, None);
+    assert_eq!(st.last_test.unwrap().result, DrRunState::Cancelled);
+}
+
+/// 재해 장애 조치: 원본 이름·라벨 `orbivisor.io/dr`, 네트워크 맵(`lan` → `dr-lan`)과 그 서브넷의 고정 IP. 이름이 이미
+/// 쓰인 VM(db1)만 `dr_name_taken`으로 실패하고(그 VM은 건드리지 않음) 실행은 `partial`. 시험이 아니라 `last_test`는 없다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disaster_failover_uses_source_names_and_maps() {
+    let env = engine_env(std::sync::Arc::new(Agent::default())).await;
+    let admin = env.admin().await;
+    restorable(&env, "db1-c", "db1", true).await;
+    restorable(&env, "web1-c", "web1", false).await;
+    let theirs = labelled_vm(&env, "db1", "owner", "someone").await;
+    let mut spec = engine_plan();
+    spec["networks"] = json!({ "lan": "dr-lan" });
+    spec["groups"][0]["wait"] = json!("running");
+    spec["groups"][1]["vms"][0]["ip"] =
+        json!([ { "nic": 0, "address": "10.30.0.7/24", "gateway": "10.30.0.1" } ]);
+    make_plan(&admin, spec).await;
+    let (status, run) = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let looper = scheduler(&env);
+    let done = finished(&env, &run["id"]).await;
+    assert_eq!(done.status.state, DrRunState::Partial, "{:?}", done.status);
+    let db = &done.status.steps[0];
+    assert_eq!(db.phase, DrPhase::Failed);
+    assert!(
+        db.error.as_deref().unwrap().starts_with("dr_name_taken"),
+        "{db:?}"
+    );
+    let mine = env.cluster.get::<VmSpec>(theirs).unwrap().unwrap();
+    assert!(!mine.labels.contains_key(DR_LABEL));
+    assert_eq!(done.status.steps[1].phase, DrPhase::Ready);
+    let web = vm_named(&env, "web1").unwrap();
+    assert_eq!(web.labels[DR_LABEL], "web-tier");
+    assert_eq!(web.spec.nics[0].network, "dr-lan");
+    assert_eq!(
+        web.spec.nics[0].ips,
+        ["10.30.0.7".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert!(done.status.rto_secs.is_some());
+    let st = settled(&env, "web-tier").await;
+    assert_eq!(st.run, None);
+    assert!(st.last_test.is_none());
+    looper.shutdown().await;
+}
+
+/// 리더가 바뀜: 첫 스케줄러가 복원 Task를 내고 기록한 뒤 멈추고, 기록을 잃은 것처럼(Task id 없는 `restoring`) 둔다. 새
+/// 스케줄러는 같은 기록에서 이어 가며 이미 낸 Task를 찾아 쓴다 — 복원·시작 Task는 VM마다 하나다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_leader_continues_without_issuing_tasks_twice() {
+    let mut env = engine_env(std::sync::Arc::new(Agent::default())).await;
+    let admin = env.admin().await;
+    restorable(&env, "web1-c", "web1", false).await;
+    make_plan(
+        &admin,
+        json!({ "source": "prod", "pool": "dr-pool",
+                "groups": [ { "name": "web", "vms": [ { "vm": "web1" } ] } ] }),
+    )
+    .await;
+    // 새 실행은 설정의 동시 수를 가진다.
+    let (status, body) = admin
+        .patch("/settings", json!({ "dr_max_parallel": 2 }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Task 실행기를 멈춰 복원 Task가 끝나지 않게 한다.
+    env.stop_runner().await;
+    let (_, run) = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_eq!(run["spec"]["max_parallel"], 2, "{run}");
+    let first = scheduler(&env);
+    until_long("no restore task", || {
+        run_of(&env, &run["id"]).status.steps[0].task.is_some()
+    })
+    .await;
+    first.shutdown().await;
+    let issued = run_of(&env, &run["id"]).status.steps[0].task.unwrap();
+    // 저장 전에 리더가 바뀐 것처럼 Task id를 지운다.
+    let mut lost = run_of(&env, &run["id"]);
+    assert_eq!(lost.status.steps[0].phase, DrPhase::Restoring);
+    lost.status.steps[0].task = None;
+    env.cluster
+        .update_status::<DrRunSpec>(lost.id, &lost.status)
+        .await
+        .unwrap();
+    let second = scheduler(&env);
+    until_long("the new leader did not pick up the task", || {
+        run_of(&env, &run["id"]).status.steps[0].task == Some(issued)
+    })
+    .await;
+    assert_eq!(restore_tasks(&env, "web1").len(), 1);
+    env.start_runner_with(std::sync::Arc::new(common::FakeStorage::default()))
+        .await;
+    let done = finished(&env, &run["id"]).await;
+    second.shutdown().await;
+    assert_eq!(
+        done.status.state,
+        DrRunState::Succeeded,
+        "{:?}",
+        done.status
+    );
+    assert_eq!(restore_tasks(&env, "web1").len(), 1);
+    let web = vm_named(&env, "web1").unwrap();
+    assert_eq!(start_tasks(&env, web.id), 1);
+}
+
+/// 계획된 이전: 운영 쪽(원격 역할의 두 번째 클러스터 — 이 클러스터를 원격 `dr`로 등록함)이 정지·백업·복제를 받는다. 켜진
+/// 운영 VM을 끄고, 실행이 정한 이름으로 그 VM의 백업 풀에 백업한 뒤 이 클러스터로 복제하고, 사본이 오면 그것으로 되살린다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_failover_stops_backs_up_and_replicates_the_source_first() {
+    let prod = Env::start().await;
+    ready_pool(&prod, "backups", true).await;
+    let prod_admin = prod.admin().await;
+    let (status, vm) = prod_admin.post("/vms", common::vm_request("web1")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let task = prod_admin.act("web1", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    // 운영 쪽의 지난 백업(마지막 백업이 이 풀을 쓴다)
+    let (status, task) = prod_admin
+        .post("/vms/web1/backups", json!({ "pool": "backups" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = prod_admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    env.start_runner_with(std::sync::Arc::new(common::FakeStorage::default()))
+        .await;
+    set_dr(&env, true).await;
+    ready_pool(&env, "dr-pool", false).await;
+    ready_pool(&env, "bk", true).await;
+    let admin = env.admin().await;
+    let prod_server = prod.serve_tls().await;
+    let dr_server = env.serve_tls().await;
+    let (status, body) = admin
+        .post(
+            "/remotes",
+            json!({ "name": "prod", "url": prod_server.url, "ca_fingerprint": prod.ca_fingerprint(),
+                    "token": prod_admin.token.clone().unwrap() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = prod_admin
+        .post(
+            "/remotes",
+            json!({ "name": "dr", "url": dr_server.url, "ca_fingerprint": env.ca_fingerprint(),
+                    "token": admin.token.clone().unwrap() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    make_plan(
+        &admin,
+        json!({ "source": "prod", "pool": "dr-pool",
+                "groups": [ { "name": "web", "vms": [ { "vm": "web1" } ] } ] }),
+    )
+    .await;
+    let (status, run) = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "planned", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let looper = scheduler(&env);
+    let done = finished(&env, &run["id"]).await;
+    assert_eq!(
+        done.status.state,
+        DrRunState::Succeeded,
+        "{:?}",
+        done.status
+    );
+    assert!(done.status.prepare_secs.is_some());
+    let step = &done.status.steps[0];
+    let prepare = step.prepare.as_ref().unwrap();
+    let source_backup = prepare.source_backup.clone().unwrap();
+    assert!(source_backup.starts_with("web1-dr-"), "{source_backup}");
+    // 운영 쪽: VM은 꺼졌고 실행의 백업이 있으며 이 클러스터로 복제됐다.
+    let source_vm = prod.cluster.get_by_name::<VmSpec>("web1").unwrap().unwrap();
+    assert_eq!(
+        source_vm.status.phase,
+        orbivisor_types::vm::VmPhase::Stopped
+    );
+    let b = prod
+        .cluster
+        .get_by_name::<BackupSpec>(&source_backup)
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.spec.pool, "backups");
+    assert_eq!(b.status.replicas[0].remote, "dr");
+    // 이 클러스터: 그 사본으로 되살린 원본 이름의 VM
+    let copy = env
+        .cluster
+        .get_by_name::<BackupSpec>(step.backup.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(copy.spec.origin.as_ref().unwrap().backup, b.id);
+    assert_eq!(copy.spec.pool, "bk");
+    let web = vm_named(&env, "web1").unwrap();
+    assert_eq!(web.labels[DR_LABEL], "web-tier");
+    assert_eq!(settled(&env, "web-tier").await.run, None);
+    looper.shutdown().await;
 }

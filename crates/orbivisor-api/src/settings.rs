@@ -13,10 +13,11 @@ use orbivisor_types::node::{
 };
 use orbivisor_types::resource::{Resource, ResourceSpec};
 use orbivisor_types::settings::{
-    Channel, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT,
-    MAX_HA_START_CONCURRENCY, MAX_PLACEMENT_THRESHOLD, PlacementMode, PlacementPolicy,
-    PlacementSettings, PrometheusSettings, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus,
-    ShutdownPolicy, TelemetrySettings, VOTER_LIMITS,
+    Channel, DEFAULT_DR_PARALLEL, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_DR_PARALLEL,
+    MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT, MAX_HA_START_CONCURRENCY,
+    MAX_PLACEMENT_THRESHOLD, PlacementMode, PlacementPolicy, PlacementSettings, PrometheusSettings,
+    SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, ShutdownPolicy, TelemetrySettings,
+    VOTER_LIMITS,
 };
 use orbivisor_types::subscription::SubscriptionState;
 use orbivisor_types::version::TELEMETRY_URL;
@@ -113,6 +114,11 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub history: Option<HistorySettingsPatch>,
+    /// DR 실행 하나가 동시에 진행하는 복원·시작 수(계획 76, 1~32, 기본 4). 새 실행부터 쓴다. 모든 노드가 `dr-plans`를
+    /// 알아야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default, minimum = 1, maximum = 32)]
+    pub dr_max_parallel: Option<u8>,
 }
 
 /// 설정 이력 보존 한도에서 바꿀 값
@@ -478,10 +484,20 @@ pub async fn patch_settings(
         && req.cpu.is_none()
         && req.acme.is_none()
         && req.history.is_none()
+        && req.dr_max_parallel.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor, cpu, acme or history",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor, cpu, acme, history or dr_max_parallel",
         ));
+    }
+    // 옛 노드는 설정 `dr_max_parallel`을 풀지 못한다(계획 76, 검증보다 먼저).
+    if let Some(n) = req.dr_max_parallel {
+        crate::cluster::require_feature(&state.cluster, orbivisor_types::node::DR_PLANS)?;
+        if !(1..=MAX_DR_PARALLEL).contains(&n) {
+            return Err(ApiError::bad_request(format!(
+                "dr_max_parallel must be between 1 and {MAX_DR_PARALLEL} (got {n})"
+            )));
+        }
     }
     // 옛 노드는 설정 `history`를 풀지 못한다(계획 73, 검증보다 먼저).
     if req.history.is_some() {
@@ -657,6 +673,10 @@ pub async fn patch_settings(
         if let Some(patch) = req.history {
             let history = patch.apply(spec.history());
             spec.history = (history != HistorySettings::default()).then_some(history);
+        }
+        // 기본(4)은 쓰지 않는다.
+        if let Some(n) = req.dr_max_parallel {
+            spec.dr_max_parallel = (n != DEFAULT_DR_PARALLEL).then_some(n);
         }
         Ok(())
     })

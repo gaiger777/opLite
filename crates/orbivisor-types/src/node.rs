@@ -488,6 +488,7 @@ pub const FEATURES: &[&str] = &[
     OPERATOR_DASHBOARD,
     LINK_ALERTS,
     RESTORE_REMAP,
+    DR_PLANS,
 ];
 
 /// 운영자 대시보드(계획 75): `GET /topology/physical`·`GET /capacity`, `NodeInterface`의 `mtu`·`parent`·`vlan_id`·
@@ -500,8 +501,8 @@ pub const OPERATOR_DASHBOARD: &str = "operator-dashboard";
 pub const LINK_ALERTS: &str = "link-alerts";
 
 /// DR 오케스트레이션(계획 76): 종류 `RecoveryPlan`·`DrRun`, `/dr-plans`·`/dr-runs` 경로, 경보 조건 `dr_rpo_exceeded`·
-/// `dr_run_failed`. 옛 노드는 새 종류·조건을 풀지 못하므로 모든 노드가 알릴 때만 쓴다. API·엔진이 다 되는 단계에서
-/// [`FEATURES`]에 넣는다(그 전에는 아무 노드도 알리지 않아 쓰기가 409 `cluster_upgrading`이다).
+/// `dr_run_failed`, 설정 `dr_max_parallel`. 옛 노드는 새 종류·조건을 풀지 못하므로 모든 노드가 알릴 때만 쓴다(4단계
+/// 엔진으로 다 되어 알린다).
 pub const DR_PLANS: &str = "dr-plans";
 
 /// 복원 맵(계획 76 §3.3): 복원 요청의 `networks`·`security_groups`·`cloud_init_networks`·`cloud_init_dns`. 옛 노드의 복원
@@ -1182,7 +1183,8 @@ mod tests {
                 "orbivisor-layout",
                 "operator-dashboard",
                 "link-alerts",
-                "restore-remap"
+                "restore-remap",
+                "dr-plans"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1401,15 +1403,15 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&RESTORE_REMAP));
+        assert_eq!(FEATURES.last(), Some(&DR_PLANS));
     }
 
-    /// 계획 76: 복원 맵은 2단계로 다 되어 알린다. 복구 계획(`dr-plans`)은 API·엔진이 다 될 때까지 알리지 않는다.
+    /// 계획 76: 복원 맵(2단계)과 복구 계획(4단계 — API·엔진)을 알린다.
     #[test]
-    fn dr_features_are_not_announced_yet() {
+    fn dr_features_are_announced() {
         assert_eq!(DR_PLANS, "dr-plans");
         assert_eq!(RESTORE_REMAP, "restore-remap");
-        assert!(!FEATURES.contains(&DR_PLANS));
+        assert!(FEATURES.contains(&DR_PLANS));
         assert!(FEATURES.contains(&RESTORE_REMAP));
     }
 

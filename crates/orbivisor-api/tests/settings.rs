@@ -511,3 +511,53 @@ async fn placement_settings_merge_and_wait_for_the_feature() {
     assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
     assert_eq!(stored().placement, None);
 }
+
+/// 계획 76: DR 실행의 동시 복원·시작 수(1~32, 기본 4는 쓰지 않음 — 새 실행이 쓰는 것은 `tests/dr.rs`). 모든 노드가
+/// `dr-plans`를 알아야 한다.
+#[tokio::test]
+async fn dr_max_parallel_is_checked_and_stored() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    for bad in [
+        json!({ "dr_max_parallel": 0 }),
+        json!({ "dr_max_parallel": 33 }),
+    ] {
+        let got = admin.patch("/settings", bad, None).await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let (status, got) = admin
+        .patch("/settings", json!({ "dr_max_parallel": 8 }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["dr_max_parallel"], 8);
+    let stored = || {
+        env.cluster
+            .get_by_name::<SettingsSpec>(SETTINGS_NAME)
+            .unwrap()
+            .unwrap()
+            .spec
+    };
+    assert_eq!(stored().dr_max_parallel(), 8);
+    let (_, got) = admin
+        .patch("/settings", json!({ "dr_max_parallel": 4 }), None)
+        .await;
+    assert!(got["spec"].get("dr_max_parallel").is_none(), "{got}");
+    assert_eq!(stored().dr_max_parallel(), 4);
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status
+        .features
+        .retain(|f| f != orbivisor_types::node::DR_PLANS);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let got = admin
+        .patch("/settings", json!({ "dr_max_parallel": 0 }), None)
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+}

@@ -1122,7 +1122,8 @@ pub enum DrAction {
     BackupSource { step: usize, vm: String },
     /// 운영 쪽 `POST /backups/{backup}/actions/replicate`(이 클러스터로)
     ReplicateSource { step: usize, backup: String },
-    /// 시험 VM을 끄고 지우는 Task. 결과는 `Task(id)`.
+    /// 시험 VM을 끄고 지운다. 켜진 VM은 끄는 Task(`Task(id)`)를 내고 그 Task가 끝나 VM이 꺼지면 같은 할 일을 다시 받는다.
+    /// 꺼진 VM은 지우고 디스크 지우기 Task(`Task(id)`, 디스크가 없으면 `Done`)를 낸다. 이미 없으면 `Done`(`deleted`).
     DeleteVm { step: usize, vm: String },
     /// 거품 네트워크를 지운다. 이미 없으면 결과는 `Done`이다.
     DeleteNetwork { bubble: usize, name: String },
@@ -1269,6 +1270,12 @@ impl DrRunStatus {
                 match result {
                     DrResult::Task(id) => st.task = Some(id),
                     DrResult::Failed(e) => fail(st, e),
+                    // 뒷정리: VM을 곧바로 지웠다(Task 없이 — 꺼진 VM, 지울 디스크 없음) 또는 이미 없었다.
+                    DrResult::Done if matches!(action, DrAction::DeleteVm { .. }) => {
+                        st.phase = DrPhase::Deleted;
+                        st.task = None;
+                        st.at = now;
+                    }
                     _ => {}
                 }
             }
@@ -1863,12 +1870,17 @@ fn advance_cleanup(
     let max = spec.max_parallel.max(1) as usize;
     for step in &mut s.steps {
         let vm = step.new_vm.clone().unwrap_or_default();
-        let present = obs.vms.contains_key(&vm);
+        let seen = obs.vms.get(&vm);
+        let present = seen.is_some();
         match (step.phase, step.task) {
-            (DrPhase::Pending, _) if !present => set_phase(step, DrPhase::Deleted, now),
+            (DrPhase::Pending | DrPhase::Deleting, None) if !present => {
+                set_phase(step, DrPhase::Deleted, now)
+            }
             (DrPhase::Deleting, Some(t)) => match outcome(obs, t, !present) {
                 TaskOutcome::Running => {}
                 TaskOutcome::Succeeded if !present => set_phase(step, DrPhase::Deleted, now),
+                // 끄는 Task가 끝났다(켜진 VM은 먼저 끈다): 이제 지운다(같은 할 일을 다시 낸다).
+                TaskOutcome::Succeeded if seen.is_some_and(|v| !v.running) => step.task = None,
                 TaskOutcome::Succeeded => {
                     set_phase(step, DrPhase::Failed, now);
                     step.error = Some(format!("VM {vm} is still there"));

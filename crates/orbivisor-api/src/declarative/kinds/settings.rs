@@ -42,6 +42,7 @@ const PATCHABLE: &[&str] = &[
     "cpu",
     "history",
     "acme",
+    "dr_max_parallel",
 ];
 
 pub(crate) struct SettingsAdapter;
@@ -62,6 +63,7 @@ fn patch_body(spec: &SettingsSpec, fields: &[String]) -> Value {
             "shutdown_policy" => json!(spec.shutdown_policy()),
             "ha_reserve" => spec.ha_reserve.map_or(json!("none"), |r| json!(r)),
             "ha_start_concurrency" => json!(spec.ha_start_concurrency()),
+            "dr_max_parallel" => json!(spec.dr_max_parallel()),
             "placement" => {
                 let p = spec.placement();
                 json!({ "policy": p.policy, "mode": p.mode, "threshold": p.threshold })

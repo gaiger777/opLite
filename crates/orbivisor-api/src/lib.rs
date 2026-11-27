@@ -121,7 +121,7 @@ pub use balancer::{Balancer, BalancerConfig};
 pub use ceph::CephPeerSource;
 pub use ceph_agent::CephAgent;
 pub use cpu::CpuRefresher;
-pub use dr::{DrProtection, DrProtectionConfig};
+pub use dr::{DrProtection, DrProtectionConfig, DrScheduler, DrSchedulerConfig};
 pub use drain::start_drain;
 pub use drift::{DriftChecker, DriftCheckerConfig};
 pub use file_restore::FileRestoreSessions;

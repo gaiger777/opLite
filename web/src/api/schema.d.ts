@@ -16487,6 +16487,11 @@ export interface components {
                  *     푼다.
                  */
                 cpu?: components["schemas"]["CpuSettings"];
+                /**
+                 * Format: int32
+                 * @description DR 실행 하나가 동시에 진행하는 복원·시작 수(계획 76, 1~32). 없으면 4이고 쓰지 않는다(기능 `dr-plans`).
+                 */
+                dr_max_parallel?: number;
                 /** @description HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다. */
                 ha_reserve?: components["schemas"]["HaReserve"];
                 /**
@@ -17745,6 +17750,12 @@ export interface components {
              */
             cpu?: components["schemas"]["CpuSettingsPatch"];
             /**
+             * Format: int32
+             * @description DR 실행 하나가 동시에 진행하는 복원·시작 수(계획 76, 1~32, 기본 4). 새 실행부터 쓴다. 모든 노드가 `dr-plans`를
+             *     알아야 한다.
+             */
+            dr_max_parallel?: number;
+            /**
              * @description HA 복구를 위해 비워 둘 용량: `{"nodes": N}`(메모리가 가장 큰 노드 N대, 1~8), `{"percent": P}`(1~90),
              *     `"none"`(예약 없음). HA VM을 켤 때 넘으면 409 `ha_capacity`다.
              */
@@ -17822,6 +17833,11 @@ export interface components {
              *     푼다.
              */
             cpu?: components["schemas"]["CpuSettings"];
+            /**
+             * Format: int32
+             * @description DR 실행 하나가 동시에 진행하는 복원·시작 수(계획 76, 1~32). 없으면 4이고 쓰지 않는다(기능 `dr-plans`).
+             */
+            dr_max_parallel?: number;
             /** @description HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             ha_reserve?: components["schemas"]["HaReserve"];
             /**

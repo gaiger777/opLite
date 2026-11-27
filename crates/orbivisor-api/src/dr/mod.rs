@@ -11,6 +11,7 @@
 //!   `dr-reprotect-<plan>`(복제 `{remote, pool}`)을 만들거나 바꾼다.
 
 pub(crate) mod protection;
+pub(crate) mod scheduler;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -52,6 +53,7 @@ use crate::resources::{CreateRequest, List, UpdateRequest, check_name, if_match,
 use crate::state::AppState;
 
 pub use protection::{DrProtection, DrProtectionConfig};
+pub use scheduler::{DrScheduler, DrSchedulerConfig};
 
 /// 계획된 이전 앞에 운영 쪽(원격)에 닿는지 보는 제한 시간
 const REACH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -482,7 +484,9 @@ async fn start_run(
         plan_name: plan.name.clone(),
         kind,
         plan_spec: plan.spec.clone(),
-        max_parallel: DEFAULT_MAX_PARALLEL,
+        // 설정 `dr_max_parallel`(새 실행부터 — 도는 실행은 시작한 때의 값)
+        max_parallel: crate::settings::current(c)
+            .map_or(DEFAULT_MAX_PARALLEL, |s| s.spec.dr_max_parallel()),
         cleanup,
     };
     let backups = c.list::<BackupSpec>()?.1;

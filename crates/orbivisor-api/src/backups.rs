@@ -822,8 +822,33 @@ pub async fn restore_backup(
     principal: Principal,
     audit: crate::audit::AuditNote,
     Path(key): Path<String>,
-    Json(mut req): Json<RestoreRequest>,
+    Json(req): Json<RestoreRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    let task = start_restore(&state, Some(&principal), &backup, req).await?;
+    if let TaskOp::BackupRestore { name, .. } | TaskOp::BackupLiveRestore { name, .. } =
+        &task.spec.op
+    {
+        let live = matches!(task.spec.op, TaskOp::BackupLiveRestore { .. });
+        audit.detail(format!(
+            "backup restore {} → {name}{}",
+            backup.name,
+            if live { " (live)" } else { "" }
+        ));
+    }
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// [`restore_backup`]의 검사와 Task 만들기. `principal`이 없으면(DR 엔진 — 실행을 시작한 관리자를 대신함) 새 폴더·풀·
+/// 네트워크 권한은 보지 않고 나머지 검사는 같다.
+pub(crate) async fn start_restore(
+    state: &Arc<AppState>,
+    principal: Option<&Principal>,
+    backup: &Backup,
+    mut req: RestoreRequest,
+) -> Result<Task, ApiError> {
+    let state = state.clone();
+    let backup = backup.clone();
     // 백업의 `backup.restore`는 경로표가 봤다. 새 VM의 폴더·풀·네트워크는 아래에서 본다.
     if req.live {
         require_feature(&state.cluster, BACKUP_STORE)?;
@@ -835,7 +860,6 @@ pub async fn restore_backup(
         require_feature(&state.cluster, RESTORE_REMAP)?;
     }
     check_name(&req.name)?;
-    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     // 복원 맵(계획 76 §3.3): 원본 이름은 백업에 있어야 한다. 아래 검사(네트워크·보안 그룹이 있는지, 권한)는 맵을 쓴
     // 스펙으로 본다.
     let remap = RestoreRemap {
@@ -867,27 +891,32 @@ pub async fn restore_backup(
                 .is_ok_and(|found| found.is_some())
         }),
     };
-    state
-        .authz
-        .require_new(&principal, Privilege::VmCreate, Kind::Vm, folder)?;
-    // 라이브 복원은 새 VM을 곧바로 켠다.
-    if req.live {
+    if let Some(principal) = principal {
         state
             .authz
-            .require_new(&principal, Privilege::VmPower, Kind::Vm, folder)?;
+            .require_new(principal, Privilege::VmCreate, Kind::Vm, folder)?;
+        // 라이브 복원은 새 VM을 곧바로 켠다.
+        if req.live {
+            state
+                .authz
+                .require_new(principal, Privilege::VmPower, Kind::Vm, folder)?;
+        }
+        // 전용 CPU·hugepages VM은 `vm.dedicated`
+        crate::numa::require_privilege(
+            &state,
+            principal,
+            orbivisor_types::numa::uses_host_resources(&backup.spec.vm_spec),
+            folder,
+        )?;
     }
-    // 전용 CPU·hugepages VM은 `vm.dedicated`, 계획 64 칸은 모든 노드가 `numa`를 알아야 한다.
-    crate::numa::require_privilege(
-        &state,
-        &principal,
-        orbivisor_types::numa::uses_host_resources(&backup.spec.vm_spec),
-        folder,
-    )?;
+    // 계획 64 칸은 모든 노드가 `numa`를 알아야 한다.
     crate::numa::require_numa_feature(&state.cluster, &backup.spec.vm_spec)?;
-    state.authz.require_pool(&principal, &req.pool)?;
-    state
-        .authz
-        .require_networks(&principal, remapped.nics.iter().map(|n| n.network.as_str()))?;
+    if let Some(principal) = principal {
+        state.authz.require_pool(principal, &req.pool)?;
+        state
+            .authz
+            .require_networks(principal, remapped.nics.iter().map(|n| n.network.as_str()))?;
+    }
     // 폴더 할당량: 되살릴 VM과 디스크(백업한 가상 크기)
     let bytes = backup
         .status
@@ -1014,12 +1043,6 @@ pub async fn restore_backup(
             ));
         }
     }
-    audit.detail(format!(
-        "backup restore {} → {}{}",
-        backup.name,
-        req.name,
-        if req.live { " (live)" } else { "" }
-    ));
     let remap = (!remap.is_empty()).then_some(remap);
     let op = if req.live {
         TaskOp::BackupLiveRestore {
@@ -1038,8 +1061,7 @@ pub async fn restore_backup(
             remap,
         }
     };
-    let task = create_task(&state.cluster, op, Uuid::now_v7(), node).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    create_task(&state.cluster, op, Uuid::now_v7(), node).await
 }
 
 /// 저장소 백업(계획 68 §8.6)을 되살릴 노드: `node`(저장소와 대상 풀을 쓸 수 있어야 함, 아니면 409 `store_not_on_node`·

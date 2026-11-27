@@ -2007,6 +2007,7 @@ async fn a_port_that_vanishes_while_pending_still_fires() {
 #[tokio::test]
 async fn dr_rules_wait_for_dr_plans() {
     let rig = Rig::start().await;
+    withdraw_dr(&rig.env).await;
     let admin = rig.env.admin().await;
     rig.target("ops", "json").await;
     for condition in [
@@ -2152,7 +2153,22 @@ async fn announce_dr(env: &Env) {
     let mut n = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
     n.status
         .features
+        .retain(|f| f != orbivisor_types::node::DR_PLANS);
+    n.status
+        .features
         .push(orbivisor_types::node::DR_PLANS.into());
+    env.cluster
+        .update_status::<NodeSpec>(n.id, &n.status)
+        .await
+        .unwrap();
+}
+
+/// 이 노드가 `dr-plans`를 알리지 않게 한다(옛 노드가 섞인 판 — 기능은 `FEATURES`에 있다).
+async fn withdraw_dr(env: &Env) {
+    let mut n = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    n.status
+        .features
+        .retain(|f| f != orbivisor_types::node::DR_PLANS);
     env.cluster
         .update_status::<NodeSpec>(n.id, &n.status)
         .await
@@ -2339,6 +2355,7 @@ async fn dr_run_failures_are_sent_once() {
 #[tokio::test]
 async fn dr_default_rules_are_made_once() {
     let rig = Rig::start().await;
+    withdraw_dr(&rig.env).await;
     let admin = rig.env.admin().await;
     let operator = rig.env.user("operator", "operator").await;
     rig.target("ops", "json").await;
