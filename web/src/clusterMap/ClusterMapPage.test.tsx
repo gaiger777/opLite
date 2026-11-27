@@ -217,7 +217,10 @@ it("draws node blocks with their state and the VMs on them", async () => {
   expect(await within(map).findByText("mig → n2 · 62%")).toBeInTheDocument();
   // 판 이름
   expect(within(map).getByText("a · 2 nodes")).toBeInTheDocument();
-  expect(screen.getByRole("list", { name: "Legend" })).toBeVisible();
+  // 범례·조작 안내는 단추로 펼친다(늦게 받음)
+  expect(screen.queryByRole("list", { name: "Legend" })).toBeNull();
+  expect(await openLegend()).toBeVisible();
+  expect(screen.getByText(/Arrows move between nodes/)).toBeVisible();
   await expectNoAxeViolations(container, { disable: ["region"] });
 });
 
@@ -787,7 +790,7 @@ it("reads the physical topology only with the network layer on", async () => {
   expect(
     within(net).getByRole("button", { name: /^Node n1, .*, 1 link fault$/ }),
   ).toBeInTheDocument();
-  expect(screen.getByRole("list", { name: "Legend" })).toHaveTextContent("Network rail");
+  expect(await openLegend()).toHaveTextContent("Network rail");
 });
 
 it("focuses the port named in ?focus=port: and opens its sheet with the impact", async () => {
@@ -831,13 +834,19 @@ it.each([409, 403])(
     await within(map).findByRole("button", { name: /^Node n1,/ });
     await waitFor(() => expect(physicalCalls).toBe(1));
     expect(within(map).queryByText(/networks?$/)).toBeNull();
-    expect(screen.getByRole("list", { name: "Legend" })).toHaveTextContent("Uplinks up");
+    expect(await openLegend()).toHaveTextContent("Uplinks up");
     expect(screen.getByRole("list", { name: "Legend" })).not.toHaveTextContent("Network rail");
     // 다시 묻지 않는다(403·409)
     await new Promise((r) => setTimeout(r, 50));
     expect(physicalCalls).toBe(1);
   },
 );
+
+/** 지도 밑 "범례·조작 안내" 단추를 눌러 범례를 연다 */
+async function openLegend() {
+  fireEvent.click(screen.getByRole("button", { name: "Legend & controls" }));
+  return screen.findByRole("list", { name: "Legend" });
+}
 
 describe("home variant", () => {
   it("reports selections instead of opening a sheet, with the legend folded", async () => {
@@ -849,8 +858,11 @@ describe("home variant", () => {
     expect(screen.queryByRole("heading", { name: "Map" })).toBeNull();
     expect(await within(map).findAllByText("vmbr0 · 2 networks")).toHaveLength(2);
     expect(map.getAttribute("class")).toContain("h-[26rem]");
-    const legend = screen.getByText("Legend", { selector: "summary" });
-    expect(legend.closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("button", { name: "Legend & controls" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("list", { name: "Legend" })).toBeNull();
     // 도구 띠는 보기 설정 단추 하나로 접힘
     expect(screen.queryByLabelText("Group by")).toBeNull();
     expect(screen.getByRole("button", { name: "View settings" })).toBeVisible();

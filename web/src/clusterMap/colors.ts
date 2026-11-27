@@ -13,6 +13,8 @@ export const TILE_COLOR: Record<TileTone | BarTone, string> = {
   more: "color-mix(in oklab, var(--muted-foreground) 75%, var(--card))",
   hidden: "color-mix(in oklab, var(--muted-foreground) 75%, var(--card))",
   ghost: "none",
+  // 꺼진 VM 덩어리(계획 77-8): 꺼짐 색을 옅게 — 글이 그 위에 올라간다
+  fold: "color-mix(in oklab, var(--muted-foreground) 45%, var(--card))",
 };
 
 /** 테두리만 그리는 타일(옮기는 중의 원본 자리, 대상의 유령) */

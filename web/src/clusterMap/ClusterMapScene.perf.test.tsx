@@ -1,9 +1,9 @@
-// 큰 클러스터의 예산(계획 70 §9.2): 100 노드 × 50 VM(5000 VM, 판 10개)의 배치 + 경로 시간과 단계마다 SVG 원소 수.
+// 큰 클러스터의 예산(계획 70 §9.2): 100 노드 × 50 VM(5000 VM, 판 10개)의 배치 + 경로 시간과 단계마다 SVG 원소 수, 노드마다
+// VM이 많은 20 노드 × 300 VM(계획 77-8 — 꺼진 VM 덩어리·촘촘한 격자).
 // 원소 수는 그리기 없이 장면으로 센다(`elementCount`) — 화면(스테이지 2)이 같은 셈을 따르고 그린 DOM으로도 잰다.
-// 지도 칸(`InfraMap` 조각) 크기 예산은 gzip 25 KiB(25,600바이트)이고 `vite build` 출력으로 잰다(이 시험 밖). 계획 75 §4.2의
-// 24 KiB(24,576바이트 — 2026-11-26 리뷰 1에서 24.43 kB)를 2026-11-27 화면 버그 고침에서 올렸다: 노드·판·레일 이름과 꼬리표를
-// 모든 그림 뒤의 글 층에 따로 그리고(블록·VM 타일이 글을 가렸다) 바닥 글이 노드 글을 비켜 가게 해 24.78 kB — 글 층만 해도
-// 24.65 kB로 옛 예산을 넘는다.
+// 지도 칸(`InfraMap` 조각) 크기 예산은 gzip 24 KiB(24,576바이트, 계획 75 §4.2)이고 `vite build` 출력으로 잰다(이 시험 밖).
+// 2026-11-27 화면 버그 고침(글 층)에서 25 KiB로 올렸던 것을 계획 77-8에서 되돌렸다: 범례·조작 안내(펼칠 때)와 가리키기
+// 카드(그림을 그린 뒤)를 늦게 받는 조각으로 옮겨 24.19 kB.
 import { layoutCluster } from "@/clusterMap/layout";
 import { toModel } from "@/clusterMap/model";
 import { netPaths } from "@/clusterMap/netPaths";
@@ -99,4 +99,25 @@ it("keeps 100 × 50 with every layer and the network layer's ports and rails und
   expect(all - before).toBeLessThan(200);
   const summary = elementCount(scene, scenePaths(scene, "summary"), "summary", [...layers]);
   expect(summary).toBeLessThan(2000);
+});
+
+it("lays out 20 nodes × 300 VMs (busy nodes: folded stopped VMs, dense grids) within the budgets", () => {
+  const input = bigCluster(20, 300, 4);
+  build(input);
+  let best = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    build(input);
+    best = Math.min(best, performance.now() - t0);
+  }
+  expect(best).toBeLessThan(BUDGET_MS);
+  const { scene, tiles } = build(input);
+  // 노드마다 한 층, 꺼진 VM은 띠 하나
+  for (const n of scene.nodes) {
+    expect(n.grid!.layers).toBe(1);
+    expect(n.grid!.cells.filter((c) => c.kind === "fold")).toHaveLength(1);
+  }
+  expect(elementCount(scene, scenePaths(scene, "summary"), "summary")).toBeLessThan(400);
+  expect(elementCount(scene, tiles, "tiles")).toBeLessThan(1000);
+  expect(elementCount(scene, tiles, "detail")).toBeLessThan(1000);
 });

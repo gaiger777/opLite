@@ -53,13 +53,18 @@ const WITNESS_H = 30;
 const WITNESS_STEP = 48;
 /** 증인 기둥 띠 번호를 노드 띠(0부터) 앞에 두는 양 */
 const WITNESS_BANDS = 1_000_000;
-/** "배치 안 됨" 판: 한 층, 열 8, 많아야 64칸 */
-const TRAY_COLS = 8;
-const TRAY_PAD = 16;
-/** 요약 단계의 상태 막대(노드 윗면 대각선 위 네 자리 — 서로 화면에서 겹치지 않는다) */
-const BAR = 16;
-const BAR_STEP = 26;
-const BAR_MAX = 64;
+/** "배치 안 됨" 판: 한 층, 노드 블록보다 크지 않게(칸이 많으면 작아진다) */
+const TRAY_PAD = 8;
+/**
+ * VM이 많은 노드(칸이 `MAX_CELLS`를 넘음 — 계획 77-8): 꺼진 VM은 윗면 앞쪽 띠 한 칸("꺼짐 n")으로 접고, 나머지는 한 층의
+ * 촘촘한 격자(칸이 작아짐, 많아야 `DENSE_MAX`칸 — 넘으면 "+N"). 배치 안 됨 판은 `PER_LAYER`를 넘으면 접는다.
+ */
+export const DENSE_MAX = 1024;
+const FOLD_D = 18;
+const INSET = 8;
+/** 요약 단계의 상태 비율 막대: 윗면 가운데 띠를 상태마다 VM 수 비율로 나눈다(높이 ≤ 틈 — 서로 겹치지 않음) */
+const BAR_PAD = 20;
+const BAR_GAP = 4;
 /** 노드 위 꼬리표가 솟는 높이(범위 셈) */
 const TAG_RISE = 30;
 /** 한 판 줄의 노드 수 한도(묶지 않을 때 `min(8, ⌈√n⌉)`) */
@@ -92,12 +97,14 @@ export type GroupBy =
 
 export interface LayoutOptions {
   group?: GroupBy;
+  /** 꺼진 VM 덩어리를 펼친 노드 열쇠(`node:<id>`·`unplaced`) */
+  open?: ReadonlySet<string>;
   /** 판 앞쪽에 네트워크 레일을 깐다(네트워크 레이어를 켰고 모델에 레일이 있을 때) */
   rails?: boolean;
 }
 
 export type TileTone =
-  "running" | "stopped" | "busy" | "failed" | "migrating" | "more" | "hidden" | "ghost";
+  "running" | "stopped" | "busy" | "failed" | "migrating" | "more" | "hidden" | "ghost" | "fold";
 
 export type BarTone = "running" | "busy" | "failed" | "stopped";
 
@@ -105,9 +112,12 @@ export type NodeTag =
   "offline" | "maintenance" | "draining" | "frozen" | "leader" | "alerts" | "overcommit";
 
 export interface TileCell {
-  /** `vm:<id>` · `more:<노드 열쇠>` · `hidden:<노드 열쇠>` · `ghost:<VM id>`(옮겨 오는 VM의 미리 보기) */
+  /**
+   * `vm:<id>` · `more:<노드 열쇠>` · `hidden:<노드 열쇠>` · `ghost:<VM id>`(옮겨 오는 VM의 미리 보기) · `fold:<노드 열쇠>`
+   * (꺼진 VM 덩어리 — 누르면 펼치고 접음)
+   */
   key: string;
-  kind: "vm" | "more" | "hidden" | "ghost";
+  kind: "vm" | "more" | "hidden" | "ghost" | "fold";
   vm: string | null;
   /** 칸 번호(이름 순 자리) — 층 = ⌊index / 칸 수⌋ */
   index: number;
@@ -121,8 +131,10 @@ export interface TileCell {
   warn: boolean;
   /** 노드가 오프라인 — 마지막으로 알려진 자리(빗금) */
   stale: boolean;
-  /** "+N"의 N */
+  /** "+N"의 N(꺼진 VM 덩어리는 꺼진 VM 수) */
   count: number;
+  /** 꺼진 VM 덩어리가 펼쳐졌는가 */
+  open?: boolean;
 }
 
 export interface TileGrid {
@@ -131,6 +143,10 @@ export interface TileGrid {
   cols: number;
   perLayer: number;
   layers: number;
+  /** 칸 간격·한 변·높이(보통 `TILE_STEP`·`TILE`·`TILE_H`, 촘촘한 격자는 작다) */
+  step: number;
+  size: number;
+  h: number;
   /** 칸 번호 순 */
   cells: TileCell[];
 }
@@ -407,12 +423,30 @@ function gridRows(members: readonly MapNode[], by: GroupBy): { rows: MapNode[][]
   return { rows, cols };
 }
 
-/** 칸 `index`(층마다 `cols × cols`)의 상자 */
+/** 격자 모양: 칸 간격·한 변·높이 */
+interface Pitch {
+  step: number;
+  size: number;
+  h: number;
+}
+
+const NORMAL: Pitch = { step: TILE_STEP, size: TILE, h: TILE_H };
+
+/** `n`칸을 `w × d` 안에 한 층으로: 열 수와 칸 크기(보통 타일보다 크지 않게) */
+function fit(n: number, w: number, d: number): Pitch & { cols: number } {
+  const cols = Math.max(1, Math.ceil(Math.sqrt((n * w) / d)));
+  const step = Math.min(TILE_STEP, w / cols, d / Math.ceil(n / cols));
+  const size = (step * TILE) / TILE_STEP;
+  return { cols, step, size, h: Math.min(TILE_H, size * 0.3) };
+}
+
+/** 칸 `index`(층마다 `perLayer`칸, 열 `cols`)의 상자 */
 function cellBox(
   grid: TileGrid["origin"],
   cols: number,
   perLayer: number,
   index: number,
+  p: Pitch,
 ): Box & {
   layer: number;
   col: number;
@@ -423,12 +457,12 @@ function cellBox(
   const col = k % cols;
   const row = Math.floor(k / cols);
   return {
-    x: grid.x + col * TILE_STEP,
-    y: grid.y + row * TILE_STEP,
-    z: grid.z + layer * TILE_H,
-    w: TILE,
-    d: TILE,
-    h: TILE_H,
+    x: grid.x + col * p.step,
+    y: grid.y + row * p.step,
+    z: grid.z + layer * p.h,
+    w: p.size,
+    d: p.size,
+    h: p.h,
     layer,
     col,
     row,
@@ -470,6 +504,69 @@ function planCells(
   return plan;
 }
 
+/** 노드(배치 안 됨 판)의 칸 계획과 꺼진 VM 덩어리: 칸이 `limit`을 넘으면 꺼진 VM을 접고(펼쳤으면 그대로) 촘촘한 격자 */
+interface NodePlan {
+  plan: CellPlan[];
+  dense: boolean;
+  fold: { count: number; open: boolean } | null;
+}
+
+function nodePlan(
+  vms: readonly MapVm[],
+  hidden: number,
+  incoming: readonly MapVm[],
+  limit: number,
+  open: boolean,
+): NodePlan {
+  if (vms.length + (hidden > 0 ? 1 : 0) <= limit) {
+    return { plan: planCells(vms, hidden, incoming, limit), dense: false, fold: null };
+  }
+  const on = vms.filter((vm) => tileTone(vm) !== "stopped");
+  const off = vms.length - on.length;
+  return {
+    plan: planCells(open ? vms : on, hidden, incoming, DENSE_MAX),
+    dense: true,
+    fold: off > 0 ? { count: off, open } : null,
+  };
+}
+
+/**
+ * 촘촘한 격자: `x·y·w·d` 안(앞쪽에 꺼진 VM 띠가 있으면 그만큼 뺌)에 한 층으로. 꺼진 VM 띠는 맨 뒤 칸이다. `w`를 다 쓰지
+ * 않으면(배치 안 됨 판의 적은 VM) 쓴 너비·깊이를 돌려준다.
+ */
+function denseGrid(
+  owner: string,
+  area: { x: number; y: number; z: number; w: number; d: number },
+  np: NodePlan,
+  stale: boolean,
+): { grid: TileGrid; w: number; d: number } {
+  const band = np.fold ? FOLD_D + (np.plan.length > 0 ? TILE_GAP : 0) : 0;
+  const p = fit(Math.max(1, np.plan.length), area.w, area.d - band);
+  const rows = Math.ceil(np.plan.length / p.cols);
+  const w = np.fold ? area.w : p.cols * p.step - p.step + p.size;
+  const d = (rows > 0 ? rows * p.step - p.step + p.size : 0) + band;
+  const grid = makeGrid(owner, area, p.cols, np.plan.length + 1, np.plan, stale, p);
+  if (np.fold) {
+    grid.cells.push({
+      key: `fold:${owner}`,
+      kind: "fold",
+      vm: null,
+      index: grid.cells.length,
+      layer: 0,
+      col: 0,
+      row: rows,
+      box: { x: area.x, y: area.y + d - FOLD_D, z: area.z, w, d: FOLD_D, h: p.h },
+      tone: "fold",
+      ha: false,
+      warn: false,
+      stale,
+      count: np.fold.count,
+      open: np.fold.open,
+    });
+  }
+  return { grid, w, d };
+}
+
 function makeGrid(
   owner: string,
   origin: TileGrid["origin"],
@@ -477,9 +574,10 @@ function makeGrid(
   perLayer: number,
   plan: readonly CellPlan[],
   stale: boolean,
+  pitch: Pitch = NORMAL,
 ): TileGrid {
   const cells = plan.map((p, index): TileCell => {
-    const { layer, col, row, ...box } = cellBox(origin, cols, perLayer, index);
+    const { layer, col, row, ...box } = cellBox(origin, cols, perLayer, index, pitch);
     const vm = p.vm;
     return {
       key:
@@ -502,7 +600,14 @@ function makeGrid(
       count: p.count,
     };
   });
-  return { origin, cols, perLayer, layers: Math.ceil(cells.length / perLayer), cells };
+  return {
+    origin,
+    cols,
+    perLayer,
+    layers: Math.ceil(cells.length / perLayer),
+    cells,
+    ...pitch,
+  };
 }
 
 function counts(vms: readonly MapVm[]): Counts {
@@ -513,28 +618,25 @@ function counts(vms: readonly MapVm[]): Counts {
   return c;
 }
 
-/** 요약 단계 막대: 윗면의 뒤 왼쪽 → 앞 오른쪽 대각선 위 네 자리(상태마다 자리 고정) */
+/**
+ * 요약 단계 막대: 윗면 가운데 띠를 왼쪽부터 켜짐·바뀌는 중·실패·꺼짐의 VM 수 비율로 나눈다(조각마다 적어도 3 — VM 1000개
+ * 가운데 실패 하나도 보이게). VM 100·1000개에서도 같은 크기라 비율로 읽힌다.
+ */
 function bars(box: Box, c: Counts): Bar[] {
-  const out: Bar[] = [];
-  BAR_TONES.forEach((tone, i) => {
-    const count = c[tone];
-    if (count === 0) {
-      return;
-    }
-    out.push({
+  const tones = BAR_TONES.filter((tone) => c[tone] > 0);
+  const total = tones.reduce((a, tone) => a + c[tone], 0);
+  const room = box.w - 2 * BAR_PAD - (tones.length - 1) * BAR_GAP - 3 * tones.length;
+  let x = box.x + BAR_PAD;
+  return tones.map((tone) => {
+    const w = 3 + (room * c[tone]) / total;
+    const bar = {
       tone,
-      count,
-      box: {
-        x: box.x + 14 + i * BAR_STEP,
-        y: box.y + box.d - 14 - BAR - i * BAR_STEP,
-        z: box.z + box.h,
-        w: BAR,
-        d: BAR,
-        h: 4 + Math.min(count, BAR_MAX),
-      },
-    });
+      count: c[tone],
+      box: { x, y: box.y + BAR_PAD, z: box.z + box.h, w, d: box.d - 2 * BAR_PAD, h: BAR_GAP },
+    };
+    x += w + BAR_GAP;
+    return bar;
   });
-  return out;
 }
 
 /** 포트 줄: 블록 앞 바닥에 왼쪽부터, 본딩은 구성 포트를 두르는 테두리 */
@@ -648,16 +750,26 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
   }
 
   // 노드마다 칸 계획(층 수가 줄 간격을 정한다)
-  const plans = new Map<string, CellPlan[]>();
+  const open = opts.open ?? new Set<string>();
+  const plans = new Map<string, NodePlan>();
   for (const n of model.nodes) {
     if (!n.witness) {
       plans.set(
         n.id,
-        planCells(onNode.get(n.id) ?? [], n.hiddenVms, incoming.get(n.id) ?? [], MAX_CELLS),
+        nodePlan(
+          onNode.get(n.id) ?? [],
+          n.hiddenVms,
+          incoming.get(n.id) ?? [],
+          MAX_CELLS,
+          open.has(`node:${n.id}`),
+        ),
       );
     }
   }
-  const layersOf = (n: MapNode) => Math.ceil((plans.get(n.id)?.length ?? 0) / PER_LAYER);
+  const layersOf = (n: MapNode) => {
+    const np = plans.get(n.id);
+    return np && !np.dense ? Math.ceil(np.plan.length / PER_LAYER) : 1;
+  };
 
   // 판 크기와 노드 자리(판 안 좌표)
   interface Placed {
@@ -769,16 +881,31 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
         ? { x: o.x + p.x, y: o.y + p.y, z: SLAB_H, w: WITNESS, d: WITNESS, h: WITNESS_H }
         : { x: o.x + p.x, y: o.y + p.y, z: SLAB_H, w: NODE, d: NODE, h: NODE_H };
       const key = `node:${n.id}`;
-      const grid = n.witness
+      const np = plans.get(n.id);
+      const top = box.z + box.h;
+      const grid = !np
         ? null
-        : makeGrid(
-            key,
-            { x: box.x + TILE_MARGIN, y: box.y + TILE_MARGIN, z: box.z + box.h },
-            PER_ROW,
-            PER_LAYER,
-            plans.get(n.id)!,
-            !n.online,
-          );
+        : np.dense
+          ? denseGrid(
+              key,
+              {
+                x: box.x + INSET,
+                y: box.y + INSET,
+                z: top,
+                w: NODE - 2 * INSET,
+                d: NODE - 2 * INSET,
+              },
+              np,
+              !n.online,
+            ).grid
+          : makeGrid(
+              key,
+              { x: box.x + TILE_MARGIN, y: box.y + TILE_MARGIN, z: top },
+              PER_ROW,
+              PER_LAYER,
+              np.plan,
+              !n.online,
+            );
       const c = counts(onNode.get(n.id) ?? []);
       const net = n.witness ? null : portRow(n, key, box);
       l.rails.forEach((r, ri) => {
@@ -822,7 +949,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
         counts: c,
         grid,
         bars: n.witness ? [] : bars(box, c),
-        stack: (grid?.layers ?? 0) * TILE_H,
+        stack: (grid?.layers ?? 0) * (grid?.h ?? 0),
         layers: {
           pools: n.pools,
           sharedDown: n.sharedDown,
@@ -841,15 +968,21 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
   });
 
   if (unplaced.length > 0) {
-    const plan = planCells(unplaced, 0, [], MAX_CELLS);
-    const cols = Math.min(TRAY_COLS, plan.length);
-    const rows = Math.ceil(plan.length / cols);
+    // 노드 블록 한 변 안에 촘촘히(많으면 꺼진 VM을 접음)
+    const np = nodePlan(unplaced, 0, [], PER_LAYER, open.has("unplaced"));
+    const inner = NODE - 2 * TRAY_PAD;
+    const fitted = denseGrid(
+      "unplaced",
+      { x: TRAY_PAD, y: frontY + TRAY_PAD, z: SLAB_H, w: inner, d: inner },
+      { ...np, dense: true },
+      false,
+    );
     const box: Box = {
       x: 0,
       y: frontY,
       z: 0,
-      w: TRAY_PAD * 2 + cols * TILE_STEP - TILE_GAP,
-      d: TRAY_PAD * 2 + rows * TILE_STEP - TILE_GAP,
+      w: TRAY_PAD * 2 + fitted.w,
+      d: TRAY_PAD * 2 + fitted.d,
       h: SLAB_H,
     };
     slabs.push({
@@ -861,15 +994,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       rails: [],
       railMore: 0,
     });
-    // 한 층(칸 수 = 층 하나의 칸 수), 열 `cols`
-    const grid = makeGrid(
-      "unplaced",
-      { x: box.x + TRAY_PAD, y: box.y + TRAY_PAD, z: SLAB_H },
-      cols,
-      plan.length,
-      plan,
-      false,
-    );
+    const grid = fitted.grid;
     nodes.push({
       key: "unplaced",
       kind: "unplaced",
@@ -885,7 +1010,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       counts: counts(unplaced),
       grid,
       bars: [],
-      stack: TILE_H,
+      stack: grid.h,
       layers: null,
       net: null,
     });

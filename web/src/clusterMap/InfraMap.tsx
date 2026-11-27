@@ -1,4 +1,4 @@
-import { Server, SlidersHorizontal } from "lucide-react";
+import { Info, Server, SlidersHorizontal } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router";
@@ -15,9 +15,7 @@ import {
   type MapScene as Scene,
   type SlabItem,
 } from "@/clusterMap/layout";
-import { Legend } from "@/clusterMap/Legend";
 import type { Lod } from "@/clusterMap/lod";
-import { NodeCard, TextCard, VmCard } from "@/clusterMap/MapCard";
 import { MapList } from "@/clusterMap/MapList";
 import { MapScene, type MapOpen } from "@/clusterMap/MapScene";
 import type { DragLogic, SheetTarget } from "@/clusterMap/MapSheet";
@@ -54,6 +52,8 @@ export type { MapSelection } from "@/clusterMap/selection";
 
 /** 서랍(미리 보기와 그 자리의 동작)은 처음 누를 때 받는다 — 그림을 그리는 데 필요 없다(지도 조각을 가볍게). */
 const MapSheet = lazy(() => import("@/clusterMap/MapSheet").then((m) => ({ default: m.MapSheet })));
+// 범례는 펼칠 때 받는다(진단 §2.6 — 그림 밑 두 줄을 차지하지 않게, 지도 칸 예산)
+const Legend = lazy(() => import("@/clusterMap/Legend").then((m) => ({ default: m.Legend })));
 
 /** 이만큼 넘으면 판 하나만 보기를 권한다(§9.2) */
 const BIG_NODES = 200;
@@ -192,6 +192,15 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
       live = false;
     };
   }, [home]);
+  // 가리키기 카드는 그림을 그린 뒤 받는다(첫 가리키기 전에 — 지도 칸 예산, 계획 77-8)
+  const [cards, setCards] = useState<typeof import("@/clusterMap/MapCard") | null>(null);
+  useEffect(() => {
+    let live = true;
+    void import("@/clusterMap/MapCard").then((m) => live && setCards(m));
+    return () => {
+      live = false;
+    };
+  }, []);
   const drag = useMapDrag(data.nodes.data, data.vms.data, data.placement.data, logic);
 
   const pref = (key: string) => readUserPref(user, `clusterMap.${key}`);
@@ -271,9 +280,11 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
   );
   // 레일 띠는 판 깊이를 바꾸므로 배치의 입력이다
   const rails = netShown && (full?.rails?.length ?? 0) > 0;
+  // 꺼진 VM 덩어리를 펼친 노드(계획 77-8 — 기억하지 않음)
+  const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
   const fullScene = useMemo(
-    () => (full ? layoutCluster(full, { group, rails }) : null),
-    [full, group, rails],
+    () => (full ? layoutCluster(full, { group, rails, open }) : null),
+    [full, group, rails, open],
   );
   if (
     fullScene &&
@@ -287,8 +298,9 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
     [full, fullScene, filter],
   );
   const scene = useMemo(
-    () => (model ? (model === full ? fullScene : layoutCluster(model, { group, rails })) : null),
-    [model, full, fullScene, group, rails],
+    () =>
+      model ? (model === full ? fullScene : layoutCluster(model, { group, rails, open })) : null,
+    [model, full, fullScene, group, rails, open],
   );
   const labels = useMemo(
     () => (model && scene ? mapLabels(t, model, scene) : new Map<string, string>()),
@@ -315,6 +327,7 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
   const returnLink = useRef<MapLink | null>(null);
   const [lod, setLod] = useState<Lod | null>(null);
   const [settings, setSettings] = useState(false);
+  const [legend, setLegend] = useState(false);
   const focus = useRef<Focus | null>(null);
   const [focusRequest, setFocusRequest] = useState<{
     focus: Focus;
@@ -414,14 +427,24 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
     }
   };
 
-  const onOpen = (open: MapOpen) => {
-    select(open.key);
+  const onOpen = (o: MapOpen) => {
+    if (o.key.startsWith("fold:")) {
+      // 꺼진 VM 덩어리: 펼치고 접기(서랍 없음 — 홈에서도)
+      const owner = o.key.slice(5);
+      const next = new Set(open);
+      if (!next.delete(owner)) {
+        next.add(owner);
+      }
+      setOpen(next);
+      return;
+    }
+    select(o.key);
     if (home) {
       return;
     }
-    returnFocus.current = open.owner as HTMLElement | null;
+    returnFocus.current = o.owner as HTMLElement | null;
     returnLink.current = null;
-    setSheet(targetOf(open.key));
+    setSheet(targetOf(o.key));
   };
   /**
    * 서랍이 닫힐 때: 목록에서 연 화살표의 단추가 사라졌으면 같은 VM의 새 화살표, 없으면 "마이그레이션과 추천" 머리글,
@@ -511,6 +534,10 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
   };
 
   const renderCard = (key: string) => {
+    if (!cards) {
+      return null;
+    }
+    const { NodeCard, TextCard, VmCard } = cards;
     const node = nodesByKey.get(key);
     const item = scene?.byKey.get(key);
     if (node && item) {
@@ -735,10 +762,26 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
                 renderCard={renderCard}
                 drag={home ? undefined : (drag.drag ?? undefined)}
               />
-              <Legend layers={shown} ports={full?.rails != null} collapsed={home} />
-              <p id={keysId} className="text-xs text-muted-foreground">
-                {t("clusterMap.keys")}
-              </p>
+              <div className="flex flex-col items-start gap-1.5">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-expanded={legend}
+                  onClick={() => setLegend(!legend)}
+                >
+                  <Info />
+                  {t("clusterMap.legendShow")}
+                </Button>
+                {legend && (
+                  <Suspense fallback={null}>
+                    <Legend layers={shown} ports={full?.rails != null} />
+                  </Suspense>
+                )}
+                {/* 조작 안내는 그림의 설명(aria-describedby)으로 늘 있고, 범례를 펼치면 보인다 */}
+                <p id={keysId} hidden={!legend} className="text-xs text-muted-foreground">
+                  {t("clusterMap.keys")}
+                </p>
+              </div>
             </DndProvider>
           ) : (
             <MapList

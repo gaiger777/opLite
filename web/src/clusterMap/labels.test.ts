@@ -122,20 +122,29 @@ it("writes arrow labels for progress, stage and recommendations", () => {
   );
 });
 
-it("names more and hidden tiles past 64 cells", () => {
+it("names more, hidden and folded-stopped cells on a busy node", () => {
   const n = mapNode(1, "n1");
-  const vms = Array.from({ length: 70 }, (_, i) =>
-    mapVm(i, `v${String(i).padStart(2, "0")}`, n.id),
+  // 1040개 가운데 열 개는 꺼짐 — 접은 뒤 1030개 + "볼 수 없음" 한 칸이 촘촘한 격자 1024칸을 넘어 "+N"
+  const vms = Array.from({ length: 1040 }, (_, i) =>
+    mapVm(i, `v${String(i).padStart(4, "0")}`, n.id, i < 10 ? "stopped" : "running"),
   );
   const model = toModel({
     nodes: [n],
     vms,
-    placement: placement([load(n, { vms: 72 })]),
+    placement: placement([load(n, { vms: 1032 })]),
     vmsLimited: true,
   });
-  const labels = mapLabels(i18n.getFixedT("en"), model, layoutCluster(model));
+  const t = i18n.getFixedT("en");
+  const labels = mapLabels(t, model, layoutCluster(model));
   expect(labels.get(`more:node:${nodeId(1)}`)).toBe("8 more VMs on n1");
   expect(labels.get(`hidden:node:${nodeId(1)}`)).toBe("2 VMs on n1 you can't see");
+  expect(labels.get(`fold:node:${nodeId(1)}`)).toBe(
+    "10 stopped VMs on n1 (folded) — press to unfold",
+  );
+  const open = mapLabels(t, model, layoutCluster(model, { open: new Set([`node:${nodeId(1)}`]) }));
+  expect(open.get(`fold:node:${nodeId(1)}`)).toBe(
+    "10 stopped VMs on n1 (unfolded) — press to fold",
+  );
 });
 
 it("reads the VM list once per picture, not once per tile", () => {

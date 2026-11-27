@@ -80,6 +80,7 @@ export function selectionOf(key: string, scene: MapScene): MapSelection | null {
       return { kind: "vm", id: rest };
     case "more":
     case "hidden":
+    case "fold":
       return rest.startsWith("node:") ? { kind: "node", id: rest.slice(5) } : null;
     case "move":
     case "rec": {

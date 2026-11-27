@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import {
   type Box,
+  boxBounds,
   boxFace,
   facesPath,
   fitBox,
@@ -63,6 +64,7 @@ import {
   portRowShown,
   type NodeItem,
   type SlabItem,
+  TILE,
   type TileCell,
 } from "@/clusterMap/layout";
 import { type Lod, lodFor, tilePx, tilesInView } from "@/clusterMap/lod";
@@ -736,10 +738,12 @@ function CellMarks({
   node,
   lod,
   vmNames,
+  t,
 }: {
   node: NodeItem;
   lod: Lod;
   vmNames: ReadonlyMap<string, string>;
+  t: Translate;
 }) {
   const cells = node.grid?.cells ?? [];
   return (
@@ -751,9 +755,11 @@ function CellMarks({
             cell={cell}
             lod={lod}
             text={
-              cell.kind === "more" || cell.kind === "hidden"
-                ? `+${cell.count}`
-                : (vmNames.get(cell.vm ?? "") ?? "").slice(0, 8)
+              cell.kind === "fold"
+                ? `${t("clusterMap.label.count.stopped", { count: cell.count })} ${cell.open ? "▾" : "▸"}`
+                : cell.kind === "more" || cell.kind === "hidden"
+                  ? `+${cell.count}`
+                  : (vmNames.get(cell.vm ?? "") ?? "").slice(0, 8)
             }
           />
         ) : null,
@@ -765,17 +771,19 @@ function CellMarks({
 function CellText({ cell, lod, text }: { cell: TileCell; lod: Lod; text: string }) {
   const c = topCenter(cell.box);
   const top = boxFace(cell.box, "top");
+  // 촘촘한 격자의 작은 칸은 글도 칸에 맞춰 작게(더 확대하면 읽힘 — 계획 77-8), 꺼진 VM 띠는 조금 크게
+  const k = cell.kind === "fold" ? 1.3 : Math.min(1, cell.box.w / TILE);
   return (
     <>
       <text
         x={round(c.x)}
-        y={round(c.y + 2.5)}
+        y={round(c.y + 2.5 * k)}
         textAnchor="middle"
-        fontSize={7}
+        fontSize={round(7 * k)}
         fontWeight={600}
         style={{ fill: "var(--foreground)" }}
         stroke="var(--background)"
-        strokeWidth={2}
+        strokeWidth={round(2 * k)}
         paintOrder="stroke"
         aria-hidden
       >
@@ -1314,9 +1322,15 @@ export function MapScene(props: MapSceneProps) {
     const avoid: Rect[] = [];
     const els: ReactNode[] = [];
     for (const n of scene.nodes) {
-      for (const cell of lod === "summary" ? [] : (n.grid?.cells ?? [])) {
+      const dense = (n.grid?.size ?? TILE) < TILE;
+      for (const cell of lod === "summary" || dense ? [] : (n.grid?.cells ?? [])) {
         const c = topCenter(cell.box);
         avoid.push({ x: c.x - 19, y: c.y - 5, w: 38, h: 9 });
+      }
+      if (dense && lod !== "summary") {
+        // 촘촘한 격자는 칸마다가 아니라 윗면 하나로(칸에 이름이 없다)
+        const b = boxBounds({ ...n.box, h: n.box.h + n.stack });
+        avoid.push({ x: b.minX, y: b.minY, w: b.maxX - b.minX, h: (b.maxY - b.minY) / 2 });
       }
       if (n.kind === "unplaced") {
         continue;
@@ -1389,12 +1403,12 @@ export function MapScene(props: MapSceneProps) {
             ))}
             {lod !== "summary" &&
               band.nodes.map((n) => (
-                <CellMarks key={`t:${n.key}`} node={n} lod={lod} vmNames={props.vmNames} />
+                <CellMarks key={`t:${n.key}`} node={n} lod={lod} vmNames={props.vmNames} t={t} />
               ))}
           </>,
         ]),
       ),
-    [paths, defs, haLayer, lod, props.vmNames],
+    [paths, defs, haLayer, lod, props.vmNames, t],
   );
   const railName = props.railName;
   // 밝힌 레일·포트의 선(원소 하나 — 가리키기마다 블록·경로를 다시 그리지 않음)

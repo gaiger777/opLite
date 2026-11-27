@@ -69,7 +69,9 @@
       "railNodes_other": "{{count}} nodes",
       "railDown": "{{count}} down",
       "railDegraded": "{{count}} degraded",
-      "railUnknown": "{{count}} unknown"
+      "railUnknown": "{{count}} unknown",
+      "fold": "{{count}} stopped VMs on {{node}} (folded) — press to unfold",
+      "unfold": "{{count}} stopped VMs on {{node}} (unfolded) — press to fold"
     },
     "pictureLabel": "Cluster map",
     "listLabel": "Cluster map as a list",
@@ -96,9 +98,9 @@
     "problems": "Problems only",
     "settings": "View settings",
     "lod": {
-      "summary": "Summary — zoom in for VM tiles.",
-      "tiles": "VM tiles — zoom in for names.",
-      "detail": "Detail."
+      "summary": "Summary — VM states per node as a ratio. Zoom in for VM cells.",
+      "tiles": "VM cells — zoom in more for names.",
+      "detail": "Detail — VM names (point at a cell on very busy nodes)."
     },
     "big": "Many nodes: show one group to read the map more easily.",
     "loadUnknownNote": "Load unknown: the leader's placement summary can't be read.",
@@ -135,7 +137,8 @@
       "rail": "Network rail",
       "wireDown": "Cut off from the rail (×)",
       "fault": "Link fault",
-      "wireUnknown": "Unknown (offline node)"
+      "wireUnknown": "Unknown (offline node)",
+      "fold": "Stopped VMs folded (busy nodes — press to unfold)"
     },
     "card": {
       "cpu": "CPU",
@@ -223,6 +226,6 @@
       "members": "Bond ports: {{list}}"
     },
     "tagFault": "link ✕ {{count}}",
-    "legendShow": "Legend"
+    "legendShow": "Legend & controls"
   }
 }

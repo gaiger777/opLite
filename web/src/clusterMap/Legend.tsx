@@ -19,16 +19,14 @@ const hatch = (base: string, line: string): CSSProperties => ({
 });
 
 /**
- * `ports`: 물리 관계를 읽어 네트워크 층이 포트 줄·레일을 그린다(계획 75). `collapsed`: 홈 — 접힌 `<details>` 안에.
+ * `ports`: 물리 관계를 읽어 네트워크 층이 포트 줄·레일을 그린다(계획 75). 지도 밑 "범례" 단추로 펼칠 때 늦게 받는다(계획 77-8).
  */
 export function Legend({
   layers,
   ports = false,
-  collapsed = false,
 }: {
   layers: readonly MapLayer[];
   ports?: boolean;
-  collapsed?: boolean;
 }) {
   const { t } = useTranslation();
   const k = (key: string, values?: Record<string, unknown>) =>
@@ -40,6 +38,7 @@ export function Legend({
     [{ background: TILE_COLOR.failed }, `${t("vms.phase.failed")} (×)`],
     [{ background: TILE_COLOR.migrating, borderColor: "var(--info)" }, t("vms.phase.migrating")],
     [{ borderColor: "var(--info)", borderStyle: "dashed" }, k("ghost")],
+    [{ background: TILE_COLOR.fold }, k("fold")],
   ];
   if (layers.includes("load")) {
     rows.push(
@@ -96,7 +95,7 @@ export function Legend({
       k("recommendation"),
     ]);
   }
-  const list = (
+  return (
     <ul aria-label={t("clusterMap.legendLabel")} className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
       {rows.map(([style, label]) => (
         <li key={label} className="flex items-center gap-1.5">
@@ -105,15 +104,5 @@ export function Legend({
         </li>
       ))}
     </ul>
-  );
-  return collapsed ? (
-    <details className="text-xs">
-      <summary className="cursor-pointer text-muted-foreground">
-        {t("clusterMap.legendShow")}
-      </summary>
-      <div className="pt-1.5">{list}</div>
-    </details>
-  ) : (
-    list
   );
 }

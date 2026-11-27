@@ -69,7 +69,9 @@
       "railNodes_other": "노드 {{count}}개",
       "railDown": "끊김 {{count}}",
       "railDegraded": "저하 {{count}}",
-      "railUnknown": "모름 {{count}}"
+      "railUnknown": "모름 {{count}}",
+      "fold": "{{node}}의 꺼진 VM {{count}}개(접힘) — 눌러서 펼치기",
+      "unfold": "{{node}}의 꺼진 VM {{count}}개(펼침) — 눌러서 접기"
     },
     "pictureLabel": "클러스터 지도",
     "listLabel": "목록으로 본 클러스터 지도",
@@ -96,9 +98,9 @@
     "problems": "문제만",
     "settings": "보기 설정",
     "lod": {
-      "summary": "요약 — 확대하면 VM 타일.",
-      "tiles": "VM 타일 — 더 확대하면 이름.",
-      "detail": "자세히."
+      "summary": "요약 — 노드마다 VM 상태 비율. 확대하면 VM 칸.",
+      "tiles": "VM 칸 — 더 확대하면 이름.",
+      "detail": "자세히 — VM 이름(VM이 아주 많은 노드는 가리키면 보임)."
     },
     "big": "노드가 많습니다: 판 하나만 보면 읽기 쉽습니다.",
     "loadUnknownNote": "부하 모름: 리더의 배치 요약을 읽을 수 없습니다.",
@@ -135,7 +137,8 @@
       "rail": "네트워크 레일",
       "wireDown": "레일에서 끊김(×)",
       "fault": "링크 장애",
-      "wireUnknown": "모름(오프라인 노드)"
+      "wireUnknown": "모름(오프라인 노드)",
+      "fold": "꺼진 VM 덩어리(VM이 많은 노드 — 눌러서 펼침)"
     },
     "card": {
       "cpu": "CPU",
@@ -223,6 +226,6 @@
       "members": "구성 포트: {{list}}"
     },
     "tagFault": "링크 ✕ {{count}}",
-    "legendShow": "범례"
+    "legendShow": "범례·조작 안내"
   }
 }
