@@ -21,9 +21,11 @@ use sha2::{Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use super::failure::coded;
 use super::migrate::write_progress;
 use super::{Ctx, clone, import_volume, resize_volume, volume_and_pool};
 use crate::volumes::{UPLOAD_RESERVE_BYTES, redact_url};
+use orbivisor_types::task_failure::{TaskFailure, code};
 
 /// 연결 한도
 pub(crate) const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,9 +100,12 @@ impl Want {
             .as_ref()
             .map(|u| format!(" (from {u})"))
             .unwrap_or_default();
-        Err(format!(
-            "checksum mismatch: expected {}{from}, got {got}",
-            self.value
+        Err(coded(
+            TaskFailure::new(code::UPLOAD_CHECKSUM),
+            format!(
+                "checksum mismatch: expected {}{from}, got {got}",
+                self.value
+            ),
         ))
     }
 }
@@ -265,7 +270,10 @@ async fn get(ctx: &Ctx, client: &reqwest::Client, url: &str) -> Result<reqwest::
         .await
         .map_err(|e| failed(&shown, e))?;
     if !response.status().is_success() {
-        return Err(format!("GET {shown}: HTTP {}", response.status()));
+        return Err(coded(
+            TaskFailure::new(code::DOWNLOAD_FAILED).param("url", &shown),
+            format!("GET {shown}: HTTP {}", response.status()),
+        ));
     }
     Ok(response)
 }
@@ -274,7 +282,10 @@ async fn get(ctx: &Ctx, client: &reqwest::Client, url: &str) -> Result<reqwest::
 fn failed(shown: &str, e: reqwest::Error) -> String {
     match blocked(&e) {
         Some(ip) => format!("GET {shown}: {}", Blocked(ip)),
-        None => format!("GET {shown}: {}", e.without_url()),
+        None => coded(
+            TaskFailure::new(code::DOWNLOAD_FAILED).param("url", shown),
+            format!("GET {shown}: {}", e.without_url()),
+        ),
     }
 }
 
@@ -315,7 +326,10 @@ async fn fetch(
     let total = response.content_length().unwrap_or(0);
     if total > 0 {
         check_space(dir, total, || {
-            format!("not enough free space for a {total}-byte download")
+            coded(
+                TaskFailure::new(code::STORAGE_FULL).param("need_bytes", total),
+                format!("not enough free space for a {total}-byte download"),
+            )
         })?;
     }
     let mut out = tokio::fs::File::create(file)
@@ -331,7 +345,10 @@ async fn fetch(
         done += chunk.len() as u64;
         if let Some(need) = space_to_check(total, done, next_check) {
             check_space(dir, need, || {
-                format!("not enough free space to go on with the download after {done} bytes")
+                coded(
+                    TaskFailure::new(code::STORAGE_FULL).param("need_bytes", need),
+                    format!("not enough free space to go on with the download after {done} bytes"),
+                )
             })?;
             next_check = done + SPACE_CHECK_BYTES;
         }

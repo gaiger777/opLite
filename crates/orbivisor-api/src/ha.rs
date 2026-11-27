@@ -2004,7 +2004,7 @@ async fn finish(ctx: Ctx<'_>, vm: &Vm, failed: &Node, target: Uuid) {
             for task in tasks.iter().filter(|t| {
                 t.spec.node == failed.id && t.spec.target == vm.id && !t.status.state.is_finished()
             }) {
-                fail_task(ctx, task, &error).await;
+                fail_task(ctx, task, &error, &failed.name).await;
             }
         }
         Err(e) => tracing::warn!(vm = %vm.name, error = %e, "cannot list tasks of a failed node"),
@@ -2026,12 +2026,18 @@ async fn finish(ctx: Ctx<'_>, vm: &Vm, failed: &Node, target: Uuid) {
 }
 
 /// Task를 실패로 끝낸다. 그사이 바뀌었으면 다시 읽어 끝나지 않았을 때만 다시 쓴다.
-async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
+async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str, node: &str) {
     let mut prev = task.status.clone();
     let mut revision = task.revision;
     for _ in 0..TASK_FAIL_ATTEMPTS {
         // 다시 읽은 사이에 시작했으면 그 시작 시각을 잇는다(리뷰 S5).
-        let status = TaskStatus::finished(TaskState::Failed, Some(error.into()), Some(&prev));
+        let status = TaskStatus::finished(TaskState::Failed, Some(error.into()), Some(&prev))
+            .with_failure(Some(
+                orbivisor_types::task_failure::TaskFailure::new(
+                    orbivisor_types::task_failure::code::HA_NODE_FAILED,
+                )
+                .param("node", node),
+            ));
         match update_status_checked::<TaskSpec>(ctx, task.id, revision, &status).await {
             Ok(_) => return,
             Err(e) => {

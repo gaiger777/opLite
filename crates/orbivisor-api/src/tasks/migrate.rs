@@ -36,10 +36,12 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::Ctx;
+use super::failure::{coded, node_name};
 use crate::backups::now;
 use crate::incoming::deactivate_disks;
 use crate::migration_disks::{self, DiskRecord, RecordedVolume, Role};
 use crate::scheduler::{Inventory, migration_moves};
+use orbivisor_types::task_failure::{TaskFailure, code};
 
 /// 확정 쓰기가 (과반수가 없는 등으로) 실패할 때 다시 시도하는 시간. 지나면 되돌린다.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -73,17 +75,24 @@ pub(super) async fn migrate(
     pool: Option<&str>,
 ) -> Result<(), String> {
     let id = task.spec.target;
-    let peers = ctx
-        .config
-        .peers
-        .clone()
-        .ok_or("this node cannot reach other nodes")?;
+    let peers = ctx.config.peers.clone().ok_or_else(|| {
+        coded(
+            TaskFailure::new(code::NODE_NO_PEERS),
+            "this node cannot reach other nodes",
+        )
+    })?;
     let addr = ctx
         .cluster
         .members()
         .addr(NodeId(target))
         .map(str::to_string)
-        .ok_or_else(|| format!("node {target} is not a cluster member"))?;
+        .ok_or_else(|| {
+            coded(
+                TaskFailure::new(code::NODE_NOT_MEMBER)
+                    .param("node", node_name(&ctx.cluster, target)),
+                format!("node {target} is not a cluster member"),
+            )
+        })?;
     let migration = MigrationStatus {
         node: target,
         task: task.id,
@@ -108,7 +117,12 @@ pub(super) async fn migrate(
         // 로컬 풀의 디스크는 할 일이 없다(공유 LVM만 잠금을 바꾼다).
         Ok(()) => match set_disks_shared(&ctx.cluster, &vm, &*ctx.storage, true).await {
             Ok(()) => send(ctx, &peers, &addr, &vm, &migration).await,
-            Err(e) => Err(format!("cannot share the disks with the target node: {e}")),
+            Err(e) => Err(coded(
+                TaskFailure::new(code::MIGRATION_STORAGE_NOT_SHARED)
+                    .param("vm", &vm.name)
+                    .param("node", node_name(&ctx.cluster, target)),
+                format!("cannot share the disks with the target node: {e}"),
+            )),
         },
     };
     // 보내기가 끝난 때가 스위치오버 시점이다(남긴 복제본의 시점).
@@ -199,12 +213,12 @@ fn plan_disks(
         .ok_or("VM was deleted")?;
     let inv = Inventory::load(&ctx.cluster).map_err(read)?;
     let pool = match pool {
-        Some(name) => Some(
-            inv.pools
-                .iter()
-                .find(|p| p.name == name)
-                .ok_or_else(|| format!("storage pool {name:?} not found"))?,
-        ),
+        Some(name) => Some(inv.pools.iter().find(|p| p.name == name).ok_or_else(|| {
+            coded(
+                TaskFailure::new(code::POOL_NOT_FOUND).param("pool", name),
+                format!("storage pool {name:?} not found"),
+            )
+        })?),
         None => None,
     };
     migration_moves(&vm, &inv, target, pool)
@@ -317,7 +331,10 @@ async fn mark_migrating(ctx: &Ctx, id: Uuid, migration: &MigrationStatus) -> Res
             .await
             .map_err(|e| refused(e.to_string()))?;
         if !running || state.is_none_or(|s| s.status != RuntimeStatus::Running) {
-            return Err(refused(format!("VM {:?} is not running", vm.name)));
+            return Err(refused(coded(
+                TaskFailure::new(code::VM_NOT_RUNNING).param("vm", &vm.name),
+                format!("VM {:?} is not running", vm.name),
+            )));
         }
         let mut status = vm.status.clone();
         status.phase = VmPhase::Migrating;
@@ -378,9 +395,12 @@ fn check_no_other_task(ctx: &Ctx, vm: &Vm) -> Result<(), String> {
             TaskOp::VmHotplug if t.spec.target == vm.id => "having its hardware changed",
             _ => continue,
         };
-        return Err(format!(
-            "VM {:?} is {doing} (task {}); try again when the task has finished",
-            vm.name, t.id
+        return Err(coded(
+            TaskFailure::new(code::TARGET_BUSY).param("name", &vm.name),
+            format!(
+                "VM {:?} is {doing} (task {}); try again when the task has finished",
+                vm.name, t.id
+            ),
         ));
     }
     Ok(())
@@ -419,10 +439,14 @@ async fn send(
         qemu_version,
         disks: disks.clone(),
     };
-    let reply = peers
-        .migrate_incoming(addr, req)
-        .await
-        .map_err(|e| format!("the target node cannot receive the VM: {e}"))?;
+    let reply = peers.migrate_incoming(addr, req).await.map_err(|e| {
+        coded(
+            TaskFailure::new(code::MIGRATION_TARGET_REFUSED)
+                .param("vm", &vm.name)
+                .param("node", node_name(&ctx.cluster, migration.node)),
+            format!("the target node cannot receive the VM: {e}"),
+        )
+    })?;
     // 대상 노드에는 받을 준비 요청이 닿은 클러스터 링크(그 노드에 지금 쓰는 링크; 첫 링크가 끊겼으면 다른 링크)의
     // 호스트로 접속한다. 요청 전에 읽으면 아직 모르는 죽은 첫 링크일 수 있다. 모든 링크의 이름이 노드 인증서에 있다.
     let link = peers.active_link(addr);
@@ -563,9 +587,16 @@ async fn prepare_copy(
             && let Some(state) = pool_state_on(&pool, node)
             && need > state.available_bytes
         {
-            return Err(format!(
-                "not enough space in storage pool {name:?} on node {:?}: need {need}, available {}",
-                node.name, state.available_bytes
+            return Err(coded(
+                TaskFailure::new(code::POOL_FULL)
+                    .param("pool", name)
+                    .param("node", &node.name)
+                    .param("need_bytes", need)
+                    .param("free_bytes", state.available_bytes),
+                format!(
+                    "not enough space in storage pool {name:?} on node {:?}: need {need}, available {}",
+                    node.name, state.available_bytes
+                ),
             ));
         }
     }
@@ -811,7 +842,10 @@ async fn commit(
         }
         // 정지 요청이 검사를 지나 마이그레이션 중에 적용됐다. 대상에서 다시 켜지 않는다.
         if vm.spec.power != PowerState::Running {
-            return Err(format!("VM {:?} was stopped during the migration", vm.name));
+            return Err(coded(
+                TaskFailure::new(code::MIGRATION_VM_STOPPED).param("vm", &vm.name),
+                format!("VM {:?} was stopped during the migration", vm.name),
+            ));
         }
         let mut spec = vm.spec.clone();
         spec.node = Some(migration.node);

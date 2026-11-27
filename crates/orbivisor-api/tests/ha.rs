@@ -335,6 +335,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
             TaskStatus {
                 state: TaskState::Failed,
                 error: Some("node failed failed; the VM was recovered by HA".into()),
+                failure: Some(ha_node_failed()),
                 progress: None,
                 ..Default::default()
             }
@@ -741,6 +742,7 @@ async fn fails_a_task_of_the_failed_node_created_before_the_spec_write() {
         TaskStatus {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
+            failure: Some(ha_node_failed()),
             progress: None,
             ..Default::default()
         }
@@ -946,6 +948,7 @@ async fn finishes_a_spec_write_settled_by_a_new_term() {
         TaskStatus {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
+            failure: Some(ha_node_failed()),
             progress: None,
             ..Default::default()
         }
@@ -2690,6 +2693,14 @@ fn recorded(status: TaskStatus) -> TaskStatus {
         finished_at: None,
         ..status
     }
+}
+
+/// HA가 죽은 노드("failed")의 Task를 끝낸 원인(계획 77-2)
+fn ha_node_failed() -> orbivisor_types::task_failure::TaskFailure {
+    orbivisor_types::task_failure::TaskFailure::new(
+        orbivisor_types::task_failure::code::HA_NODE_FAILED,
+    )
+    .param("node", "failed")
 }
 
 fn succeeded() -> TaskStatus {

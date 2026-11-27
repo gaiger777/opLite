@@ -10,6 +10,7 @@ mod clone;
 mod download;
 mod drain;
 mod export;
+pub(crate) mod failure;
 pub(crate) mod file_restore;
 mod firmware;
 mod hotplug;
@@ -49,7 +50,7 @@ use orbivisor_types::storage::{
     SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeStatus,
     is_shared, pool_listed_on,
 };
-use orbivisor_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
+use orbivisor_types::task::{Task, TaskFailure, TaskOp, TaskSpec, TaskState, TaskStatus};
 use orbivisor_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -59,10 +60,12 @@ use crate::error::ApiError;
 use crate::schedule::task_failed;
 use crate::snapshots::{uses_block_snapshots, vm_placement};
 use crate::state::AppState;
+use crate::tasks::failure::coded;
 use crate::updates::Updates;
 use crate::vm_imports::ImportCredentials;
 use crate::vms::{is_stopped, vm_uses_volume};
 use crate::volumes::{block_pool_kind, usable_node};
+use orbivisor_types::task_failure::code;
 
 /// Task를 만든 API 요청의 사용자 id를 담는 레이블(요청 밖에서 만든 Task — 스케줄러·HA·정리 작업 — 에는 없다)
 pub const REQUESTED_BY: &str = "requested-by";
@@ -878,8 +881,8 @@ fn start(
                 | TaskOp::VmwareCleanup { .. }
         );
         if interrupted && !resumes {
-            let error = "interrupted: orbivisord restarted while the task was running".to_string();
-            fail(&ctx, &task, error, true).await;
+            let error = format!("{} while the task was running", failure::INTERRUPTED);
+            fail(&ctx, &task, error, true, None).await;
         } else {
             execute(&ctx, task, interrupted).await;
         }
@@ -955,7 +958,14 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // Task가 쓰는 spec은 Task를 만든 사용자와 이 Task를 출처로 이력에 남는다(계획 73 §7.1). `perform`의 future는 크므로
     // 상자에 넣어 범위(`TaskLocalFuture`)가 스택에 싣지 않게 한다(넣지 않으면 VMware 동기화에서 스택이 넘친다).
     let change = task_change(ctx, &task);
-    let run = || change.clone().scope(Box::pin(perform(ctx, &task, resume)));
+    // 실패를 만든 곳이 적는 원인 코드 칸(계획 77-2)
+    let slot = failure::Slot::default();
+    let run = || {
+        failure::scope(
+            slot.clone(),
+            change.clone().scope(Box::pin(perform(ctx, &task, resume))),
+        )
+    };
     let (result, unfinished) = if unlimited {
         (run().await, false)
     } else {
@@ -980,9 +990,9 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             if task.spec.op.is_sdn() {
                 sdn::finished(ctx, &task, None).await;
             }
-            set_status(ctx, task.id, TaskState::Succeeded, warning).await
+            set_status(ctx, task.id, TaskState::Succeeded, warning, None).await
         }
-        Err(e) => fail(ctx, &task, e, unfinished).await,
+        Err(e) => fail(ctx, &task, e, unfinished, Some(&slot)).await,
     }
 }
 
@@ -1010,7 +1020,16 @@ fn task_change(ctx: &Ctx, task: &Task) -> ChangeContext {
 
 /// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기나 예약 정리의 삭제였으면
 /// VM에 이유를 남긴다. `unfinished`면 작업이 끝나지 않았다(시간 초과, 재시작으로 중단).
-async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
+/// `slot`은 실행이 적은 원인 코드다(계획 77-2).
+async fn fail(
+    ctx: &Ctx,
+    task: &Task,
+    error: String,
+    unfinished: bool,
+    slot: Option<&failure::Slot>,
+) {
+    // 남은 일을 덧붙이기 전의 원문으로 원인을 고른다(시간 초과·중단은 머리로 안다).
+    let cause = failure::resolve(&error, slot);
     let error = if unfinished {
         unfinished_error(ctx, task, error).await
     } else {
@@ -1023,7 +1042,7 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
     if let Some(vm) = scheduled {
         snapshot::record_schedule(ctx, vm, Some(task_failed(error.clone()))).await;
     }
-    set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
+    set_status(ctx, task.id, TaskState::Failed, Some(error), cause).await;
 }
 
 /// 끝나지 않은(시간 초과, 재시작으로 중단) Task의 오류에 남은 일을 붙인다. 템플릿 표시를 지운 뒤 끊긴 되돌리기는 다시 보기를
@@ -1178,7 +1197,13 @@ async fn begin(ctx: &Ctx, id: Uuid) -> bool {
 }
 
 /// 저장소에 기록될 때까지 다시 시도한다. 실행기가 멈추면 이 future도 함께 멈춘다.
-async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>) {
+async fn set_status(
+    ctx: &Ctx,
+    id: Uuid,
+    state: TaskState,
+    error: Option<String>,
+    failure: Option<TaskFailure>,
+) {
     // 끝 시각을 적고 시작 시각은 잇는다(계획 77). 읽지 못하면 끝 시각만.
     let prev = ctx
         .cluster
@@ -1186,7 +1211,7 @@ async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>
         .ok()
         .flatten()
         .map(|t| t.status);
-    let status = TaskStatus::finished(state, error, prev.as_ref());
+    let status = TaskStatus::finished(state, error, prev.as_ref()).with_failure(failure);
     loop {
         match ctx.cluster.update_status::<TaskSpec>(id, &status).await {
             Ok(_) => return,
@@ -1436,11 +1461,22 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
 fn started(vm: &Vm) -> Option<Result<(), String>> {
     match (vm.spec.power, vm.status.phase) {
         (PowerState::Running, VmPhase::Running) => Some(Ok(())),
-        (PowerState::Stopped, VmPhase::Stopped | VmPhase::Failed) => Some(Err(vm
-            .status
-            .last_error
-            .clone()
-            .unwrap_or_else(|| "VM was stopped".into()))),
+        (PowerState::Stopped, VmPhase::Stopped | VmPhase::Failed) => {
+            let error = vm
+                .status
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "VM was stopped".into());
+            // reconciler가 켜지 못하고 포기했다(`failed to start: QEMU failed to start: …`).
+            Some(Err(if error.starts_with("failed to start") {
+                coded(
+                    TaskFailure::new(code::QEMU_START_FAILED).param("vm", &vm.name),
+                    error,
+                )
+            } else {
+                error
+            }))
+        }
         _ => None,
     }
 }
@@ -1541,12 +1577,17 @@ fn volume_and_pool(ctx: &Ctx, id: Uuid) -> Result<(Volume, StoragePool), String>
         .cluster
         .get::<VolumeSpec>(id)
         .map_err(|e| e.to_string())?
-        .ok_or("volume was deleted")?;
+        .ok_or_else(|| coded(TaskFailure::new(code::TARGET_DELETED), "volume was deleted"))?;
     let pool = ctx
         .cluster
         .get_by_name::<StoragePoolSpec>(&volume.spec.pool)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("storage pool {:?} not found", volume.spec.pool))?;
+        .ok_or_else(|| {
+            coded(
+                TaskFailure::new(code::POOL_NOT_FOUND).param("pool", &volume.spec.pool),
+                format!("storage pool {:?} not found", volume.spec.pool),
+            )
+        })?;
     Ok((volume, pool))
 }
 
@@ -1649,7 +1690,13 @@ async fn import_volume(
     ctx.storage
         .check_import_source(source, source_format)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| match e {
+            // 기술자만 있는 VMDK, 기반 파일·외부 데이터 파일이 있는 qcow2(계획 77-2)
+            DriverError::InvalidSpec(_) => {
+                coded(TaskFailure::new(code::IMAGE_UNSUPPORTED), e.to_string())
+            }
+            e => e.to_string(),
+        })?;
     ctx.storage
         .import_volume(&pool, id, source, source_format, volume.spec.format)
         .await
@@ -1672,7 +1719,10 @@ async fn check_iso_source(source: &Path) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     if !is_iso_image(&header) {
-        return Err("not an ISO 9660 or UDF image".into());
+        return Err(coded(
+            TaskFailure::new(code::IMAGE_UNSUPPORTED),
+            "not an ISO 9660 or UDF image",
+        ));
     }
     Ok(())
 }
@@ -1779,9 +1829,12 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
         && vm.status.phase != VmPhase::Running
         && !is_stopped(vm)
     {
-        return Err(format!(
-            "VM {:?} is starting or stopping; try again when it has settled",
-            vm.name
+        return Err(coded(
+            TaskFailure::new(code::TARGET_BUSY).param("name", &vm.name),
+            format!(
+                "VM {:?} is starting or stopping; try again when it has settled",
+                vm.name
+            ),
         ));
     }
     // 앞 Task가 지우지 못한 허가(기록 실패·노드 죽음)가 남아 있으면 먼저 지운다(리뷰 2 N8): 남은 허가는 그 크기까지의
@@ -1937,7 +1990,13 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), RemoveError> {
     };
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
     if let Some(vm) = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name)) {
-        return Err(format!("volume is attached to VM {:?}", vm.name).into());
+        return Err(coded(
+            TaskFailure::new(code::VOLUME_IN_USE)
+                .param("volume", &volume.name)
+                .param("vm", &vm.name),
+            format!("volume is attached to VM {:?}", vm.name),
+        )
+        .into());
     }
     if let Some(pool) = ctx
         .cluster

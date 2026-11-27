@@ -22,6 +22,7 @@ use orbivisor_types::sdn::{
     SdnStatus, central_address,
 };
 use orbivisor_types::task::{Task, TaskOp};
+use orbivisor_types::task_failure::{TaskFailure, code};
 use uuid::Uuid;
 
 use super::Ctx;
@@ -495,7 +496,10 @@ impl Run<'_> {
 
     fn require_ready(&self) -> Result<(), String> {
         if self.status().phase != SdnPhase::Ready || self.status().centrals.is_empty() {
-            return Err("SDN (OVN) is not ready yet".into());
+            return Err(super::failure::coded(
+                TaskFailure::new(code::SDN_NOT_READY),
+                "SDN (OVN) is not ready yet",
+            ));
         }
         Ok(())
     }
@@ -555,11 +559,12 @@ impl Run<'_> {
         } else {
             &options.host_packages
         };
-        let versions = self
-            .host
-            .ensure_packages(packages)
-            .await
-            .map_err(|e| e.to_string())?;
+        let versions = self.host.ensure_packages(packages).await.map_err(|e| {
+            super::failure::coded(
+                TaskFailure::new(code::PACKAGE_INSTALL_FAILED).param("node", self.name()),
+                e.to_string(),
+            )
+        })?;
         check_release(self.name(), &versions.ovn, self.status().release.as_deref())?;
         if central {
             self.host

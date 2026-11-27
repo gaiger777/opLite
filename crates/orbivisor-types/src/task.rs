@@ -8,6 +8,7 @@ use crate::fence::FenceKind;
 use crate::ha_check::HaCheckAction;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::storage::SourceFormat;
+pub use crate::task_failure::TaskFailure;
 use crate::template::{CloneOverrides, TemplateDraft};
 use crate::vm::Arch;
 use crate::vm_import::ImportRun;
@@ -528,9 +529,19 @@ pub struct TaskStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub finished_at: Option<u64>,
+    /// 실패의 원인 코드와 값(계획 77-2). `error` 원문은 그대로 남긴다(옛 노드·코드 없는 실패는 원문만).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub failure: Option<TaskFailure>,
 }
 
 impl TaskStatus {
+    /// 실패의 원인 코드를 단다(계획 77-2).
+    pub fn with_failure(mut self, failure: Option<TaskFailure>) -> Self {
+        self.failure = failure;
+        self
+    }
+
     /// 끝난 상태: 지금을 `finished_at`에, 앞 상태(`prev`)의 `started_at`은 그대로 둔다.
     pub fn finished(state: TaskState, error: Option<String>, prev: Option<&TaskStatus>) -> Self {
         Self {
@@ -539,6 +550,7 @@ impl TaskStatus {
             progress: None,
             started_at: prev.and_then(|p| p.started_at),
             finished_at: Some(now_ms()),
+            failure: None,
         }
     }
 
@@ -552,6 +564,7 @@ impl TaskStatus {
             progress: None,
             started_at: Some(now),
             finished_at: Some(now),
+            failure: None,
         }
     }
 
@@ -563,6 +576,7 @@ impl TaskStatus {
             progress,
             started_at: Some(prev.and_then(|p| p.started_at).unwrap_or_else(now_ms)),
             finished_at: None,
+            failure: None,
         }
     }
 }

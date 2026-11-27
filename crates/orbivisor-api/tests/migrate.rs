@@ -178,6 +178,10 @@ async fn migrate_creates_a_task_on_the_source_node() {
         task["status"]["error"],
         "this node cannot reach other nodes"
     );
+    assert_eq!(
+        task["status"]["failure"],
+        json!({ "code": "node_no_peers" })
+    );
     // 원본 VM은 그대로 돈다.
     let vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
     assert_eq!(vm.spec.node, Some(env.node));

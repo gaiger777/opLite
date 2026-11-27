@@ -364,6 +364,13 @@ async fn failed_downloads_leave_nothing_behind() {
         task["status"]["error"],
         format!("GET {base}/missing.iso: HTTP 404 Not Found")
     );
+    // 원인 코드와 받은 주소(계획 77-2)
+    assert_eq!(task["status"]["failure"]["code"], "download_failed");
+    assert_eq!(
+        task["status"]["failure"]["params"]["url"],
+        format!("{base}/missing.iso")
+    );
+    assert_eq!(task["status"]["failure"]["retryable"], true);
     assert_cleaned(&env, &admin, "gone").await;
 
     let wrong = "0".repeat(64);
@@ -384,6 +391,7 @@ async fn failed_downloads_leave_nothing_behind() {
             sha256(&files.iso)
         )
     );
+    assert_eq!(task["status"]["failure"]["code"], "upload_checksum");
     assert_cleaned(&env, &admin, "bad").await;
 
     // ISO로 받은 것이 설치 매체가 아니면 가져오지 않는다.
@@ -394,6 +402,10 @@ async fn failed_downloads_leave_nothing_behind() {
     .await;
     let task = admin.wait_task(&task).await;
     assert_eq!(task["status"]["error"], "not an ISO 9660 or UDF image");
+    assert_eq!(
+        task["status"]["failure"],
+        json!({ "code": "image_unsupported" })
+    );
     assert_cleaned(&env, &admin, "notiso").await;
 }
 

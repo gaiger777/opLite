@@ -29,6 +29,7 @@ use orbivisor_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 use super::clone::{StrictIps, copy_format, create_vm, made, volume_name};
+use super::failure::coded;
 use super::firmware::{current_tpm, place_private};
 use super::snapshot::{
     check_local, check_settled, copy_file, fetch_vars, get_vm, is_down, now_secs, ready_disks,
@@ -36,6 +37,7 @@ use super::snapshot::{
 };
 use super::{Ctx, mark_ready};
 use crate::backups::parent_in_use;
+use orbivisor_types::task_failure::{TaskFailure, code};
 
 /// 백업 디렉터리 안의 UEFI 변수 파일 이름
 pub(crate) const VARS_FILE: &str = "vars.fd";
@@ -57,10 +59,24 @@ pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
         .cluster
         .get_by_name::<StoragePoolSpec>(name)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("storage pool {name:?} not found"))?;
+        .ok_or_else(|| {
+            coded(
+                TaskFailure::new(code::POOL_NOT_FOUND).param("pool", name),
+                format!("storage pool {name:?} not found"),
+            )
+        })?;
+    let not_ready = || {
+        TaskFailure::new(code::POOL_NOT_READY)
+            .param("pool", name)
+            .param(
+                "node",
+                super::failure::node_name(&ctx.cluster, ctx.config.node),
+            )
+    };
     if !pool_listed_on(&pool, ctx.config.node) {
-        return Err(format!(
-            "storage pool {name:?} is not available on this node"
+        return Err(coded(
+            not_ready(),
+            format!("storage pool {name:?} is not available on this node"),
         ));
     }
     let me = ctx
@@ -69,9 +85,12 @@ pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
         .map_err(|e| e.to_string())?
         .ok_or("this node is not registered")?;
     if !pool_usable_on(&pool, &me) {
-        return Err(format!(
-            "storage pool {name:?} is not ready on this node: {}",
-            pool_error_on(&pool, &me)
+        return Err(coded(
+            not_ready(),
+            format!(
+                "storage pool {name:?} is not ready on this node: {}",
+                pool_error_on(&pool, &me)
+            ),
         ));
     }
     Ok(pool)
@@ -1010,7 +1029,10 @@ pub(super) async fn restore(
         .map_err(|e| e.to_string())?
         .is_some()
     {
-        return Err(format!("VM {name:?} already exists"));
+        return Err(coded(
+            TaskFailure::new(code::RESTORE_NAME_TAKEN).param("name", name),
+            format!("VM {name:?} already exists"),
+        ));
     }
     if backup.spec.store.is_some() {
         return Box::pin(super::backup_store::restore(

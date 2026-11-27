@@ -19,6 +19,7 @@ use orbivisor_types::node::{Node, NodeSpec};
 use orbivisor_types::resource::Resource;
 use orbivisor_types::storage::{PoolBackend, StoragePoolSpec};
 use orbivisor_types::task::{Task, TaskOp};
+use orbivisor_types::task_failure::{TaskFailure, code};
 use uuid::Uuid;
 
 use super::Ctx;
@@ -217,13 +218,21 @@ impl Run<'_> {
     }
 
     /// `installing-packages`: 데몬 꾸러미를 깔고 판이 클러스터와 같은지 본다.
+    /// 꾸러미 설치 실패(원인 코드 — 계획 77-2)
+    fn install_failed(&self, e: impl std::fmt::Display) -> String {
+        super::failure::coded(
+            TaskFailure::new(code::PACKAGE_INSTALL_FAILED).param("node", self.name()),
+            e.to_string(),
+        )
+    }
+
     async fn install_daemon(&self) -> Result<CephVersion, String> {
         self.stage("installing-packages").await;
         let version = self
             .host
             .ensure_packages(&self.host.options().packages)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| self.install_failed(e))?;
         check_release(self.name(), &version, self.status().release.as_deref())
             .map_err(|e| e.to_string())?;
         Ok(version)
@@ -348,7 +357,12 @@ impl Run<'_> {
         self.host
             .wait_quorum(&mon.name, &quorum)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                super::failure::coded(
+                    TaskFailure::new(code::CEPH_NO_QUORUM).param("node", self.name()),
+                    e.to_string(),
+                )
+            })?;
         let add = |s: &mut CephStatus| {
             if s.mons.iter().any(|m| m.node == mon.node) {
                 return false;
@@ -505,7 +519,7 @@ impl Run<'_> {
         self.host
             .ensure_packages(&self.host.options().client_packages)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| self.install_failed(e))?;
         Ok(())
     }
 }
