@@ -35,7 +35,12 @@
       "reprotect": "Reprotect"
     },
     "test": {
-      "started": "Test failover of {{name}} started."
+      "started": "Test failover of {{name}} started.",
+      "title": "Test failover of {{name}}",
+      "description": "Restores the plan's VMs into isolated networks on this cluster and measures the RTO. The source is not touched. Clean up afterwards.",
+      "submit": "Start test",
+      "notIsolated": "These test networks can reach outside (bridge, uplink or router): {{networks}}. Test VMs keep the production IPs and host names.",
+      "allowRouted": "I understand — run the test on these networks anyway"
     },
     "failover": {
       "title": "Fail over {{name}}",
@@ -59,7 +64,9 @@
       "overRpo": "Older than the RPO target: {{vms}}",
       "willStop": "Shut down on {{source}}: {{vms}}",
       "andMore_one": "and {{count}} more",
-      "andMore_other": "and {{count}} more"
+      "andMore_other": "and {{count}} more",
+      "preemptsTest": "A test of this plan is running: it is cancelled first, and its cleanup starts after the failover.",
+      "verifyFailed": "Newest copy failed verification (an older one is used): {{vms}}"
     },
     "cleanup": {
       "title": "Clean up the test of {{name}}",
@@ -150,7 +157,14 @@
         "routed": "This network has a router: the test may reach other networks.",
         "provider": "This is an uplink (provider) network: the test reaches the physical network.",
         "physical": "This is a bridge network, not SDN: it may share a physical L2 with production."
-      }
+      },
+      "sourceBackupPool": "Source backup pool",
+      "sourceBackupPoolHint": "Planned migration: pool on the source for the last backup of a VM that has no earlier backup there. Each VM can override it.",
+      "vmSourceBackupPool": "Source backup pool",
+      "planSourceBackupPool": "Plan's",
+      "ipHelpLabel": "About IP rules and cloud-init",
+      "ipHelpInstance": "A recovered VM gets a new cloud-init instance-id, so cloud-init runs its first-boot modules again: new SSH host keys, and user-data (users, passwords, runcmd) runs again.",
+      "ipHelpNoCloudInit": "A guest without cloud-init keeps its IP: the rules do not change it."
     },
     "pick": {
       "title": "Add VMs to {{group}}",
@@ -182,7 +196,8 @@
       "address": "Address/prefix, for example 10.20.0.5/24.",
       "time": "HH:MM",
       "mapHalf": "Fill in both names or remove the row.",
-      "mapDuplicate": "This source is already mapped above."
+      "mapDuplicate": "This source is already mapped above.",
+      "pointInTime": "Pick a valid date and time."
     },
     "report": {
       "protection": "Protection",
@@ -201,7 +216,8 @@
     },
     "issue": {
       "no-recovery-point": "No recovery point",
-      "over-rpo": "Over RPO"
+      "over-rpo": "Over RPO",
+      "verify-failed": "Newest copy failed verification"
     },
     "runs": {
       "empty": "No runs yet.",
@@ -229,7 +245,16 @@
       "task": "Task",
       "elapsed": "Elapsed",
       "openCleanup": "Open the cleanup that started after the cancel",
-      "sourceBackup": "backup {{backup}}"
+      "sourceBackup": "backup {{backup}}",
+      "stalled": "No progress for {{time}}. Check the errors below. If the source went down during a planned migration, cancel and fail over in disaster mode.",
+      "preempted": "A failover of this plan cancelled this test. Its cleanup starts after the failover.",
+      "openPreemptedBy": "Open the failover",
+      "preemptedTest": "This failover cancelled a running test.",
+      "openPreemptedTest": "Open that test",
+      "copyTask": "Disk copy",
+      "tried": "tried {{backups}}",
+      "retrying": "Retrying for {{time}}: {{error}}",
+      "notes": "Notes"
     },
     "kind": {
       "test": "Test failover",
@@ -275,14 +300,17 @@
     "errors": {
       "dr_source_missing": "The source remote is not registered on this cluster.",
       "dr_run_active": "Another run of this plan is still going. Wait for it or cancel it.",
-      "dr_cleanup_required": "The last test left VMs or networks behind. Clean up first.",
+      "dr_cleanup_required": "The last test left VMs or networks behind. Use Clean up first — deleting or testing again would lose track of them.",
       "dr_test_network_required": "SDN is not set up here: map every source network in the test network map.",
       "dr_name_taken": "A VM with that name already exists here.",
       "dr_confirm_mismatch": "Type the plan name exactly.",
       "dr_source_unreachable": "The source cluster cannot be reached. A planned migration needs it; use disaster mode if it is down.",
       "dr_no_active_run": "No run is going.",
       "dr_nothing_to_clean": "Nothing is left from the last test.",
-      "dr_no_recovered_vms": "No VMs were recovered by a failover of this plan yet."
+      "dr_no_recovered_vms": "No VMs were recovered by a failover of this plan yet.",
+      "dr_missing_recovery_points": "No recovery point for {{vms}}. Tick “Skip these VMs and go on”, or wait until their copies arrive here.",
+      "dr_test_network_not_isolated": "Test networks {{networks}} can reach outside (bridge, uplink or router). Map an isolated network in the plan's test network map, or tick “I understand” to go on.",
+      "dr_planned_preflight": "The planned migration cannot start; nothing was shut down."
     },
     "prepare": {
       "shutdown": "shutting down on the source",
@@ -290,6 +318,61 @@
       "backup": "backing up on the source",
       "replicate": "replicating here",
       "done": "prepared"
+    },
+    "runOptions": {
+      "advanced": "Advanced",
+      "pointInTime": "Recovery point at or before (local time)",
+      "pointInTimeHint": "Empty: the newest recovery point. Pick a time before ransomware or corruption reached the copies.",
+      "missing": "No recovery point: {{vms}}.",
+      "allowMissing": "Skip these VMs and go on (they are not recovered; the run ends partial)"
+    },
+    "fence": {
+      "band": "Recovered on this cluster but not stopped on {{source}}: {{vms}}. When {{source}} comes back, these VMs start there too and run twice with the same IPs — fence them.",
+      "button": "Fence source VMs",
+      "title": "Fence the VMs on {{source}}",
+      "description": "Forces these VMs off on {{source}} and keeps them stopped there (they do not start again when its nodes come back). The copies running here are not touched.",
+      "confirm": "Fence",
+      "impact": "Forced off on {{source}}: {{vms}}",
+      "done": "The VMs on {{source}} are stopped.",
+      "partial_one": "{{count}} VM could not be stopped on the source.",
+      "partial_other": "{{count}} VMs could not be stopped on the source.",
+      "result": "Fence result",
+      "stopped": "stopped",
+      "failed": "not stopped",
+      "stillPending": "Still to fence: {{vms}}",
+      "close": "Close",
+      "errors": {
+        "dr_nothing_to_fence": "No recovered VMs are waiting to be fenced.",
+        "dr_source_unreachable": "The source cluster cannot be reached. Fence it when it comes back (before reconnecting its networks), or stop the VMs there by hand.",
+        "dr_fence_preflight": "The token of the source remote is a viewer token. Register the source here with an operator or admin token (Remotes) and try again."
+      }
+    },
+    "readiness": {
+      "column": "Failover readiness",
+      "ok": "Ready",
+      "badge_one": "{{count}} VM not ready for failover",
+      "badge_other": "{{count}} VMs not ready for failover",
+      "lastTest_one": "The last test found {{count}} VM not ready for a real failover (see Failover readiness above).",
+      "lastTest_other": "The last test found {{count}} VMs not ready for a real failover (see Failover readiness above).",
+      "issue": {
+        "recovery-point": "no recovery point",
+        "network": "network {{name}} missing",
+        "security-group": "security group {{name}} missing",
+        "pool": "pool {{name}} missing",
+        "node": "node {{name}} missing"
+      }
+    },
+    "preflight": {
+      "token_role": "The token of the source remote is not an admin token — register the source here with an admin token (Remotes).",
+      "no_remote_here": "The source has no remote for this cluster — add this cluster as a remote on the source.",
+      "vm_missing": "{{vm}} is not on the source — remove it from the plan or use disaster mode.",
+      "no_backup_pool": "{{vm}} has no backup on the source — set a source backup pool in the plan.",
+      "no_receiving_pool": "This cluster has no backup pool to receive the copies — create one (Storage).",
+      "unreadable": "Could not read the source: {{message}}"
+    },
+    "step": {
+      "noPoint": "No recovery point — skipped.",
+      "alreadyRecovered": "Already recovered by this plan — skipped."
     }
   }
 }

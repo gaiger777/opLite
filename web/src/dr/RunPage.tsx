@@ -21,9 +21,18 @@ import {
   oldNodes,
   refreshDr,
   usePlan,
+  usePlanRuns,
   useRun,
 } from "@/dr/api";
-import { CLEANUP_DOTS, failedPhase, formatDuration, PHASE_DOTS, rtoClock } from "@/dr/model";
+import {
+  CLEANUP_DOTS,
+  failedPhase,
+  formatDuration,
+  PHASE_DOTS,
+  rtoClock,
+  stalledFor,
+  stepNoteKey,
+} from "@/dr/model";
 import { UpgradeNotice } from "@/dr/PlansPage";
 import { cancelText, PhaseChip, PhaseDots, RunStateChip, useNow } from "@/dr/parts";
 import { formatTime } from "@/lib/format";
@@ -76,13 +85,20 @@ function RunView({ run }: { run: DrRun }) {
   const [cancelling, setCancelling] = useState(false);
   const status = run.status;
   const cleanup = run.spec.kind === "cleanup";
-  // 취소한 시험이 끝나면 서버가 뒷정리를 저절로 시작한다: 계획의 지금 실행으로 가는 길(리뷰 1 웹 4)
+  // 취소한 시험이 끝나면 서버가 뒷정리를 저절로 시작한다: 계획의 지금 실행으로 가는 길(리뷰 1 웹 4). 장애 조치가 끊은
+  // 시험(`preempted`)의 뒷정리는 장애 조치 뒤이고 그때 계획의 지금 실행은 장애 조치다 — 그 장애 조치를 실행 기록에서 찾는다.
+  const preempted = run.spec.kind === "test" && !!status.preempted;
   const plan = usePlan(
-    run.spec.kind === "test" && status.state === "cancelled" ? run.spec.plan : undefined,
+    run.spec.kind === "test" && status.state === "cancelled" && !preempted
+      ? run.spec.plan
+      : undefined,
   );
   const autoCleanup = plan.data?.status.run !== run.id ? plan.data?.status.run : undefined;
+  const planRuns = usePlanRuns(preempted ? run.spec.plan : undefined);
+  const preemptedBy = planRuns.data?.find((r) => r.status.preempted_test === run.id);
   const live = status.state === "running";
   const now = useNow(live);
+  const stalled = stalledFor(status, now);
   const rto = rtoClock(status, now);
   const time = (s: number) => formatTime(new Date(s * 1000), i18n.language);
   const taskOf = (id: string | undefined) => tasks.data?.find((task) => task.id === id);
@@ -119,6 +135,35 @@ function RunView({ run }: { run: DrRun }) {
         }
       />
       {live && <UpgradeNotice old={old} />}
+      {stalled !== undefined && (
+        <p
+          role="alert"
+          className="rounded-md border border-warning px-3 py-2 text-sm text-warning-fg"
+        >
+          {t("dr.run.stalled", { time: formatDuration(stalled) })}
+        </p>
+      )}
+      {preempted && (
+        <p role="status" className="rounded-md border px-3 py-2 text-sm">
+          {t("dr.run.preempted")}{" "}
+          {preemptedBy && (
+            <Link to={`/dr-runs/${preemptedBy.id}`} className="underline-offset-4 hover:underline">
+              {t("dr.run.openPreemptedBy")}
+            </Link>
+          )}
+        </p>
+      )}
+      {status.preempted_test && (
+        <p role="status" className="text-sm">
+          {t("dr.run.preemptedTest")}{" "}
+          <Link
+            to={`/dr-runs/${status.preempted_test}`}
+            className="underline-offset-4 hover:underline"
+          >
+            {t("dr.run.openPreemptedTest")}
+          </Link>
+        </p>
+      )}
       {autoCleanup && (
         <p role="status" className="text-sm">
           <Link to={`/dr-runs/${autoCleanup}`} className="underline-offset-4 hover:underline">
@@ -221,9 +266,12 @@ function RunView({ run }: { run: DrRun }) {
                 <ul className="mt-2 flex flex-col divide-y">
                   {band.steps.map((s) => {
                     const task = taskOf(s.task);
+                    const copy = taskOf(s.copy_task);
+                    // 서버가 적은 실패 단계가 먼저(옛 실행은 Task 목록에서 어림)
                     const failedAt = cleanup
                       ? "deleting"
-                      : failedPhase(s, tasks.data, status.started_at);
+                      : (s.failed_in ?? failedPhase(s, tasks.data, status.started_at));
+                    const note = s.phase === "skipped" ? stepNoteKey(s.error) : undefined;
                     // 새 VM은 복원이 끝난 뒤에만 이 실행의 것이다(이름이 겹쳐 실패했으면 남의 VM — 리뷰 1 웹 2).
                     const restored =
                       AFTER_RESTORE.has(s.phase) ||
@@ -266,8 +314,45 @@ function RunView({ run }: { run: DrRun }) {
                             {task && <TaskStateBadge task={task} />}
                           </Link>
                         )}
-                        {s.error && (
-                          <span className="basis-full text-xs text-destructive">{s.error}</span>
+                        {s.copy_task && (
+                          <Link
+                            to="/tasks"
+                            className="inline-flex items-center gap-1 text-xs underline-offset-4 hover:underline"
+                          >
+                            {t("dr.run.copyTask")}
+                            {copy && <TaskStateBadge task={copy} />}
+                          </Link>
+                        )}
+                        {(s.tried ?? []).length > 0 && (
+                          <span className="text-xs text-muted-foreground">
+                            {t("dr.run.tried", { backups: s.tried!.join(", ") })}
+                          </span>
+                        )}
+                        {s.retrying_since !== undefined && (
+                          <span className="basis-full text-xs text-warning-fg">
+                            {t("dr.run.retrying", {
+                              time: formatDuration(now - s.retrying_since),
+                              error: s.last_error ?? "",
+                            })}
+                          </span>
+                        )}
+                        {s.error &&
+                          (note ? (
+                            <span className="basis-full text-xs text-muted-foreground">
+                              {t(note)}
+                            </span>
+                          ) : (
+                            <span className="basis-full text-xs text-destructive">{s.error}</span>
+                          ))}
+                        {(s.notes ?? []).length > 0 && (
+                          <ul
+                            aria-label={t("dr.run.notes")}
+                            className="basis-full list-disc pl-5 text-xs text-muted-foreground"
+                          >
+                            {s.notes!.map((n, i) => (
+                              <li key={i}>{n}</li>
+                            ))}
+                          </ul>
                         )}
                       </li>
                     );

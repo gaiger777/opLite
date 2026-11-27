@@ -1,6 +1,6 @@
 // 복구 계획 편집(계획 76 §4)의 순수 함수: 계획 ↔ 편집 초안, 검사(서버 `RecoveryPlanSpec::validate`의 형식 검사와 같은 범위),
 // VM 고르기 후보, 실행 단계 점, 시간 글. 화면은 이것을 그리기만 한다.
-import type { Backup, Network, Task, Vm } from "@/api/types";
+import type { Backup, Network, Task } from "@/api/types";
 import type {
   DrPhase,
   DrRunKind,
@@ -25,8 +25,6 @@ export const DEFAULT_TIMEOUT_SECS = 600;
 export const MAX_NIC = 15;
 /** 시험 VM 이름의 꼬리(서버 `TEST_VM_SUFFIX`) */
 export const TEST_VM_SUFFIX = "-drt";
-/** 시험이 만든 VM·거품 네트워크의 라벨(서버 `DR_TEST_LABEL`, 값은 계획 이름) */
-export const DR_TEST_LABEL = "orbivisor.io/dr-test";
 
 export const WAITS: readonly DrWait[] = ["running", "guest", "ip"];
 export const ON_TIMEOUT: readonly OnTimeout[] = ["continue", "stop"];
@@ -50,6 +48,8 @@ export interface VmDraft {
   pool: string;
   node: string;
   live: boolean;
+  /** 계획된 이전에서 운영 쪽에 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 풀(비면 계획의 것) */
+  sourceBackupPool: string;
   ip: IpDraft[];
 }
 
@@ -68,6 +68,8 @@ export interface Draft {
   source: string;
   pool: string;
   folder: string;
+  /** 계획된 이전의 운영 쪽 백업 풀 기본값(VM마다 덮어씀) */
+  sourceBackupPool: string;
   /** RPO 목표(시간, 소수 가능, 0 = 끔) */
   rpoHours: string;
   onTimeout: OnTimeout;
@@ -95,7 +97,7 @@ export function newGroup(name: string): GroupDraft {
 }
 
 export function newVm(vm: string): VmDraft {
-  return { vm, pool: "", node: "", live: false, ip: [] };
+  return { vm, pool: "", node: "", live: false, sourceBackupPool: "", ip: [] };
 }
 
 export function newIp(nic: number): IpDraft {
@@ -109,6 +111,7 @@ export function emptyDraft(): Draft {
     source: "",
     pool: "",
     folder: "",
+    sourceBackupPool: "",
     rpoHours: String(DEFAULT_RPO_SECS / 3600),
     onTimeout: "continue",
     networks: [],
@@ -127,6 +130,7 @@ export function toDraft(name: string, spec: RecoveryPlanSpec): Draft {
     source: spec.source,
     pool: spec.pool,
     folder: spec.folder ?? "",
+    sourceBackupPool: spec.source_backup_pool ?? "",
     rpoHours: String(spec.rpo_target_secs / 3600),
     onTimeout: spec.on_timeout ?? "continue",
     networks: pairs(spec.networks),
@@ -143,6 +147,7 @@ export function toDraft(name: string, spec: RecoveryPlanSpec): Draft {
         pool: v.pool ?? "",
         node: v.node ?? "",
         live: v.live ?? false,
+        sourceBackupPool: v.source_backup_pool ?? "",
         ip: (v.ip ?? []).map((r) => ({
           nic: String(r.nic),
           dhcp: r.dhcp ?? false,
@@ -170,6 +175,7 @@ export function toSpec(draft: Draft): RecoveryPlanSpec {
     source: draft.source,
     pool: draft.pool.trim(),
     folder: opt(draft.folder),
+    source_backup_pool: opt(draft.sourceBackupPool),
     rpo_target_secs: Math.round(Number(draft.rpoHours) * 3600),
     on_timeout: draft.onTimeout,
     networks: map(draft.networks),
@@ -185,6 +191,7 @@ export function toSpec(draft: Draft): RecoveryPlanSpec {
         pool: opt(v.pool),
         node: opt(v.node),
         live: v.live || undefined,
+        source_backup_pool: opt(v.sourceBackupPool),
         ip:
           v.ip.length > 0
             ? v.ip.map((r) =>
@@ -222,8 +229,8 @@ function intIn(text: string, min: number, max: number): boolean {
 }
 
 /**
- * 초안 검사. 칸 → 오류 번역 키(`dr.invalid.*`). 칸 이름: `name`, `source`, `pool`, `rpo`, `groups`, `g{i}.name`, `g{i}.timeout`,
- * `g{i}.delay`, `g{i}.vms`, `g{i}.v{j}.ip{k}`, `vms`(겹침), 맵 줄 `net{i}`·`sg{i}`·`tnet{i}`(네트워크·보안 그룹·시험 네트워크).
+ * 초안 검사. 칸 → 오류 번역 키(`dr.invalid.*`). 칸 이름: `name`, `source`, `pool`, `sourceBackupPool`, `rpo`, `groups`, `g{i}.name`,
+ * `g{i}.timeout`, `g{i}.delay`, `g{i}.vms`, `g{i}.v{j}.pool`·`.sourceBackupPool`·`.ip{k}`, `vms`(겹침), 맵 줄 `net{i}`·`sg{i}`·`tnet{i}`(네트워크·보안 그룹·시험 네트워크).
  */
 export function validate(draft: Draft, isNew: boolean): Record<string, string> {
   const errors: Record<string, string> = {};
@@ -235,6 +242,9 @@ export function validate(draft: Draft, isNew: boolean): Record<string, string> {
   }
   if (!NAME.test(draft.pool.trim())) {
     errors.pool = "dr.invalid.name";
+  }
+  if (draft.sourceBackupPool.trim() && !NAME.test(draft.sourceBackupPool.trim())) {
+    errors.sourceBackupPool = "dr.invalid.name";
   }
   const rpo = Number(draft.rpoHours);
   if (
@@ -273,6 +283,9 @@ export function validate(draft: Draft, isNew: boolean): Record<string, string> {
     g.vms.forEach((v, j) => {
       if (v.pool.trim() && !NAME.test(v.pool.trim())) {
         errors[`g${i}.v${j}.pool`] = "dr.invalid.name";
+      }
+      if (v.sourceBackupPool.trim() && !NAME.test(v.sourceBackupPool.trim())) {
+        errors[`g${i}.v${j}.sourceBackupPool`] = "dr.invalid.name";
       }
       v.ip.forEach((r, k) => {
         const at = `g${i}.v${j}.ip${k}`;
@@ -385,28 +398,21 @@ export function testNetworkIssues(
   return out;
 }
 
-/** 장애 조치 확인에 보일 보호 상태의 빈 곳: 복구 지점이 없는 VM과 RPO를 넘은 VM(나이) */
+/**
+ * 장애 조치 확인에 보일 보호 상태의 빈 곳: 복구 지점이 없는 VM, RPO를 넘은 VM(나이), 가장 새 사본이 검증에 실패해 그 앞의
+ * 사본을 쓸 VM(`verify-failed`)
+ */
 export function protectionGaps(protection: readonly VmProtection[] | undefined) {
   const bad = (protection ?? []).filter((p) => !p.ok);
   return {
     missing: bad.filter((p) => p.age_secs === undefined).map((p) => p.vm),
-    over: bad.filter((p) => p.age_secs !== undefined).map((p) => ({ vm: p.vm, age: p.age_secs! })),
+    over: bad
+      .filter((p) => p.age_secs !== undefined && p.issue !== "verify-failed")
+      .map((p) => ({ vm: p.vm, age: p.age_secs! })),
+    verifyFailed: bad
+      .filter((p) => p.age_secs !== undefined && p.issue === "verify-failed")
+      .map((p) => p.vm),
   };
-}
-
-/**
- * 뒷정리가 지울 것(서버 `leftovers`와 같은 기준 — 시험 라벨이 이 계획인 VM과 네트워크). 이미 받은 목록에서 센다.
- */
-export function testLeftovers(
-  plan: string,
-  vms: readonly Vm[] | undefined,
-  networks: readonly Network[] | undefined,
-): string[] {
-  const mine = (labels: Record<string, string> | undefined) => labels?.[DR_TEST_LABEL] === plan;
-  return [
-    ...(vms ?? []).filter((v) => mine(v.labels)).map((v) => v.name),
-    ...(networks ?? []).filter((n) => mine(n.labels)).map((n) => n.name),
-  ].sort();
 }
 
 /** UUIDv7의 만든 시각(초) */
@@ -417,7 +423,7 @@ function uuidSecs(id: string): number {
 const RESTORE_OPS = new Set(["backup-restore", "backup-live-restore"]);
 
 /**
- * 실패한 VM이 어느 단계에서 실패했는지(리뷰 1 웹 6). 실행 기록은 실패할 때 Task를 비우므로 Task 목록에서 찾는다: 이 실행이
+ * 실패한 VM이 어느 단계에서 실패했는지(리뷰 1 웹 6) — 서버가 단계에 `failed_in`을 적기 전의 실행에만 쓴다. 실행 기록은 실패할 때 Task를 비우므로 Task 목록에서 찾는다: 이 실행이
  * 시작한 뒤 그 백업으로 그 이름을 만든 복원 Task가 실패했으면 `restoring`, 성공했으면 그 VM의 `vm-start` Task가 실패한 때
  * `starting`, 시작도 끝났으면(또는 라이브 복원) `waiting`이다. 운영 쪽 준비에서 실패했거나 Task를 찾지 못하면 모른다
  * (undefined — 점을 모두 빈 칸으로 두고 칩만 보인다).
@@ -612,4 +618,38 @@ export function rtoClock(
     return Math.max(0, nowSecs - status.started_at);
   }
   return status.rto_secs;
+}
+
+/** 실행이 나아가지 않으면 "멈춤"으로 보는 시간(서버 경보 `dr_run_failed`의 stalled와 같은 30분) */
+export const STALL_SECS = 30 * 60;
+
+/** 도는 실행이 `progress_at`부터 [`STALL_SECS`]보다 오래 나아가지 않았으면 그 초(아니면 undefined) */
+export function stalledFor(
+  status: { state: DrRunState; progress_at?: number },
+  nowSecs: number,
+): number | undefined {
+  if (status.state !== "running" || status.progress_at === undefined) {
+    return undefined;
+  }
+  const idle = nowSecs - status.progress_at;
+  return idle > STALL_SECS ? idle : undefined;
+}
+
+/** 서버가 단계 `error`에 적는 알려진 글 → 번역 키(건너뛴 까닭 — 실패가 아니다) */
+const STEP_NOTES: Record<string, string> = {
+  "no recovery point": "dr.step.noPoint",
+  "already recovered by this plan": "dr.step.alreadyRecovered",
+};
+
+export function stepNoteKey(error: string | undefined): string | undefined {
+  return error ? STEP_NOTES[error] : undefined;
+}
+
+/** `datetime-local` 값(지역 시각) → 유닉스 초. 비었거나 틀리면 undefined. */
+export function localToSecs(value: string): number | undefined {
+  if (!value.trim()) {
+    return undefined;
+  }
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
 }

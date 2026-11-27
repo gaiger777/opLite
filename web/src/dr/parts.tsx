@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { StatusChip } from "@/components/StatusChip";
-import type { DrPhase, DrRunKind, DrRunState, VmProtection } from "@/dr/api";
+import type { DrPhase, DrRunKind, DrRunState, VmProtection, VmReadiness } from "@/dr/api";
 import { type DotState, isFailover, PHASE_TONE, phaseDots, rpoCounts, RUN_TONE } from "@/dr/model";
 
 /**
@@ -120,4 +120,25 @@ export function useNow(active: boolean): number {
     return () => clearInterval(timer);
   }, [active]);
   return now;
+}
+
+/**
+ * 장애 조치 준비 칸(보고의 `failover_readiness` 한 줄): 준비됐으면 그렇다고, 아니면 문제마다 종류와 이름(`network lan` 등 —
+ * 실제 장애 조치가 쓸 것이 이 클러스터에 없음). 보고에 없는 VM은 "—".
+ */
+export function ReadinessCell({ readiness }: { readiness: VmReadiness | undefined }) {
+  const { t } = useTranslation();
+  if (!readiness) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  if (readiness.ok) {
+    return <span className="text-success-fg">{t("dr.readiness.ok")}</span>;
+  }
+  return (
+    <ul className="flex flex-col text-warning-fg">
+      {(readiness.issues ?? []).map((issue, i) => (
+        <li key={i}>{t(`dr.readiness.issue.${issue.kind}`, { name: issue.name ?? "" })}</li>
+      ))}
+    </ul>
+  );
 }

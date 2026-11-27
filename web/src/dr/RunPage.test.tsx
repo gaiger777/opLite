@@ -249,3 +249,131 @@ it("tells that a cancelled test cleans up by itself and links that cleanup", asy
     await screen.findByRole("link", { name: "Open the cleanup that started after the cancel" }),
   ).toHaveAttribute("href", `/dr-runs/${CLEANUP}`);
 });
+
+it("shows the server's failed phase, notes, tried copies, retries and the disk copy", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  setup(
+    run({
+      spec: { kind: "failover-disaster" },
+      status: {
+        progress_at: now - 60,
+        steps: [
+          // 서버가 적은 실패 단계가 Task 어림보다 먼저다
+          {
+            group: "db",
+            vm: "db1",
+            phase: "failed",
+            failed_in: "starting",
+            at: NOW - 10,
+            new_vm: "db1",
+            error: "start failed",
+            tried: ["db1-copy-2", "db1-copy-1"],
+            notes: ["restore from db1-copy-2 failed: bad chunk; trying db1-copy-1"],
+          },
+          {
+            group: "web",
+            vm: "web1",
+            phase: "waiting",
+            at: NOW - 10,
+            new_vm: "web1",
+            copy_task: "019a0f3c-0000-7000-8005-0000000000c1",
+          },
+          {
+            group: "web",
+            vm: "web2",
+            phase: "preparing",
+            at: NOW - 10,
+            retrying_since: now - 300,
+            last_error: "cannot read the source cluster: timed out",
+          },
+        ],
+      },
+    }),
+  );
+  open();
+  const db1 = await screen.findByRole("listitem", { name: "db1" });
+  expect(dotStates(db1)).toEqual(["done", "failed", "todo", "todo"]);
+  expect(db1).toHaveTextContent("tried db1-copy-2, db1-copy-1");
+  expect(within(db1).getByRole("list", { name: "Notes" })).toHaveTextContent("bad chunk");
+  const web1 = screen.getByRole("listitem", { name: "web1" });
+  expect(within(web1).getByRole("link", { name: /Disk copy/ })).toHaveAttribute("href", "/tasks");
+  const web2 = screen.getByRole("listitem", { name: "web2" });
+  expect(web2).toHaveTextContent(/Retrying for 5m \ds: cannot read the source cluster: timed out/);
+  // 1분 전에 나아갔으므로 멈춤이 아니다
+  expect(screen.queryByText(/No progress for/)).not.toBeInTheDocument();
+});
+
+it("warns when a running run made no progress for 30 minutes", async () => {
+  setup(run({ status: { progress_at: Math.floor(Date.now() / 1000) - 3600 } }));
+  open();
+  expect(await screen.findByRole("alert")).toHaveTextContent(/No progress for 1h 0m/);
+});
+
+it("tells a skipped VM was already recovered by this plan, not failed", async () => {
+  setup(
+    run({
+      spec: { kind: "failover-disaster" },
+      status: {
+        state: "succeeded",
+        finished_at: NOW,
+        steps: [
+          {
+            group: "db",
+            vm: "db1",
+            phase: "skipped",
+            at: NOW - 10,
+            error: "already recovered by this plan",
+          },
+        ],
+      },
+    }),
+  );
+  open();
+  const db1 = await screen.findByRole("listitem", { name: "db1" });
+  expect(db1).toHaveTextContent("Already recovered by this plan — skipped.");
+  expect(db1).not.toHaveTextContent("already recovered by this plan");
+});
+
+it("links a test a failover cancelled and the failover back to it", async () => {
+  const FAILOVER = "019a0f3c-0000-7000-8076-0000000000c3";
+  setup(run({ status: { state: "cancelled", preempted: true, finished_at: NOW, steps: [] } }));
+  server.use(
+    // 계획의 지금 실행은 장애 조치다 — 뒷정리로 잘못 잇지 않는다
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}`), () =>
+      HttpResponse.json(plan("web-tier", { status: { run: FAILOVER } })),
+    ),
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}/runs`), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [
+          {
+            ...run({ spec: { kind: "failover-disaster" }, status: { preempted_test: RUN_ID } }),
+            id: FAILOVER,
+          },
+          run({ status: { state: "cancelled", preempted: true } }),
+        ],
+      }),
+    ),
+  );
+  open();
+  expect(
+    await screen.findByText(/A failover of this plan cancelled this test/),
+  ).toBeInTheDocument();
+  expect(await screen.findByRole("link", { name: "Open the failover" })).toHaveAttribute(
+    "href",
+    `/dr-runs/${FAILOVER}`,
+  );
+  expect(
+    screen.queryByRole("link", { name: "Open the cleanup that started after the cancel" }),
+  ).not.toBeInTheDocument();
+});
+
+it("links the test a failover cancelled", async () => {
+  const TEST = "019a0f3c-0000-7000-8076-0000000000c4";
+  setup(run({ spec: { kind: "failover-disaster" }, status: { preempted_test: TEST } }));
+  open();
+  expect(await screen.findByRole("link", { name: "Open that test" })).toHaveAttribute(
+    "href",
+    `/dr-runs/${TEST}`,
+  );
+});

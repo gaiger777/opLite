@@ -3,10 +3,10 @@ import type { Backup, Network, Task } from "@/api/types";
 import type { DrStep } from "@/dr/api";
 import {
   candidates,
-  DR_TEST_LABEL,
   emptyDraft,
   failedPhase,
   formatDuration,
+  localToSecs,
   moveGroup,
   newVm,
   phaseDots,
@@ -14,20 +14,23 @@ import {
   rpoCounts,
   rtoClock,
   sameSpec,
-  testLeftovers,
+  STALL_SECS,
+  stalledFor,
+  stepNoteKey,
   testNetworkIssues,
   toDraft,
   toSpec,
   validate,
 } from "@/dr/model";
 import { planSpec } from "@/test/dr";
-import { providerNetwork, sdnNetwork, vm } from "@/test/fixtures";
+import { providerNetwork, sdnNetwork } from "@/test/fixtures";
 
 it("round-trips a plan through the editor draft", () => {
   const spec = planSpec({ security_groups: { web: "dr-web" }, folder: "dr/prod" });
   const back = toSpec(toDraft("web-tier", spec));
   expect(back).toEqual({
     ...spec,
+    source_backup_pool: undefined,
     test_networks: undefined,
     groups: spec.groups.map((g) => ({
       ...g,
@@ -36,6 +39,7 @@ it("round-trips a plan through the editor draft", () => {
         pool: undefined,
         node: undefined,
         live: undefined,
+        source_backup_pool: undefined,
         ip: v.ip?.map((r) => ({ ...r, dns: undefined })),
       })),
     })),
@@ -245,27 +249,51 @@ it("warns about test networks that can reach production", () => {
   });
 });
 
-it("lists protection gaps and test leftovers by label", () => {
+it("lists protection gaps apart from copies that failed verification", () => {
   expect(
     protectionGaps([
       { vm: "a", ok: true, age_secs: 10 },
       { vm: "b", ok: false },
-      { vm: "c", ok: false, age_secs: 90_000 },
+      { vm: "c", ok: false, issue: "over-rpo", age_secs: 90_000 },
+      // 가장 새 사본이 검증에 실패해 앞 사본을 쓴다(나이는 그 사본의 것)
+      { vm: "d", ok: false, issue: "verify-failed", age_secs: 100 },
     ]),
-  ).toEqual({ missing: ["b"], over: [{ vm: "c", age: 90_000 }] });
-  const mine = { [DR_TEST_LABEL]: "web-tier" };
-  expect(
-    testLeftovers(
-      "web-tier",
-      [
-        vm("web1-drt", "running", { labels: mine }),
-        // 이름만 시험 VM 같은 남의 VM은 세지 않는다(서버 기준)
-        vm("web2-drt", "running"),
-        vm("db1-drt", "stopped", { labels: { [DR_TEST_LABEL]: "other" } }),
-      ],
-      [{ ...sdnNetwork("drt-web-tier-1"), labels: mine }, sdnNetwork("drt-web-tier-2")],
-    ),
-  ).toEqual(["drt-web-tier-1", "web1-drt"]);
+  ).toEqual({ missing: ["b"], over: [{ vm: "c", age: 90_000 }], verifyFailed: ["d"] });
+});
+
+it("round-trips and checks the source backup pool of a plan and its VMs", () => {
+  const spec = planSpec({ source_backup_pool: "prod-bk" });
+  spec.groups[0]!.vms[0]!.source_backup_pool = "fast-bk";
+  const draft = toDraft("web-tier", spec);
+  expect(draft.sourceBackupPool).toBe("prod-bk");
+  const back = toSpec(draft);
+  expect(back.source_backup_pool).toBe("prod-bk");
+  expect(back.groups[0]!.vms[0]!.source_backup_pool).toBe("fast-bk");
+  expect(back.groups[1]!.vms[0]!.source_backup_pool).toBeUndefined();
+  draft.sourceBackupPool = "Prod BK";
+  draft.groups[0]!.vms[0]!.sourceBackupPool = "x_y";
+  expect(validate(draft, false)).toEqual({
+    sourceBackupPool: "dr.invalid.name",
+    "g0.v0.sourceBackupPool": "dr.invalid.name",
+  });
+});
+
+it("calls a running run stalled after 30 minutes without progress", () => {
+  const status = { state: "running" as const, progress_at: 1000 };
+  expect(stalledFor(status, 1000 + STALL_SECS)).toBeUndefined();
+  expect(stalledFor(status, 1001 + STALL_SECS)).toBe(STALL_SECS + 1);
+  expect(stalledFor({ ...status, state: "failed" }, 99_999)).toBeUndefined();
+  expect(stalledFor({ state: "running" }, 99_999)).toBeUndefined();
+});
+
+it("knows the skip reasons the server writes and reads local times", () => {
+  expect(stepNoteKey("already recovered by this plan")).toBe("dr.step.alreadyRecovered");
+  expect(stepNoteKey("no recovery point")).toBe("dr.step.noPoint");
+  expect(stepNoteKey("restore failed")).toBeUndefined();
+  expect(stepNoteKey(undefined)).toBeUndefined();
+  expect(localToSecs("")).toBeUndefined();
+  expect(localToSecs("nope")).toBeUndefined();
+  expect(localToSecs("2026-11-26T00:00")).toBe(new Date(2026, 10, 26).getTime() / 1000);
 });
 
 /** 시각 `secs`에 만든 UUIDv7 모양의 Task */

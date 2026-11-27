@@ -6,6 +6,7 @@ import type { TFunction } from "i18next";
 import { api, ApiError, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import type { Node, Vm } from "@/api/types";
+import i18n from "@/i18n";
 import { codeMessage } from "@/i18n/errors";
 import { proxy } from "@/remotes/remotes";
 
@@ -26,6 +27,19 @@ export type DrIpRule = Schemas["DrIpRule"];
 export type VmProtection = Schemas["VmProtection"];
 export type FailoverMode = Schemas["FailoverMode"];
 export type OnTimeout = Schemas["OnTimeout"];
+export type TestRequest = Schemas["TestRequest"];
+export type FenceResponse = Schemas["FenceResponse"];
+export type VmReadiness = Schemas["VmReadiness"];
+
+/**
+ * 409 `dr_planned_preflight`의 `details.problems` 하나(서버 `PreflightProblem` — 오류 본문이라 스키마에 없다). `code`는
+ * `token_role`·`no_remote_here`·`vm_missing`·`no_backup_pool`·`no_receiving_pool`·`unreadable`.
+ */
+export interface PreflightProblem {
+  code: string;
+  vm?: string;
+  message: string;
+}
 
 export const PLANS_KEY = ["dr-plans"] as const;
 export const RUNS_KEY = ["dr-runs"] as const;
@@ -112,22 +126,65 @@ export async function refreshDr(queryClient: QueryClient) {
   );
 }
 
-/** DR API 오류를 문장으로(`dr.errors.<code>`가 먼저, 없으면 공통 문구나 서버 설명) */
-export function drErrorText(t: TFunction, err: unknown): string {
-  return err instanceof ApiError
-    ? codeMessage(t, err.code, err.message, "dr.errors")
-    : err instanceof Error
-      ? err.message
-      : String(err);
+/** 오류 `details`의 이름 목록(`vms`·`networks` — 없거나 모양이 다르면 빈 목록) */
+export function detailNames(err: unknown, key: "vms" | "networks"): string[] {
+  if (!(err instanceof ApiError) || !err.details || typeof err.details !== "object") {
+    return [];
+  }
+  const list = (err.details as Record<string, unknown>)[key];
+  return Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : [];
+}
+
+function preflightProblems(err: ApiError): PreflightProblem[] {
+  const list = (err.details as { problems?: unknown } | undefined)?.problems;
+  return Array.isArray(list)
+    ? list.filter(
+        (p): p is PreflightProblem =>
+          !!p && typeof p === "object" && typeof (p as PreflightProblem).code === "string",
+      )
+    : [];
+}
+
+/** 사전 검사 문제 하나를 고칠 곳과 함께(모르는 코드는 서버 설명) */
+function preflightText(t: TFunction, p: PreflightProblem): string {
+  const key = `dr.preflight.${p.code}`;
+  return i18n.exists(key) ? t(key, { vm: p.vm ?? "", message: p.message }) : p.message;
+}
+
+/**
+ * DR API 오류를 문장으로. `scope.<code>`(fence-source처럼 같은 코드가 다른 뜻일 때)가 먼저, 다음 `dr.errors.<code>`, 없으면
+ * 공통 문구나 서버 설명. `details`가 있는 오류(복구 지점 없는 VM, 격리되지 않은 시험망, 계획된 이전 사전 검사)는 그 이름과
+ * 고칠 곳을 문장에 넣는다.
+ */
+export function drErrorText(t: TFunction, err: unknown, scope?: string): string {
+  if (!(err instanceof ApiError)) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  if (err.code === "dr_missing_recovery_points" || err.code === "dr_test_network_not_isolated") {
+    const key = err.code === "dr_missing_recovery_points" ? "vms" : "networks";
+    const names = detailNames(err, key);
+    if (names.length > 0) {
+      return t(`dr.errors.${err.code}`, { [key]: names.join(", ") });
+    }
+    return err.message;
+  }
+  if (err.code === "dr_planned_preflight") {
+    const problems = preflightProblems(err);
+    return [t("dr.errors.dr_planned_preflight"), ...problems.map((p) => preflightText(t, p))].join(
+      " ",
+    );
+  }
+  const own = scope && i18n.exists(`${scope}.${err.code}`) ? scope : "dr.errors";
+  return codeMessage(t, err.code, err.message, own);
 }
 
 /**
  * 대화상자는 공통 문구로 오류를 보인다. DR 문구는 늦게 받는 묶음에 있으므로 던지기 전에 문장으로 바꾼다(코드는 머리를 붙여
  * 공통 문구에 없게 한다 — VMware 이전과 같은 방식).
  */
-export function localized(t: TFunction, err: unknown): unknown {
+export function localized(t: TFunction, err: unknown, scope?: string): unknown {
   if (err instanceof ApiError) {
-    return new ApiError(err.status, `dr:${err.code}`, drErrorText(t, err), err.details);
+    return new ApiError(err.status, `dr:${err.code}`, drErrorText(t, err, scope), err.details);
   }
   return err;
 }

@@ -1,5 +1,5 @@
 import { cn } from "cn";
-import { ArrowDown, ArrowUp, Plus, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, CircleHelp, Plus, Trash2, X } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -10,6 +10,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Draft,
   type GroupDraft,
@@ -146,6 +147,22 @@ export function PlanEditor({
                 value={draft.folder}
                 autoComplete="off"
                 onChange={(e) => set({ folder: e.target.value })}
+                {...a11y}
+              />
+            )}
+          </Field>
+          <Field
+            id={`${id}-sbpool`}
+            label={t("dr.edit.sourceBackupPool")}
+            error={errors.sourceBackupPool}
+            hint={t("dr.edit.sourceBackupPoolHint")}
+          >
+            {(a11y) => (
+              <Input
+                id={`${id}-sbpool`}
+                value={draft.sourceBackupPool}
+                autoComplete="off"
+                onChange={(e) => set({ sourceBackupPool: e.target.value })}
                 {...a11y}
               />
             )}
@@ -484,6 +501,19 @@ function VmRow({
             onChange={(e) => onChange({ node: e.target.value })}
           />
         </div>
+        <div className="flex flex-col gap-1">
+          <Label htmlFor={`${id}-sbpool`} className="text-xs">
+            {t("dr.edit.vmSourceBackupPool")}
+          </Label>
+          <Input
+            id={`${id}-sbpool`}
+            className="h-7 w-32"
+            placeholder={t("dr.edit.planSourceBackupPool")}
+            value={vm.sourceBackupPool}
+            aria-invalid={errors[`${at}.sourceBackupPool`] ? true : undefined}
+            onChange={(e) => onChange({ sourceBackupPool: e.target.value })}
+          />
+        </div>
         <div className="flex items-center gap-2 self-center">
           <Checkbox
             id={`${id}-live`}
@@ -576,21 +606,44 @@ function VmRow({
           ))}
         </ul>
       )}
-      {errors[`${at}.pool`] && (
-        <p className="text-xs text-destructive">{t(errors[`${at}.pool`]!)}</p>
+      {(errors[`${at}.pool`] ?? errors[`${at}.sourceBackupPool`]) && (
+        <p className="text-xs text-destructive">
+          {t((errors[`${at}.pool`] ?? errors[`${at}.sourceBackupPool`])!)}
+        </p>
       )}
       {!readOnly && (
-        <Button
-          type="button"
-          variant="link"
-          size="sm"
-          className="h-auto w-fit p-0"
-          onClick={() => onChange({ ip: [...vm.ip, newIp(vm.ip.length)] })}
-        >
-          {t("dr.edit.addIp")}
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="h-auto w-fit p-0"
+            onClick={() => onChange({ ip: [...vm.ip, newIp(vm.ip.length)] })}
+          >
+            {t("dr.edit.addIp")}
+          </Button>
+          <IpHelp />
+        </div>
       )}
     </li>
+  );
+}
+
+/** IP 규칙 옆 "?": 되살린 VM과 cloud-init(문서 "한계" 절을 짧게) */
+function IpHelp() {
+  const { t } = useTranslation();
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button type="button" variant="ghost" size="icon-xs" aria-label={t("dr.edit.ipHelpLabel")}>
+          <CircleHelp />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="text-xs">
+        <p>{t("dr.edit.ipHelpInstance")}</p>
+        <p>{t("dr.edit.ipHelpNoCloudInit")}</p>
+      </PopoverContent>
+    </Popover>
   );
 }
 

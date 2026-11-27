@@ -1,5 +1,13 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Ban, Eraser, FlaskConical, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
+import {
+  Ban,
+  Eraser,
+  FlaskConical,
+  PowerOff,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
@@ -11,6 +19,7 @@ import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
+import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -26,6 +35,7 @@ import {
   type DrRun,
   type DrRunSummary,
   drErrorText,
+  type FenceResponse,
   localized,
   oldNodes,
   type RecoveryPlan,
@@ -34,27 +44,26 @@ import {
   usePlanRuns,
   useReport,
 } from "@/dr/api";
-import { FailoverDialog, ReprotectDialog } from "@/dr/dialogs";
+import { FailoverDialog, FenceDialog, ReprotectDialog, TestDialog } from "@/dr/dialogs";
 import {
   type Draft,
   emptyDraft,
   formatDuration,
   sameSpec,
-  testLeftovers,
   toDraft,
   toSpec,
   validate,
 } from "@/dr/model";
 import { PlanEditor } from "@/dr/PlanEditor";
 import { UpgradeNotice } from "@/dr/PlansPage";
-import { cancelText, RpoBar, RunStateChip } from "@/dr/parts";
+import { cancelText, ReadinessCell, RpoBar, RunStateChip } from "@/dr/parts";
 import { formatTime } from "@/lib/format";
 import { useRemotes } from "@/remotes/remotes";
 
 const TABS = ["overview", "plan", "runs"] as const;
 type Tab = (typeof TABS)[number];
 
-type Dialog = "failover" | "cleanup" | "cancel" | "delete" | "reprotect";
+type Dialog = "test" | "failover" | "fence" | "cleanup" | "cancel" | "delete" | "reprotect";
 
 function useTime() {
   const { i18n } = useTranslation();
@@ -80,41 +89,29 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
   const report = useReport(plan.name);
   const runs = usePlanRuns(plan.id);
   const nodes = useList("node");
-  const vms = useList("vm");
-  const networks = useList("network");
   const old = oldNodes(nodes.data);
   const ready = nodes.data !== undefined && old.length === 0;
   const write = perms.can("write", "recovery-plan");
   const operate = perms.can("operate", "recovery-plan") && ready;
   const [dialog, setDialog] = useState<Dialog | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [fenced, setFenced] = useState<FenceResponse | null>(null);
   const tab: Tab = TABS.find((id) => id === params.get("tab")) ?? "overview";
   const running = plan.status.run;
   const runningKind = runs.data?.find((r) => r.id === running)?.spec.kind;
-  // 서버가 지울 것과 같은 기준(시험 라벨이 이 계획인 VM·네트워크 — 리뷰 1 웹 3). 남은 것이 없으면 뒷정리를 막는다.
-  const leftovers = testLeftovers(plan.name, vms.data, networks.data);
-  const nothingToClean = vms.data !== undefined && networks.data !== undefined && !leftovers.length;
+  // 뒷정리가 지울 것은 서버가 센 것(보고의 `leftovers` — 시험 실행이 만든 VM과 거품 네트워크). 남은 것이 없으면 막는다.
+  const leftovers = [
+    ...(report.data?.leftovers.vms ?? []),
+    ...(report.data?.leftovers.networks ?? []),
+  ];
+  const nothingToClean = report.data !== undefined && leftovers.length === 0;
+  // 장애 조치는 도는 시험을 끊고 시작한다(서버). 다른 실행(장애 조치·뒷정리)이 돌면 막는다.
+  const preemptsTest = !!running && runningKind === "test";
+  const fencePending = plan.status.source_fence_pending ?? [];
   const openRun = (run: DrRun) => void navigate(`/dr-runs/${run.id}`);
-
-  async function test() {
-    setBusy(true);
-    try {
-      const run = await call(
-        api.POST("/dr-plans/{key}/actions/test", { params: { path: { key: plan.id } } }),
-      );
-      toast.success(t("dr.test.started", { name: plan.name }));
-      openRun(run);
-    } catch (err) {
-      toast.error(drErrorText(t, err));
-    } finally {
-      setBusy(false);
-      await refreshDr(queryClient);
-    }
-  }
 
   const actions = operate && (
     <>
-      <Button variant="outline" disabled={busy || !!running} onClick={() => void test()}>
+      <Button variant="outline" disabled={!!running} onClick={() => setDialog("test")}>
         <FlaskConical />
         {t("dr.action.test")}
       </Button>
@@ -139,7 +136,11 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
           {t("dr.action.reprotect")}
         </Button>
       )}
-      <Button variant="destructive" disabled={!!running} onClick={() => setDialog("failover")}>
+      <Button
+        variant="destructive"
+        disabled={!!running && !preemptsTest}
+        onClick={() => setDialog("failover")}
+      >
         <ShieldAlert />
         {t("dr.action.failover")}
       </Button>
@@ -155,6 +156,23 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
         actions={actions}
       />
       <UpgradeNotice old={old} />
+      {fencePending.length > 0 && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-3 rounded-md border border-danger bg-danger-soft px-3 py-2 text-sm text-danger-fg"
+        >
+          <span className="min-w-0 flex-1">
+            {t("dr.fence.band", { source: plan.spec.source, vms: fencePending.join(", ") })}
+          </span>
+          {operate && (
+            <Button variant="destructive" size="sm" onClick={() => setDialog("fence")}>
+              <PowerOff />
+              {t("dr.fence.button")}
+            </Button>
+          )}
+        </div>
+      )}
+      {fenced && <FenceResult result={fenced} onClose={() => setFenced(null)} />}
       {running && (
         <p
           role="status"
@@ -186,7 +204,11 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
           ))}
         </TabsList>
         <TabsContent value="overview">
-          {report.data ? <Overview report={report.data} /> : <ListPending error={report.error} />}
+          {report.data ? (
+            <Overview report={report.data} lastTest={plan.status.last_test} />
+          ) : (
+            <ListPending error={report.error} />
+          )}
         </TabsContent>
         <TabsContent value="plan">
           {tab === "plan" && <EditPlan plan={plan} readOnly={!write || !ready} />}
@@ -213,12 +235,31 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
         </TabsContent>
       </Tabs>
 
-      {dialog === "failover" && (
-        <FailoverDialog
+      {dialog === "test" && (
+        <TestDialog
           plan={plan}
           report={report.data}
           onClose={() => setDialog(null)}
           onStarted={openRun}
+        />
+      )}
+      {dialog === "failover" && (
+        <FailoverDialog
+          plan={plan}
+          report={report.data}
+          preemptsTest={preemptsTest}
+          onClose={() => setDialog(null)}
+          onStarted={openRun}
+        />
+      )}
+      {dialog === "fence" && (
+        <FenceDialog
+          plan={plan}
+          onClose={() => setDialog(null)}
+          onDone={(result) => {
+            setFenced(result);
+            setDialog(null);
+          }}
         />
       )}
       {dialog === "reprotect" && <ReprotectDialog plan={plan} onClose={() => setDialog(null)} />}
@@ -301,10 +342,55 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
   );
 }
 
-/** 개요: RPO 지킴, VM별 복구 지점, 최근 시험 셋의 RTO, 지난 장애 조치(`GET /report` — 나이는 보고를 센 때의 것) */
-function Overview({ report }: { report: DrReport }) {
+/** fence-source 결과: VM마다 멈춤·실패와 아직 남은 VM */
+function FenceResult({ result, onClose }: { result: FenceResponse; onClose(): void }) {
+  const { t } = useTranslation();
+  return (
+    <section
+      aria-label={t("dr.fence.result")}
+      className="flex flex-col gap-1 rounded-md border px-3 py-2 text-sm"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="font-medium">{t("dr.fence.result")}</h2>
+        <Button variant="ghost" size="sm" onClick={onClose}>
+          {t("dr.fence.close")}
+        </Button>
+      </div>
+      <ul className="flex flex-col gap-0.5">
+        {result.results.map((r) => (
+          <li key={r.vm} className="flex flex-wrap gap-x-2">
+            <span className="font-medium">{r.vm}</span>
+            <span className={r.ok ? "text-success-fg" : "text-danger-fg"}>
+              {t(r.ok ? "dr.fence.stopped" : "dr.fence.failed")}
+            </span>
+            {r.error && <span className="text-muted-foreground">{r.error}</span>}
+          </li>
+        ))}
+      </ul>
+      {result.pending.length > 0 && (
+        <p className="text-danger-fg">
+          {t("dr.fence.stillPending", { vms: result.pending.join(", ") })}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/**
+ * 개요: RPO 지킴, VM별 복구 지점과 장애 조치 준비(`failover_readiness` — 실제 장애 조치가 쓸 네트워크·보안 그룹·풀·노드),
+ * 최근 시험 셋의 RTO와 마지막 시험이 본 준비 문제 수, 지난 장애 조치(`GET /report` — 나이는 보고를 센 때의 것)
+ */
+function Overview({
+  report,
+  lastTest,
+}: {
+  report: DrReport;
+  lastTest: RecoveryPlan["status"]["last_test"];
+}) {
   const { t } = useTranslation();
   const time = useTime();
+  const readiness = new Map(report.failover_readiness.map((r) => [r.vm, r]));
+  const notReady = report.failover_readiness.filter((r) => !r.ok).length;
   return (
     <div className="flex flex-col gap-6 pt-2">
       {!report.source_registered && (
@@ -319,6 +405,9 @@ function Overview({ report }: { report: DrReport }) {
           </h2>
           <span className="flex flex-wrap items-center gap-3 text-sm">
             <RpoBar protection={report.protection} />
+            {notReady > 0 && (
+              <StatusChip tone="warning">{t("dr.readiness.badge", { count: notReady })}</StatusChip>
+            )}
             <span className="text-muted-foreground">
               {report.rpo_target_secs > 0
                 ? t("dr.report.target", { time: formatDuration(report.rpo_target_secs) })
@@ -335,6 +424,7 @@ function Overview({ report }: { report: DrReport }) {
                 <TableHead>{t("dr.report.pointAt")}</TableHead>
                 <TableHead>{t("dr.report.age")}</TableHead>
                 <TableHead>{t("dr.report.status")}</TableHead>
+                <TableHead>{t("dr.readiness.column")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -366,6 +456,9 @@ function Overview({ report }: { report: DrReport }) {
                       </span>
                     )}
                   </TableCell>
+                  <TableCell>
+                    <ReadinessCell readiness={readiness.get(p.vm)} />
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -376,6 +469,11 @@ function Overview({ report }: { report: DrReport }) {
         <h2 id="dr-tests" className="text-base font-semibold">
           {t("dr.report.tests")}
         </h2>
+        {lastTest?.readiness_issues ? (
+          <p className="text-sm text-warning-fg">
+            {t("dr.readiness.lastTest", { count: lastTest.readiness_issues })}
+          </p>
+        ) : null}
         {report.tests.length === 0 ? (
           <p className="text-sm text-muted-foreground">{t("dr.plan.neverTested")}</p>
         ) : (
