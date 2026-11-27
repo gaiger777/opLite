@@ -4,7 +4,7 @@ import { Inbox, TriangleAlert } from "lucide-react";
 
 import type { Vm } from "@/api/types";
 import { EmptyState } from "@/components/EmptyState";
-import { ACTION_ICONS, AREA_ICONS } from "@/components/icons";
+import { ACTION_ICONS, GROUP_ICONS } from "@/components/icons";
 import { CHANGED_MS, StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
@@ -113,11 +113,9 @@ describe("EmptyState", () => {
 });
 
 describe("icons", () => {
-  it("has one icon for each of the six areas", () => {
-    expect(Object.keys(AREA_ICONS).sort()).toEqual(
-      ["activity", "home", "infra", "protect", "settings", "vms"].sort(),
-    );
-    expect(new Set(Object.values(AREA_ICONS)).size).toBe(6);
+  it("has its own icon for each sidebar group", () => {
+    expect(Object.keys(GROUP_ICONS)).toHaveLength(10);
+    expect(new Set(Object.values(GROUP_ICONS)).size).toBe(10);
   });
 
   it("does not reuse an action icon for another action", () => {

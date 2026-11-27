@@ -2,17 +2,20 @@
 // 크기는 표·메뉴 16px(`ICON_SIZE`), 사이드바 레일 20px(`RAIL_ICON_SIZE`)이고, 선 굵기 1.75는
 // `index.css`의 `svg.lucide`가 정한다.
 import {
-  Activity,
   ArrowLeftRight,
+  Boxes,
   Bell,
   Camera,
   Copy,
+  Database,
+  Disc3,
   Download,
   Ellipsis,
   Eye,
-  House,
+  History,
   Keyboard,
   Languages,
+  LayoutDashboard,
   LogOut,
   Network,
   Palette,
@@ -33,19 +36,34 @@ import {
   Star,
   Trash2,
   Upload,
+  UserRound,
   type LucideIcon,
 } from "lucide-react";
 
-/** 사이드바의 최상위 영역(설계 §4.2) */
-export type AreaId = "home" | "vms" | "infra" | "protect" | "activity" | "settings";
+/** 사이드바의 묶음(계획 77 — 진단 §1.3). `account`는 사이드바에 없고 사용자 메뉴에서 연다. */
+export type GroupId =
+  | "overview"
+  | "vms"
+  | "images"
+  | "storage"
+  | "network"
+  | "cluster"
+  | "backup"
+  | "records"
+  | "admin"
+  | "account";
 
-export const AREA_ICONS: Record<AreaId, LucideIcon> = {
-  home: House,
+export const GROUP_ICONS: Record<GroupId, LucideIcon> = {
+  overview: LayoutDashboard,
   vms: Server,
-  infra: Network,
-  protect: ShieldCheck,
-  activity: Activity,
-  settings: Settings,
+  images: Disc3,
+  storage: Database,
+  network: Network,
+  cluster: Boxes,
+  backup: ShieldCheck,
+  records: History,
+  admin: Settings,
+  account: UserRound,
 };
 
 /** 동작의 아이콘. 메뉴·단추·팔레트·일괄 막대가 함께 쓴다. */

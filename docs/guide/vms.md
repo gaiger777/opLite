@@ -55,7 +55,7 @@ orbivisorctl iso delete alpine
   (되돌리기가 그 매체로 켠다). 백업은 막지 않는다(복원이 드라이브를 비운다). 확인한 뒤 다른 노드에서 그 ISO를 넣었거나 그
   매체가 든 스냅샷을 찍었으면 지우기 Task가 다시 보고 같은 문구로 실패한다. 지우기 Task가 끝나지 않은 ISO는 CD에 넣지 못한다
   (**409** `volume_in_use` `ISO "alpine" is being deleted (task …)`).
-- 웹: 가상 머신 › 이미지·ISO › ISO 이미지 보기(풀별 표, 올리기·URL에서 받기·지우기, 넣은 VM). 볼륨 화면은 ISO를 빼고 보이며 "ISO 이미지도 보기"로
+- 웹: 이미지·이전 › ISO 파일 화면(풀별 표, 올리기·URL에서 받기·지우기, 넣은 VM). 볼륨 화면은 ISO를 빼고 보이며 "ISO 이미지도 보기"로
   함께 본다.
 
 **CD/DVD 드라이브.** VM마다 4개까지(`spec.cdroms`, 드라이브 번호 = 순번 `cdrom0`…). 빈 드라이브도 된다.
@@ -294,7 +294,7 @@ orbivisorctl volume flatten web-1-disk0          # POST /volumes/{key}/flatten �
 | 409 `volume_has_clones` | 연결 복제의 기반 볼륨 지우기 |
 | 409 `cluster_upgrading` | `templates` 기능이 없는 노드가 있을 때 새 칸·새 Task |
 
-웹: 가상 머신 › 템플릿 탭(이름·디스크·풀·연결 복제 수, "배포"·"VM으로 되돌리기"·"삭제"), 배포 창(개수와 `{n}` 미리 보기, 디스크
+웹: 가상 머신 › 템플릿 화면(이름·디스크·풀·연결 복제 수, "배포"·"VM으로 되돌리기"·"삭제"), 배포 창(개수와 `{n}` 미리 보기, 디스크
 복제 방식 — 되는 디스크만 연결·모두 연결·전체 복사 — 와 디스크별 가능 여부, 노드·풀, vCPU·메모리, NIC별 네트워크, 디스크
 크기, cloud-init, "배포 뒤 켜기"; VM마다 Task 알림), VM 목록 행 메뉴와 VM 상세 동작 메뉴(⋯)의 "템플릿으로 바꾸기"(안 되면 이유)와 "템플릿만 보기"
 칩, 볼륨 화면의 "기반" 열과 "평탄화".
@@ -348,7 +348,7 @@ orbivisorctl template deploy debian-tmpl --name 'app-{n}' --count 3 --start
   (배포 때 준다). API가 VM 만들기와 같은 검사를 미리 한다(이름 **409** `name_taken`, 아키텍처가 맞는 노드가 없으면 **400**
   `machine_arch_mismatch`). 템플릿 단계가 실패하면(그새 이름이 쓰였거나 orbivisord가 재시작) **받은 볼륨은 지우지 않고**
   `…; volume "ubuntu-24-04" is ready; create the template from it with vm create and template convert`로 알린다.
-  가져오기 전 실패(체크섬 등)는 볼륨을 지운다. 웹은 가상 머신 › 이미지·ISO › 이미지 라이브러리 보기(아키텍처 거름, 항목별 "받기"·"받은 뒤 템플릿
+  가져오기 전 실패(체크섬 등)는 볼륨을 지운다. 웹은 이미지·이전 › OS 이미지 화면(아키텍처 거름, 항목별 "받기"·"받은 뒤 템플릿
   만들기", 진행률, 관리자 항목 더하기·지우기).
 
 **체크섬 확인.** `volume download`·`iso download`(`POST /volumes/download`)에도 `--sha512 HEX`와
@@ -927,7 +927,7 @@ VM 하나만이면 1·2단계, 클러스터 전체면 1·3단계부터 따라 �
    # 12 running VM(s) keep their CPU until their next power cycle (`vm reboot`; a reboot inside the guest does not apply it)
    ```
 
-   웹은 설정 › 일반 › CPU › **"모든 VM에서 숨기기"**에 `avx512vbmi`를 넣고 **"CPU 설정 저장"**. 저장하면 "실행 중 VM N개는
+   웹은 관리 › 일반·업데이트 › CPU › **"모든 VM에서 숨기기"**에 `avx512vbmi`를 넣고 **"CPU 설정 저장"**. 저장하면 "실행 중 VM N개는
    전원을 껐다 켤 때까지 지금 CPU 그대로입니다."와 **"목록 보기"** 링크가 뜬다. 노드가 모르는 이름은 **400**
    `unknown_cpu_flag`이고, 감사 로그에 `settings cpu.mask=avx512vbmi`가 남는다. 몇 초 안에 각 노드가 자기 실행 중 VM에 보류
    `cpu`를 쓴다.
@@ -1305,7 +1305,7 @@ govc import.ova -name web web.ova                              # vSphere 쪽(또
   덜 쓴·실패한 내보내기는 409 `export_not_ready`.
 - **Task.** `vm-export`(VM 줄, 시간 제한 없음, 이어 가지 않음 — orbivisord가 다시 뜨면 실패하고 디렉터리를 지운다),
   `vm-export-delete`.
-- **웹.** VM 상세 ⋯의 "OVA로 내보내기…"(꺼진 VM, `vm.export`)는 가상 머신 › 가져오기의 **내보내기** 보기(`/vm-exports?export=<VM>`)로
+- **웹.** VM 상세 ⋯의 "OVA로 내보내기…"(꺼진 VM, `vm.export`)는 이미지·이전 › **내보내기**(`/vm-exports?export=<VM>`)로
   가서 대화상자(풀·이름·guestId·하드웨어 판·MAC 유지)를 연다. 진행·경고·내려받기·지우기는 그 보기에 있다.
 - **권한.** 그 VM의 `vm.export`(내장 `operator`에 없다, 지운 VM의 내보내기는 루트) — 만들기·내려받기·지우기 모두, 만들기는 풀의
   `storage.allocate`도(403). 기능

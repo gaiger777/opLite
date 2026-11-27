@@ -86,11 +86,11 @@ it("refreshes a remote", async () => {
   renderPage(<RemotesPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Refresh dr" }));
   expect(await screen.findByText("0.38.0")).toBeInTheDocument();
-  // 고치기·지우기는 설정 › 원격 클러스터에 있다.
+  // 고치기·지우기는 같은 항목의 원격 클러스터 관리 탭에 있다.
   expect(screen.queryByRole("button", { name: "Edit dr" })).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Manage remote clusters" })).toHaveAttribute(
     "href",
-    "/settings/remotes",
+    "/remotes/-manage",
   );
 });
 

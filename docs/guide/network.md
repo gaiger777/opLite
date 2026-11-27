@@ -93,7 +93,7 @@ orbivisorctl vm nic-sg web1 0                                # 0번 NIC의 그�
 orbivisorctl security-group delete web                       # 그룹을 쓰는 NIC가 없어야 한다
 ```
 
-웹은 인프라 › 보안 그룹 탭에서 그룹을 만들고 지우며, 그룹 화면의 규칙 표에서 방향·동작·프로토콜·포트·원격 CIDR을
+웹은 네트워크 › 방화벽(보안 그룹)에서 그룹을 만들고 지우며, 그룹 화면의 규칙 표에서 방향·동작·프로토콜·포트·원격 CIDR을
 고치고 순서를 바꿔 저장한다. VM 편집의 NIC마다 그룹을 고른다. API는 `/api/v1/security-groups`(목록·만들기·읽기·
 지우기)와 `PATCH /api/v1/security-groups/{name}`(`{"description": …, "rules": […]}` 중 보낸 것만, `If-Match`로
 revision), VM NIC의 `security_groups: ["web"]`, Node `status.firewall`이다.
@@ -310,7 +310,7 @@ orbivisorctl sdn status
 orbivisorctl sdn central remove n3        # 마지막 중앙은 뺄 수 없다(409 sdn_last_central). 꺼진 노드는 다른 중앙이 내쫓는다
 ```
 
-웹은 **인프라 › 네트워크 › SDN** 보기의 "SDN 설정 시작" 마법사다(① 중앙 노드 — 투표 멤버 셋을 미리 고름 ② 설치 진행과
+웹은 **네트워크 › SDN(가상 네트워크)** 보기의 "SDN 설정 시작" 마법사다(① 중앙 노드 — 투표 멤버 셋을 미리 고름 ② 설치 진행과
 나머지 중앙의 합류 ③ chassis — 노드마다·"모든 노드에 설치"). 자세한 것은 [웹 화면 둘러보기](web-ui.md#sdn-화면). API는
 `GET/POST /api/v1/sdn`(`{"node": "n1", "address": "10.1.0.11"}`), `POST /api/v1/sdn/centrals`(`{"node": "n2"}`),
 `DELETE /api/v1/sdn/centrals/{node}`, `POST /api/v1/sdn/chassis`(`{"nodes": [...]}` 또는 `{"all": true}`, 노드마다 Task 목록)이다.
@@ -492,7 +492,7 @@ orbivisorctl network list
 # dmz   provider  br-int  ext:100   1500  198.51.100.0/24
 ```
 
-웹은 **인프라 › 노드 › 노드 상세의 "SDN 물리 네트워크" 카드**(physnet 표 — 이름 → 브리지, 준비·적용 중·빼는 중·오류 — 와
+웹은 **클러스터·가용성 › 노드 › 노드 상세의 "SDN 물리 네트워크" 카드**(physnet 표 — 이름 → 브리지, 준비·적용 중·빼는 중·오류 — 와
 게이트웨이 줄, admin의 "고치기" 대화상자)와 **네트워크 만들기의 종류 "외부(공급자)"**(admin만, SDN 설정 전에는 막힘 — physnet은
 노드가 알린 이름을 제안하는 입력, VLAN, MTU 기본 1500, 서브넷 표에 "유동 IP 범위"와 DHCP 기본 끔)다. 네트워크 목록은 공급자
 행에 `physnet[:vlan]`과 physnet이 준비된 chassis를 보인다. 자세한 것은 [웹 화면 둘러보기](web-ui.md#sdn-화면).
@@ -584,7 +584,7 @@ orbivisorctl router get r1
 orbivisorctl router delete r1                                     # 인터페이스가 없어야 한다(409 router_in_use)
 ```
 
-웹은 **인프라 › 네트워크 › 라우터**(`/routers`) 보기다. "라우터 만들기"(이을 SDN 네트워크와 바깥 네트워크)와, 이름을 누르면
+웹은 **네트워크 › 라우터·공인 IP › 라우터**(`/routers`) 보기다. "라우터 만들기"(이을 SDN 네트워크와 바깥 네트워크)와, 이름을 누르면
 여는 서랍: 인터페이스 더하기·빼기(붙일 수 있는 네트워크만 보임), 바깥 네트워크와 SNAT 바꾸기, 정적 경로 표, 게이트웨이 표
 (노드·노드 우선순위·순위·주인), "게이트웨이 노드 없음" 경고 띠, 물리 라우터에 둘 IPv6 경로.
 
@@ -683,7 +683,7 @@ orbivisorctl fip detach web
 orbivisorctl fip delete web                                     # 붙어 있어도 지운다(떼고 지움)
 ```
 
-웹은 **인프라 › 네트워크 › 유동 IP**(`/floating-ips`) 보기다. 목록(주소·붙은 VM 링크·상태 칩), "유동 IP 만들기"(바깥 네트워크,
+웹은 **네트워크 › 라우터·공인 IP › 유동 IP**(`/floating-ips`) 보기다. 목록(주소·붙은 VM 링크·상태 칩), "유동 IP 만들기"(바깥 네트워크,
 주소·이름은 선택, 곧바로 붙일 곳), 행마다 "붙이기"(라우팅되는 오버레이 SDN 인터페이스만 고를 수 있고, 못 고르는 것에는 까닭 —
 템플릿, 라우터에 없음, IPv4 없음, 다른 유동 IP가 붙음, 권한 없음. 라우팅은 서버가 `GET /routers`의 `routed`로 알려 볼 수 없는
 라우터 뒤의 인터페이스도 고를 수 있다)·"떼기"·삭제. VM 상세 › 하드웨어의 NIC 표에 "유동 IP" 칸(링크)이 있다
@@ -881,7 +881,7 @@ orbivisorctl vm nic-qos web1 0 --clear                    # 모두 뺌
 
 ### 토폴로지
 
-웹 **인프라 › 네트워크 › 토폴로지**(`/networks/topology`)는 네트워크·라우터·게이트웨이·유동 IP·VM·LB를 **2.5D 그림**(아이소메트릭
+웹 **네트워크 › 토폴로지 그림**(`/networks/topology`)는 네트워크·라우터·게이트웨이·유동 IP·VM·LB를 **2.5D 그림**(아이소메트릭
 SVG — WebGL이 아님) 하나로 보인다. 바닥에 오버레이 네트워크 판과 그 위의 VM 블록·LB 기둥, 가운데 높이에 라우터 블록과 게이트웨이
 칩(활성 노드, 후보 없으면 경고 색), 뒤에 공급자 네트워크 판과 유동 IP·바깥 VIP 꼬리표, 옆에 회색 단순 네트워크 판(옮기는 중이면 대상
 판으로 화살표와 진행 수)이다. 누르면 그 서랍(라우터·LB는 그 보기로 가서 서랍), 가리키면 이어진 길(VM → 네트워크 → 라우터 → 공급자,

@@ -1,4 +1,5 @@
 import { expect, type Locator, type Page, test } from "@playwright/test";
+import { openItem } from "./nav";
 
 // 계획 71: VM › 만들기의 보기 "빌더"로 VM을 셋 만든다 — 넓은 화면 마우스 끌기(b1, 폼에서 넘어온 NIC 블록을 "빼기"에 끌어
 // 놓기·폴더·작게 포함), 키보드만(b2), 휴대폰 폭 서랍의 누르기 들기와 "여기에 놓기"(b3). 모두 꺼진 채 만든다(QEMU를 켜지
@@ -22,16 +23,9 @@ async function signIn(page: Page) {
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
 }
 
-/** VM › VM의 "만들기" → 보기 "빌더"(늦게 읽는 조각) */
+/** 가상 머신 › 모든 VM의 "만들기" → 보기 "빌더"(늦게 읽는 조각) */
 async function openBuilder(page: Page) {
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: "Virtual machines", exact: true })
-    .click();
-  await page
-    .getByRole("navigation", { name: "Virtual machines menu" })
-    .getByRole("link", { name: "VMs", exact: true })
-    .click();
+  await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("link", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   await page.getByRole("link", { name: "Builder", exact: true }).click();

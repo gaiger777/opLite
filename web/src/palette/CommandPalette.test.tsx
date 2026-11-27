@@ -94,7 +94,8 @@ it("opens with ⌘K or Ctrl+K and gives focus back on Escape", async () => {
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(account).toHaveFocus();
 
-  await user.click(screen.getByRole("button", { name: "Search or run a command" }));
+  // 사이드바 맨 위(768px 이상)와 머리줄(그 아래)에 하나씩 있다.
+  await user.click(screen.getAllByRole("button", { name: "Search or run a command" })[0]!);
   expect(await screen.findByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
   // ⌘K를 다시 누르면 닫는다.
   await user.keyboard("{Meta>}k{/Meta}");
@@ -319,26 +320,45 @@ it("offers only the views the user can read", async () => {
     ),
   );
   shell("/", FOLDER_USER);
-  await search("infra", "Infrastructure › Networks");
-  expect(screen.queryByRole("option", { name: "Infrastructure › SDN" })).not.toBeInTheDocument();
+  await search("network", "Networking › Networks");
+  expect(
+    screen.queryByRole("option", { name: "Networking › SDN (virtual networks)" }),
+  ).not.toBeInTheDocument();
 });
 
 it("offers the SDN view to admins", async () => {
   shell();
-  await search("sdn", "Infrastructure › SDN");
+  await search("sdn", "Networking › SDN (virtual networks)");
 });
 
-it("goes to every sub-screen, including views", async () => {
+it("goes to every item, page tab and folder view", async () => {
   const { router } = shell();
-  const { user } = await search("cluster", "Infrastructure › Cluster");
-  await user.click(screen.getByRole("option", { name: "Infrastructure › Cluster" }));
+  const { user } = await search(
+    "cluster",
+    "Cluster & availability › Cluster (members, certificates)",
+  );
+  await user.click(
+    screen.getByRole("option", {
+      name: "Cluster & availability › Cluster (members, certificates)",
+    }),
+  );
   await waitFor(() => expect(router.state.location.pathname).toBe("/cluster"));
+  const second = await search("floating", "Networking › Routers & public IPs › Floating IPs");
+  await second.user.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await search("vm folders", "Virtual machines › All VMs › VM folders");
+});
+
+it("still finds a page by its old menu name", async () => {
+  shell();
+  // 예전 "백업 작업"은 이제 "백업 일정"이다.
+  await search("backup jobs", "Backup & recovery › Backup schedules");
 });
 
 it("finds the cluster map by its other names (plan 70)", async () => {
   const { router } = shell();
-  const { user } = await search("3d", "Infrastructure › Map");
-  await user.click(screen.getByRole("option", { name: "Infrastructure › Map" }));
+  const { user } = await search("3d", "Overview › Infrastructure map");
+  await user.click(screen.getByRole("option", { name: "Overview › Infrastructure map" }));
   await waitFor(() => expect(router.state.location.pathname).toBe("/cluster/map"));
 });
 

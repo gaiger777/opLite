@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 
 import { expect, type Page, test } from "@playwright/test";
+import { openItem } from "./nav";
 
 // 계획 69: 백업 안 파일 찾아보기. 실제 도우미 이미지·QEMU로 연 세션에서 디렉터리에 들어가고, 파일 하나와 폴더(zip)를
 // 내려받고, 닫는다. 고정물 ext4 디스크 VM과 그 저장소 백업은 Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비한다.
@@ -27,14 +28,7 @@ test("browses a backup, downloads a file and a folder, and closes the session", 
   page,
 }) => {
   await signIn(page);
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: "Protection", exact: true })
-    .click();
-  await page
-    .getByRole("navigation", { name: "Protection menu" })
-    .getByRole("link", { name: "Backups", exact: true })
-    .click();
+  await openItem(page, "Backup & recovery", "Backups");
   await page.getByRole("link", { name: `Browse files of ${backup}` }).click();
   await expect(page).toHaveURL(/\/backups\/[^/]+\/files$/);
   await expect(page.getByRole("heading", { name: `Files in ${backup}` })).toBeVisible();

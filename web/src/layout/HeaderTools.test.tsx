@@ -97,22 +97,21 @@ describe("cluster switch", () => {
 });
 
 describe("shortcuts", () => {
-  it("goes to an area with g and a letter, but not while typing", async () => {
-    localStorage.setItem("opl.nav.last.infra", "/volumes");
+  it("goes to a group with g and a letter, but not while typing", async () => {
     const user = userEvent.setup();
     const { router } = shell();
     await screen.findByRole("navigation", { name: "Main" });
     await user.keyboard("gv");
     await waitFor(() => expect(where(router)).toBe("/vms"));
-    await user.keyboard("gi");
-    await waitFor(() => expect(where(router)).toBe("/volumes"));
+    await user.keyboard("gn");
+    await waitFor(() => expect(where(router)).toBe("/networks"));
 
     // 입력 칸 안의 글자는 단축키가 아니다.
     const input = document.createElement("input");
     document.body.append(input);
     input.focus();
     await user.keyboard("gh");
-    expect(where(router)).toBe("/volumes");
+    expect(where(router)).toBe("/networks");
     input.remove();
   });
 

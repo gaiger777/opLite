@@ -90,7 +90,7 @@ it("shows the empty state and blocks creating before SDN is set up", async () =>
   expect(await screen.findByText("No routers")).toBeVisible();
   expect(
     await screen.findByText(
-      "Routers and floating IPs need SDN (OVN) set up first, under Networks › SDN.",
+      "Routers and floating IPs need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
     ),
   ).toBeVisible();
   expect(screen.getByRole("button", { name: "Create a router" })).toBeDisabled();

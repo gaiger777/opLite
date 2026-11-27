@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 
 import { expect, type Page, test } from "@playwright/test";
+import { openItem } from "./nav";
 
 // 계획 62: 전역 역할이 없는 사용자(alice, 그룹으로 /teamA operator)는 VM 목록·폴더 트리·팔레트에 자기 폴더만
 // 보고, + 만들기가 그 폴더를 골라 둔다. 인증 앱을 켜면 로그인에 둘째 단계가 생긴다. 클러스터·폴더·VM·사용자·grant는
@@ -43,17 +44,6 @@ async function signIn(page: Page) {
   await page.getByRole("button", { name: "Sign in" }).click();
 }
 
-async function openTab(page: Page, area: string, tab: string) {
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: area, exact: true })
-    .click();
-  await page
-    .getByRole("navigation", { name: `${area} menu` })
-    .getByRole("link", { name: tab, exact: true })
-    .click();
-}
-
 test.use({ locale: "en-US" });
 
 test("a folder user sees only their folder and signs in with a second factor", async ({ page }) => {
@@ -64,15 +54,15 @@ test("a folder user sees only their folder and signs in with a second factor", a
   await expect(page.getByRole("status").filter({ hasText: "Live" })).toBeVisible();
 
   // VM 목록: /teamA의 a1만. 다른 폴더(b1)와 루트(r1)의 VM은 없다.
-  await openTab(page, "Virtual machines", "VMs");
+  await openItem(page, "Virtual machines", "All VMs");
   await expect(page.getByRole("link", { name: "a1", exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "b1", exact: true })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "r1", exact: true })).toHaveCount(0);
 
-  // 폴더 보기: 트리에 teamA만
+  // 폴더 보기(목록 오른쪽 위 토글): 트리에 teamA만
   await page
-    .getByRole("navigation", { name: "VMs views" })
-    .getByRole("link", { name: "VM folders" })
+    .getByRole("navigation", { name: "Show as" })
+    .getByRole("link", { name: "Show by folder" })
     .click();
   const tree = page.getByRole("tree", { name: "VM folders" });
   await expect(tree.getByRole("treeitem")).toHaveText(["All VMs", "teamA"]);
@@ -108,8 +98,9 @@ test("a folder user sees only their folder and signs in with a second factor", a
   await page.getByRole("button", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "a2" })).toBeVisible();
 
-  // 인증 앱을 켠다(설정 › 2단계 인증). 비밀로 코드를 셈한다.
-  await openTab(page, "Settings", "Two-step verification");
+  // 인증 앱을 켠다(사용자 메뉴 › 내 2단계 인증). 비밀로 코드를 셈한다.
+  await page.getByRole("button", { name: /^Account / }).click();
+  await page.getByRole("menuitem", { name: "My two-step verification" }).click();
   await page.getByRole("button", { name: "Set up an authenticator app" }).click();
   await expect(page.getByRole("img", { name: "QR code for the authenticator app" })).toBeVisible();
   const secret = (await page.getByTestId("totp-secret").textContent()) ?? "";

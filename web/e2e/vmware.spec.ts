@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 
 import { expect, type Page, test } from "@playwright/test";
+import { openItem, openPageTab } from "./nav";
 
 // 계획 72: 가상 머신 › 가져오기의 VMware 보기로 따뜻한 이전을 끝까지 한다 — 원본 더하기(지문을 보고 믿기) → 마법사(나무에서
 // web01 고르기·네트워크 둘·기본 풀·켜지 않기·미리 확인) → 시작 → 동기화 중 → 전환 → 끝남·실제 내린 시간 → VM 링크. 그 VM을 메뉴의
@@ -33,17 +34,14 @@ async function signIn(page: Page) {
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
 }
 
-/** 가상 머신 › 가져오기의 보기 하나 */
+/** 이미지·이전 묶음의 화면 하나(VMware 이전·원본은 "VMware migration" 항목의 화면 안 탭) */
 async function importsView(page: Page, view: string) {
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: "Virtual machines", exact: true })
-    .click();
-  await page
-    .getByRole("navigation", { name: "Virtual machines menu" })
-    .getByRole("link", { name: "Imports", exact: true })
-    .click();
-  await page.getByRole("link", { name: view, exact: true }).click();
+  if (view === "Exports") {
+    await openItem(page, "Images & migration", "Exports");
+    return;
+  }
+  await openItem(page, "Images & migration", "VMware migration");
+  await openPageTab(page, "VMware migration", view);
 }
 
 test("migrates a running VMware VM warm, cuts it over and exports it as OVA", async ({ page }) => {

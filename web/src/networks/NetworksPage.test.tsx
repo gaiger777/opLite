@@ -472,7 +472,9 @@ it("blocks the SDN type until SDN is set up", async () => {
   const option = await within(dialog).findByRole("option", { name: "SDN (OVN) — not set up" });
   expect(option).toBeDisabled();
   expect(
-    within(dialog).getByText("SDN networks need SDN (OVN) set up first, under Networks › SDN."),
+    within(dialog).getByText(
+      "SDN networks need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+    ),
   ).toBeInTheDocument();
 });
 

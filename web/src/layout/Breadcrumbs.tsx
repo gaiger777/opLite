@@ -9,7 +9,7 @@ import { useNavUser } from "@/auth/usePermissions";
 import { FOLDER_PATHS } from "@/folders/folders";
 import { crumbsOf } from "@/layout/nav";
 
-/** 머리줄 왼쪽의 `영역 › 탭 › 리소스`. 768px 아래에서는 마지막 둘만 보인다. */
+/** 머리줄 왼쪽의 `묶음 › 항목 › 리소스`. 묶음 이름은 링크가 아니다. 768px 아래에서는 마지막 둘만 보인다. */
 export function Breadcrumbs() {
   const { t } = useTranslation();
   const me = useNavUser();
@@ -26,7 +26,7 @@ export function Breadcrumbs() {
     enabled: onBackup,
   });
   // 폴더 상세 주소의 id는 폴더 이름으로 보인다.
-  const crumbs = crumbsOf(pathname, me, t, (prefix, segment) =>
+  const crumbs = crumbsOf(pathname, me.gate, t, (prefix, segment) =>
     Object.values(FOLDER_PATHS).includes(prefix)
       ? folders.data?.find((f) => f.id === segment)?.spec.name
       : prefix === "/backups"
@@ -57,10 +57,12 @@ export function Breadcrumbs() {
               >
                 {crumb.label}
               </Link>
-            ) : (
+            ) : i === crumbs.length - 1 ? (
               <span aria-current="page" className="truncate font-medium">
                 {crumb.label}
               </span>
+            ) : (
+              <span className="truncate text-muted-foreground">{crumb.label}</span>
             )}
           </li>
         ))}

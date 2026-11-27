@@ -5,7 +5,27 @@ it("finishes a g sequence within a second", () => {
   expect(seq.feed("g", 0)).toBeNull();
   expect(seq.feed("v", 500)).toBe("go.vms");
   expect(seq.feed("g", 1000)).toBeNull();
-  expect(seq.feed("s", 1900)).toBe("go.settings");
+  expect(seq.feed("s", 1900)).toBe("go.admin");
+  // `g c`는 클러스터 묶음이고, 홀로 누른 `c`는 그대로 만들기 메뉴다.
+  expect(seq.feed("g", 3000)).toBeNull();
+  expect(seq.feed("c", 3100)).toBe("go.cluster");
+  expect(seq.feed("c", 3200)).toBe("create");
+});
+
+it("has a g key for every sidebar group", () => {
+  const go = SHORTCUTS.filter((s) => s.id.startsWith("go."));
+  expect(go.map((s) => s.id)).toEqual([
+    "go.overview",
+    "go.vms",
+    "go.images",
+    "go.storage",
+    "go.network",
+    "go.cluster",
+    "go.backup",
+    "go.records",
+    "go.admin",
+  ]);
+  expect(new Set(go.map((s) => s.keys.join(" "))).size).toBe(go.length);
 });
 
 it("forgets the first key after the timeout", () => {
@@ -19,7 +39,7 @@ it("starts over from a key that breaks a sequence", () => {
   seq.feed("g", 0);
   expect(seq.feed("x", 10)).toBeNull();
   expect(seq.feed("g", 20)).toBeNull();
-  expect(seq.feed("i", 30)).toBe("go.infra");
+  expect(seq.feed("i", 30)).toBe("go.images");
   seq.feed("g", 40);
   expect(seq.feed("?", 50)).toBe("help");
 });
