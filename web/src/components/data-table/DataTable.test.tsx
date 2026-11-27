@@ -350,6 +350,9 @@ it("keeps detail-only columns out of the table and in the expanded row", async (
   await userEvent.click(toggle);
   const detail = document.getElementById(toggle.getAttribute("aria-controls")!)!;
   expect(within(detail).getByText("kind b").closest("div")).not.toHaveClass("hidden");
+  // 열 메뉴는 이 열이 펼침에만 보인다고 알린다.
+  await userEvent.click(screen.getByRole("button", { name: "Columns" }));
+  expect(await screen.findByLabelText("Kind (only under Details)")).toBeChecked();
 });
 
 it("splits a long list into pages and keeps selections from other pages", async () => {

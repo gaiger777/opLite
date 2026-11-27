@@ -3596,7 +3596,8 @@
     "viewDeleted": "보기 {{name}}을(를) 지웠습니다.",
     "noMatch": "검색·거름에 맞는 것이 없습니다.",
     "details": "{{name}} 자세히 펼치기",
-    "more": "자세히"
+    "more": "자세히",
+    "detailsOnly": "자세히에만"
   },
   "impact": {
     "vmsAssigned": "배정된 VM: {{count}}개",

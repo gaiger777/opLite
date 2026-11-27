@@ -7,7 +7,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { cn } from "cn";
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronRight } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown } from "lucide-react";
 import {
   Fragment,
   type HTMLAttributes,
@@ -382,7 +382,8 @@ export function DataTable<T>(props: Props<T>) {
       aria-label={t("table.details", { name: rowName(row) })}
       onClick={() => toggleExpanded(row)}
     >
-      <ChevronRight aria-hidden className={cn("transition-transform", open && "rotate-90")} />
+      {/* 아래 화살표: 행 끝의 ">"는 "이 행으로 이동"처럼 보인다(77-6 리뷰). */}
+      <ChevronDown aria-hidden className={cn("transition-transform", open && "rotate-180")} />
     </Button>
   );
   /** 숨은 열을 이름·값으로(넓은 화면에서 열로 보이는 것은 그 폭에서 감춘다) */
@@ -540,9 +541,9 @@ export function DataTable<T>(props: Props<T>) {
                       aria-label={t("table.details", { name: rowName(row) })}
                       onClick={() => toggleExpanded(row)}
                     >
-                      <ChevronRight
+                      <ChevronDown
                         aria-hidden
-                        className={cn("transition-transform", open && "rotate-90")}
+                        className={cn("transition-transform", open && "rotate-180")}
                       />
                       {t("table.more")}
                     </Button>

@@ -54,7 +54,11 @@ it("disables browsing with the reason when no node has the helper image", async 
       "Browsing files needs the orbivisor-restore-image package on at least one node.",
     ),
   ).toBeInTheDocument();
-  expect(await rowAction("Browse files of web-1")).toHaveAttribute("aria-disabled", "true");
+  const browse = await rowAction("Browse files of web-1");
+  expect(browse).toHaveAttribute("aria-disabled", "true");
+  expect(browse).toHaveAccessibleDescription(
+    "Browsing files needs the orbivisor-restore-image package on at least one node.",
+  );
 });
 
 it("hides browsing while a node does not know file restore yet", async () => {

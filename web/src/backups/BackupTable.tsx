@@ -68,6 +68,15 @@ const REPLICA_ICON = {
  * 원격 사본 하나: 상태 아이콘과 원격 이름. 풀·상태·오류는 툴팁(title)에, 풀과 상태는 화면 읽기용 글에도
  * 둔다(실패한 사본의 오류는 표가 사본 아래에 글로 보인다).
  */
+/** 막힌 ⋯ 메뉴 항목의 까닭(작은 둘째 줄). */
+function MenuWhy({ id, children }: { id: string; children: React.ReactNode }) {
+  return (
+    <span id={id} className="max-w-64 text-xs whitespace-normal text-muted-foreground">
+      {children}
+    </span>
+  );
+}
+
 function ReplicaBadge({ replica }: { replica: Replica }) {
   const { t } = useTranslation();
   const Icon = REPLICA_ICON[replica.state];
@@ -493,7 +502,7 @@ export function BackupTable({
                     aria-label={t("backups.browseNamed", { name: backup.name })}
                     asChild={browsable}
                     disabled={!browsable}
-                    title={ready && !browsable ? t("backups.browseUnavailable") : undefined}
+                    aria-describedby={ready && !browsable ? `${backup.id}-browse-why` : undefined}
                   >
                     {browsable ? (
                       <Link to={filesHref(backup.id)}>
@@ -501,9 +510,17 @@ export function BackupTable({
                         {t("backups.browse")}
                       </Link>
                     ) : (
-                      <span>
+                      <span className="flex items-start gap-2">
                         <FolderSearch />
-                        {t("backups.browse")}
+                        {/* 막힌 메뉴 항목은 포인터를 받지 않아 `title`이 뜨지 않는다 — 까닭을 둘째 줄로 적는다. */}
+                        <span className="flex flex-col">
+                          {t("backups.browse")}
+                          {ready && (
+                            <MenuWhy id={`${backup.id}-browse-why`}>
+                              {t("backups.browseUnavailable")}
+                            </MenuWhy>
+                          )}
+                        </span>
                       </span>
                     )}
                   </DropdownMenuItem>
@@ -551,13 +568,20 @@ export function BackupTable({
                     aria-label={t("backups.deleteNamed", { name: backup.name })}
                     variant="destructive"
                     disabled={liveInto !== undefined}
-                    title={liveInto && t("backups.liveRestoreInUse", { vm: liveInto.name })}
+                    aria-describedby={liveInto && `${backup.id}-delete-why`}
                     onSelect={() => {
                       setDeleting(backup);
                       setDeleteOpen(true);
                     }}
                   >
-                    {t("common.delete")}
+                    <span className="flex flex-col">
+                      {t("common.delete")}
+                      {liveInto && (
+                        <MenuWhy id={`${backup.id}-delete-why`}>
+                          {t("backups.liveRestoreInUse", { vm: liveInto.name })}
+                        </MenuWhy>
+                      )}
+                    </span>
                   </DropdownMenuItem>
                 ),
               ].filter(Boolean);

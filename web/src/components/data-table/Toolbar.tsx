@@ -112,7 +112,7 @@ export function ColumnMenu({
   hidden,
   onChange,
 }: {
-  columns: { id: string; header: string }[];
+  columns: { id: string; header: string; priority?: number }[];
   hidden: string[];
   onChange(hidden: string[]): void;
 }) {
@@ -139,7 +139,15 @@ export function ColumnMenu({
                   onChange(v === true ? hidden.filter((h) => h !== c.id) : [...hidden, c.id])
                 }
               />
-              <Label htmlFor={id}>{c.header}</Label>
+              <Label htmlFor={id}>
+                {c.header}
+                {/* 4순위 열은 어느 폭에서도 열로 그리지 않고 펼친 "자세히"에만 보인다. */}
+                {c.priority === 4 && (
+                  <span className="text-xs font-normal text-muted-foreground">
+                    {` (${t("table.detailsOnly")})`}
+                  </span>
+                )}
+              </Label>
             </div>
           );
         })}

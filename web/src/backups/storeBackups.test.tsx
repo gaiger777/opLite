@@ -366,8 +366,8 @@ it("blocks deleting a backup that a live restore uses and shows why the server r
   renderPage(<BackupsPage />);
   const del = await rowAction("Delete backup web-s1");
   expect(del).toHaveAttribute("aria-disabled", "true");
-  expect(del).toHaveAttribute(
-    "title",
+  // 막힌 메뉴 항목은 `title`이 뜨지 않아 까닭을 둘째 줄로 적고 설명으로 잇는다(77-6 리뷰).
+  expect(del).toHaveAccessibleDescription(
     "VM web is being live-restored from this backup. Finish or cancel the live restore first.",
   );
   expect(await rowAction("Delete backup web-s2")).not.toHaveAttribute("aria-disabled");

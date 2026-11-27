@@ -3596,7 +3596,8 @@
     "viewDeleted": "View {{name}} deleted.",
     "noMatch": "Nothing matches the search or filter.",
     "details": "Show details for {{name}}",
-    "more": "Details"
+    "more": "Details",
+    "detailsOnly": "only under Details"
   },
   "impact": {
     "vmsAssigned": "VMs assigned to it: {{count}}",
