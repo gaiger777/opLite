@@ -239,14 +239,14 @@ export function NodesPage() {
       id: "underlay",
       header: t("nodes.underlay"),
       className: "font-mono text-xs",
-      priority: 3,
+      priority: 4,
       // VXLAN 패킷을 주고받는 주소. 위트니스와 정하지 못한 노드는 없다.
       cell: (node) => node.status.underlay ?? "—",
     },
     {
       id: "hypervisor",
       header: t("nodes.hypervisor"),
-      priority: 3,
+      priority: 4,
       cell: (node) => (
         <>
           {node.status.hypervisor}
@@ -265,14 +265,14 @@ export function NodesPage() {
     {
       id: "arch",
       header: t("nodes.arch"),
-      priority: 3,
+      priority: 4,
       // 옛 버전으로 등록한 노드는 모른다.
       cell: (node) => node.status.arch ?? "—",
     },
     {
       id: "firmware",
       header: t("nodes.firmware"),
-      priority: 3,
+      priority: 4,
       // TPM·Secure Boot 능력. 옛 노드는 알리지 않고(모름), 위트니스는 VM을 돌리지 않는다.
       cell: (node) =>
         node.spec.witness ? (
@@ -289,7 +289,7 @@ export function NodesPage() {
     {
       id: "fencing",
       header: t("nodes.fencing"),
-      priority: 3,
+      priority: 4,
       // 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다.
       cell: (node) => (
         <>
@@ -360,7 +360,7 @@ export function NodesPage() {
     {
       id: "dedicated",
       header: t("numa.columns.dedicated"),
-      priority: 3,
+      priority: 4,
       value: (node) => usageOf(node)?.dedicated_used ?? -1,
       // 고정할 수 없거나(macOS·위트니스·옛 노드) 전용 CPU가 없는 노드는 비어 있다.
       cell: (node) => {
@@ -373,7 +373,7 @@ export function NodesPage() {
     {
       id: "hugepages",
       header: t("numa.columns.hugepages"),
-      priority: 3,
+      priority: 4,
       cell: (node) => {
         const pools = usageOf(node)?.hugepages ?? [];
         return pools.length === 0
@@ -392,7 +392,7 @@ export function NodesPage() {
     {
       id: "sdn",
       header: t("nodes.sdn"),
-      priority: 3,
+      priority: 4,
       // OVN chassis 상태와 중앙이면 NB Raft 역할(계획 65). SDN을 세우지 않은 노드는 없다.
       cell: (node) => <NodeSdnCell sdn={node.status.sdn} stray={strays.has(node.id)} />,
     },
@@ -400,13 +400,13 @@ export function NodesPage() {
       id: "bridges",
       header: t("nodes.bridges"),
       className: "font-mono text-xs",
-      priority: 3,
+      priority: 4,
       cell: (node) => node.status.bridges.map((b) => b.name).join(", ") || "—",
     },
     {
       id: "pools",
       header: t("nodes.pools"),
-      priority: 3,
+      priority: 4,
       cell: (node) =>
         Object.keys(node.status.pools).length === 0
           ? "—"
@@ -420,7 +420,7 @@ export function NodesPage() {
       id: "labels",
       header: t("nodes.labels"),
       className: "font-mono text-xs",
-      priority: 3,
+      priority: 4,
       // 배치 규칙의 노드 태그(`zone=rack-a`)가 보는 레이블
       cell: (node) => labelText(node.labels) || "—",
     },
@@ -434,7 +434,7 @@ export function NodesPage() {
     {
       id: "replicas",
       header: t("nodes.replicas"),
-      priority: 3,
+      priority: 4,
       // 그 노드가 대상인 복제(VM 목록으로 센다)
       cell: (node) => (vms.isSuccess ? <ReplicasCell node={node} vms={vms.data} /> : "—"),
     },
@@ -442,7 +442,7 @@ export function NodesPage() {
       id: "ceph",
       header: t("nodes.ceph"),
       className: "font-mono text-xs",
-      priority: 3,
+      priority: 4,
       // 관리 Ceph에서 이 노드가 맡은 데몬(mon·mgr·osd)
       cell: (node) => cephRoles(ceph.data, node.id).join(", ") || "—",
     },

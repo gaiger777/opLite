@@ -7,6 +7,7 @@ import { taskTarget } from "@/tasks/target";
 import { backup, NODE, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import i18n from "@/i18n";
+import { rowAction } from "@/test/rowMenu";
 
 // 계획 69: 백업 표의 "파일 찾아보기" — 권한·기능·도우미 이미지에 따라 숨김·막힘·링크
 const web = vm("web", "running");
@@ -39,14 +40,10 @@ it("links ready backups to the file browser when a node has the helper image", a
     ],
   });
   renderPage(<BackupsPage />);
-  const link = await within(await row("web-1")).findByRole("link", {
-    name: "Browse files of web-1",
-  });
+  const link = await rowAction("Browse files of web-1");
   expect(link).toHaveAttribute("href", `/backups/${ready.id}/files`);
   // 만드는 중인 백업은 찾아볼 수 없다.
-  expect(
-    within(await row("web-2")).getByRole("button", { name: "Browse files of web-2" }),
-  ).toBeDisabled();
+  expect(await rowAction("Browse files of web-2")).toHaveAttribute("aria-disabled", "true");
 });
 
 it("disables browsing with the reason when no node has the helper image", async () => {
@@ -57,9 +54,7 @@ it("disables browsing with the reason when no node has the helper image", async 
       "Browsing files needs the orbivisor-restore-image package on at least one node.",
     ),
   ).toBeInTheDocument();
-  expect(
-    within(await row("web-1")).getByRole("button", { name: "Browse files of web-1" }),
-  ).toBeDisabled();
+  expect(await rowAction("Browse files of web-1")).toHaveAttribute("aria-disabled", "true");
 });
 
 it("hides browsing while a node does not know file restore yet", async () => {

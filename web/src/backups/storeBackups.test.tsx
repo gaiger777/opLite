@@ -14,6 +14,7 @@ import { backup, backupJob, backupStore, NODE, pool, storeBackup, task, vm } fro
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
+import { rowAction, rowActionOrNull } from "@/test/rowMenu";
 
 afterEach(resetTasks);
 
@@ -95,11 +96,11 @@ it("verifies a store backup and moves a pool backup into a store", async () => {
     }),
   );
   renderPage(<BackupsPage />);
-  await user.click(await screen.findByRole("button", { name: "Verify web-s1 now" }));
+  await user.click(await rowAction("Verify web-s1 now"));
   await waitFor(() => expect(verified).toBe(true));
   // 풀 백업은 검증하지 않고(서버 400) 저장소로 옮긴다.
-  expect(screen.queryByRole("button", { name: "Verify web-1 now" })).toBeNull();
-  await user.click(screen.getByRole("button", { name: "Move web-1 to a backup store" }));
+  expect(await rowActionOrNull("Verify web-1 now")).toBeNull();
+  await user.click(await rowAction("Move web-1 to a backup store"));
   let dialog = await screen.findByRole("dialog", { name: "Move web-1 to a backup store" });
   const select = within(dialog).getByLabelText("Backup store");
   expect(
@@ -111,7 +112,7 @@ it("verifies a store backup and moves a pool backup into a store", async () => {
   await user.click(within(dialog).getByRole("button", { name: "Move to store" }));
   await waitFor(() => expect(convert).toEqual({ store: "s3" }));
   // 복사는 다른 저장소로만
-  await user.click(screen.getByRole("button", { name: "Copy web-s1 to another backup store" }));
+  await user.click(await rowAction("Copy web-s1 to another backup store"));
   dialog = await screen.findByRole("dialog", { name: "Copy web-s1 to another backup store" });
   expect(
     within(within(dialog).getByLabelText("Backup store"))
@@ -300,7 +301,7 @@ it("moves into a store named like the pool, sorts store backups by new data and 
       .map((r) => within(r).getAllByRole("cell")[0]!.textContent),
   ).toEqual(["web-1", "web-s9"]);
   expect(row("web-1")).toHaveAttribute("id", `backup-${inPool.id}`);
-  await user.click(screen.getByRole("button", { name: "Move web-1 to a backup store" }));
+  await user.click(await rowAction("Move web-1 to a backup store"));
   const dialog = await screen.findByRole("dialog", { name: "Move web-1 to a backup store" });
   expect(
     within(within(dialog).getByLabelText("Backup store"))
@@ -363,13 +364,13 @@ it("blocks deleting a backup that a live restore uses and shows why the server r
   mockLists({ vm: [restoring], node: [NODE], backup: [base, inStore] });
   stores([ST]);
   renderPage(<BackupsPage />);
-  const del = await screen.findByRole("button", { name: "Delete backup web-s1" });
-  expect(del).toBeDisabled();
+  const del = await rowAction("Delete backup web-s1");
+  expect(del).toHaveAttribute("aria-disabled", "true");
   expect(del).toHaveAttribute(
     "title",
     "VM web is being live-restored from this backup. Finish or cancel the live restore first.",
   );
-  expect(screen.getByRole("button", { name: "Delete backup web-s2" })).toBeEnabled();
+  expect(await rowAction("Delete backup web-s2")).not.toHaveAttribute("aria-disabled");
 });
 
 it("shows the server's reason when a backup is still in use", async () => {
@@ -384,7 +385,7 @@ it("shows the server's reason when a backup is still in use", async () => {
     ),
   );
   renderPage(<BackupsPage />);
-  await user.click(await screen.findByRole("button", { name: "Delete backup web-s1" }));
+  await user.click(await rowAction("Delete backup web-s1"));
   const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-s1?" });
   await user.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(

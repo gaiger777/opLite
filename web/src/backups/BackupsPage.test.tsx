@@ -16,6 +16,7 @@ import {
 } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
+import { rowAction, rowActionOrNull } from "@/test/rowMenu";
 
 afterEach(resetTasks);
 
@@ -144,10 +145,11 @@ it("copies a ready backup to a backup pool of a remote cluster", async () => {
     }),
   );
   renderPage(<BackupsPage />);
-  expect(
-    await screen.findByRole("button", { name: "Copy web-0 to a remote cluster" }),
-  ).toBeDisabled();
-  await userEvent.click(screen.getByRole("button", { name: "Copy web-1 to a remote cluster" }));
+  expect(await rowAction("Copy web-0 to a remote cluster")).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await userEvent.click(await rowAction("Copy web-1 to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-1 to a remote cluster" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Copy" }));
   expect(within(dialog).getByText("Choose a remote cluster.")).toBeVisible();
@@ -180,9 +182,7 @@ it("explains a remote cluster whose pools cannot be read", async () => {
     ),
   );
   renderPage(<BackupsPage />);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Copy web-1 to a remote cluster" }),
-  );
+  await userEvent.click(await rowAction("Copy web-1 to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-1 to a remote cluster" });
   await within(dialog).findByRole("option", { name: "dr" });
   await userEvent.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
@@ -322,7 +322,7 @@ it("deletes a backup after confirming", async () => {
     }),
   );
   renderPage(<BackupsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Delete backup web-1" }));
+  await userEvent.click(await rowAction("Delete backup web-1"));
   const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-1?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await screen.findByText("Delete backup web-1")).toBeInTheDocument();
@@ -340,7 +340,7 @@ it("explains a backup that is busy", async () => {
     ),
   );
   renderPage(<BackupsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Delete backup web-1" }));
+  await userEvent.click(await rowAction("Delete backup web-1"));
   const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-1?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
@@ -353,19 +353,15 @@ it("lets operators restore and delete but leaves copying to a remote to admins",
   mockLists({ vm: [web], backup: [ofWeb] });
   renderPage(<BackupsPage />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByRole("button", { name: "Restore web-1" })).toBeEnabled();
-  expect(screen.getByRole("button", { name: "Delete backup web-1" })).toBeEnabled();
-  expect(
-    screen.queryByRole("button", { name: "Copy web-1 to a remote cluster" }),
-  ).not.toBeInTheDocument();
+  expect(await rowAction("Delete backup web-1")).not.toHaveAttribute("aria-disabled");
+  expect(await rowActionOrNull("Copy web-1 to a remote cluster")).not.toBeInTheDocument();
 });
 
 it("does not let viewers copy backups", async () => {
   mockLists({ vm: [web], backup: [ofWeb] });
   renderPage(<BackupsPage />, { as: { ...ADMIN, role: "viewer" } });
   expect(await screen.findByText("web-1")).toBeInTheDocument();
-  expect(
-    screen.queryByRole("button", { name: "Copy web-1 to a remote cluster" }),
-  ).not.toBeInTheDocument();
+  expect(await rowActionOrNull("Copy web-1 to a remote cluster")).not.toBeInTheDocument();
 });
 
 it("shows the type, parent, reason for a full backup and chain size", async () => {
@@ -488,7 +484,7 @@ it("copies an incremental backup and shows how much of its chain was copied", as
   expect(copies("web-sent-inc")).not.toHaveTextContent("chain");
 
   // 증분 백업도 복제한다. 설명은 체인의 앞 백업도 보낸다고 알린다.
-  await userEvent.click(screen.getByRole("button", { name: "Copy web-inc to a remote cluster" }));
+  await userEvent.click(await rowAction("Copy web-inc to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-inc to a remote cluster" });
   expect(dialog).toHaveAccessibleDescription(
     /An incremental backup is sent with the earlier backups of its chain that the remote cluster does not have yet, starting from the full backup\./,
@@ -536,9 +532,7 @@ it.each([
     ),
   );
   renderPage(<BackupsPage />);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Copy web-inc to a remote cluster" }),
-  );
+  await userEvent.click(await rowAction("Copy web-inc to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-inc to a remote cluster" });
   await within(dialog).findByRole("option", { name: "dr" });
   await userEvent.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
@@ -565,7 +559,7 @@ it("explains why a parent backup cannot be deleted", async () => {
     ),
   );
   renderPage(<BackupsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Delete backup web-1" }));
+  await userEvent.click(await rowAction("Delete backup web-1"));
   const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-1?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(

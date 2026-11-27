@@ -10,6 +10,7 @@ import { resetTasks } from "@/tasks/tasks";
 import { backupStore, pool, remote, storeBackup, task, vm } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
+import { rowAction } from "@/test/rowMenu";
 
 afterEach(resetTasks);
 
@@ -51,7 +52,7 @@ it("copies a store backup to a backup store of the remote cluster", async () => 
     }),
   );
   renderPage(<BackupsPage />);
-  await user.click(await screen.findByRole("button", { name: "Copy web-s1 to a remote cluster" }));
+  await user.click(await rowAction("Copy web-s1 to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-s1 to a remote cluster" });
   await within(dialog).findByRole("option", { name: "dr" });
   await user.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
@@ -131,7 +132,7 @@ it("offers only remote stores with the same key as the backup's store", async ()
     ),
   );
   renderPage(<BackupsPage />);
-  await user.click(await screen.findByRole("button", { name: "Copy web-e1 to a remote cluster" }));
+  await user.click(await rowAction("Copy web-e1 to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-e1 to a remote cluster" });
   await within(dialog).findByRole("option", { name: "dr" });
   await user.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");
@@ -154,7 +155,7 @@ it("says when no remote store has the same key", async () => {
     ),
   );
   renderPage(<BackupsPage />);
-  await user.click(await screen.findByRole("button", { name: "Copy web-s1 to a remote cluster" }));
+  await user.click(await rowAction("Copy web-s1 to a remote cluster"));
   const dialog = await screen.findByRole("dialog", { name: "Copy web-s1 to a remote cluster" });
   await within(dialog).findByRole("option", { name: "dr" });
   await user.selectOptions(within(dialog).getByLabelText("Remote cluster"), "dr");

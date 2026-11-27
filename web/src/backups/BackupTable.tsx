@@ -1,4 +1,11 @@
-import { CircleAlert, CircleCheck, CircleDashed, FolderSearch, LoaderCircle } from "lucide-react";
+import {
+  CircleAlert,
+  CircleCheck,
+  CircleDashed,
+  FolderSearch,
+  LoaderCircle,
+  MoreHorizontal,
+} from "lucide-react";
 import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -25,6 +32,12 @@ import { StatusChip } from "@/components/StatusChip";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { Badge } from "@/components/ui/badge";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -347,7 +360,7 @@ export function BackupTable({
     {
       id: "type",
       header: t("backups.type"),
-      priority: 3,
+      priority: 4,
       cell: (backup) => {
         const { parentId, fullReason, parent, target, baseId, base } = rowInfo(backup);
         // 저장소 백업은 체인이 없다: 바뀌지 않은 청크를 가져온 base만 보인다(복원은 따라가지 않는다).
@@ -404,7 +417,7 @@ export function BackupTable({
     {
       id: "replicas",
       header: t("backups.replicas"),
-      priority: 3,
+      priority: 4,
       cell: (backup) => {
         const { replicas, chainCopies } = rowInfo(backup);
         return (
@@ -467,114 +480,120 @@ export function BackupTable({
               const liveInto = (vms.data ?? []).find(
                 (v) => v.status.live_restore?.backup === backup.id,
               );
-              return (
-                <>
-                  {browse &&
-                    (phase === "ready" && browseState === "ready" ? (
-                      <Button
-                        asChild
-                        variant="outline"
-                        size="sm"
-                        className="mr-2"
-                        aria-label={t("backups.browseNamed", { name: backup.name })}
-                      >
-                        <Link to={filesHref(backup.id)}>
-                          <FolderSearch />
-                          {t("backups.browse")}
-                        </Link>
-                      </Button>
-                    ) : (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="mr-2"
-                        disabled
-                        aria-label={t("backups.browseNamed", { name: backup.name })}
-                        title={phase === "ready" ? t("backups.browseUnavailable") : undefined}
-                      >
+              const ready = phase === "ready";
+              const browsable = ready && browseState === "ready";
+              const remember = (e: { currentTarget: HTMLElement }) => {
+                opener.current = e.currentTarget;
+              };
+              // 주 동작 "복원" 하나 + ⋯ 메뉴(계획 77-6 — 단추 4~6개가 1440px에서도 표를 넘치던 것)
+              const items = [
+                browse && (
+                  <DropdownMenuItem
+                    key="browse"
+                    aria-label={t("backups.browseNamed", { name: backup.name })}
+                    asChild={browsable}
+                    disabled={!browsable}
+                    title={ready && !browsable ? t("backups.browseUnavailable") : undefined}
+                  >
+                    {browsable ? (
+                      <Link to={filesHref(backup.id)}>
                         <FolderSearch />
                         {t("backups.browse")}
-                      </Button>
-                    ))}
+                      </Link>
+                    ) : (
+                      <span>
+                        <FolderSearch />
+                        {t("backups.browse")}
+                      </span>
+                    )}
+                  </DropdownMenuItem>
+                ),
+                // 원격 쪽 권한은 원격 토큰의 역할이다.
+                replicate && (
+                  <DropdownMenuItem
+                    key="replicate"
+                    aria-label={t("backups.replicateNamed", { name: backup.name })}
+                    disabled={!ready}
+                    onSelect={() => setReplicating(backup)}
+                  >
+                    {t("backups.replicate")}
+                  </DropdownMenuItem>
+                ),
+                create && target.kind === "store" && (
+                  <DropdownMenuItem
+                    key="verify"
+                    aria-label={t("backups.verifyNamed", { name: backup.name })}
+                    disabled={!ready}
+                    onSelect={() => void verifyNow(backup)}
+                  >
+                    {t("backups.verifyNow")}
+                  </DropdownMenuItem>
+                ),
+                create && others.length > 0 && (
+                  <DropdownMenuItem
+                    key="move"
+                    aria-label={t(
+                      target.kind === "store" ? "backups.copyNamed" : "backups.convertNamed",
+                      { name: backup.name },
+                    )}
+                    disabled={!ready}
+                    onSelect={() =>
+                      setMoving({ backup, kind: target.kind === "store" ? "copy" : "convert" })
+                    }
+                  >
+                    {t(target.kind === "store" ? "backups.copy" : "backups.convert")}
+                  </DropdownMenuItem>
+                ),
+                // 실패했거나 Task 없이 남은 백업도 지운다. 진행 중인 Task가 있으면 서버가 거절한다.
+                remove && (
+                  <DropdownMenuItem
+                    key="delete"
+                    aria-label={t("backups.deleteNamed", { name: backup.name })}
+                    variant="destructive"
+                    disabled={liveInto !== undefined}
+                    title={liveInto && t("backups.liveRestoreInUse", { vm: liveInto.name })}
+                    onSelect={() => {
+                      setDeleting(backup);
+                      setDeleteOpen(true);
+                    }}
+                  >
+                    {t("common.delete")}
+                  </DropdownMenuItem>
+                ),
+              ].filter(Boolean);
+              return (
+                <div className="inline-flex items-center gap-1">
                   {restore && (
                     <Button
                       variant="outline"
                       size="sm"
                       aria-label={t("backups.restoreNamed", { name: backup.name })}
-                      disabled={phase !== "ready"}
+                      disabled={!ready}
                       onClick={(e) => {
-                        opener.current = e.currentTarget;
+                        remember(e);
                         setRestoring(backup);
                       }}
                     >
                       {t("backups.restore")}
                     </Button>
                   )}
-                  {/* 원격 쪽 권한은 원격 토큰의 역할이다. */}
-                  {replicate && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="ml-2"
-                      aria-label={t("backups.replicateNamed", { name: backup.name })}
-                      disabled={phase !== "ready"}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setReplicating(backup);
-                      }}
-                    >
-                      {t("backups.replicate")}
-                    </Button>
+                  {items.length > 0 && (
+                    <DropdownMenu modal={false}>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t("vms.actionsFor", { name: backup.name })}
+                          onPointerDown={remember}
+                          onKeyDown={remember}
+                        >
+                          <MoreHorizontal />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">{items}</DropdownMenuContent>
+                    </DropdownMenu>
                   )}
-                  {create && target.kind === "store" && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="ml-2"
-                      aria-label={t("backups.verifyNamed", { name: backup.name })}
-                      disabled={phase !== "ready"}
-                      onClick={() => void verifyNow(backup)}
-                    >
-                      {t("backups.verifyNow")}
-                    </Button>
-                  )}
-                  {create && others.length > 0 && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="ml-2"
-                      aria-label={t(
-                        target.kind === "store" ? "backups.copyNamed" : "backups.convertNamed",
-                        { name: backup.name },
-                      )}
-                      disabled={phase !== "ready"}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setMoving({ backup, kind: target.kind === "store" ? "copy" : "convert" });
-                      }}
-                    >
-                      {t(target.kind === "store" ? "backups.copy" : "backups.convert")}
-                    </Button>
-                  )}
-                  {/* 실패했거나 Task 없이 남은 백업도 지운다. 진행 중인 Task가 있으면 서버가 거절한다. */}
-                  {remove && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="ml-2"
-                      aria-label={t("backups.deleteNamed", { name: backup.name })}
-                      disabled={liveInto !== undefined}
-                      title={liveInto && t("backups.liveRestoreInUse", { vm: liveInto.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setDeleting(backup);
-                        setDeleteOpen(true);
-                      }}
-                    >
-                      {t("common.delete")}
-                    </Button>
-                  )}
-                </>
+                </div>
               );
             },
           },

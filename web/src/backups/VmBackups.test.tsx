@@ -9,6 +9,7 @@ import { backup, NODE, pool, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
+import { rowAction } from "@/test/rowMenu";
 
 afterEach(resetTasks);
 
@@ -55,7 +56,7 @@ it("lists the VM's backups, newest first", async () => {
   ).toBeDisabled();
   expect(failed).toHaveTextContent("Failed");
   expect(failed).toHaveTextContent("qemu-img convert failed");
-  expect(within(failed).getByRole("button", { name: "Delete backup web-broken" })).toBeEnabled();
+  expect(await rowAction("Delete backup web-broken")).not.toHaveAttribute("aria-disabled");
 });
 
 it("backs up a running VM to the chosen backup pool and follows its task", async () => {
