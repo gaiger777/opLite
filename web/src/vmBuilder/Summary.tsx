@@ -98,7 +98,6 @@ export function Summary({
             value={v.name}
             disabled={b.busy}
             autoComplete="off"
-            placeholder="web-01"
             onChange={(e) => b.set(setName(b.s, e.target.value))}
             onBlur={() => v.name !== "" && b.touch()}
             {...a11y}
@@ -156,8 +155,7 @@ export function Summary({
                 <button
                   type="button"
                   data-level={p.level}
-                  className="w-full truncate rounded-md px-1 py-0.5 text-left text-xs hover:bg-muted"
-                  title={problemText(t, p)}
+                  className="w-full rounded-md px-1 py-0.5 text-left text-xs break-words hover:bg-muted"
                   onClick={() => focusProblem(p)}
                 >
                   <span className="font-medium">{t(`vmBuilder.check.${p.level}`)}</span>{" "}
