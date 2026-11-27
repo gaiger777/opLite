@@ -29,6 +29,9 @@ import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
 import { useTaskHref } from "@/tasks/taskLink";
 
+/** 한 쪽에 그리는 감사 줄 수(계획 77 실험실 — 로그인 줄이 쌓이면 화면이 수천 px로 길어졌다). */
+const AUDIT_PAGE_SIZE = 50;
+
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-[7rem_1fr] gap-x-3 text-sm max-sm:grid-cols-1">
@@ -368,6 +371,7 @@ export function AuditPage() {
         }
         labelledBy="audit-title"
         keys
+        pageSize={AUDIT_PAGE_SIZE}
         rowProps={(entry) => ({
           className: "cursor-pointer",
           onClick: (e) => {

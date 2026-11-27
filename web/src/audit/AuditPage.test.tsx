@@ -367,3 +367,18 @@ it("explains an empty range", async () => {
   expect(empty).toHaveTextContent("Widen the time range");
   expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
 });
+
+it("pages long logs fifty lines at a time", async () => {
+  const many = Array.from({ length: 60 }, (_, i) => ({
+    ...LOGIN,
+    id: `019a0f3c-8a10-7000-8000-${String(i).padStart(12, "0")}`,
+    time: LOGIN.time - i * 1000,
+  }));
+  mockAudit({ entries: many });
+  renderPage(<AuditPage />);
+  const table = await screen.findByRole("table", { name: "Audit log" });
+  await within(table).findAllByText("Sign in");
+  // 머리 줄 + 50줄
+  expect(within(table).getAllByRole("row")).toHaveLength(51);
+  expect(screen.getByRole("navigation", { name: "Pages" })).toBeInTheDocument();
+});
