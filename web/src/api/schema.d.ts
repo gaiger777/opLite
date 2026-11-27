@@ -11924,8 +11924,18 @@ export interface components {
                 status: {
                     /** @default null */
                     error: string | null;
+                    /**
+                     * Format: int64
+                     * @description 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
+                     */
+                    finished_at?: number;
                     /** @description 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다. */
                     progress?: components["schemas"]["TaskProgress"];
+                    /**
+                     * Format: int64
+                     * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+                     */
+                    started_at?: number;
                     /** @default pending */
                     state: components["schemas"]["TaskState"];
                 };
@@ -17001,8 +17011,18 @@ export interface components {
             status: {
                 /** @default null */
                 error: string | null;
+                /**
+                 * Format: int64
+                 * @description 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
+                 */
+                finished_at?: number;
                 /** @description 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다. */
                 progress?: components["schemas"]["TaskProgress"];
+                /**
+                 * Format: int64
+                 * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+                 */
+                started_at?: number;
                 /** @default pending */
                 state: components["schemas"]["TaskState"];
             };
@@ -19156,8 +19176,18 @@ export interface components {
         TaskStatus: {
             /** @default null */
             error: string | null;
+            /**
+             * Format: int64
+             * @description 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
+             */
+            finished_at?: number;
             /** @description 실행 중인 Task의 진행률(지금은 로컬 디스크를 복사하는 마이그레이션만). Task가 끝나면 지운다. */
             progress?: components["schemas"]["TaskProgress"];
+            /**
+             * Format: int64
+             * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+             */
+            started_at?: number;
             /** @default pending */
             state: components["schemas"]["TaskState"];
         };
