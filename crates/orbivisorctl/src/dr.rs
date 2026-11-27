@@ -73,19 +73,30 @@ pub(crate) enum DrCmd {
         watch: bool,
     },
     /// RPO/RTO 보고: VM마다 복구 지점과 나이, 최근 시험 셋, 지난 장애 조치, 도는 실행
-    Report { plan: String },
+    Report {
+        plan: String,
+        /// 이 시각(RFC 3339) 이하의 사본으로 보호 상태·장애 조치 준비를 센다(`--point-in-time`으로 돌리기 전에 볼 때)
+        #[arg(long, value_name = "TIME", value_parser = crate::vmware::parse_time)]
+        point_in_time: Option<u64>,
+    },
     /// 되돌리기 준비: 장애 조치로 되살린 VM에 원격(되살아난 운영 클러스터)으로 복제하는 백업 작업
     /// `dr-reprotect-<plan>`을 만들거나 바꾼다.
     Reprotect(ReprotectArgs),
-    /// 재해 장애 조치 뒤 돌아온 운영 쪽에서 이곳에 되살린 VM을 강제로 끄고 원하는 상태를 stopped로 둔다(두 벌 막기). 계획의
-    /// `source_fence_pending` 목록을 비운다.
+    /// 재해 장애 조치 뒤 돌아온 운영 쪽에서 이곳에 되살린 VM을 강제로 끄고 원하는 상태를 stopped로 둔다(두 벌 막기). 장애
+    /// 조치 때의 운영 쪽 VM(id)만 끄고 같은 이름의 다른 VM은 건너뛴다. 멈춘 VM은 계획의 `source_fence_pending` 목록에서 뺀다.
     FenceSource { plan: String },
+    /// 두 벌 막기 목록(`source_fence_pending`)을 운영 쪽에 아무것도 하지 않고 비운다 — 운영 쪽 옛 VM이 멈췄거나 없음을
+    /// 스스로 확인했을 때(되돌리기 앞에 지움, 원격을 새 클러스터로 바꿈 등).
+    ClearFence { plan: String },
 }
 
 /// 복구 지점 고르기(시험·재해 장애 조치)
 #[derive(Args)]
 pub(crate) struct PointArgs {
-    /// 복구 지점이 없는 VM은 건너뛰고 진행한다(없으면 그런 VM이 있을 때 거절).
+    /// 복구 지점이 없으면 이 VM을 건너뛰고 진행한다(여러 번 줄 수 있다 — 여기 없는 VM에 복구 지점이 없으면 거절).
+    #[arg(long = "skip-vm", value_name = "VM")]
+    skip_vms: Vec<String>,
+    /// 복구 지점이 없는 VM은 모두 건너뛰고 진행한다(`--skip-vm`으로 고르는 편이 안전하다).
     #[arg(long)]
     allow_missing: bool,
     /// 이 시각(RFC 3339) 이전의 가장 새 복구 지점으로(랜섬웨어·논리 손상이 복제된 경우)
@@ -97,6 +108,9 @@ impl PointArgs {
     fn fill(&self, body: &mut Value) {
         if self.allow_missing {
             body["allow_missing"] = json!(true);
+        }
+        if !self.skip_vms.is_empty() {
+            body["skip_vms"] = json!(self.skip_vms);
         }
         if let Some(t) = self.point_in_time {
             body["point_in_time"] = json!(t);
@@ -550,8 +564,43 @@ fn run_view(out: &mut dyn Write, r: &Value) -> std::io::Result<()> {
         for n in s["notes"].as_array().into_iter().flatten() {
             writeln!(out, "{}: {}", cell(&s["vm"]), cell(n))?;
         }
+        // 리뷰 2: 데이터를 더 잃음·디스크를 다 받지 못함·운영 쪽에서 꺼진 채 남음
+        if let Some(lost) = s["lost_secs"].as_u64() {
+            writeln!(
+                out,
+                "{}: warning: restored from an older recovery point ({} older than the first choice)",
+                cell(&s["vm"]),
+                dur_cell(&json!(lost))
+            )?;
+        }
+        if let Some(e) = s["copy_error"].as_str() {
+            writeln!(
+                out,
+                "{}: warning: the live restore did not finish copying the disks: {e}",
+                cell(&s["vm"])
+            )?;
+        }
+        if let Some(e) = s["prepare"]["restart_error"].as_str() {
+            writeln!(
+                out,
+                "{}: warning: source VM left stopped ({e}) — start it on the source cluster",
+                cell(&s["vm"])
+            )?;
+        }
+    }
+    if let Some(by) = st["preempted_by"].as_str() {
+        writeln!(out, "stopped by failover {by}")?;
     }
     readiness_lines(out, &st["failover_readiness"])
+}
+
+/// 두 벌 막기 목록의 VM 이름(새 모양 `{vm, source_id}`, 옛 서버의 이름 목록도)
+fn fence_names(list: &Value) -> Vec<String> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| f["vm"].as_str().map_or_else(|| cell(f), str::to_string))
+        .collect()
 }
 
 /// 장애 조치 준비 문제(VM마다 한 줄)
@@ -660,16 +709,11 @@ fn report_view(out: &mut dyn Write, r: &Value) -> std::io::Result<()> {
         .collect();
     table(out, PROTECTION_HEADERS, &rows)?;
     readiness_lines(out, &r["failover_readiness"])?;
-    let pending: Vec<String> = r["source_fence_pending"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(cell)
-        .collect();
+    let pending = fence_names(&r["source_fence_pending"]);
     if !pending.is_empty() {
         writeln!(
             out,
-            "warning: recovered after a disaster and not yet stopped on the source cluster: {} — run `orbivisorctl dr fence-source {}` when it is back",
+            "warning: recovered after a disaster and not yet stopped on the source cluster: {} — run `orbivisorctl dr fence-source {}` when it is back (or `dr clear-fence` once you checked yourself)",
             pending.join(", "),
             cell(&r["plan"])
         )?;
@@ -961,8 +1005,14 @@ async fn run_cmd(
                 run_view(out, &r)?;
             }
         }
-        DrCmd::Report { plan } => {
-            let r = client.get(&format!("{}/report", plan_path(&plan))).await?;
+        DrCmd::Report {
+            plan,
+            point_in_time,
+        } => {
+            let at = point_in_time.map_or_else(String::new, |t| format!("?point_in_time={t}"));
+            let r = client
+                .get(&format!("{}/report{at}", plan_path(&plan)))
+                .await?;
             if json_out {
                 print_json(out, &r)?;
             } else {
@@ -1006,22 +1056,50 @@ async fn run_cmd(
                 return Ok(print_json(out, &r)?);
             }
             for v in r["results"].as_array().into_iter().flatten() {
-                let what = match (v["ok"] == json!(true), v["error"].as_str()) {
-                    (true, None) => "stopped".to_string(),
-                    (true, Some(e)) => e.to_string(),
-                    (false, e) => format!("not stopped: {}", e.unwrap_or("failed")),
+                let what = match (v["result"].as_str(), v["error"].as_str()) {
+                    (Some("not_found"), _) => "not on the source cluster".to_string(),
+                    (Some("different_vm"), _) => {
+                        "a different VM has this name there; not stopped".to_string()
+                    }
+                    (Some("different_cluster"), e) => {
+                        format!(
+                            "not stopped: {}",
+                            e.unwrap_or("the remote points at another cluster")
+                        )
+                    }
+                    // 옛 서버(`result` 없음)
+                    (None, Some(e)) if v["ok"] == json!(true) => e.to_string(),
+                    _ if v["ok"] == json!(true) => "stopped".to_string(),
+                    (_, e) => format!("not stopped: {}", e.unwrap_or("failed")),
                 };
                 writeln!(out, "{}: {what}", cell(&v["vm"]))?;
             }
-            let pending: Vec<String> = r["pending"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(cell)
-                .collect();
+            let pending = fence_names(&r["pending"]);
             if !pending.is_empty() {
                 writeln!(out, "still to fence: {}", pending.join(", "))?;
                 anyhow::bail!("some VMs are not stopped on the source cluster");
+            }
+        }
+        DrCmd::ClearFence { plan } => {
+            let before = client.get(&plan_path(&plan)).await?;
+            let names = fence_names(&before["status"]["source_fence_pending"]);
+            let r = client
+                .post(
+                    &format!("{}/actions/clear-fence", plan_path(&plan)),
+                    &json!({}),
+                )
+                .await?;
+            if json_out {
+                return Ok(print_json(out, &r)?);
+            }
+            if names.is_empty() {
+                writeln!(out, "nothing was pending for plan {plan}")?;
+            } else {
+                writeln!(
+                    out,
+                    "cleared the fence list of plan {plan}: {} (nothing was done on the source cluster)",
+                    names.join(", ")
+                )?;
             }
         }
     }
@@ -1547,14 +1625,25 @@ mod tests {
             "2026-11-01T00:00:00Z",
         ];
         exec(&client, &args, false).await.0.unwrap();
-        let args = ["test", "web", "--allow-routed-test-networks"];
+        let args = [
+            "test",
+            "web",
+            "--allow-routed-test-networks",
+            "--skip-vm",
+            "db1",
+            "--skip-vm",
+            "web2",
+        ];
         exec(&client, &args, false).await.0.unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen[4].body,
             json!({ "mode": "disaster", "confirm": "web", "allow_missing": true, "point_in_time": 1_793_491_200u64 })
         );
-        assert_eq!(seen[5].body, json!({ "allow_routed_test_networks": true }));
+        assert_eq!(
+            seen[5].body,
+            json!({ "allow_routed_test_networks": true, "skip_vms": ["db1", "web2"] })
+        );
         assert_eq!(
             seen[0].body,
             json!({ "mode": "disaster", "confirm": "web" })
@@ -1564,6 +1653,16 @@ mod tests {
             seen[3].line,
             "POST /api/v1/dr-plans/web/actions/cancel HTTP/1.1"
         );
+    }
+
+    /// 두 벌 막기 목록은 새 모양(`{vm, source_id}`)과 옛 서버의 이름 목록을 함께 읽는다.
+    #[test]
+    fn fence_lists_read_both_shapes() {
+        assert_eq!(
+            fence_names(&json!([{ "vm": "db1", "source_id": "x" }, "web1"])),
+            ["db1", "web1"]
+        );
+        assert!(fence_names(&Value::Null).is_empty());
     }
 
     /// `dr run --watch`는 바뀔 때만 다시 찍고(빈 줄로 나눔) 끝나면 멈춘다. 닿지 않는 오류는 알리고 다시 읽는다.
