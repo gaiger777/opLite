@@ -6,7 +6,8 @@ import type { MapSelection } from "@/dashboard/selection";
 import type { NodeTopologyInfo } from "@/numa/numa";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { expectNoAxeViolations } from "@/test/axe";
-import { NODE, vm, volume } from "@/test/fixtures";
+import type { Task } from "@/api/types";
+import { NODE, task, vm, volume } from "@/test/fixtures";
 import { PHYSICAL_KEY } from "@/physical/api";
 import { CAPACITY, LAN, PHYSICAL } from "@/test/physical";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
@@ -69,9 +70,9 @@ const WEB = vm("web", "running", {
   spec: { ...vm("web", "running").spec, nics: [{ network: "lan", model: "virtio" }] },
 });
 
-function dashboard({ rules = [] as unknown[] } = {}) {
+function dashboard({ rules = [] as unknown[], tasks = [] as Task[] } = {}) {
   const volumes = [volume("db-root", "fast")];
-  mockLists({ node: [LINKED, NODE_B], vm: [DB, WEB] });
+  mockLists({ node: [LINKED, NODE_B], vm: [DB, WEB], task: tasks });
   server.use(
     // VM 판은 디스크의 볼륨만 하나씩 묻는다(목록 전체를 지켜보지 않음).
     http.get(apiUrl("/volumes/:key"), ({ params }) => {
@@ -648,4 +649,42 @@ it("folds the allocation table and the other widgets under 'more widgets' at fir
     "true",
   );
   expect(localStorage.getItem(`opl.${ADMIN.user}.home.more`)).toBe("1");
+});
+
+it("keeps recent tasks unfolded and counts failed tasks of the last 24 hours in the health strip (plan 77-6)", async () => {
+  localStorage.removeItem(`opl.${ADMIN.user}.home.more`);
+  const failed = (id: string, finished_at: number): Task => ({
+    ...task(id, "vm-migrate", WEB.id),
+    status: { state: "failed", error: "boom", finished_at },
+  });
+  dashboard({
+    tasks: [
+      failed("019a0f3c-8a10-7000-8000-000000000001", Date.now() - 60_000),
+      // 어제보다 오래된 실패는 세지 않는다.
+      failed("019a0f3c-8a10-7000-8000-000000000002", Date.now() - 2 * 24 * 60 * 60 * 1000),
+    ],
+  });
+  const { container } = renderPage(<DashboardPage />);
+  const health = await screen.findByRole("region", { name: "Cluster health" });
+  const stat = await within(health).findByRole("group", { name: "Failed tasks (24 h)" });
+  expect(stat).toHaveTextContent(/^Failed tasks \(24 h\)1/);
+  expect(within(stat).getByRole("link", { name: "View failed tasks" })).toHaveAttribute(
+    "href",
+    "/tasks?failed=1",
+  );
+  // "위젯 더 보기"가 접혀 있어도 최근 작업은 보이고, 접힌 것의 이름에서 빠진다.
+  await screen.findByRole("button", { name: "Show more widgets" });
+  expect(screen.getByRole("region", { name: "Recent tasks" })).toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "More widgets" })).not.toHaveTextContent(
+    "Recent tasks",
+  );
+  await expectNoAxeViolations(container);
+});
+
+it("hides the failed-tasks cell when no task failed in the last 24 hours (plan 77-6)", async () => {
+  dashboard();
+  renderPage(<DashboardPage />);
+  const health = await screen.findByRole("region", { name: "Cluster health" });
+  await within(health).findByRole("group", { name: "Leader" });
+  expect(within(health).queryByRole("group", { name: "Failed tasks (24 h)" })).toBeNull();
 });

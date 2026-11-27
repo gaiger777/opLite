@@ -2458,6 +2458,8 @@
     "alerts": "Alerts firing",
     "ringing": "View alerts",
     "failedCount": "{{count}} failed",
+    "failedTasks": "Failed tasks (24 h)",
+    "viewFailedTasks": "View failed tasks",
     "clusterHidden": "Nodes, capacity and cluster charts need permission to read the cluster.",
     "boardAfterUpgrade": "Upgrade every node to see the operator dashboard (map, details and allocation by node).",
     "more": {

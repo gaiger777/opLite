@@ -2,7 +2,7 @@ import { hashKey, useQueryClient } from "@tanstack/react-query";
 import { ListChecks } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link } from "react-router";
+import { Link, useSearchParams } from "react-router";
 
 import { listKey, useList } from "@/api/live";
 import type { Task } from "@/api/types";
@@ -246,7 +246,9 @@ export function newestFirst(tasks: Task[]): Task[] {
 export function TasksPage() {
   const { t } = useTranslation();
   const tasks = useList("task");
-  const [failedOnly, setFailedOnly] = useState(false);
+  // 거르기는 주소(`?failed=1`)에 둔다 — 홈 건강 띠의 "실패한 작업" 칸이 이리로 온다.
+  const [params, setParams] = useSearchParams();
+  const failedOnly = params.get("failed") === "1";
   const shown = useMemo(
     () =>
       newestFirst(tasks.data ?? []).filter((task) => !failedOnly || task.status.state === "failed"),
@@ -265,10 +267,20 @@ export function TasksPage() {
             <Checkbox
               id="failed-only"
               checked={failedOnly}
-              onCheckedChange={(v) => {
-                setFailedOnly(v === true);
-                pager.setPage(0);
-              }}
+              onCheckedChange={(v) =>
+                setParams(
+                  (prev) => {
+                    const next = new URLSearchParams(prev);
+                    if (v === true) {
+                      next.set("failed", "1");
+                    } else {
+                      next.delete("failed");
+                    }
+                    return next;
+                  },
+                  { replace: true },
+                )
+              }
             />
             <Label htmlFor="failed-only">{t("tasks.failedOnly")}</Label>
           </div>

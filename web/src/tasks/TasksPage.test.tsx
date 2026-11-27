@@ -23,7 +23,7 @@ it("lists tasks newest first and filters failures", async () => {
       },
     ],
   });
-  renderPage(<TasksPage />);
+  const rendered = renderPage(<TasksPage />);
   // 작업 이름은 그 Task의 상세 서랍을 연다(계획 77).
   const stop = await screen.findByRole("link", { name: "Stop web" });
   expect(stop).toHaveAttribute("href", "/?task=019a0f3c-9a10-7000-8000-000000000002");
@@ -36,9 +36,35 @@ it("lists tasks newest first and filters failures", async () => {
   expect(screen.getByRole("table", { name: "Task history" })).toBeInTheDocument();
   expect(rows[2]!.querySelector("time")).toHaveAttribute("datetime", "2025-10-23T04:03:37.104Z");
 
+  const { router } = rendered;
   await userEvent.click(screen.getByLabelText("Failed only"));
   expect(screen.getAllByRole("row")).toHaveLength(2);
   expect(screen.queryByText("Stop web")).not.toBeInTheDocument();
+  // 거르기는 주소에 남는다(홈의 "실패한 작업" 칸이 `/tasks?failed=1`로 온다).
+  expect(router.state.location.search).toBe("?failed=1");
+  await userEvent.click(screen.getByLabelText("Failed only"));
+  expect(router.state.location.search).toBe("");
+});
+
+it("opens with failures only from the address (plan 77-6)", async () => {
+  mockLists({
+    task: [
+      {
+        id: "019a0f3c-8a10-7000-8000-000000000001",
+        spec: { op: { kind: "vm-start" }, target: VM, node: "n1" },
+        status: { state: "failed", error: "no firmware" },
+      },
+      {
+        id: "019a0f3c-9a10-7000-8000-000000000002",
+        spec: { op: { kind: "vm-stop" }, target: VM, node: "n1" },
+        status: { state: "succeeded", error: null },
+      },
+    ],
+  });
+  renderPage(<TasksPage />, { path: "/tasks", url: "/tasks?failed=1" });
+  expect(await screen.findByLabelText("Failed only")).toBeChecked();
+  await screen.findAllByText(/Start 0+1/);
+  expect(screen.getAllByRole("row")).toHaveLength(2);
 });
 
 it("names deleted targets by the end of their id and says when no task failed", async () => {

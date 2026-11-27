@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
-import { lazy, Suspense, useId } from "react";
+import { lazy, Suspense, useEffect, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -21,6 +21,7 @@ import { PoolUsageWidget } from "@/dashboard/PoolUsageWidget";
 import { TopVmsWidget } from "@/dashboard/TopVmsWidget";
 import { WidgetCard } from "@/dashboard/WidgetCard";
 import { errorMessage } from "@/i18n/errors";
+import { uuidTime } from "@/lib/format";
 import { compareVersions } from "@/lib/version";
 import { isUpgrading, useCapacity } from "@/physical/api";
 import { SubscriptionBanner } from "@/settings/SubscriptionBanner";
@@ -74,9 +75,34 @@ function Stat({
   );
 }
 
-/** 건강 띠(설계 §8.1): 노드 온라인, VM(실패), 울리는 경보, 리더. 혼합 버전 경고는 그 아래 줄이다. */
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 지난 24시간에 실패한 작업 수. 시각은 끝난 시각, 옛 노드가 끝내 없으면 만든 시각(UUIDv7). 홈을 오래 열어 두어도 맞게 1분마다
+ * 기준을 옮긴다.
+ */
+function useFailedTasks(): number {
+  const tasks = useList("task");
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+  const since = now - DAY_MS;
+  return (tasks.data ?? []).filter(
+    (task) =>
+      task.status.state === "failed" &&
+      (task.status.finished_at ?? uuidTime(task.id).getTime()) >= since,
+  ).length;
+}
+
+/**
+ * 건강 띠(설계 §8.1): 노드 온라인, VM(실패), 울리는 경보, 실패한 작업(24시간, 있을 때만), 리더. 혼합 버전 경고는 그 아래
+ * 줄이다.
+ */
 function HealthStrip({ clusterRead }: { clusterRead: boolean }) {
   const { t } = useTranslation();
+  const failedTasks = useFailedTasks();
   const nodes = useList("node");
   const vms = useList("vm");
   const alerts = useAlerts();
@@ -104,7 +130,7 @@ function HealthStrip({ clusterRead }: { clusterRead: boolean }) {
   }
   return (
     <section aria-label={t("dashboard.health")} className="flex flex-col gap-(--gap)">
-      <div className="grid grid-cols-2 gap-(--gap) lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-(--gap) lg:grid-flow-col lg:grid-cols-none lg:auto-cols-fr">
         {/* 노드와 리더는 클러스터 읽기(루트 `cluster.read`)가 있어야 보인다(폴더 사용자는 VM과 경보만). */}
         {clusterRead && (
           <Stat
@@ -152,6 +178,17 @@ function HealthStrip({ clusterRead }: { clusterRead: boolean }) {
             </Link>
           }
         />
+        {failedTasks > 0 && (
+          <Stat
+            title={t("dashboard.failedTasks")}
+            value={<span className="text-danger-fg">{failedTasks}</span>}
+            detail={
+              <Link to="/tasks?failed=1" className="underline-offset-4 hover:underline">
+                {t("dashboard.viewFailedTasks")}
+              </Link>
+            }
+          />
+        )}
         {clusterRead && (
           <Stat title={t("dashboard.leader")} value={leader} detail={cluster.data?.name} />
         )}
@@ -213,12 +250,14 @@ export function DashboardPage() {
   );
   // 울리는 경보가 있으면 경보 위젯을 접지 않고 지도 위에 둔다(홈 한 화면의 "주의할 것", 77-6).
   const ringing = (alerts.data?.alerts.filter(isRinging).length ?? 0) > 0;
+  // 지난 24시간에 실패한 작업이 있으면 최근 작업 위젯도 접지 않는다(방금 실패한 마이그레이션·백업이 첫 화면에 보이게).
+  const failedTasks = useFailedTasks() > 0;
   const more = {
     names: [
       ...(ringing ? [] : [t("alerts.active")]),
       t("metrics.topVms"),
       t("metrics.clusterLoad"),
-      t("dashboard.recentTasks"),
+      ...(failedTasks ? [] : [t("dashboard.recentTasks")]),
       t("favorites.title"),
     ],
     content: (
@@ -229,7 +268,7 @@ export function DashboardPage() {
         </div>
         <ClusterChartsWidget />
         <div className={grid2}>
-          <RecentTasksWidget />
+          {!failedTasks && <RecentTasksWidget />}
           <FavoritesWidget />
         </div>
       </>
@@ -286,7 +325,17 @@ export function DashboardPage() {
             loading
           ) : operator ? (
             <>
-              {ringing && <ActiveAlertsWidget />}
+              {ringing && failedTasks ? (
+                <div className={grid2}>
+                  <ActiveAlertsWidget />
+                  <RecentTasksWidget />
+                </div>
+              ) : (
+                <>
+                  {ringing && <ActiveAlertsWidget />}
+                  {failedTasks && <RecentTasksWidget />}
+                </>
+              )}
               {board}
             </>
           ) : clusterRead ? (

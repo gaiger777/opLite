@@ -78,9 +78,7 @@ export function VmListPage() {
     const statics = (vm.spec.cloud_init?.networks ?? []).flatMap((net) =>
       [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
     );
-    return [
-      ...new Set([...statics, ...guestIps(vm)].map((a) => a.split("/")[0] ?? a)),
-    ];
+    return [...new Set([...statics, ...guestIps(vm)].map((a) => a.split("/")[0] ?? a))];
   };
 
   const nodeName = useMemo(() => {
