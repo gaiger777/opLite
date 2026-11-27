@@ -1,4 +1,3 @@
-import { Network as NetworkIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate } from "react-router";
@@ -124,7 +123,12 @@ export function TopologyPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader id="topology-title" title={t("nav.topology")} description={t("topology.hint")} />
+      <PageHeader
+        id="topology-title"
+        title={t("nav.topology")}
+        help="topology"
+        intro={t("help.topology.intro")}
+      />
       <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
         <ToggleGroup
           type="single"
@@ -142,22 +146,25 @@ export function TopologyPage() {
           <ToggleGroupItem value="list">{t("topology.list")}</ToggleGroupItem>
         </ToggleGroup>
         {tree.folders.length > 0 && (
-          <Field id="topology-folder" label={t("topology.folder")}>
-            <NativeSelect
-              id="topology-folder"
-              value={folder}
-              onChange={(e) => setFolder(e.target.value)}
-            >
-              <NativeSelectOption value="">{t("topology.allFolders")}</NativeSelectOption>
-              {tree.folders
-                .map((f) => ({ id: f.id, path: folderPath(tree, f.id) }))
-                .sort((a, b) => a.path.localeCompare(b.path))
-                .map((f) => (
-                  <NativeSelectOption key={f.id} value={f.id}>
-                    {f.path}
-                  </NativeSelectOption>
-                ))}
-            </NativeSelect>
+          <Field id="topology-folder" label={t("topology.folder")} help={t("help.topology.folder")}>
+            {(a11y) => (
+              <NativeSelect
+                id="topology-folder"
+                value={folder}
+                onChange={(e) => setFolder(e.target.value)}
+                {...a11y}
+              >
+                <NativeSelectOption value="">{t("topology.allFolders")}</NativeSelectOption>
+                {tree.folders
+                  .map((f) => ({ id: f.id, path: folderPath(tree, f.id) }))
+                  .sort((a, b) => a.path.localeCompare(b.path))
+                  .map((f) => (
+                    <NativeSelectOption key={f.id} value={f.id}>
+                      {f.path}
+                    </NativeSelectOption>
+                  ))}
+              </NativeSelect>
+            )}
           </Field>
         )}
         <div className="flex items-center gap-2">
@@ -186,7 +193,8 @@ export function TopologyPage() {
         <ListPending error={topology.error} />
       ) : graph.networks.length === 0 ? (
         <EmptyState
-          icon={NetworkIcon}
+          diagram="sdn"
+          help="topology.page"
           title={t("topology.empty.title")}
           description={t("topology.empty.description")}
           action={

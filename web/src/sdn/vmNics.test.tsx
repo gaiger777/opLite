@@ -63,7 +63,7 @@ it("gives an SDN interface addresses and keeps its security groups", async () =>
   expect(ips).toHaveAttribute("placeholder", "Automatic");
   await user.type(ips, "10.10.0.5, 10.10.0.6");
   // cloud-init의 그 NIC 주소는 IPAM이 정한다.
-  await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
+  await user.click(screen.getByLabelText("Set up the guest on first boot (cloud-init)"));
   expect(
     screen.getByText("NIC 1 is on an SDN network: its addresses come from the subnet (IPAM)."),
   ).toBeVisible();
@@ -357,8 +357,8 @@ it("shows the floating IP of an SDN interface on the VM page", async () => {
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
   await userEvent.click(await screen.findByRole("tab", { name: "Hardware" }));
   const table = screen.getByRole("table", { name: "Network interfaces" });
-  expect(await within(table).findByRole("columnheader", { name: "Floating IP" })).toBeVisible();
-  const link = await within(table).findByRole("link", { name: "Floating IP 203.0.113.120" });
+  expect(await within(table).findByRole("columnheader", { name: "Public IP" })).toBeVisible();
+  const link = await within(table).findByRole("link", { name: "Public IP 203.0.113.120" });
   expect(link).toHaveAttribute("href", "/floating-ips");
   expect(within(table).getByText("10.10.0.3").closest("tr")).toHaveTextContent(/—$/);
 });

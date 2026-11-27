@@ -71,7 +71,9 @@ function lists(fips: unknown[], visible = true) {
 it("shows the empty state", async () => {
   mockLists({ node: [N1] });
   const { container } = renderPage(<FloatingIpsPage />);
-  expect(await screen.findByText("No floating IPs")).toBeVisible();
+  expect(await screen.findByText("No public IPs")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Create a public IP" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
   await expectNoAxeViolations(container);
 });
 
@@ -172,8 +174,8 @@ it("creates a floating IP from an external network", async () => {
   );
   renderPage(<FloatingIpsPage />);
   const user = userEvent.setup();
-  await user.click(await screen.findByRole("button", { name: "Create a floating IP" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create a floating IP" });
+  await user.click(await screen.findByRole("button", { name: "Create a public IP" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a public IP" });
   expect(within(dialog).getByLabelText("External network")).toHaveValue("ext");
   await user.selectOptions(within(dialog).getByLabelText("Attach to (optional)"), [
     `${WEB.id}/52:54:00:00:00:01`,
@@ -183,7 +185,7 @@ it("creates a floating IP from an external network", async () => {
   expect(body).toEqual({
     spec: { network: "ext", target: { vm: WEB.id, mac: "52:54:00:00:00:01" } },
   });
-  expect(await screen.findByText("Created floating IP 203.0.113.101.")).toBeVisible();
+  expect(await screen.findByText("Created public IP 203.0.113.101.")).toBeVisible();
 });
 
 it("deletes a floating IP with If-Match", async () => {

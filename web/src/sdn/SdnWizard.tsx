@@ -213,6 +213,7 @@ function CentralsStep({ onCreated }: { onCreated(plan: Plan): void }) {
           label={t("sdn.wizard.address")}
           error={addressError}
           help={t("sdn.wizard.addressHint")}
+          info="sdn.address"
         >
           {(a11y) => (
             <Input

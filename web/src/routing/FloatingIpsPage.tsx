@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Globe, Link2, Plus, Trash2, Unlink } from "lucide-react";
+import { Link2, Plus, Trash2, Unlink } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -111,7 +111,8 @@ export function FloatingIpsPage() {
       <PageHeader
         id="fips-title"
         title={t("nav.floatingIps")}
-        description={t("fip.pageHint")}
+        help="fip"
+        intro={t("help.fip.intro")}
         actions={items.length > 0 && createButton}
       />
       {blocked && (
@@ -123,7 +124,8 @@ export function FloatingIpsPage() {
         <ListPending error={fips.error} />
       ) : items.length === 0 ? (
         <EmptyState
-          icon={Globe}
+          diagram="sdn"
+          help="fip.page"
           title={t("fip.empty.title")}
           description={t("fip.empty.description")}
           action={createButton}
@@ -319,6 +321,7 @@ function NicSelect({
         label={t(optional ? "fip.attachOptional" : "fip.nic")}
         error={error}
         help={t("fip.nicHint")}
+        info="fip.nic"
       >
         {(a11y) => (
           <NativeSelect
@@ -418,7 +421,12 @@ function CreateFipDialog({ onClose }: { onClose(): void }) {
       onSubmit={submit}
     >
       <FolderSelect id="fip-folder" state={folder} />
-      <Field id="fip-network" label={t("fip.network")} error={errors.network}>
+      <Field
+        id="fip-network"
+        label={t("fip.network")}
+        error={errors.network}
+        help={t("help.fip.network")}
+      >
         {(a11y) => (
           <NativeSelect
             id="fip-network"

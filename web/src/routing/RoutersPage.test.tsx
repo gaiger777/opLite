@@ -90,10 +90,11 @@ it("shows the empty state and blocks creating before SDN is set up", async () =>
   expect(await screen.findByText("No routers")).toBeVisible();
   expect(
     await screen.findByText(
-      "Routers and floating IPs need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+      "Routers and public IPs need SDN set up first, under Networking › SDN (virtual networks).",
     ),
   ).toBeVisible();
   expect(screen.getByRole("button", { name: "Create a router" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
   await expectNoAxeViolations(container);
 });
 
@@ -187,7 +188,7 @@ it("warns when no gateway node has the physnet and shows server errors", async (
   );
   await user.click(within(sheet).getByRole("button", { name: "Remove interface t1" }));
   expect(
-    await within(sheet).findByText(/A floating IP is in the way: floating IPs 203-0-113-120/),
+    await within(sheet).findByText(/A public IP is in the way: floating IPs 203-0-113-120/),
   ).toBeVisible();
 });
 
@@ -239,7 +240,7 @@ it("creates a router with an external network, SNAT off and interfaces", async (
   const dialog = await screen.findByRole("dialog", { name: "Create a router" });
   await user.type(within(dialog).getByLabelText("Name"), "r9");
   await user.selectOptions(within(dialog).getByLabelText("External network"), "ext");
-  await user.click(within(dialog).getByLabelText(/SNAT/));
+  await user.click(within(dialog).getByLabelText(/^Let private VMs reach the internet/));
   await user.click(within(dialog).getByRole("checkbox", { name: "t2" }));
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   await waitFor(() => expect(body).toBeDefined());

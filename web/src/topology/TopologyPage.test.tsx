@@ -188,3 +188,22 @@ it("leaves out VMs that are only on networks the user can't see and says so (rev
   const list = screen.getByRole("region", { name: "Network topology as a list" });
   expect(within(list).queryByRole("button", { name: "ghost" })).toBeNull();
 });
+
+it("explains an empty topology with a link to create a network and more help", async () => {
+  mockLists({});
+  topology({
+    networks: [],
+    routers: [],
+    load_balancers: [],
+    floating_ips: [],
+    vms: [],
+    hidden: { networks: 0, routers: 0, load_balancers: 0, floating_ips: 0, vms: 0 },
+  });
+  renderPage(<TopologyPage />, { path: "/networks/topology" });
+  expect(await screen.findByText("No networks")).toBeVisible();
+  expect(screen.getByRole("link", { name: "Create a network" })).toHaveAttribute(
+    "href",
+    "/networks?create=1",
+  );
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});

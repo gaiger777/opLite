@@ -253,9 +253,7 @@ it("creates a VXLAN network with a VNI and an optional MTU", async () => {
   // VXLAN에는 브리지와 VLAN이 없다.
   expect(within(dialog).queryByLabelText("Bridge")).not.toBeInTheDocument();
   expect(within(dialog).queryByLabelText("VLAN tag (optional)")).not.toBeInTheDocument();
-  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(
-    /Defaults to 1450/,
-  );
+  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(/1450/);
   await userEvent.type(within(dialog).getByLabelText("VNI"), "16777216");
   await userEvent.type(within(dialog).getByLabelText("MTU (optional)"), "1000");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
@@ -315,6 +313,16 @@ it("deletes an unused network and shows why a delete failed", async () => {
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
     'This network is still in use: network "lab" is used by VM "x"',
   );
+});
+
+it("explains an empty network list with a create button and more help", async () => {
+  mockLists({ network: [] });
+  renderPage(<NetworksPage />);
+  expect(await screen.findByText("No networks.")).toBeInTheDocument();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Learn more" }));
+  await userEvent.click(screen.getByRole("button", { name: "Create a network" }));
+  expect(await screen.findByRole("dialog", { name: "Create a network" })).toBeInTheDocument();
 });
 
 it("hides changes from operators", async () => {
@@ -497,9 +505,7 @@ it("creates an SDN network with subnets", async () => {
   await within(dialog).findByRole("option", { name: "SDN (OVN)" });
   await user.selectOptions(within(dialog).getByLabelText("Type"), "sdn");
   expect(within(dialog).queryByLabelText("VNI")).not.toBeInTheDocument();
-  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(
-    /Defaults to 1442/,
-  );
+  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(/1442/);
   await user.click(within(dialog).getByRole("button", { name: "Add a subnet" }));
   await user.click(within(dialog).getByRole("button", { name: "Add a subnet" }));
   const first = within(dialog).getByRole("group", { name: "Subnet 1" });
@@ -792,9 +798,7 @@ it("creates a provider network with a physnet, VLAN and floating IP ranges", asy
   await user.type(within(dialog).getByLabelText("Name"), "ext");
   await within(dialog).findByRole("option", { name: "External (provider)" });
   await user.selectOptions(within(dialog).getByLabelText("Type"), "provider");
-  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(
-    /Defaults to 1500/,
-  );
+  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(/1500/);
   await user.type(within(dialog).getByLabelText("Physical network"), "Ext");
   await user.type(within(dialog).getByLabelText("VLAN tag (optional)"), "100");
   await user.click(within(dialog).getByRole("button", { name: "Add a subnet" }));
@@ -803,10 +807,7 @@ it("creates a provider network with a physnet, VLAN and floating IP ranges", asy
   expect(within(subnet).getByLabelText("DHCP")).not.toBeChecked();
   await user.type(within(subnet).getByLabelText("CIDR"), "203.0.113.0/24");
   await user.type(within(subnet).getByLabelText("Gateway"), "203.0.113.1");
-  await user.type(
-    within(subnet).getByLabelText("Floating IP ranges"),
-    "203.0.113.100-203.0.113.199",
-  );
+  await user.type(within(subnet).getByLabelText("Public IP ranges"), "203.0.113.100-203.0.113.199");
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(
     within(dialog).getByText(

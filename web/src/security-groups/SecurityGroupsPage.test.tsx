@@ -73,7 +73,7 @@ it("creates a group and opens it to add rules", async () => {
   await userEvent.type(within(dialog).getByLabelText("Name"), "Web");
   await userEvent.type(within(dialog).getByLabelText("Description (optional)"), "x".repeat(201));
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-  expect(within(dialog).getByText(/lowercase letters/)).toBeVisible();
+  expect(within(dialog).getByText(/^Use 1–63 lowercase letters/)).toBeVisible();
   expect(within(dialog).getByText("Use at most 200 characters.")).toBeVisible();
   expect(body).toBeUndefined();
 
@@ -132,7 +132,18 @@ it("counts the simple and SDN interfaces that use a group", async () => {
   const table = await screen.findByRole("table", { name: "Security groups" });
   const row = (await within(table).findByRole("link", { name: "ssh" })).closest("tr")!;
   expect(await within(row).findByText("1 simple · 1 SDN")).toBeVisible();
+  // SDN 카드와의 차이(OVN ACL)는 화면 도움말 패널로 옮겼다.
+  expect(screen.getByRole("button", { name: "Help: About this page" })).toBeVisible();
+});
+
+it("explains an empty group list with a create button and more help", async () => {
+  mockLists({ "security-group": [] });
+  renderPage(<SecurityGroupsPage />);
+  expect(await screen.findByText("No security groups (firewall rule bundles).")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Create a security group" }));
   expect(
-    screen.getByText(/The same groups apply to SDN interfaces through OVN ACLs/),
-  ).toBeVisible();
+    await screen.findByRole("dialog", { name: "Create a security group" }),
+  ).toBeInTheDocument();
 });
