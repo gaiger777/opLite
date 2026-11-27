@@ -105,7 +105,7 @@ it("lists every group's items for admins", async () => {
   expect(names("Networking")).toEqual([
     "Networks",
     "Firewall (security groups)",
-    "Routers & public IPs",
+    "Routers & floating IPs",
     "Load balancers",
     "SDN (virtual networks)",
     "Topology diagram",
@@ -173,17 +173,17 @@ it("opens the group of a page in another group and marks its item", async () => 
   shell("/floating-ips");
   const nav = await screen.findByRole("navigation", { name: "Main" });
   const item = within(group(nav, "Networking")).getByRole("link", {
-    name: "Routers & public IPs",
+    name: "Routers & floating IPs",
   });
   expect(item).toHaveAttribute("aria-current", "page");
   expect(item).toHaveAttribute("href", "/routers");
-  // 화면 안 탭(라우터 | 공인 IP)
-  const tabs = screen.getByRole("navigation", { name: "Routers & public IPs pages" });
+  // 화면 안 탭(라우터 | 유동 IP)
+  const tabs = screen.getByRole("navigation", { name: "Routers & floating IPs pages" });
   expect(links(tabs)).toEqual([
     ["Routers", "/routers"],
-    ["Public IPs", "/floating-ips"],
+    ["Floating IPs", "/floating-ips"],
   ]);
-  expect(within(tabs).getByRole("link", { name: "Public IPs" })).toHaveAttribute(
+  expect(within(tabs).getByRole("link", { name: "Floating IPs" })).toHaveAttribute(
     "aria-current",
     "page",
   );
@@ -191,11 +191,11 @@ it("opens the group of a page in another group and marks its item", async () => 
   const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
   expect(within(crumbs).queryByRole("link", { name: "Networking" })).toBeNull();
   expect(within(crumbs).getByText("Networking")).toBeInTheDocument();
-  expect(within(crumbs).getByRole("link", { name: "Routers & public IPs" })).toHaveAttribute(
+  expect(within(crumbs).getByRole("link", { name: "Routers & floating IPs" })).toHaveAttribute(
     "href",
     "/routers",
   );
-  expect(within(crumbs).getByText("Public IPs")).toHaveAttribute("aria-current", "page");
+  expect(within(crumbs).getByText("Floating IPs")).toHaveAttribute("aria-current", "page");
   wide.mockRestore();
 });
 
@@ -415,7 +415,8 @@ it("switches density, language and theme from the account menu", async () => {
   await user.click(screen.getByRole("button", { name: "Account (admin)" }));
   await user.click(await screen.findByRole("menuitem", { name: "Language" }));
   fireEvent.click(await screen.findByRole("menuitemradio", { name: "한국어" }));
-  expect(i18n.language).toBe("ko");
+  // 다른 언어의 문구는 바꿀 때 받으므로 바뀌기까지 기다린다.
+  await vi.waitFor(() => expect(i18n.language).toBe("ko"));
   // 머리줄에는 언어·테마 단추가 따로 없다.
   expect(screen.queryByRole("button", { name: /^(언어|테마|Language|Theme)$/ })).toBeNull();
   document.documentElement.classList.remove("dark");
@@ -432,7 +433,7 @@ it("has a skip link to the content", async () => {
 it("has no accessibility violations in the shell, wide and as a rail", async () => {
   const wide = wideScreen();
   const first = shell("/routers");
-  await screen.findByRole("navigation", { name: "Routers & public IPs pages" });
+  await screen.findByRole("navigation", { name: "Routers & floating IPs pages" });
   await expectNoAxeViolations(first.container);
   first.unmount();
   wide.mockRestore();

@@ -46,7 +46,7 @@ export function Field({
       {info ? (
         <div className="flex items-center gap-1">
           <Label htmlFor={id}>{label}</Label>
-          <InfoButton topic={info} label={label} line={help} />
+          <InfoButton topic={info} label={label} line={help} className="-my-1" />
         </div>
       ) : (
         <Label htmlFor={id}>{label}</Label>

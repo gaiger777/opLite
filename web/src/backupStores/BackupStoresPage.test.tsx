@@ -271,7 +271,9 @@ it("opens the drawer with schedules, node reachability and the key card", async 
   const sheet = await screen.findByRole("dialog", { name: "Backup store s3-dr" });
   expect(sheet).toHaveTextContent("Owner clusterprod");
   expect(sheet).toHaveTextContent("Sun 06:00 UTC");
-  expect(sheet).toHaveTextContent("Verify again after 30 days, Full (read every piece)");
+  expect(sheet).toHaveTextContent(
+    "Verify again after 30 days, Full (read all of the backup's pieces)",
+  );
   const reach = within(sheet).getByRole("table", { name: "Reachable from nodes" });
   expect(reach).toHaveTextContent("node-a");
   expect(reach).toHaveTextContent("Unreachable");

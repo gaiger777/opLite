@@ -144,8 +144,8 @@
     "cloud_init_sdn_nic": "{{message}}",
     "invalid_router": "The router is not valid: {{message}}",
     "router_in_use": "The router still has interfaces. Remove them first.",
-    "fip_in_use": "A public IP is in the way: {{message}}",
-    "fip_not_routable": "That interface cannot take a public IP: {{message}}",
+    "fip_in_use": "A floating IP is in the way: {{message}}",
+    "fip_not_routable": "That interface cannot take a floating IP: {{message}}",
     "physnet_in_use": "VMs on this node use that physical network: {{message}}",
     "physnet_conflict": "Another network already uses that physical network and VLAN: {{message}}",
     "invalid_node_sdn": "The SDN settings are not valid: {{message}}",
@@ -243,7 +243,7 @@
     "noAccess": "You do not have permission to view this page.",
     "sdn": "SDN",
     "routers": "Routers",
-    "floatingIps": "Public IPs",
+    "floatingIps": "Floating IPs",
     "loadBalancers": "Load balancers",
     "topology": "Topology",
     "dr": "DR",
@@ -286,7 +286,7 @@
       "vmware": "VMware migration",
       "volumes": "Disks (volumes)",
       "securityGroups": "Firewall (security groups)",
-      "routing": "Routers & public IPs",
+      "routing": "Routers & floating IPs",
       "sdn": "SDN (virtual networks)",
       "topology": "Topology diagram",
       "cluster": "Cluster (members, certificates)",
@@ -316,7 +316,7 @@
     "badgeAlerts": "{{n}} alerts ringing",
     "badgeFailedTasks": "{{n}} tasks failed in the last 24 hours",
     "groupMenu": "{{group}} menu",
-    "floatingIpsKeywords": "public ip, floating ip, fip, elastic ip, external address"
+    "floatingIpsKeywords": "floating ip, public ip, external ip, external address, fip, elastic ip"
   },
   "header": {
     "language": "Language",
@@ -1027,7 +1027,7 @@
   "backups": {
     "vm": "VM",
     "pool": "Backup pool",
-    "job": "Backup schedule",
+    "job": "Schedule",
     "jobDeleted": "Deleted schedule",
     "created": "Created",
     "size": "Size",
@@ -1035,7 +1035,7 @@
     "kind": {
       "full": "Full",
       "incremental": "Incremental",
-      "store": "Store"
+      "store": "Dedup"
     },
     "parent": "Parent:",
     "fullReason": "Why full: {{reason}}",
@@ -1131,8 +1131,8 @@
       "at": "Verified {{at}}",
       "neverHint": "Not verified yet"
     },
-    "newData": "Added this time {{size}}",
-    "logical": "(VM disk {{size}})",
+    "newData": "New {{size}}",
+    "logical": "disk {{size}}",
     "base": "Base:",
     "fullRead": "Read in full: {{reason}}",
     "verifyNamed": "Verify {{name}} now",
@@ -1154,10 +1154,11 @@
     "securityGroupMap": "Security groups",
     "securityGroupMapHint": "These security groups of the backed-up VM are not on this cluster. Choose one of this cluster for each.",
     "securityGroupFor": "Security group for {{name}}",
-    "chooseSecurityGroup": "Choose a security group"
+    "chooseSecurityGroup": "Choose a security group",
+    "newDataTitle": "What this backup newly wrote to the store (pieces no other backup shares) and the VM disk size"
   },
   "backupJobs": {
-    "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
+    "pageHint": "Back up the chosen VMs at a set time and delete this schedule's backups the retention rules do not keep. Times are in UTC. The cluster leader runs the schedules, at most 2 backups per node at a time.",
     "empty": "No backup schedules.",
     "vms": "VMs",
     "schedule": "Schedule (UTC)",
@@ -1202,11 +1203,11 @@
     "targets": {
       "all": "All VMs",
       "names": "VMs by name",
-      "labels": "VMs with tags"
+      "labels": "VMs with labels"
     },
     "names": "VM names",
     "namesHint": "Separate names with commas.",
-    "labels": "Tags",
+    "labels": "Labels",
     "labelsHint": "KEY=VALUE pairs separated by commas (such as tier=prod). Only VMs with all of them are backed up.",
     "at": "Time (UTC)",
     "atHint": "HH:MM in UTC, such as 03:00. Pick a quiet time.",
@@ -1238,7 +1239,7 @@
     "errors": {
       "exists": "A backup schedule with this name already exists.",
       "names": "Enter at least one VM name.",
-      "labels": "Enter at least one KEY=VALUE tag.",
+      "labels": "Enter at least one KEY=VALUE label.",
       "at": "Enter a time from 00:00 to 23:59.",
       "keep": "Enter whole numbers of 0 or more.",
       "fullEvery": "Enter a whole number of 0 or more.",
@@ -1561,7 +1562,7 @@
       "bridge": "Plugs VMs straight into a bridge the node already has (such as vmbr0). Simplest; VMs only start on nodes with that bridge.",
       "vxlan": "Joins all nodes with a tunnel so they share one network: a VM sees the same network on any node. Orbivisor creates the bridge on each node.",
       "sdn": "A virtual switch spanning the nodes, with address ranges (subnets) and automatic addresses (DHCP). Attach it to a router to reach the outside.",
-      "provider": "An SDN network on the nodes' real physical network (untagged or a VLAN). Router outsides and public IPs (external addresses) come from it. Administrators only."
+      "provider": "An SDN network on the nodes' real physical network (untagged or a VLAN). Router outsides and floating IPs (external addresses) come from it. Administrators only."
     },
     "bridge": "Bridge",
     "vlanVni": "VLAN/VNI",
@@ -1721,12 +1722,12 @@
         "node_offline": "The node is offline."
       }
     },
-    "labels": "Tags",
-    "labelsMenu": "Edit tags",
-    "labelsTitle": "Tags of {{name}}",
-    "labelsDescription": "Placement rules choose nodes by these tags, such as zone=rack-a. The zone tag follows [node] zone in the node's configuration file.",
-    "labelsHint": "name=value pairs separated by commas (for example zone=rack-a, ssd=yes). Leave empty to remove all tags.",
-    "labelsSaved": "Tags of {{name}} saved.",
+    "labels": "Labels",
+    "labelsMenu": "Edit labels",
+    "labelsTitle": "Labels of {{name}}",
+    "labelsDescription": "Placement rules choose nodes by these labels, such as zone=rack-a. The zone label follows [node] zone in the node's configuration file.",
+    "labelsHint": "name=value pairs separated by commas (for example zone=rack-a, ssd=yes). Leave empty to remove all labels.",
+    "labelsSaved": "Labels of {{name}} saved.",
     "errors": {
       "labels": "Use KEY=VALUE pairs separated by commas.",
       "labelsChanged": "The labels of this node changed elsewhere. Close this dialog and open it again."
@@ -1748,7 +1749,7 @@
       "menu": "Force-isolate failed node…",
       "title": "Force-isolate {{name}} when it fails (power off)",
       "description": "When the node stops sending its heartbeat, the leader powers it off with these methods in order and starts its HA VMs on other nodes right away. If every method fails, it waits until the node stops itself (watchdog).",
-      "none": "No methods. When the node dies, the leader waits until it stops itself (watchdog, about a minute) before recovering.",
+      "none": "No methods. When the node dies, the leader waits until it stops itself (watchdog, about 22 seconds by default — about 62 with the safe profile) before recovering.",
       "add": "Add a method",
       "note": "The leader powers nodes off, and neighbour nodes (regular checks), the testing node and the leader read the power, so every node must reach the BMC. IPMI needs ipmitool on every node. Commands get ORBIVISOR_NODE_NAME, ORBIVISOR_NODE_ID and ORBIVISOR_NODE_ADDRESS.",
       "remove": "Remove force-isolation",
@@ -2744,7 +2745,7 @@
     "deleted": "Placement rule {{name}} deleted.",
     "createTitle": "Create placement rule",
     "editTitle": "Edit {{name}}",
-    "dialogDescription": "Conflicting 'hard' rules are refused. Nodes can also be picked by node tag (such as zone=rack-a).",
+    "dialogDescription": "Conflicting 'hard' rules are refused. Nodes can also be picked by node label (such as zone=rack-a).",
     "saved": "Placement rule {{name}} saved.",
     "created": "Placement rule {{name}} created.",
     "kinds": {
@@ -2769,14 +2770,14 @@
     },
     "vmBy": "Choose VMs",
     "byNames": "By name",
-    "byLabel": "By tag",
+    "byLabel": "By label",
     "vmNames": "VM names",
     "vmNamesHint": "Separate names with commas. VMs you create later may be named here.",
-    "vmTag": "VM tag",
-    "vmTagHint": "KEY=VALUE (such as app=web). Applies to every VM with this tag.",
+    "vmTag": "VM label",
+    "vmTagHint": "KEY=VALUE (such as app=web). Applies to every VM with this label.",
     "nodeBy": "Choose nodes",
-    "nodeTag": "Node tag",
-    "nodeTagHint": "KEY=VALUE (such as disk=ssd). Node tags are set on the Nodes page.",
+    "nodeTag": "Node label",
+    "nodeTagHint": "KEY=VALUE (such as disk=ssd). Node labels are set on the Nodes page.",
     "weightHint": "1 to 100, 50 if empty. When 'if possible' rules clash, the larger number wins.",
     "haMayViolate": "HA recovery may break this rule",
     "haMayViolateHint": "If HA can recover a VM only by breaking the rule, it starts the VM anyway and shows the broken rule. Otherwise the VM stays off.",
@@ -3131,7 +3132,7 @@
     "addTitle": "Add a catalog entry",
     "addDescription": "An image entry for this cluster only. Use the same id for each architecture; built-in ids cannot be used.",
     "id": "id",
-    "idHint": "Lowercase letters, digits, ., _ and -, up to 63 (e.g. myos-1.0).",
+    "idHint": "Lowercase letters, digits, . and -, up to 57; start and end with a letter or digit (e.g. myos-1.0).",
     "title": "Title",
     "os": "Distribution",
     "version": "Version",
@@ -3602,7 +3603,7 @@
     "volumes": "Volumes in it: {{count}}",
     "backups": "Backups in it: {{count}}",
     "routersUsing": "Routers using it: {{count}}",
-    "fipsUsing": "Public IPs on this network: {{count}}"
+    "fipsUsing": "Floating IPs on this network: {{count}}"
   },
   "center": {
     "title": "Tasks and alerts",
@@ -3677,7 +3678,7 @@
     "memberKind": {
       "network": "Network",
       "router": "Router",
-      "floating-ip": "Public IP",
+      "floating-ip": "Floating IP",
       "load-balancer": "Load balancer"
     },
     "emptyFolder": "Nothing in this folder.",
@@ -3725,7 +3726,7 @@
       "vms": "VMs",
       "dedicated_vcpus": "Dedicated vCPUs",
       "routers": "Routers",
-      "floating_ips": "Public IPs",
+      "floating_ips": "Floating IPs",
       "networks": "Networks",
       "load_balancers": "Load balancers",
       "backup_bytes": "Backups"
@@ -3736,7 +3737,7 @@
     "boundBy": "Limited by {{path}}",
     "badCount": "Enter a whole number of 0 or more.",
     "hiddenLimits": "Folders above this one that you cannot see may also have quotas. If one of them blocks a change, the error says so.",
-    "networkQuotaDescription": "Limits for this folder and everything below it. Public IPs (external addresses) are usually scarce, so a limit is recommended.",
+    "networkQuotaDescription": "Limits for this folder and everything below it. Floating IPs (external addresses) are usually scarce, so a limit is recommended.",
     "backupGib": "Backups (GiB)"
   },
   "permissions": {
@@ -3763,8 +3764,8 @@
     "choose": "Choose…",
     "typedHint": "Enter a user or group id. Pick one from the list below or get it from an administrator.",
     "badPrincipal": "Enter a user or group id.",
-    "propagate": "Also apply to subfolders and what they contain",
-    "propagateShort": "Subfolders",
+    "propagate": "Apply inside the folder and its subfolders",
+    "propagateShort": "Inside",
     "remove": "Remove",
     "removeNamed": "Remove the permission of {{name}}",
     "removeTitle": "Remove the permission of {{name}}?",
@@ -4217,8 +4218,8 @@
       "fillNotice_other": "{{count}} interfaces on this network have no address; saving gives each one from the new subnet. Their ports are off until then.",
       "conflict": "Someone changed the subnets meanwhile (now: {{subnets}}). Your rows are kept; check them and save again.",
       "noneShort": "none",
-      "floating": "Public IP ranges",
-      "floatingHint": "Optional. Router outside addresses and public IPs (external addresses) come from here; without it they share the allocation ranges.",
+      "floating": "Floating IP ranges",
+      "floatingHint": "Optional. Router outside addresses and floating IPs (external addresses) come from here; without it they share the allocation ranges.",
       "floatingFromPools": "from the allocation ranges",
       "ipv6Mode": "IPv6 mode",
       "ipv6ModeHint": "How VMs get an IPv6 address. If unsure, SLAAC (needs a /64). Works only on networks attached to a router."
@@ -4230,7 +4231,7 @@
       "hiddenRouter": "A router you can't see",
       "detach": "Detach from the router",
       "detachTitle": "Detach {{name}} from its router?",
-      "detachDescription": "The router's port on this network goes away: guests lose the default route at their next DHCP renewal. Public IPs and load balancer VIPs that use this path must be removed first.",
+      "detachDescription": "The router's port on this network goes away: guests lose the default route at their next DHCP renewal. Floating IPs and load balancer VIPs that use this path must be removed first.",
       "detached": "Detached {{name}} from its router."
     },
     "ips": {
@@ -4254,9 +4255,9 @@
       "off": "Off: no address",
       "offHint": "Its port passes nothing until it gets an address: type one in Edit (the VM may keep running), or run orbivisorctl network ips NAME --fill.",
       "router": "Router {{name}}",
-      "fip": "Public IP {{name}}",
-      "fipTo": "Public IP {{name}} → {{vm}}",
-      "floating": "public IPs: {{used}} used of {{size}}, {{free}} free",
+      "fip": "Floating IP {{name}}",
+      "fipTo": "Floating IP {{name}} → {{vm}}",
+      "floating": "floating IPs: {{used}} used of {{size}}, {{free}} free",
       "lbVip": "Load balancer {{name}} (VIP)",
       "lbMonitor": "Load balancer {{name}} (health checks)"
     },
@@ -4489,7 +4490,7 @@
     }
   },
   "router": {
-    "sdnNotReady": "Routers and public IPs need SDN set up first, under Networking › SDN (virtual networks).",
+    "sdnNotReady": "Routers and floating IPs need SDN set up first, under Networking › SDN (virtual networks).",
     "empty": {
       "title": "No routers",
       "description": "Create a router to join SDN private networks or let private VMs reach the internet."
@@ -4509,7 +4510,7 @@
     "external": "External network",
     "externalHint": "The network the router uses to reach the outside (external network). None joins SDN private networks only.",
     "externalIps": "Outside addresses",
-    "externalChangeHint": "Keeping the same network keeps the outside addresses. Public IPs going through this router must be detached before you change or clear it.",
+    "externalChangeHint": "Keeping the same network keeps the outside addresses. Floating IPs going through this router must be detached before you change or clear it.",
     "editExternal": "Change",
     "noExternal": "None",
     "noExternalHint": "No external network: the router only connects its SDN networks.",
@@ -4544,7 +4545,7 @@
     "activeNow": "active",
     "standby": "standby",
     "noGateway": "No gateway node",
-    "gatewayError": "No gateway node has the physical network of {{network}} ready. The router's outside port stays off (no SNAT or public IPs) until one has: set it under Nodes › node › SDN physical networks.",
+    "gatewayError": "No gateway node has the physical network of {{network}} ready. The router's outside port stays off (no SNAT or floating IPs) until one has: set it under Nodes › node › SDN physical networks.",
     "liveError": "Could not read the active gateway from OVN: {{error}}",
     "hostingOutside": "Active now: {{node}}.",
     "upstreamHint": "These routes are not translated. The physical router needs them:",
@@ -4558,19 +4559,19 @@
     "preferredGateway": "Preferred gateway",
     "gatewayDown": "down — a standby takes over",
     "activeUnknown": "Unknown: OVN could not be read",
-    "gatewayErrorAsk": "No gateway node has the physical network of {{network}} ready, so the router's outside port stays off (no SNAT or public IPs). Ask an administrator to give a gateway node that physical network."
+    "gatewayErrorAsk": "No gateway node has the physical network of {{network}} ready, so the router's outside port stays off (no SNAT or floating IPs). Ask an administrator to give a gateway node that physical network."
   },
   "fip": {
     "empty": {
-      "title": "No public IPs",
-      "description": "Create a public IP from an external network and attach it to a VM interface that reaches the outside through a router."
+      "title": "No floating IPs",
+      "description": "Create a floating IP from an external network and attach it to a VM interface that reaches the outside through a router."
     },
-    "create": "Create a public IP",
-    "createTitle": "Create a public IP",
-    "createDescription": "Takes a free address from the external network's public IP ranges.",
-    "created": "Created public IP {{address}}.",
-    "deleted": "Deleted public IP {{name}}.",
-    "deleteTitle": "Delete public IP {{name}}?",
+    "create": "Create a floating IP",
+    "createTitle": "Create a floating IP",
+    "createDescription": "Takes a free address from the external network's floating IP ranges.",
+    "created": "Created floating IP {{address}}.",
+    "deleted": "Deleted floating IP {{name}}.",
+    "deleteTitle": "Delete floating IP {{name}}?",
     "deleteDescription": "The address goes back to the external network.",
     "deleteAttached": "It is attached to a VM: the way in from outside goes away and the address goes back to the external network.",
     "attach": "Attach",
@@ -4581,7 +4582,7 @@
     "detach": "Detach",
     "detachNamed": "Detach {{name}}",
     "detachTitle": "Detach {{name}}?",
-    "detachDescription": "The VM keeps its private address; connections through the public IP stop.",
+    "detachDescription": "The VM keeps its private address; connections through the floating IP stop.",
     "detached": "Detached {{name}}.",
     "address": "Address",
     "addressOptional": "Address (optional)",
@@ -4601,8 +4602,8 @@
     "nicLabel": "{{vm}} #{{n}} ({{network}})",
     "blockedNic": "{{nic}} — {{reason}}",
     "noRoutableNic": "No interface goes out to this external network yet: attach the VM's network to a router whose external network is this one.",
-    "column": "Public IP",
-    "onNic": "Public IP {{address}}",
+    "column": "Floating IP",
+    "onNic": "Floating IP {{address}}",
     "state": {
       "unattached": "not attached",
       "distributed": "distributed",
@@ -4707,7 +4708,7 @@
     "externalOn": "External VIP on {{network}} (the router's external network)",
     "externalNone": "External VIP (the router of this network has no external network)",
     "externalIpOptional": "External VIP address (optional)",
-    "externalIpHint": "The public IP (external address) to reach it from outside. Empty takes the next free public IP; it counts toward the folder's public IP quota.",
+    "externalIpHint": "The floating IP (external address) to reach it from outside. Empty takes the next free floating IP; it counts toward the folder's floating IP quota.",
     "affinityOptional": "Source affinity in seconds (optional)",
     "affinityHint": "Sends the same client to the same member for this many seconds (to keep login sessions, for example). Empty spreads every connection.",
     "addListener": "Add a listener",
@@ -4778,7 +4779,7 @@
       "stopped": "Stopped VM",
       "failed": "Failed",
       "lb": "Load balancer",
-      "fip": "Public IP",
+      "fip": "Floating IP",
       "warning": "Needs attention"
     },
     "empty": {
@@ -4800,7 +4801,7 @@
     },
     "migrating": "migrating to SDN: {{moved}} of {{total}}",
     "lbItem": "Load balancer {{name}} (VIP {{vip}})",
-    "fipItem": "Public IP {{address}}",
+    "fipItem": "Floating IP {{address}}",
     "healthy": "{{online}} of {{total}} members up",
     "gatewayOn": "active gateway {{node}}",
     "gatewayActive": "gateway active",
@@ -4819,7 +4820,7 @@
       "more_one": "{{count}} more VM on {{network}}",
       "more_other": "{{count}} more VMs on {{network}}",
       "lb": "Load balancer {{name}}, VIP {{vip}}, {{online}} of {{total}} members up",
-      "fip": "Public IP {{address}}, {{state}}, to {{vm}}",
+      "fip": "Floating IP {{address}}, {{state}}, to {{vm}}",
       "vip": "External VIP {{address}} of load balancer {{name}}"
     },
     "nicless_one": "{{count}} VM is only on networks you can't see and is not drawn.",
@@ -5145,7 +5146,7 @@
     "reverifyHint": "Backups verified longer ago than this are verified again.",
     "verifyMode": "Verify mode",
     "mode": {
-      "full": "Full (read every piece)",
+      "full": "Full (read all of the backup's pieces)",
       "metadata": "Metadata (check pieces exist)"
     },
     "verifyNew": "Verify each new backup right after it is made",
@@ -5405,9 +5406,9 @@
     "closeIntro": "Hide the introduction (the ⓘ next to the title shows it again)",
     "more": "Learn more",
     "pools": {
-      "intro": "Where VM disks (volumes) and backups are kept. A 'local' pool is separate on each node; a 'shared' pool is used by all nodes. VMs on shared pools move between nodes quickly and can be restarted by HA.",
+      "intro": "Where VM disks (volumes) and backups are kept. A 'local' pool is separate on each node; a 'shared' pool is used by all nodes. VMs on shared pools move between nodes quickly and HA can restart them anywhere (on local pools, only where a replica exists).",
       "empty": "To create VMs you need a pool for their disks. The simplest is a folder (directory) on each node.",
-      "name": "The name screens and VM settings use for this pool. Lowercase letters, digits and - only; it cannot be changed later.",
+      "name": "The name screens and VM settings use for this pool. Lowercase letters, digits and - only (not at the start or end); it cannot be changed later.",
       "vg": "An LVM volume group that already exists on the nodes (check with `vgs`).",
       "thinpool": "The LVM area that only takes the space VMs actually write. In `lvs`, its attributes start with 'twi'.",
       "sharedVg": "The shared volume group on a LUN every node sees (check with `vgs`).",
@@ -5420,7 +5421,7 @@
       "ttl": "Run the join command on the new node within this time. Default 1 hour — shorter is safer when you join right away."
     },
     "nodes": {
-      "intro": "The servers (nodes) in the cluster. Open a row for its metrics, CPU and VMs; use the ⋯ menu for maintenance (move VMs off), tags and removal. To add a node, issue a join token on the Cluster page.",
+      "intro": "The servers (nodes) in the cluster. Open a row for its metrics, CPU and VMs; use the ⋯ menu for maintenance (move VMs off), labels and removal. To add a node, issue a join token on the Cluster page.",
       "fence": {
         "address": "The address of the node's remote management card (BMC, iDRAC, iLO), such as 10.0.0.101 — the card's IP, not the node OS.",
         "port": "The IPMI port. Usually 623.",
@@ -5431,9 +5432,9 @@
       }
     },
     "networks": {
-      "intro": "Networks are what VM network cards plug into. A 'bridge' network on a node's existing bridge is the simplest; with several nodes, pick 'VXLAN' or 'SDN' so a VM sees the same network on any node.",
+      "intro": "Networks are what VM network cards plug into. A 'bridge' network on a node's existing bridge is the simplest (administrators only); with several nodes, pick 'VXLAN' or 'SDN' so a VM sees the same network on any node.",
       "empty": "VMs can already reach the outside through the user network (NAT). Create a network so VMs can talk to each other or to your LAN.",
-      "name": "The name you pick in a VM's network card settings. 1 to 63 lowercase letters, digits or -.",
+      "name": "The name you pick in a VM's network card settings. 1 to 63 lowercase letters, digits or - (not at the start or end).",
       "bridge": "A Linux bridge already set up on the nodes, such as vmbr0. VMs on this network only start on nodes that have it."
     },
     "backups": {
@@ -5445,17 +5446,17 @@
       "restorePool": "Where the new VM's disks go. A shared pool allows HA and fast migration.",
       "restoreNetwork": "The network of this cluster to use instead of the one the backed-up VM was on.",
       "restoreSecurityGroup": "The security group to use instead of one this cluster does not have. Its rules apply to the new VM.",
-      "convertStore": "The backup store to move this backup into. A store keeps each identical piece only once, saving space.",
+      "convertStore": "The backup store to copy this backup into. The original backup stays. A store keeps each identical piece only once, saving space.",
       "copyStore": "Another backup store to hold a copy, such as S3 in addition to a fast local store.",
       "replicateRemote": "Another Orbivisor cluster that receives the copy, so you can restore there if this site is lost.",
       "remotePool": "The backup pool on the remote cluster that holds the copy.",
       "remoteStore": "The backup store on the remote cluster that holds the copy. Only pieces it does not have are sent."
     },
     "backupJobs": {
-      "intro": "Backs up the chosen VMs automatically on the chosen days and time, and deletes backups older than the retention rules. Times are UTC.",
+      "intro": "Backs up the chosen VMs automatically on the chosen days and time, and deletes this schedule's backups that the retention rules (last n, daily, weekly, monthly) do not keep. Times are UTC; each node runs at most 2 backups at once.",
       "empty": "Create a backup schedule to back up VMs automatically at a set time, such as every night, and delete old ones.",
       "name": "The name of this schedule in lists, such as nightly-prod. It cannot be changed later.",
-      "target": "Which VMs this schedule backs up. Choosing by tag also picks up VMs that get the same tag later."
+      "target": "Which VMs this schedule backs up. Choosing by label also picks up VMs that get the same label later."
     },
     "settings": {
       "intro": "Settings that apply to the whole cluster at once: where updates come from, what happens on host shutdown and HA, the VM CPU baseline, usage reports and metrics export. Only administrators can change them.",
@@ -5472,29 +5473,29 @@
       "chassis": "A connector program that runs on each node where SDN VMs start. SDN VMs only start on nodes marked ready.",
       "moveNode": "The node that takes over the first setup. Pick one that is online and can install the SDN packages.",
       "centralNode": "A node that shares the job of storing and handing out the SDN settings. Add them one at a time to reach 1, 3 or 5.",
-      "cidr": "The address range of this network, such as 10.10.0.0/24 (10.10.0.1–254). It cannot change once saved.",
+      "cidr": "The address range of this network, such as 10.10.0.0/24 (gateway 10.10.0.1, VMs .2–.254). It cannot change once saved.",
       "gatewaySaved": "The gateway of a saved subnet cannot change. To change it, remove the subnet and add it again.",
       "subnetDescription": "Optional. A note on what this address range is for (up to 200 characters).",
-      "dhcp": "On: VMs get an address from this range automatically when they start. Off: set the address inside the VM yourself.",
+      "dhcp": "On: VMs get the address Orbivisor assigned automatically when they start. Off: the VM must still use that address (shown on the VM page) — traffic from other addresses is blocked (cloud-init sets it for you).",
       "physnetName": "The name SDN uses for this physical network, such as ext. You pick it when creating an external network.",
       "physnetBridge": "The Linux bridge on this node that reaches that physical network, such as vmbr1. It may differ per node.",
-      "gateway": "On: this node can host a router's outside door (gateway). Turn it on only on nodes that reach the outside network."
+      "gateway": "On: this node can host a router's external gateway. Turn it on only on nodes that reach the outside network."
     },
     "backupStores": {
       "intro": "A backup store keeps identical content only once. Backups are cut into pieces and each identical piece is stored once; cleanup removes pieces no backup uses to give the space back.",
-      "name": "The name screens and backup schedules use for this store. Lowercase letters, digits and - only.",
+      "name": "The name screens and backup schedules use for this store. Lowercase letters, digits and - only (not at the start or end).",
       "backend": "Where the pieces are actually kept: a backup pool (a folder or NFS on the nodes) or an S3-compatible bucket (AWS S3, MinIO and so on).",
       "region": "The region of the bucket, such as us-east-1. Without regions (like MinIO), us-east-1 usually works.",
       "bucket": "The S3 bucket that holds the pieces. Create it first.",
-      "accessKeyId": "The access key ID of an S3 user that can write to the bucket.",
-      "verifyMode": "Full re-reads every piece to find damage (slow). Metadata only checks the pieces exist (fast).",
+      "accessKeyId": "The access key ID of an S3 user that can read, write, list and delete objects in the bucket (without delete, cleanup fails and space keeps growing).",
+      "verifyMode": "Full re-reads every piece the checked backups use, to find damage (slow). Metadata only checks those pieces exist (fast).",
       "gcAt": "When the space cleanup starts (UTC, HH:MM). Pick a time with few backups running, such as 05:00.",
       "escrowPassphrase": "The passphrase that wraps the key (8+ characters). With the store and this passphrase you can open the backups even without this cluster.",
       "passphraseAgain": "Type the same passphrase again to catch typos."
     },
     "images": {
       "intro": "Cloud images of well-known Linux distributions. Download (⬇) puts one in a pool as a disk and can also make a template you can stamp VMs from right away.",
-      "empty": "There are no images to download. An administrator can add your own images as entries.",
+      "empty": "There are no images to download. An administrator can add in-house images to the list.",
       "pool": "The storage pool for the downloaded disk. For a template used on several nodes, a shared pool (NFS, Ceph) is best.",
       "volumeName": "The name of the downloaded disk (volume). Empty uses the suggested name shown in grey.",
       "makeTemplate": "When on, a stopped template VM is made from the disk after the download. VMs can be cloned from a template in seconds.",
@@ -5545,8 +5546,8 @@
       "cores": "Cores per socket. Sockets × cores is the VM's vCPU count.",
       "memory": "The VM's memory (MiB), taken from the source VM.",
       "firmware": "How the source VM booted. Changing it may stop the VM from booting; keep the source value.",
-      "diskBus": "How disks are attached. virtio-blk is the fast virtual device (recommended); SATA is the compatible device for Windows without drivers.",
-      "nicModel": "The network card type. virtio is the fast virtual device (recommended); e1000e is the compatible device for an OS without drivers.",
+      "diskBus": "How disks are attached. Keep the suggestion made for the source OS: virtio-blk is fast but the guest needs its driver (most Linux has it); SATA works without drivers (suggested for Windows). A Windows guest without the driver does not boot on virtio-blk.",
+      "nicModel": "The network card type. Keep the suggestion: virtio is fast but needs a guest driver (most Linux has it); e1000e works without drivers (suggested for Windows).",
       "network": "Choose which Orbivisor network the card on this source network joins.",
       "esxiHost": "The name or IP address of the ESXi host or vCenter.",
       "esxiPort": "The HTTPS port, usually 443.",
@@ -5560,7 +5561,7 @@
       "name": "The name of the disk. VM settings attach it by this name.",
       "pool": "The storage pool for the disk. On a shared pool the VM moves to other nodes quickly.",
       "size": "The disk size the VM sees. A qcow2 disk only takes what is written. It can only grow later.",
-      "format": "qcow2: takes only what is written, supports snapshots (recommended). raw: one plain file, a little faster.",
+      "format": "qcow2: takes only what is written, supports snapshots (recommended). raw: one plain file, a little faster, but no snapshots on directory and NFS pools.",
       "newSize": "Only a larger size works. Grow the partition inside the guest afterwards."
     },
     "ceph": {
@@ -5573,8 +5574,8 @@
       "size": "How many copies of the data are kept. 3 is recommended; copies are always on different nodes."
     },
     "routers": {
-      "intro": "A router joins SDN private networks to each other and, through an external network, lets private VMs reach the internet (SNAT). To let the outside reach a VM, attach a public IP (external address).",
-      "name": "The name of this router. 1 to 63 lowercase letters, digits or -.",
+      "intro": "A router joins SDN private networks to each other and, through an external network, lets private VMs reach the internet (SNAT). To let the outside reach a VM, attach a floating IP (external address).",
+      "name": "The name of this router. 1 to 63 lowercase letters, digits or - (not at the start or end).",
       "description": "Optional. A note on what this router joins (up to 200 characters).",
       "snat": "On: private VMs share the router's one outside address to reach the internet. Usually leave it on.",
       "addInterface": "An SDN network to attach to this router. Its VMs then go through the router to other networks and the outside.",
@@ -5583,12 +5584,12 @@
     },
     "remotes": {
       "intro": "Orbivisor clusters at other sites, and the backup schedules that send copies there. If this whole site is lost, you can restore on the remote cluster.",
-      "empty": "Register an Orbivisor cluster at another site to send backup copies there and, with a DR plan, start VMs there.",
+      "empty": "Register an Orbivisor cluster at another site to send backup copies there. If this cluster is the standby site, register the main site and use a DR plan to bring its VMs back up here.",
       "name": "The name this cluster uses for the remote cluster, such as dr-site. It cannot be changed later."
     },
     "fip": {
-      "intro": "A public IP (external address) ties one address of an external network to one private VM, so the outside can reach that VM directly (for example, to publish a web server).",
-      "network": "The external network to take the address from: a free one from its public IP ranges."
+      "intro": "A floating IP (external address) ties one address of an external network to one private VM, so the outside can reach that VM directly (for example, to publish a web server). A private-range address on the external network works too.",
+      "network": "The external network to take the address from: a free one from its floating IP ranges."
     },
     "alerts": {
       "intro": "When something goes wrong — CPU stays high, a node goes down — an alert fires and a notification goes where you chose (email, Slack and more). Rules decide what to watch; notification targets decide where to send.",
@@ -5597,13 +5598,13 @@
     },
     "alertRules": {
       "empty": "A rule watches a condition such as \"node CPU above 90% for 5 minutes\" and sends a notification.",
-      "name": "The name of this rule (for example node-cpu-high). Lowercase letters, digits and -; it cannot change later.",
-      "condition": "What to watch. Metrics (a value crosses a threshold) or events (something happens, such as a node going down or a task failing).",
+      "name": "The name of this rule (for example node-cpu-high). Lowercase letters, digits and - (not at the start or end); it cannot change later.",
+      "condition": "What to watch. States (a value over a threshold, or something that lasts, such as a node being down — can have a duration) or events (something that happens once, such as a task failing or an HA recovery — no duration).",
       "metric": "The value to watch.",
       "op": "Above or below the threshold.",
       "value": "The value that triggers the alert.",
       "percent": "Notify when the pool is this full. 80–90 is usual.",
-      "role": "Which ports to watch for a lost link. Default: uplink and node-to-node ports only.",
+      "role": "Which ports to watch for a lost link. Default: uplink, underlay and service ports with addresses, plus bridges an administrator took down.",
       "severity": "How serious the alert is. Critical: fix now; warning: will become a problem; info: good to know.",
       "sendResolved": "Also sends one notification when the problem clears."
     },
@@ -5611,7 +5612,7 @@
       "intro": "Where alert notifications go (email, Slack, Teams, a webhook and more). After creating one, press Test to check it arrives, then choose its name in an alert rule.",
       "empty": "Alerts reach email or chat only through a notification target. Create one place to receive them.",
       "kind": "How to send. Email (SMTP) or webhook (Slack, Teams, ntfy, Gotify or your own server).",
-      "name": "The name alert rules choose (for example ops-mail). Lowercase letters, digits and -; it cannot change later.",
+      "name": "The name alert rules choose (for example ops-mail). Lowercase letters, digits and - (not at the start or end); it cannot change later.",
       "host": "The SMTP server that sends the mail (for example smtp.example.com).",
       "port": "The SMTP port. Usually 587 for STARTTLS and 465 for TLS.",
       "tls": "How the connection to the server is encrypted. Follow your server's instructions — usually STARTTLS.",
@@ -5624,8 +5625,8 @@
     "securityGroups": {
       "intro": "Security groups are bundles of firewall rules. Put one on a VM network card and incoming traffic is accepted only when a rule allows it, while outgoing traffic is sent unless a rule drops it. Running VMs pick it up right away.",
       "empty": "To open only SSH (22) and web (443) on a VM and block the rest, create a rule bundle and put it on the VM's network card.",
-      "rulesEmpty": "Cards with this group now drop all incoming traffic and send all outgoing traffic. Add rules for what to let in.",
-      "name": "The name you pick in a VM's network card settings, such as web or ssh. 1 to 63 lowercase letters, digits or -.",
+      "rulesEmpty": "Cards with this group now drop all new incoming connections and send all outgoing traffic. Add rules for what to let in.",
+      "name": "The name you pick in a VM's network card settings, such as web or ssh. 1 to 63 lowercase letters, digits or - (not at the start or end).",
       "description": "Optional. A note on what this group opens (up to 200 characters)."
     },
     "fileRestore": {
@@ -5637,7 +5638,7 @@
       "cpu": "Virtual CPU layout (sockets × cores) and CPU model. The host model passes the node's CPU through — fastest, but hard to move live to a node with a different CPU.",
       "vcpus": "Number of virtual CPUs. If a maximum is shown, you can add vCPUs up to it while the VM runs.",
       "memory": "Memory given to the VM. If a maximum is shown, you can grow it up to that while the VM runs.",
-      "hotplug": "Free slots for adding disks or network devices without turning the VM off. If none, restart the VM once first.",
+      "hotplug": "Free slots for adding disks or network devices without turning the VM off. Only virtio disks can be added while it runs. If none, restart the VM once first.",
       "bootOrder": "Devices the VM tries in turn when it starts. After installing the OS, the disk should come first.",
       "cloudInit": "Settings put into the guest automatically on first boot — host name, user, SSH keys, addresses (cloud-init).",
       "template": "This VM is a template: it can't be started, you deploy new VMs from it. The number counts linked clones built on it.",
@@ -5646,23 +5647,17 @@
       "machine": "(Advanced) Virtual motherboard type: q35 on x86 nodes, virt on ARM nodes.",
       "restart": "Whether Orbivisor restarts the VM when it stops with an error.",
       "power": "Whether Orbivisor keeps this VM on or off. After a node reboots, it brings the VM back to this state.",
-      "pid": "(Advanced) ID of the QEMU process running this VM on its node. Only needed for troubleshooting.",
-      "created": "When this VM was created.",
       "lastError": "The last error while starting or running the VM. Fix the cause, then start it again.",
       "haPolicy": "Whether the VM is restarted automatically on another node if its node fails (HA). The line below is how many restarts and moves are allowed within 10 minutes.",
       "haGroup": "Set of nodes HA picks from when restarting this VM. Without one, any node is used.",
       "haPriority": "Order when many VMs recover at once (0–100, higher first).",
-      "guestWatch": "If the guest OS hangs and the guest agent doesn't answer for this long, the VM is force-restarted.",
+      "guestWatch": "For VMs with automatic recovery (HA) on: if the guest OS hangs and the guest agent doesn't answer for this long, the VM is force-restarted.",
       "pinned": "Automatic load balancing won't move this VM. HA recovery and node evacuation still do.",
       "ruleViolations": "Placement rules (keep together / keep apart) this VM doesn't meet right now — usually because resources forced it onto another node.",
       "haError": "Why HA couldn't restart or move this VM. It clears when you fix the cause and start the VM again.",
       "guest": {
         "settings": "Guest agent settings: whether file systems are frozen for snapshots and backups, and how the VM is shut down.",
-        "os": "Guest operating system, as reported by the guest agent.",
-        "hostname": "Host name inside the guest (reported by the agent).",
         "addresses": "Network addresses of the guest. Shown only when the guest agent runs.",
-        "kernel": "Kernel version of the guest.",
-        "agentVersion": "Version of qemu-guest-agent installed in the guest.",
         "user": "Account inside the guest whose password to change (e.g. root, Administrator).",
         "newPassword": "The guest agent changes it right away. Orbivisor does not store the password.",
         "passwordAgain": "Type the same password again to catch typos."
@@ -5674,7 +5669,7 @@
       }
     },
     "vmForm": {
-      "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or -. It can't be changed later.",
+      "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or - (not at the start or end). It can't be changed later.",
       "cores": "Number of virtual CPUs. Start with 2 and add more if the VM is slow.",
       "memory": "Memory for the VM in MiB (1024 = 1 GiB). 2048 is a good start for Linux servers, 4096 or more for Windows.",
       "firmware": "Firmware that boots the VM. UEFI (default, recommended) for modern OSes; BIOS for old OSes or BIOS-only images.",
@@ -5689,11 +5684,11 @@
       "pinnedFlags": "CPU features to add to or hide from the chosen model. Usually left empty."
     },
     "migrate": {
-      "node": "Node to move the VM to. It pauses very briefly (about a second) at the end. Disabled nodes can't run this VM's CPU.",
+      "node": "Node to move the VM to. It pauses very briefly at the end. Disabled nodes can't run this VM's CPU.",
       "pool": "Pool on the target node for the copied node-local disks. By default, the pool with the same name."
     },
     "clone": {
-      "name": "Name of the new VM: 1–63 lowercase letters, digits or -.",
+      "name": "Name of the new VM: 1–63 lowercase letters, digits or - (not at the start or end).",
       "source": "What to copy. The current state works only for a stopped VM; pick a snapshot to copy a running VM as of that point.",
       "pool": "Pool for the new disks. By default, the same pool as the source disks."
     },
@@ -5721,42 +5716,42 @@
       "bridgeNode": "Node that hosts the bridge joining both networks during the move. Traffic between the two sides passes through it."
     },
     "haGroups": {
-      "empty": "HA works without groups. Create one when you want to choose which nodes a VM may go to and in what order, such as 'databases only on these two nodes, node1 first'.",
+      "empty": "HA works without groups. Create one when you want to set the order of nodes a VM goes to, such as 'databases on node1 first, then node2'. To keep VMs on those nodes only, turn on the group's 'Restricted'.",
       "name": "The group name chosen in a VM's HA settings, such as db-nodes."
     },
     "lb": {
       "intro": "A load balancer spreads connections arriving at one address (VIP) over several VMs. Health checks take dead VMs out, so the service keeps running when one VM stops.",
-      "name": "The name of this load balancer. 1 to 63 lowercase letters, digits or -.",
+      "name": "The name of this load balancer. 1 to 63 lowercase letters, digits or - (not at the start or end).",
       "description": "Optional. A note on what it serves (up to 200 characters).",
       "listeners": "A listener = 'spread connections to this VIP port over these members', such as TCP 443 → 3 web VMs.",
       "protocol": "Usually TCP for web and databases, UDP for DNS or games.",
       "vipPort": "The VIP port clients connect to, such as 443.",
       "health": "On: members are probed regularly and get no traffic while they do not answer. Recommended.",
       "interval": "Seconds between checks. Default 5.",
-      "timeout": "No answer in this many seconds fails.",
+      "timeout": "A check fails if there is no answer within this many seconds.",
       "rise": "Back in after this many passes.",
       "fall": "Out after this many fails.",
-      "memberIp": "The member's IPv4 address (devices other than VMs work too).",
+      "memberIp": "The member's IPv4 address, on an SDN network attached to the router. Devices other than VMs work too, but members given by address are not health-checked.",
       "memberPort": "The port the member actually listens on.",
       "pickNic": "Adds a VM network card on this router's networks as a member. It follows the VM if its address changes."
     },
     "haChecks": {
-      "intro": "Every node checks its network and shared storage connections every 5 seconds. When a check fails on a node for longer than the wait time (10 seconds by default), that node's HA VMs are moved or started on another node.",
-      "empty": "Add HA checks to move VMs automatically off a node that lost its switch or storage connection. A node that dies completely is handled by HA without any checks.",
+      "intro": "Every node checks its network and shared storage connections every 5 seconds. When a check fails on a node for longer than the wait time (10 seconds by default), only the HA VMs that check affects get its action (warn, move, or start elsewhere; management checks only warn by default). When most nodes fail together, it is treated as a shared fault and only warns.",
+      "empty": "Add HA checks so that, on a node that lost its switch or storage connection, the HA VMs the check affects are moved or restarted elsewhere (management checks only warn by default). A node that dies completely is handled by HA without any checks.",
       "name": "The name of this check in lists, such as storage-nas or uplink-bond0.",
       "onFail": "What to do when the check fails for longer than the wait time. Empty uses the default for what it checks."
     },
     "topology": {
-      "intro": "See in one picture how networks, routers, public IPs (external addresses), VMs and load balancers connect. Click an item to open it.",
+      "intro": "See in one picture how networks, routers, floating IPs (external addresses), VMs and load balancers connect. Click an item to open it.",
       "folder": "Draws only this folder's networks. Narrow it down when the picture is large."
     },
     "users": {
-      "intro": "Local users who can sign in to this cluster. The global role sets what they can do across the cluster; extra rights per folder or VM are set on the Permissions page.",
+      "intro": "Users who can sign in to this cluster (local users, and directory users who have signed in at least once). The global role sets what they can do across the cluster; extra rights per folder or VM are set on the Permissions page.",
       "empty": "Create users so people other than the administrator can sign in as operators or viewers.",
       "name": "The name used to sign in (for example kim). It cannot change later."
     },
     "tokens": {
-      "intro": "Keys that scripts and tools such as Terraform or Prometheus use instead of a password. A token acts with its creator's role; deleting it stops whatever uses it at once.",
+      "intro": "Keys that scripts and tools such as Terraform or Prometheus use instead of a password. A token has all of its creator's rights (global role plus folder and VM permissions), narrowed to its scope if you set one. Deleting it stops whatever uses it at once.",
       "empty": "Create an API token so scripts and other tools can manage this cluster. It is shown only once, when created.",
       "name": "A name that says where the token is used (for example terraform, prometheus)."
     },
@@ -5778,13 +5773,13 @@
     },
     "placementRules": {
       "intro": "Rules for which nodes VMs run on. For example: the two web VMs on different nodes (so one survives a node failure), databases only on SSD nodes.",
-      "empty": "For example 'the two web VMs on different nodes' or 'databases only on SSD nodes'. Without rules, VMs go to the least loaded node.",
+      "empty": "For example 'the two web VMs on different nodes' or 'databases only on SSD nodes'. Without rules, VMs go where the placement policy puts them (by default 'balance' — the least loaded node).",
       "name": "The name of this rule in lists, such as web-spread or db-on-ssd.",
-      "vmBy": "Name the VMs the rule applies to, or pick them by tag. With a tag, VMs that get the same tag later follow too.",
-      "nodeBy": "Pick nodes one by one or by node tag (such as disk=ssd). Node tags are set on the Nodes page."
+      "vmBy": "Name the VMs the rule applies to, or pick them by label. With a label, VMs that get the same label later follow too.",
+      "nodeBy": "Pick nodes one by one or by node label (such as disk=ssd). Node labels are set on the Nodes page."
     },
     "placement": {
-      "intro": "VMs start on the least loaded node. Every 5 minutes the balancer looks at the load difference between nodes and, above the move threshold, suggests or makes VM moves."
+      "intro": "A VM's start node is picked by HA group priority, then 'if possible' rule penalties, then load (the least loaded node with the 'balance' policy, the fullest with 'pack'). Every 5 minutes the balancer looks at the load difference between nodes and, above the move threshold, suggests or makes VM moves."
     },
     "realms": {
       "intro": "Lets people sign in with company accounts (Active Directory, LDAP) or a sign-in service (OIDC — Keycloak, Azure AD, Google and others). Users become <name>@<realm>, and their role is set from their groups at every sign-in.",
@@ -5805,26 +5800,26 @@
     "permissions": {
       "intro": "One table of who (users, groups) can do what (role) where (the whole cluster, a folder, one VM). Permissions only add up; nothing denies.",
       "empty": "Add permissions to give users and groups work per folder or VM, beyond their global role.",
-      "target": "Where the permission applies. Choose a folder to also cover the VMs, networks and storage in it.",
+      "target": "Where the permission applies. Choose a folder and turn on 'Apply inside the folder and its subfolders' to also cover the VMs, networks and storage in it.",
       "principalKind": "Give it to one person, or to a group of people. With many people, groups are easier.",
       "principal": "The user or group that gets the permission.",
       "role": "The set of things they can do there. You can only give roles within your own rights here.",
-      "propagate": "The folder's permission also applies to the folders below it and everything in them."
+      "propagate": "On: the permission reaches everything in the folder (VMs, networks, storage) and its subfolders. Off: it applies to the folder itself only (renaming it and so on), not even to the VMs directly in it."
     },
     "roles": {
       "intro": "A role is a set of things someone can do (a privilege list). Besides the built-in roles (administrator, operator, viewer), make roles such as \"backups only\" and give them on the Permissions page.",
       "empty": "Create a role to hand out just the work needed, such as \"takes snapshots only\".",
-      "name": "The name chosen on the Permissions page (for example backup-operator). admin, operator, viewer and none are reserved.",
+      "name": "The name you pick on the Permissions page (for example backup-operator). admin, operator, viewer and none are reserved.",
       "description": "A short note on what the role is for. It shows in the list."
     },
     "groups": {
       "intro": "A group is a set of people you give permissions to at once. Add local users directly, or link a company directory group (LDAP, OIDC) so its members join when they sign in.",
       "empty": "Create a group to give permissions once to the group instead of to each person.",
-      "name": "The name chosen on the Permissions page (for example dev-team). It cannot change later.",
+      "name": "The name you pick on the Permissions page (for example dev-team). It cannot change later.",
       "description": "A short note on who is in the group. It shows in the list."
     },
     "audit": {
-      "intro": "A record, kept on every node, of who did what, when and from where (IP). Every request is there — sign-ins, creating and deleting VMs, changing settings. Open a row to see all of it.",
+      "intro": "A record, kept on every node, of who did what, when and from where (IP). Requests that change something — sign-ins, creating and deleting VMs, changing settings — plus console opens and file-restore downloads are kept; requests that only read are not. Open a row to see all of it.",
       "empty": "Widen the time range, or clear the user and action filters."
     },
     "tasks": {
@@ -5832,11 +5827,12 @@
       "empty": "When you start, move or back up a VM, its progress and result collect here."
     },
     "folders": {
-      "intro": "Group VMs, networks and storage into folders. Permissions given on a folder pass down to what is inside, and quotas cap the resources it can use. Drag and drop to move things.",
+      "intro": "Group VMs, networks and storage into folders. Permissions given on a folder with 'Apply inside' pass down to what is inside, and VM folders can have quotas that cap the resources they use. Drag and drop to move things.",
       "empty": "This folder is empty. Drag rows here or use Move to folder to put things in.",
       "name": "The folder name (for example prod, team-a). Up to 64 characters, without '/'.",
-      "folder": "The folder the new item goes in. It gets that folder's permissions and quotas.",
-      "destination": "Where to move them. Moved items follow the new folder's permissions and quotas."
-    }
+      "folder": "The folder the new item goes in. It gets the folder permissions given with 'Apply inside' and, for VM folders, counts toward the quota.",
+      "destination": "Where to move them. Moved items follow the permissions given on the new folder with 'Apply inside' and, for VM folders, its quota."
+    },
+    "aboutPageOf": "About {{name}}"
   }
 }

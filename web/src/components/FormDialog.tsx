@@ -14,6 +14,30 @@ import {
 import { errorMessage } from "@/i18n/errors";
 
 /**
+ * 열 때 첫 입력 칸에 포커스를 준다. Radix는 첫 tabbable에 주는데, 이름표 옆 ⓘ(`data-info-button`)가 입력보다 앞에 있어
+ * 그리로 가면 Enter가 도움말을 연다(계획 77-4 리뷰). ⓘ를 건너뛴 첫 tabbable이 없으면 Radix 기본대로 둔다.
+ */
+function focusFirstInput(e: Event) {
+  const root = e.currentTarget;
+  if (!(root instanceof HTMLElement)) {
+    return;
+  }
+  const first = [
+    ...root.querySelectorAll<HTMLElement>(
+      "input:not([type=hidden]), select, textarea, button, [href], [tabindex]",
+    ),
+  ].find(
+    (el) =>
+      !el.matches(":disabled, [tabindex='-1'], [data-info-button]") &&
+      !el.closest("[hidden], [aria-hidden=true]"),
+  );
+  if (first) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+/**
  * 대화상자 하나의 폼. 연 쪽은 열 때만 그리고(`{open && <FormDialog ... />}`) 닫으면 지우므로 입력이 매번
  * 새로 시작한다. 보내는 동안은 입력과 닫기를 막고, 실패하면 서버의 오류를 폼 위에 보여 준다.
  */
@@ -76,6 +100,7 @@ export function FormDialog({
         className={className}
         {...(description ? {} : { "aria-describedby": undefined })}
         onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
+        onOpenAutoFocus={(e) => focusFirstInput(e)}
       >
         <form noValidate onSubmit={(e) => void submit(e)} className="flex flex-col gap-4">
           <DialogHeader>

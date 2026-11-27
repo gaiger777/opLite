@@ -118,14 +118,14 @@
     "emptyAccountsHint": "The account at a certificate authority such as Let's Encrypt. All it needs is an email and accepting the terms.",
     "emptyDnsHint": "Needed for wildcard names (*.example.com) or for nodes that the internet cannot reach on port 80. Otherwise you can skip it.",
     "help": {
-      "name": "The name this page uses for it. Lowercase letters, digits and hyphens (for example le-prod).",
+      "name": "The name this page uses for it. Lowercase letters, digits and hyphens, not at the start or end (for example le-prod).",
       "directory": "The certificate authority that issues the certificates. Default Let's Encrypt (free) — pick staging while testing to avoid rate limits.",
       "url": "The https:// ACME directory address of your in-house CA (step-ca and the like).",
-      "email": "Gets expiry and problem notices. Optional, but recommended.",
+      "email": "A contact address for the CA account. Optional. Let's Encrypt no longer sends expiry emails (since 2025), so use this cluster's alert rules (certificate expiring) for expiry notices.",
       "eabHint": "An account-binding key that ZeroSSL, Google and many in-house CAs require. Leave it empty for Let's Encrypt.",
       "kid": "The EAB key id from the CA's website. Enter it with the HMAC key.",
       "caHint": "Only for an in-house CA browsers do not trust yet: paste its root certificate (PEM). Usually leave it empty.",
-      "dnsName": "The name for this DNS provider. Lowercase letters, digits and hyphens.",
+      "dnsName": "The name for this DNS provider. Lowercase letters, digits and hyphens (not at the start or end).",
       "dnsKind": "Who runs DNS for your domain. If it is not listed, a hook script can connect an acme.sh or lego plugin.",
       "dnsFields": {
         "api_token": "A Cloudflare API token allowed to edit DNS. It is not shown again after saving.",
@@ -143,12 +143,12 @@
         "server_id": "The PowerDNS server id. Empty means localhost.",
         "path": "The program that adds and removes the TXT record. Put it under /etc/orbivisor/acme-hooks/ on every node."
       },
-      "certName": "The name for this certificate. Lowercase letters, digits and hyphens (for example api).",
+      "certName": "The name for this certificate. Lowercase letters, digits and hyphens, not at the start or end (for example api).",
       "account": "The ACME account that orders the certificate.",
       "scope": "Shared: every node uses one certificate (when users come in by one name). Per node: each node gets its own, by node name ({node}).",
-      "challenge": "How you prove you own the domain. Default HTTP-01 (port 80) — use DNS-01 for wildcard names or private networks.",
+      "challenge": "How you prove you own the domain. The default is DNS-01 when a DNS provider is set up, otherwise HTTP-01 (port 80). Use DNS-01 for wildcard names or private networks.",
       "dns": "The DNS provider that writes the TXT record for DNS-01.",
-      "profile": "The kind of certificate the CA offers (for example short-lived). Usually keep the CA default.",
+      "profile": "The kind of certificate the CA offers (for example Let's Encrypt's shortlived). Usually keep the CA default.",
       "hmac": "The EAB HMAC key from the CA. It is not shown again after saving."
     },
     "pageHint": "Public certificates for the API and web listener from an ACME CA (Let's Encrypt, ZeroSSL, your own step-ca). The leader orders and renews them; nodes swap them in without a restart."

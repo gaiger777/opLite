@@ -807,7 +807,10 @@ it("creates a provider network with a physnet, VLAN and floating IP ranges", asy
   expect(within(subnet).getByLabelText("DHCP")).not.toBeChecked();
   await user.type(within(subnet).getByLabelText("CIDR"), "203.0.113.0/24");
   await user.type(within(subnet).getByLabelText("Gateway"), "203.0.113.1");
-  await user.type(within(subnet).getByLabelText("Public IP ranges"), "203.0.113.100-203.0.113.199");
+  await user.type(
+    within(subnet).getByLabelText("Floating IP ranges"),
+    "203.0.113.100-203.0.113.199",
+  );
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(
     within(dialog).getByText(

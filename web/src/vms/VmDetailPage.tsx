@@ -424,7 +424,7 @@ function Field({
     <div className="flex flex-col gap-1">
       <dt className="flex items-center gap-1 text-xs text-muted-foreground">
         {label}
-        {help && <InfoButton topic={info ?? ""} label={label} line={help} />}
+        {help && info && <InfoButton topic={info} label={label} line={help} />}
       </dt>
       <dd className="text-sm">{children}</dd>
     </div>
@@ -488,7 +488,7 @@ function TemplateField({ vm }: { vm: Vm }) {
   });
   if (isTemplate(vm)) {
     return (
-      <Field label={t("vms.template")} help={t("help.vms.template")} info="vms.template">
+      <Field label={t("vms.template")} help={t("help.vms.template")} info="templates.page">
         {t("vms.templateClones", { count: linkedClones(disks, volumes).length })}
       </Field>
     );
@@ -528,7 +528,7 @@ function Summary({ vm }: { vm: Vm }) {
       : format(now);
   return (
     <dl className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2 lg:grid-cols-3">
-      <Field label={t("vms.cpu")} help={t("help.vms.cpu")} info="vms.cpu">
+      <Field label={t("vms.cpu")} help={t("help.vms.cpu")} info="cpu.mode">
         {t("vms.cpuValue", {
           sockets: cpu.sockets ?? 1,
           cores: cpu.cores,
@@ -541,10 +541,10 @@ function Summary({ vm }: { vm: Vm }) {
           </span>
         )}
       </Field>
-      <Field label={t("vms.vcpus")} help={t("help.vms.vcpus")} info="vms.vcpus">
+      <Field label={t("vms.vcpus")} help={t("help.vms.vcpus")} info="vmForm.maxVcpus">
         {withMax(vcpus, String)}
       </Field>
-      <Field label={t("vms.memory")} help={t("help.vms.memory")} info="vms.memory">
+      <Field label={t("vms.memory")} help={t("help.vms.memory")} info="vmForm.maxMemory">
         {withMax(memory, formatMib)}
       </Field>
       {hw && (
@@ -561,7 +561,7 @@ function Summary({ vm }: { vm: Vm }) {
         <CloudInitLine vm={vm} />
       </Field>
       <TemplateField vm={vm} />
-      <Field label={t("vms.firmware")} help={t("help.vms.firmware")} info="vms.firmware">
+      <Field label={t("vms.firmware")} help={t("help.vms.firmware")} info="vmForm.firmware">
         {(vm.spec.firmware ?? "uefi").toUpperCase()}
       </Field>
       <Field label={t("vms.machine")} help={t("help.vms.machine")} info="vms.machine">
@@ -573,12 +573,8 @@ function Summary({ vm }: { vm: Vm }) {
       <Field label={t("vms.power")} help={t("help.vms.power")} info="vms.power">
         {t(`vms.powerState.${vm.spec.power ?? "stopped"}`)}
       </Field>
-      <Field label={t("vms.pid")} help={t("help.vms.pid")} info="vms.pid">
-        {vm.status.pid ?? "—"}
-      </Field>
-      <Field label={t("vms.created")} help={t("help.vms.created")} info="vms.created">
-        {formatTime(uuidTime(vm.id), i18n.language)}
-      </Field>
+      <Field label={t("vms.pid")}>{vm.status.pid ?? "—"}</Field>
+      <Field label={t("vms.created")}>{formatTime(uuidTime(vm.id), i18n.language)}</Field>
       <Field label={t("vms.lastError")} help={t("help.vms.lastError")} info="vms.lastError">
         {vm.status.last_error ?? "—"}
       </Field>
@@ -591,17 +587,17 @@ function Summary({ vm }: { vm: Vm }) {
         )}
       </Field>
       {ha && (
-        <Field label={t("vms.haGroup")} help={t("help.vms.haGroup")} info="vms.haGroup">
+        <Field label={t("vms.haGroup")} help={t("help.vms.haGroup")} info="haGroups.page">
           {ha.group ?? "—"}
         </Field>
       )}
       {ha && (
-        <Field label={t("vms.haPriority")} help={t("help.vms.haPriority")} info="vms.haPriority">
+        <Field label={t("vms.haPriority")} help={t("help.vms.haPriority")} info="vmForm.haPriority">
           {ha.priority}
         </Field>
       )}
       {ha && (
-        <Field label={t("vms.guestWatch")} help={t("help.vms.guestWatch")} info="vms.guestWatch">
+        <Field label={t("vms.guestWatch")} help={t("help.vms.guestWatch")} info="vmForm.guestWatch">
           {ha.guest_watch
             ? t("vms.guestWatchSecs", { secs: ha.guest_watch.timeout_secs })
             : t("vms.haOff")}

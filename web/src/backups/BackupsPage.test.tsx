@@ -47,7 +47,7 @@ it("names the job that made each backup", async () => {
   const headers = within(table).getAllByRole("columnheader");
   const job = async (name: string) =>
     within((await within(table).findByText(name)).closest("tr")!).getAllByRole("cell")[
-      headers.findIndex((h) => h.textContent === "Backup schedule")
+      headers.findIndex((h) => h.textContent === "Schedule")
     ];
   expect(await job("web-2")).toHaveTextContent("nightly");
   expect(await job("web-3")).toHaveTextContent("Deleted schedule");

@@ -59,9 +59,11 @@ it("shows the store, verify badge, new data and base of store backups", async ()
   expect(cell("web-s2", "Verified")).toHaveTextContent("2 bad pieces");
   expect(cell("web-s1", "Verified")).toHaveTextContent("Verified");
   expect(cell("web-s3", "Verified")).toHaveTextContent("Not verified");
-  expect(cell("web-s2", "Size")).toHaveTextContent("Added this time 300 MiB(VM disk 16 GiB)");
+  expect(cell("web-s2", "Size")).toHaveTextContent("New 300 MiBdisk 16 GiB");
+  // 짧은 셀 글의 뜻은 title로 남긴다(계획 77-4 리뷰 — 표 가로 넘침).
+  expect(within(cell("web-s2", "Size")).getByTitle(/newly wrote to the store/)).toBeInTheDocument();
   expect(cell("web-s2", "Type")).toHaveTextContent(
-    "StoreBase: web-s1Read in full: a chunk of the base backup failed verification",
+    "DedupBase: web-s1Read in full: a chunk of the base backup failed verification",
   );
   expect(within(cell("web-s2", "Type")).getByRole("link", { name: "web-s1" })).toHaveAttribute(
     "href",

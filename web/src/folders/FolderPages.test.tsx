@@ -269,12 +269,12 @@ it("sets the router and floating IP quota of a network folder", async () => {
     as: ADMIN,
   });
   expect(await screen.findByText("3 of 4")).toBeInTheDocument();
-  expect(screen.getByRole("meter", { name: "Public IPs" })).toBeInTheDocument();
+  expect(screen.getByRole("meter", { name: "Floating IPs" })).toBeInTheDocument();
   expect(screen.queryByRole("meter", { name: "vCPUs" })).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Actions for tenant" }));
   await user.click(screen.getByRole("menuitem", { name: "Set quota" }));
   const dialog = screen.getByRole("dialog", { name: "Quota of tenant" });
-  expect(within(dialog).getByLabelText("Public IPs")).toHaveValue("4");
+  expect(within(dialog).getByLabelText("Floating IPs")).toHaveValue("4");
   expect(within(dialog).queryByLabelText("vCPUs")).not.toBeInTheDocument();
   await user.type(within(dialog).getByLabelText("Routers"), "2");
   await user.click(within(dialog).getByRole("button", { name: "Save" }));
@@ -319,7 +319,7 @@ it("lists routers and floating IPs in a network folder and moves them with their
   const r1Row = (await screen.findByText("r1")).closest("tr")!;
   expect(within(r1Row).getByText("Router")).toBeInTheDocument();
   const fipRow = screen.getByText(fip.name).closest("tr")!;
-  expect(within(fipRow).getByText("Public IP")).toBeInTheDocument();
+  expect(within(fipRow).getByText("Floating IP")).toBeInTheDocument();
   expect(within(screen.getByText("t1").closest("tr")!).getByText("Network")).toBeInTheDocument();
   // 라우터 목록은 NB를 읽지 않는 것이다.
   expect(reads.every((q) => q === "?live=false")).toBe(true);

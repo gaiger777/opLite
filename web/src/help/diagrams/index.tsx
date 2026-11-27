@@ -305,7 +305,7 @@ function ReplicationDr() {
   );
 }
 
-/** SDN: 노드들 위의 가상 스위치, 라우터, SNAT, 공인 IP */
+/** SDN: 노드들 위의 가상 스위치, 라우터, SNAT, 유동 IP */
 function Sdn() {
   const d = useD("sdn");
   return (

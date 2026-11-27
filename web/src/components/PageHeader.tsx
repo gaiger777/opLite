@@ -55,7 +55,17 @@ export function PageHeader({
           <h1 id={id} className="text-xl font-semibold">
             {title}
           </h1>
-          {help && <InfoButton topic={`${help}.page`} label={t("help.aboutPage")} line={intro} />}
+          {help && (
+            <InfoButton
+              topic={`${help}.page`}
+              label={
+                typeof title === "string"
+                  ? t("help.aboutPageOf", { name: title })
+                  : t("help.aboutPage")
+              }
+              line={intro}
+            />
+          )}
         </div>
         {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
       </div>

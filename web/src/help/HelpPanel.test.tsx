@@ -81,8 +81,8 @@ it("remembers a closed page intro and keeps the ⓘ", async () => {
     </>,
   );
   expect(screen.queryByText("Where VM disks live.")).not.toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Help: About this page" }));
-  const panel = await screen.findByRole("dialog", { name: "About this page" });
+  await user.click(screen.getByRole("button", { name: "Help: About Pools" }));
+  const panel = await screen.findByRole("dialog", { name: "About Pools" });
   expect(await within(panel).findByText("Where VM disks live.")).toBeInTheDocument();
 });
 

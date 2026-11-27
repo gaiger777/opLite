@@ -53,7 +53,7 @@ function Field({
     <div className="flex flex-col gap-1">
       <dt className="flex items-center gap-1 text-xs text-muted-foreground">
         {label}
-        {help && <InfoButton topic={info ?? ""} label={label} line={help} />}
+        {help && info && <InfoButton topic={info} label={label} line={help} />}
       </dt>
       <dd className="text-sm">{children}</dd>
     </div>
@@ -123,7 +123,7 @@ export function VmSecurity({ vm }: { vm: Vm }) {
           <Field
             label={t("vms.security.secureBoot")}
             help={t("help.vms.security.secureBoot")}
-            info="vms.security.secureBoot"
+            info="vmForm.secureBoot"
           >
             {t(secureBoot ? "vms.on" : "vms.haOff")}
           </Field>

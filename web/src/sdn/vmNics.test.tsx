@@ -357,8 +357,8 @@ it("shows the floating IP of an SDN interface on the VM page", async () => {
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
   await userEvent.click(await screen.findByRole("tab", { name: "Hardware" }));
   const table = screen.getByRole("table", { name: "Network interfaces" });
-  expect(await within(table).findByRole("columnheader", { name: "Public IP" })).toBeVisible();
-  const link = await within(table).findByRole("link", { name: "Public IP 203.0.113.120" });
+  expect(await within(table).findByRole("columnheader", { name: "Floating IP" })).toBeVisible();
+  const link = await within(table).findByRole("link", { name: "Floating IP 203.0.113.120" });
   expect(link).toHaveAttribute("href", "/floating-ips");
   expect(within(table).getByText("10.10.0.3").closest("tr")).toHaveTextContent(/—$/);
 });

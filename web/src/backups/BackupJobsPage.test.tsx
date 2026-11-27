@@ -179,13 +179,13 @@ it("creates a job after checking the form", async () => {
   expect(
     within(dialog).getByText("A backup schedule with this name already exists."),
   ).toBeVisible();
-  expect(within(dialog).getByText("Enter at least one KEY=VALUE tag.")).toBeVisible();
+  expect(within(dialog).getByText("Enter at least one KEY=VALUE label.")).toBeVisible();
   expect(within(dialog).getByText("Enter a time from 00:00 to 23:59.")).toBeVisible();
 
   await userEvent.clear(within(dialog).getByLabelText("Name"));
   await userEvent.type(within(dialog).getByLabelText("Name"), "prod");
   await userEvent.selectOptions(within(dialog).getByLabelText("Backup pool"), "bk2");
-  await userEvent.type(within(dialog).getByLabelText("Tags"), "tier=prod");
+  await userEvent.type(within(dialog).getByLabelText("Labels"), "tier=prod");
   await userEvent.clear(within(dialog).getByLabelText("Time (UTC)"));
   await userEvent.type(within(dialog).getByLabelText("Time (UTC)"), "01:30");
   await userEvent.click(within(dialog).getByLabelText("Sat"));
@@ -218,7 +218,7 @@ it("edits a job and sends only what changed", async () => {
   renderPage(<BackupJobsPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Edit nightly" }));
   const dialog = await screen.findByRole("dialog", { name: "Edit nightly" });
-  expect(within(dialog).getByLabelText("Tags")).toHaveValue("tier=prod");
+  expect(within(dialog).getByLabelText("Labels")).toHaveValue("tier=prod");
   expect(within(dialog).getByLabelText("Mon")).toBeChecked();
   expect(within(dialog).getByLabelText("Weekly")).toHaveValue("4");
   // 바꾼 것이 없으면 저장하지 않는다.

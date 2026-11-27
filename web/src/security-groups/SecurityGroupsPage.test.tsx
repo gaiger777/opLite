@@ -133,7 +133,9 @@ it("counts the simple and SDN interfaces that use a group", async () => {
   const row = (await within(table).findByRole("link", { name: "ssh" })).closest("tr")!;
   expect(await within(row).findByText("1 simple · 1 SDN")).toBeVisible();
   // SDN 카드와의 차이(OVN ACL)는 화면 도움말 패널로 옮겼다.
-  expect(screen.getByRole("button", { name: "Help: About this page" })).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Help: About Firewall (security groups)" }),
+  ).toBeVisible();
 });
 
 it("explains an empty group list with a create button and more help", async () => {

@@ -22,12 +22,12 @@
         "note2": "same VM at the same time and corrupting its disk."
       },
       "backupChain": {
-        "alt": "Backup diagram: the first backup copies everything; later ones add only what changed (incremental).",
+        "alt": "Backup pool incremental diagram: one full backup, then only what changed (incremental) is chained on. Only when incremental is on; a backup store has no such chain.",
         "full": "Full",
         "fullSize": "whole disk",
         "inc": "Incr.",
         "restore": "Restore = full + the increments after it",
-        "note": "Longer chains: faster, smaller backups but slower restores."
+        "note": "In a backup pool, longer chains mean faster, smaller backups but slower restores. A backup store restores each backup on its own."
       },
       "replicationDr": {
         "alt": "Replication and DR diagram: VMs at the main site are copied to a standby site on a schedule and started there in a disaster.",
@@ -42,13 +42,13 @@
         "note2": "Run a test now and then to check the copies start."
       },
       "sdn": {
-        "alt": "SDN diagram: VMs on several nodes join one virtual switch; a virtual router sends traffic out with SNAT; a public IP brings traffic in.",
+        "alt": "SDN diagram: VMs on several nodes join one virtual switch; a virtual router sends traffic out with SNAT; a floating IP brings traffic in.",
         "node": "Node",
         "switch": "Virtual switch (one private network)",
         "router": "Virtual router",
         "snat": "SNAT",
         "internet": "Internet",
-        "floating": "Public IP: internet → router → VM",
+        "floating": "Floating IP: internet → router → VM",
         "note": "VMs share one private network on any node."
       },
       "securityGroup": {
@@ -68,7 +68,7 @@
         "node": "Node",
         "togetherNote": "VMs that talk a lot",
         "apartNote": "one survives a node failure",
-        "note": "'Must' rules block the start if broken; 'prefer' rules apply when possible."
+        "note": "'(hard)' rules block the start if broken; '(if possible)' rules apply when possible."
       },
       "storageSharing": {
         "alt": "Storage diagram: local storage is separate on each node, so moving a VM copies its disk; shared storage is used by all nodes, so only memory moves.",
@@ -79,7 +79,7 @@
         "sharedDisk": "Shared disk",
         "localMove": "Moving copies the disk (slow)",
         "sharedMove": "Only memory moves (fast)",
-        "note": "HA restarts on another node need shared storage."
+        "note": "HA restarts on another node need the disks on shared storage, or a replica of the local disks on that node."
       },
       "thinOvercommit": {
         "alt": "Thin provisioning diagram: three VMs are promised 60 GiB each but the real disk is 100 GiB; each uses only what it writes.",
@@ -99,7 +99,7 @@
         "step3": "Pause very briefly and continue on the new node"
       },
       "declarativeApply": {
-        "alt": "Manage-as-code diagram: the YAML file is compared with the cluster to show what will be added, changed and removed; applying makes the cluster match.",
+        "alt": "Manage-as-code diagram: the YAML file is compared with the cluster to show what will be added, changed and removed; applying makes the cluster match. Removal happens only with --prune.",
         "file": "YAML file",
         "diff": "Compare",
         "add": "add",
@@ -107,8 +107,8 @@
         "remove": "remove",
         "apply": "Apply",
         "cluster": "Cluster",
-        "note": "The file is the 'wanted state'; applying makes the cluster match it.",
-        "note2": "If someone changes it in the UI, you see 'differs from file'."
+        "note": "The file is the 'wanted state'; applying makes the cluster match it. Removal happens only with --prune and an apply set (--set), and only for objects that set applied before and the file no longer has (VMs, volumes and stores also need --prune-data).",
+        "note2": "If anyone changes it after an apply (UI, CLI or API), what differs from the last apply shows as 'drift'."
       },
       "dedupStore": {
         "alt": "Backup store diagram: three backups repeat the same pieces, but the store keeps each different piece only once.",
@@ -134,14 +134,14 @@
         "how": "Local pools (directory, LVM-thin, ZFS) are separate on each node, so moving a VM to another node copies its whole disk. Shared pools (NFS, Ceph RBD, shared LVM, directories marked shared) are seen by every node, so only memory moves.",
         "when": "With one node or for a test, start with a directory pool. With several nodes that need HA or fast migration, add one shared pool.",
         "diagram": "storageSharing",
-        "caution": "Deleting a pool keeps its files and images. A pool that still holds volumes or backups cannot be deleted."
+        "caution": "Deleting a pool keeps its files and images. A pool that still holds volumes, backups, a backup store or OVA exports cannot be deleted."
       },
       "kind": {
         "what": "Chooses where and how disks are stored.",
         "how": "Directory: simplest, a folder on the node's disk (qcow2 files — snapshots).\nLVM-thin: fast, takes only what is written, snapshots (per node).\nZFS: compression and snapshots (per node).\nNFS: a NAS share used by all nodes.\nCeph RBD: distributed storage across several nodes' disks, used by all nodes.\nShared LVM: a SAN (iSCSI/FC) LUN used by all nodes, no snapshots.",
         "when": "Start with Directory. With several nodes and a NAS use NFS; with 3+ nodes that each have spare disks use Ceph.",
         "diagram": "storageSharing",
-        "caution": "The kind cannot be changed later. VMs on a per-node pool are not restarted on another node by HA."
+        "caution": "The kind cannot be changed later. VMs on a per-node pool are restarted by HA only on a node that has a replica of their disks."
       },
       "thinpool": {
         "what": "A 'thin pool' inside LVM — VM disks are promised a size but only take the space they actually write.",
@@ -153,8 +153,8 @@
     },
     "cluster": {
       "page": {
-        "what": "A cluster is a group of nodes that share one state. The nodes vote on changes, so a majority must be alive to create or change VMs and to restart HA VMs.",
-        "how": "Voter: votes and keeps the cluster state. The leader is the voter doing the work right now.\nJoining: a new node still catching up on the state — it becomes a voter when done.\nRead-only member: follows the state without voting — adding many does not slow the cluster.\nVote-only node (witness): runs no VMs and only votes.",
+        "what": "A cluster is a group of nodes that share one state. The voters (usually 3, 5 or 7 nodes) vote on changes, so a majority of them must be alive to create or change VMs and to restart HA VMs.",
+        "how": "Voter: votes and keeps the cluster state. The leader is the voter doing the work right now.\nJoining: a new node catching up on the state — when done it becomes a voter only if the voter count (default 5) is not reached; otherwise it stays a read-only member.\nRead-only member: follows the state without voting — adding many does not slow the cluster.\nVote-only node (witness): runs no VMs and only votes.",
         "when": "With 2 nodes, losing 1 breaks the majority (2 of 2 votes) and the cluster stops. Use 3 or more nodes, or add a small vote-only node to a 2-node cluster.",
         "diagram": "quorum",
         "caution": "An even number of voters does not tolerate more failures (4 nodes still survive only 1). Use 3 or 5."
@@ -163,15 +163,15 @@
     "nodes": {
       "page": {
         "what": "A node is one server that runs VMs. This page shows each node's state, resources and failure handling at a glance.",
-        "how": "Maintenance stops placing new VMs on the node, and Move VMs off moves running VMs to other nodes. HA VMs run only on nodes with a forced-reboot device (watchdog): when a node loses the cluster it reboots itself, so another node can safely start the same VM.",
-        "when": "Before servicing or updating a server, turn on maintenance and move its VMs off. Tags for placement rules (such as zone=rack-a) are set here too.",
+        "how": "Maintenance stops placing new VMs on the node, and Drain node moves running VMs to other nodes. HA VMs run only on nodes with a forced-reboot device (watchdog): when a node loses the cluster it first stops its HA VMs, and if that fails the watchdog reboots it, so another node can safely start the same VM.",
+        "when": "Before servicing or updating a server, turn on maintenance and move its VMs off. Labels for placement rules (such as zone=rack-a) are set here too.",
         "diagram": "haFencing",
         "caution": "A live node cannot be removed here. Run orbivisorctl cluster leave on that node."
       },
       "fence": {
         "what": "Force-isolating a failed node (fencing) cuts its power so a node that only seemed dead cannot run the same VMs at the same time.",
         "how": "When the node stops sending its heartbeat, the leader powers it off through its remote management card (IPMI, Redfish) or a command, and as soon as it is confirmed off starts the VMs on another node. With no method, or if all fail, it waits until the node stops itself (watchdog).",
-        "when": "Set it up whenever the servers have a BMC (iDRAC, iLO, IPMI). Recovery becomes over a minute faster.",
+        "when": "Set it up whenever the servers have a BMC (iDRAC, iLO, IPMI). Recovery no longer waits for the node to stop itself (watchdog), so it is faster (about 22 s → about 10 s with the default fast profile; about 62 s → about 30 s with safe), and above all the node is confirmed off first.",
         "diagram": "haFencing",
         "caution": "Every node must reach the management cards. Use Test first to check the power can be read (it does not change the power)."
       }
@@ -179,42 +179,42 @@
     "networks": {
       "page": {
         "what": "A network is what a VM's network card plugs into. When you create or edit a VM you pick one of these networks for each network card.",
-        "how": "Bridge: plugs into a real bridge on the node, so VMs sit on the same network as your LAN.\nVXLAN: joins the nodes with a tunnel so a VM sees the same network on any node.\nSDN: a virtual switch spanning the nodes, with address ranges, automatic addresses (DHCP), routers and public IPs (external addresses).\nExternal (provider): the door from SDN to the real physical network.",
+        "how": "Bridge: plugs into a real bridge on the node, so VMs sit on the same network as your LAN.\nVXLAN: joins the nodes with a tunnel so a VM sees the same network on any node.\nSDN: a virtual switch spanning the nodes, with address ranges, automatic addresses (DHCP), routers and floating IPs (external addresses).\nExternal (provider): the door from SDN to the real physical network.",
         "when": "One node, or VMs that should sit right on your LAN: bridge. Several nodes where a VM must keep its network wherever it moves: VXLAN or SDN.",
         "diagram": "sdn",
-        "caution": "Networks used by VMs, routers or public IPs cannot be deleted. The user network (QEMU NAT) always exists and is not listed."
+        "caution": "Networks used by VMs, routers, floating IPs or load balancers, or with a migration running, cannot be deleted. The user network (QEMU NAT) always exists and is not listed."
       },
       "kind": {
         "what": "Chooses how this network is built.",
-        "how": "Bridge: plugs into a bridge the node already has (vmbr0 and so on). Simplest.\nVXLAN: Orbivisor creates a bridge and a tunnel (UDP 4789) on every node and joins them.\nSDN (OVN): a virtual switch spanning the nodes, with subnets, DHCP, routers, public IPs and security groups. Set up SDN on the SDN screen first.\nExternal (provider): the real physical network SDN routers use to reach the outside. Administrators only.",
-        "when": "First time: bridge. A private network across several nodes (with routers and public IPs): SDN. Just joining the nodes: VXLAN.",
+        "how": "Bridge: plugs into a bridge the node already has (vmbr0 and so on). Simplest. Administrators only.\nVXLAN: Orbivisor creates a bridge and a tunnel (UDP 4789) on every node and joins them.\nSDN (OVN): a virtual switch spanning the nodes, with subnets, DHCP, routers, floating IPs and security groups. Set up SDN on the SDN screen first.\nExternal (provider): the real physical network SDN routers use to reach the outside. Administrators only.",
+        "when": "First time: bridge (if you are not an administrator, VXLAN or SDN). A private network across several nodes (with routers and floating IPs): SDN. Just joining the nodes: VXLAN.",
         "diagram": "sdn",
         "caution": "The kind cannot change later. Bridge and VXLAN networks can move to SDN later with the simple → SDN migration (⇄ button)."
       },
       "vlan": {
-        "what": "A VLAN tag is a number (1–4094) that splits one switch into separate networks. Only the same number can talk to each other.",
+        "what": "A VLAN tag is a number (1–4094) that splits one switch into separate networks. Only networks with the same number can talk to each other.",
         "how": "Packets from VMs on this network leave with this number attached. Empty sends them without a number (untagged).",
         "when": "Use it when your network team gave you a number, such as 'put VMs on VLAN 20'. If unsure, leave it empty.",
         "example": "office 10, servers 20, test 30",
-        "caution": "The switch port the node is plugged into must be a trunk (carries several VLANs), and for a bridge network the node's bridge needs VLAN awareness (vlan_filtering 1). Otherwise VMs never reach the network."
+        "caution": "The switch port the node is plugged into must be a trunk (carries several VLANs), and for a bridge network the node's bridge needs VLAN awareness (vlan_filtering 1). Without it, VMs do not start on that node."
       },
       "physnet": {
         "what": "A physical network (physnet) is a name given to a node's real network (bridge). It is how SDN reaches the outside.",
         "how": "On the Nodes screen you map 'name → bridge' on each node; here you only pick the name. Bridge names may differ per node.",
-        "when": "To reach the internet or your LAN through SDN routers, or to use public IPs (external addresses), you need one such external network.",
+        "when": "To reach the internet or your LAN through SDN routers, or to use floating IPs (external addresses), you need one such external network.",
         "example": "ext → the node's vmbr0"
       },
       "mtu": {
         "what": "The MTU is the largest packet (in bytes) sent at once.",
-        "how": "VXLAN and SDN wrap packets in a tunnel, so the default is 1500 minus the tunnel header (1450, 1442).",
-        "when": "Usually leave it empty. Raise it only when the physical switches are set up for jumbo frames (9000).",
-        "caution": "Setting it larger than the physical network allows drops big packets, so web pages and file copies seem to hang."
+        "how": "VXLAN and SDN wrap packets in a tunnel, so the default is the physical MTU minus the tunnel header (with 1500: VXLAN 1450, SDN 1442). External (provider) networks have no tunnel, so the default is 1500.",
+        "when": "Usually leave it empty. Raise it only when the physical switches take jumbo frames (9000) — even then subtract the tunnel header: VXLAN 8950, SDN 8942.",
+        "caution": "Setting it larger than the physical network allows drops big packets, so web pages and file copies seem to hang. An SDN network's MTU cannot change after it is created."
       }
     },
     "backups": {
       "page": {
         "what": "A backup is a copy of a VM's disks, settings and firmware state at one moment. It stays after the VM is deleted, and you can make a new VM from it (restore) or take out a few files.",
-        "how": "The first backup copies the whole disk (full); later ones copy only what changed (incremental). Restoring an incremental reads the full one and each later one in turn.",
+        "how": "By default every backup copies the whole disk (full). With incremental on, a backup pool copies only what changed since the previous backup and chains them; a restore reads the full one and each later one in turn. A backup store has no chain — it reads only changed pieces, but every backup has a complete list, so any backup is restored or deleted on its own.",
         "when": "For one backup now, use 'Back up now' on the VM. For daily backups, create a backup schedule.",
         "diagram": "backupChain",
         "caution": "Backups on the same disk are lost with that disk. Keep them on another disk, a NAS or a remote cluster too."
@@ -226,8 +226,8 @@
         "diagram": "dedupStore"
       },
       "incremental": {
-        "what": "A backup that copies only what changed since the previous one.",
-        "how": "Incrementals follow one full backup in a chain. They are fast and small, but a restore reads the full backup and every incremental after it.",
+        "what": "A backup that copies only what changed since the previous one. Off by default (every backup is full).",
+        "how": "Backup pool: incrementals follow one full backup in a chain. They are fast and small, but a restore reads the full backup and every incremental after it.\nBackup store: only changed pieces are read, so it is fast, but there is no chain. Every backup has a complete list and restores on its own.",
         "when": "Turn it on for large VMs that are backed up often.",
         "diagram": "backupChain",
         "caution": "When the VM is stopped or there is no earlier backup, a full backup is taken. The Type column shows why."
@@ -243,16 +243,16 @@
       },
       "retention": {
         "what": "How many backups to keep and for how long, counted per VM.",
-        "how": "Last: the n newest backups.\nDaily: the newest one per day for the last n days.\nWeekly: one per week for the last n weeks.\nMonthly: one per month for the last n months.\nBackups no rule keeps are deleted.",
+        "how": "Last: the n newest backups.\nDaily: the newest one per day, for n days that have one.\nWeekly: one per week, for n weeks.\nMonthly: one per month, for n months.\nBackups made by this schedule that no rule keeps are deleted (except ones a kept incremental still needs). Manual 'Back up now' backups and other schedules' backups are never deleted.",
         "when": "Last 3, Daily 7, Weekly 4, Monthly 3 lets you go back three months.",
         "example": "Last 3, Daily 7, Weekly 4 keeps: ▮▮▮ ▯▯▯▯▯▯▯ ▯▯▯▯",
         "diagram": "backupChain",
-        "caution": "All 0 deletes nothing, so space keeps growing. Failed backups are deleted after a later success."
+        "caution": "All 0 deletes no successful backup, so space keeps growing. A failed backup is deleted once a later one succeeds."
       },
       "fullEvery": {
-        "what": "How many backups of only the changes (incremental) to take between full backups.",
-        "how": "With 6 it repeats 'one full + six of only the changes'. With daily backups that is one full and six incremental a week.",
-        "when": "Larger is faster and smaller, but a restore reads more pieces. 6 is usual for daily backups.",
+        "what": "How many incremental backups (reading only the changes) before a full one again. The default 0 means always full.",
+        "how": "Backup pool: with 6 it repeats 'one full + six of only the changes'. With daily backups that is one full and six incremental a week.\nBackup store: with 6, after six backups that read only changed pieces, the next one reads the whole disk again. Space and restore time do not change.",
+        "when": "In a backup pool, larger is faster and smaller, but a restore reads more pieces. If you use incrementals, 6 is usual for daily backups.",
         "diagram": "backupChain",
         "caution": "0 means every backup is full."
       }
@@ -260,7 +260,7 @@
     "settings": {
       "page": {
         "what": "Settings that apply to the whole cluster. Change a section and press its Save; it reaches every node at once.",
-        "how": "Updates: the channel nodes get packages from.\nHost shutdown and HA: what happens to VMs when a node is shut down or dies.\nCPU baseline: makes VMs see the same CPU on every node (so moving them never breaks them).\nUsage reports: a daily report with counts and versions only.\nPrometheus: the address an external metrics server reads.",
+        "how": "Updates: the channel nodes get packages from.\nHost shutdown and HA: what happens to VMs when a node is shut down or dies.\nCPU baseline: makes VMs see the same CPU on every node (so moving them never breaks them).\nUsage reports: a daily report with versions, counts and totals only (no names or addresses).\nPrometheus: the address an external metrics server reads.",
         "when": "Look through it once after installing, and when you change the update policy or monitoring."
       },
       "channel": {
@@ -271,7 +271,7 @@
       },
       "telemetry": {
         "what": "A short usage report that tells the developers how many clusters run which versions.",
-        "how": "The leader node sends node count, VM count and versions once a day. You see the exact report before turning it on. A new report ID breaks the link to earlier reports.",
+        "how": "Once a day the leader node sends versions, counts (nodes, VMs, pools and networks by type, …), total CPUs and memory, and the subscription level. You see the exact report before turning it on. A new report ID breaks the link to earlier reports.",
         "when": "Turn it on to help improve the product. Everything works the same when it is off.",
         "caution": "No names, IPs, keys or VM contents are sent."
       },
@@ -285,7 +285,7 @@
         "what": "Keeps memory free on the other nodes to take a dead node's HA VMs.",
         "how": "None: nothing is kept free (recovery may run out of room).\nNumber of nodes: memory worth n nodes, starting with the largest, is kept free.\nPercent of memory: n% of all memory is kept free.\nStarting an HA VM that would use this room is refused.",
         "when": "Choose one node's worth so every HA VM can start again when any one node dies.",
-        "example": "3 nodes of 128 GiB, one node's worth → HA VMs may use up to 256 GiB in all",
+        "example": "3 nodes of 128 GiB, one node's worth → running VMs, HA or not, may use up to 256 GiB in all",
         "diagram": "haFencing",
         "caution": "All running VMs count, HA or not. Migrations are not blocked."
       },
@@ -313,8 +313,8 @@
     "sdn": {
       "page": {
         "what": "SDN (software-defined networking) builds virtual switches and virtual routers across the nodes. A VM keeps the same private network and address wherever it moves. Similar to VMware NSX.",
-        "how": "Orbivisor installs and runs OVN (Open Virtual Network).\nCentral nodes (1, 3 or 5): run the databases that store the settings (NB, SB) and northd, which translates them. SDN keeps working while a majority is alive.\nNode connectors (chassis, ovn-controller): run on every node with VMs and join the nodes with tunnels (Geneve).\nOn top you create SDN networks (virtual switches), routers, public IPs (external addresses) and security groups.",
-        "when": "Use it when you have several nodes and need one private network wherever a VM runs, or want private VMs to reach the internet through a router or be reached from outside through a public IP. With one node, or when plugging into your LAN is enough, a bridge network will do.",
+        "how": "Orbivisor installs and runs OVN (Open Virtual Network).\nCentral nodes (1, 3 or 5): run the databases that store the settings (NB, SB) and northd, which translates them. SDN keeps working while a majority is alive.\nNode connectors (chassis, ovn-controller): run on every node with VMs and join the nodes with tunnels (Geneve).\nOn top you create SDN networks (virtual switches), routers, floating IPs (external addresses) and security groups.",
+        "when": "Use it when you have several nodes and need one private network wherever a VM runs, or want private VMs to reach the internet through a router or be reached from outside through a floating IP. With one node, or when plugging into your LAN is enough, a bridge network will do.",
         "diagram": "sdn",
         "caution": "2 or 4 central nodes survive no more failures than 1 or 3. Three is recommended."
       },
@@ -342,21 +342,21 @@
         "how": "/24 is 256 addresses (about 250 for VMs), /16 is 65536. Orbivisor picks a unique address for each VM and hands it out with DHCP.",
         "when": "Each network takes one IPv4 and one IPv6 subnet at most. Pick a range that does not overlap other networks or your LAN.",
         "example": "10.10.0.0/24, 192.168.50.0/24, fd00:10::/64",
-        "caution": "The range and gateway cannot change once saved. A subnet can be removed only when no VM uses it."
+        "caution": "The range and gateway cannot change once saved. A subnet can be removed only when no VM, router, floating IP or load balancer uses it and no migration is running."
       },
       "ipv6Mode": {
         "what": "How VMs get an IPv6 address.",
         "how": "None: set inside the VM (or by first-boot setup).\nSLAAC: VMs build their own address from router advertisements (RA).\nDHCPv6 (stateful): a DHCP server assigns the address.\nSLAAC + DHCPv6 (stateless): the address from SLAAC, extras such as DNS from DHCPv6.",
         "when": "If unsure, SLAAC.",
-        "caution": "SLAAC modes need a /64 subnet, and advertisements go out only while this network is attached to a router."
+        "caution": "SLAAC modes need a /64 subnet, and advertisements go out only while this network is attached to a router. It cannot change while VMs hold addresses in this subnet (their addresses would change)."
       },
       "dhcp": {
         "what": "DHCP lets a VM get its address, gateway and DNS automatically when it starts.",
         "how": "SDN's built-in DHCP hands out the address Orbivisor picked for each VM. No separate DHCP server is needed.",
-        "when": "Usually leave it on. Turn it off only when you set addresses by hand inside the VMs or run another DHCP server on the network."
+        "when": "On SDN networks, usually leave it on. Turn it off only to enter the address inside the VM yourself — even then use the address Orbivisor assigned (other addresses, or ones from another DHCP server, are blocked). External (provider) networks have it off by default, and DHCP gives IPv4 only."
       },
       "gateway": {
-        "what": "A gateway node actually hosts a router's outside door. SNAT and public IP traffic pass through it.",
+        "what": "A gateway node actually hosts a router's external gateway. SNAT (private VMs going out) passes through it. Floating IP traffic leaves straight from the VM's node when that node has the physical network, and goes through the gateway node only when it does not.",
         "how": "Among gateway candidates with the external network's physical network ready, the highest priority hosts it; if it fails the next takes over within seconds (BFD).",
         "when": "Turn it on only on nodes plugged into the outside network (internet line, LAN). With two or more, the outside stays reachable when one fails.",
         "diagram": "sdn",
@@ -365,23 +365,23 @@
     },
     "fip": {
       "range": {
-        "what": "Public IP ranges are the addresses on the external network handed out as router outside addresses and public IPs (external addresses).",
-        "how": "When a router attaches to the external network it takes one address from here for SNAT (private VMs going out). Each public IP you create takes one from here and is tied to one VM.",
-        "when": "Enter the block of addresses your company or data center gave you for this network. Empty shares the allocation ranges.",
+        "what": "Floating IP ranges are the addresses on the external network handed out as router outside addresses and floating IPs (external addresses).",
+        "how": "When a router attaches to the external network it takes one address from here for SNAT (private VMs going out). Each floating IP you create takes one from here and is tied to one VM.",
+        "when": "Enter the block of addresses your company or data center gave you for this network. If empty, the allocation ranges are used.",
         "example": "203.0.113.100-203.0.113.199",
         "diagram": "sdn",
         "caution": "Overlapping addresses used by DHCP or other devices causes address conflicts."
       },
       "page": {
-        "what": "A public IP (external address; called a floating IP in other products) ties one address of an external network one to one to one interface of a private VM.",
-        "how": "Traffic from outside to the public address (such as 203.0.113.120) is handed to the VM's private address (such as 10.10.0.5) by the router, and the VM goes out with the public address. Nothing changes inside the VM. You can detach it and attach it to another VM, so the address survives a server swap.\nDistributed: leaves straight from the VM's node. Centralized: goes through the gateway node.",
+        "what": "A floating IP (external address) maps one address of an external network 1:1 to one interface of a private VM. Any address on the external network works, even a private range (such as 192.168.x.x) — it does not have to be an internet address. The CLI and API name is floating IP too (orbivisorctl fip).",
+        "how": "Traffic from outside to the external address (such as 203.0.113.120) is handed to the VM's private address (such as 10.10.0.5) by the router, and the VM goes out with the external address. Nothing changes inside the VM. You can detach it and attach it to another VM, so the address survives a server swap.\nDistributed: leaves straight from the VM's node. Centralized: goes through the gateway node.",
         "when": "When the outside must reach a VM first, like a web server or VPN. For going out only, the router's SNAT is enough. To spread traffic over several VMs, use a load balancer.",
         "diagram": "sdn",
-        "caution": "The VM's network must be attached to a router that goes out to that external network. A security group blocking inbound traffic stops it too. It counts toward the folder's public IP quota."
+        "caution": "The VM's network must be attached to a router that goes out to that external network. A security group blocking inbound traffic stops it too. It counts toward the folder's floating IP quota."
       },
       "nic": {
-        "what": "The VM network card to attach this public IP to.",
-        "how": "Each card takes one public IP. Cards you cannot pick show why (no router, no IPv4, already attached).",
+        "what": "The VM network card to attach this floating IP to.",
+        "how": "Each card takes one floating IP. Cards you cannot pick show why (no router, no IPv4, already attached).",
         "when": "You can also create it unattached and use Attach in the list later.",
         "caution": "Templates cannot take one."
       }
@@ -420,7 +420,7 @@
         "how": "Ten VMs with the same OS keep the OS pieces only once. Each backup lists the pieces it uses, so any backup can be restored or deleted on its own. Space cleanup removes pieces no backup uses and gives the space back.",
         "when": "Use a store with many VMs, to keep backups in S3, or to encrypt on the nodes. With a few VMs a backup pool is enough.",
         "diagram": "dedupStore",
-        "caution": "Deleting backups frees space only at the next cleanup. An encrypted store cannot be opened without its recovery key."
+        "caution": "Deleting backups frees space only at the next cleanup. An encrypted store opens with either its recovery key or its escrow passphrase — lose both and the backups cannot be opened."
       },
       "backend": {
         "what": "Where the pieces are actually kept.",
@@ -458,9 +458,9 @@
       },
       "diskSize": {
         "what": "The disk size of the template (and of VMs cloned from it).",
-        "how": "Cloud images come small, 2–3 GiB. The disk is grown to the size you give, and the guest widens its partition on first boot. A qcow2 disk does not take the promised size at once — only what is written.",
+        "how": "Cloud images come small (built-in images are about 2–10 GiB — for example Ubuntu 24.04 3.5 GiB, Rocky 9 10 GiB). The disk is grown to the size you give, and the guest widens its partition on first boot. A qcow2 disk does not take the promised size at once — only what is written.",
         "diagram": "thinOvercommit",
-        "example": "20 → a 20 GiB disk (actually using little more than 2 GiB at first)",
+        "example": "20 → a 20 GiB disk (actually using a few GiB at first)",
         "caution": "It cannot be smaller than the image, and later it can only grow, never shrink."
       },
       "checksum": {
@@ -487,7 +487,7 @@
       },
       "devices": {
         "what": "Which virtual devices the imported VM's disks and network cards use.",
-        "how": "virtio (virtio-blk): the fast virtual device (recommended). Most Linux systems include its drivers.\nSATA / e1000e: compatible devices. Windows recognises them without drivers, but they are slower.",
+        "how": "Import suggests devices from the source OS: SATA and e1000e for Windows, virtio for others.\nvirtio (virtio-blk): the fast virtual device. The guest needs its drivers (most Linux includes them; Windows needs them installed).\nSATA / e1000e: compatible devices. Windows recognises them without drivers, but they are slower.",
         "when": "If a Windows VM has no virtio drivers, import it with SATA and e1000e first, install the drivers, then switch to virtio.",
         "caution": "Switching to a device without drivers leaves the OS unable to find its disk, so it does not boot."
       }
@@ -505,7 +505,7 @@
         "how": "qcow2: a file that takes only what is written. Supports snapshots and linked clones.\nraw: one plain file the full size of the disk. Fewer features, a little faster.",
         "when": "Usually keep qcow2 (the default). Use raw when disk speed matters a lot, as for a database, and snapshots are not needed.",
         "diagram": "thinOvercommit",
-        "caution": "LVM-thin, ZFS and Ceph pools have no choice: always raw (the pool does the snapshots)."
+        "caution": "LVM-thin, ZFS, Ceph and shared LVM pools have no choice: always raw (LVM-thin, ZFS and Ceph do the snapshots themselves; shared LVM has none)."
       },
       "size": {
         "what": "The disk size promised to the VM.",
@@ -595,7 +595,7 @@
       },
       "poolSize": {
         "what": "How many copies of each piece of data are kept.",
-        "how": "Copies are always on different nodes. With 3, data survives two failed nodes, but usable space is a third of the total.",
+        "how": "Copies are always on different nodes. With 3, everything keeps working when one node fails; with two failed nodes the data survives but reads and writes stop until one comes back. Usable space is a third of the total.",
         "when": "3 is recommended. 2 with two nodes; 1 only for a single test node.",
         "caution": "With 1, a single failed disk loses data. With 2, data can be lost while one copy is down."
       },
@@ -609,36 +609,36 @@
     "routers": {
       "page": {
         "what": "A router is a virtual router joining SDN networks (virtual switches) to each other and private networks to the outside.",
-        "how": "Attach an SDN network as a router interface and its subnet gateway address becomes the router's address. Pick an external network and the router takes one outside address there, replacing private VMs' addresses with it on the way out (SNAT). To let the outside reach a VM, attach a public IP (external address).\nOne gateway node hosts the outside door; if it fails, the next node takes over.",
-        "when": "When private VMs must reach the internet, when two or more SDN networks must talk, or to use public IPs.",
+        "how": "Attach an SDN network as a router interface and its subnet gateway address becomes the router's address. Pick an external network and the router takes one outside address there, replacing private VMs' addresses with it on the way out (SNAT). To let the outside reach a VM, attach a floating IP (external address).\nOne gateway node hosts the outside door; if it fails, the next node takes over.",
+        "when": "When private VMs must reach the internet, when two or more SDN networks must talk, or to use floating IPs.",
         "diagram": "sdn",
         "caution": "A router with interfaces left cannot be deleted. An external network needs a gateway node with that physical network, set on the Nodes screen."
       },
       "external": {
         "what": "The external network is the real physical network the router uses to reach the outside (your LAN, the internet). Create it on the Networks screen as External (provider).",
-        "how": "The router takes one outside address from this network's public IP ranges. The default route (0.0.0.0/0) goes to this network's gateway.",
-        "when": "Pick one for VMs to reach the internet or to use public IPs. None if the router only joins SDN networks.",
+        "how": "The router takes one outside address from this network's floating IP ranges. The default route (0.0.0.0/0) goes to this network's gateway.",
+        "when": "Pick one for VMs to reach the internet or to use floating IPs. None if the router only joins SDN networks.",
         "diagram": "sdn",
-        "caution": "Changing it changes the outside address. Detach public IPs going through this router first."
+        "caution": "Changing it changes the outside address. Detach floating IPs going through this router first, and turn off the external VIP of (or delete) load balancers that use it."
       },
       "snat": {
-        "what": "SNAT (source address translation) replaces the source address of private VMs going out with the router's one outside address, like a home router.",
+        "what": "SNAT (source address translation) replaces the source address of private VMs going out with the router's one outside address (IPv4 only), like a home router.",
         "how": "When VM 10.10.0.5 opens a website, the site sees the router's outside address (such as 203.0.113.10). Replies come back through the router to the VM.",
         "when": "Usually on. Turn it off only when the outside router knows the private addresses and has routes to them.",
         "diagram": "sdn",
-        "caution": "SNAT alone does not let the outside reach a VM first; public IPs or load balancers do that."
+        "caution": "SNAT alone does not let the outside reach a VM first; floating IPs or load balancers do that."
       },
       "routes": {
         "what": "A static route is a rule like 'send this address range to that device'.",
-        "how": "The router sends traffic matching a route to its next hop, and everything else to the external network's gateway.",
+        "how": "The router sends traffic matching a route to its next hop, and everything else to the external network's gateway. Without an external network, traffic with no matching route is dropped.",
         "when": "Use it when another network sits behind a VPN or firewall VM inside a private network.",
         "example": "destination 10.20.0.0/16 → next hop 10.10.0.254 (VPN VM)",
-        "caution": "With an external network the default route (0.0.0.0/0) exists already; do not add it."
+        "caution": "The default route (0.0.0.0/0) comes with the external network; adding it yourself is refused."
       }
     },
     "remotes": {
       "page": {
-        "what": "A remote cluster is another Orbivisor cluster in another building or region. This cluster can see its status, send backup copies there and hand VMs over to it with a DR plan.",
+        "what": "A remote cluster is another Orbivisor cluster in another building or region. This cluster can see its status and send backup copies there. A DR plan lives on the recovering side (the standby site): register the main site as a remote there, and its VMs' copies are brought back up on that cluster.",
         "how": "Register it with its address, CA fingerprint and an API token made there. Its status is collected every 30 seconds. Turning on remote replication in a backup schedule sends a copy of each backup to a pool or store there.",
         "when": "When work must go on even if one site stops completely from fire, power loss or ransomware.",
         "diagram": "replicationDr",
@@ -647,14 +647,14 @@
       "token": {
         "what": "The key the remote cluster uses to recognise this cluster.",
         "how": "Create it under Settings › API tokens on the remote cluster. This cluster can do there only what that token's user may do.",
-        "when": "For backup copies only, use a user that can write backups; for DR, one that can also create and start VMs.",
+        "when": "For backup copies only, use a user that can write backups. When a standby site registers the main site for DR, the token (made on the main site) needs to read VMs and backups, stop and start VMs, and create and send backups there (the standby site restores VMs itself).",
         "caution": "The token is not shown again. Enter it again when the address or CA changes."
       }
     },
     "dr": {
       "page": {
         "what": "A DR (disaster recovery) plan is the running order for starting a production site's VMs on this cluster when that whole site is lost.",
-        "how": "The production cluster keeps sending backup copies here (remote replication). A failover makes VMs from the newest copies, changes networks and IPs to suit this site, then starts the boot groups in order.\nTest: starts them on test networks that cannot reach production, then cleans up.\nPlanned migration: stops the production VMs and moves up to a last backup (no data lost).\nDisaster failover: when production is already down, starts from the newest copies.",
+        "how": "The production cluster keeps sending backup copies here (remote replication). A failover goes through the boot groups in order: for each group it restores the VMs from the newest copies (networks and IPs changed to suit this site) and starts them. The next group's restore begins after the previous group finishes.\nTest: starts them on test networks that cannot reach production, then cleans up.\nPlanned migration: stops the production VMs and moves up to a last backup (no data lost).\nDisaster failover: when production is already down, starts from the newest copies.",
         "when": "Test about once a month and note how long it takes (RTO).",
         "diagram": "replicationDr",
         "caution": "After a disaster failover, the same VM may run in both places once production comes back. Make sure the production VMs are stopped (fenced)."
@@ -666,14 +666,14 @@
       },
       "rpo": {
         "what": "RPO is the most data, in time, you can afford to lose in a disaster.",
-        "how": "The age of each VM's newest copy is measured and an alert fires when it is older than the target. The bar shows how far along the target it is.",
-        "when": "With one copy a day, 24 to 26 hours fits.",
-        "example": "RPO 24 hours: alert when last night's 03:00 copy passes 03:00 today",
+        "how": "The age of each VM's newest copy is measured and an alert fires when it is older than the target. The bar shows how close it is to the target.",
+        "when": "A copy's age counts from when the backup was made on the main site. Set the target a little above the backup interval plus backup and copy time. With one copy a day, 26 to 30 hours.",
+        "example": "RPO 28 hours, backup daily at 03:00: each 03:00 copy normally arrives that morning, so no alert; if a day is missed, the alert fires at 07:00 the next day",
         "caution": "0 turns the alert off."
       },
       "groups": {
         "what": "Boot groups are the order VMs start in.",
-        "how": "All VMs of group 1 start; once they meet 'Ready when', group 2 starts. VMs in the same group start together.",
+        "how": "Group 1's VMs are restored and started; when all have finished (ready, failed or timed out), group 2 begins. VMs in a group run together, up to 4 at once (2 per node; setting max_parallel). Whether a timeout stops the run or continues follows the group setting (continue by default).",
         "example": "Group 1: db → Group 2: app → Group 3: web",
         "when": "Put VMs that depend on others (app → database) in later groups."
       },
@@ -686,8 +686,8 @@
     "drRun": {
       "page": {
         "what": "The progress of one DR run (test, planned migration, disaster failover or cleanup).",
-        "how": "The step dots fill in order — prepare, pick copies, restore, start each group — and below, each VM shows its state and task. The elapsed time is the RTO.",
-        "when": "When the stalled banner appears, read the task errors below and cancel if needed.",
+        "how": "For each VM the step dots fill in order — Restoring → Starting → Waiting → Ready (cleanup: Deleting → Deleted). Each group starts once the group before has finished (ready, failed or timed out). The elapsed time is the RTO.",
+        "when": "When the stalled banner appears, read the task errors below. Cancelling is advised only for a planned migration you can run again — cancelling a failover can leave VMs running on neither side.",
         "diagram": "replicationDr",
         "caution": "Always clean up after a test, or the test VMs keep using resources."
       }
@@ -703,7 +703,7 @@
     "alertRules": {
       "condition": {
         "what": "The kind of condition that fires the alert.",
-        "how": "Metric: a node or VM value such as CPU, memory or disk goes above or below a threshold.\nStorage pool usage: a pool is fuller than a percentage.\nEvents: a node goes down, a VM fails, a task fails, HA recovers, a backup fails — notified once, right away.\nPick the SDN, backup store and DR groups only if you use those features.",
+        "how": "Metric: a node or VM value such as CPU, memory or disk goes above or below a threshold.\nStorage pool usage: a pool is fuller than a percentage.\nStates: something that lasts, such as a node being down or a VM failed — can have a duration.\nEvents: something that happens once — a task fails, HA recovers, a backup schedule fails, a DR run fails — notified once, right away, with no duration.\nPick the SDN, backup store and DR groups only if you use those features.",
         "example": "Node metric · CPU % · above · 90 · for 300 s → notify when CPU stays above 90% for over 5 minutes."
       },
       "forSecs": {
@@ -720,6 +720,11 @@
         "what": "How serious the alert is. It shows in the colour on screen and in the notification title.",
         "how": "Critical: the service stopped or is about to — fix now.\nWarning: fine for now, but a problem if left.\nInfo: good to know.",
         "when": "To send severities to different places, use separate rules and targets."
+      },
+      "sendResolved": {
+        "what": "Whether to send one more 'resolved' notice when the problem clears.",
+        "how": "On (default): a resolved notice is sent when a state condition is back to normal. Events (one-off things such as a task failing or an HA recovery) have nothing to clear, so none is sent.",
+        "when": "Usually keep it on. Turn it off if there are too many notices."
       }
     },
     "notificationTargets": {
@@ -741,14 +746,14 @@
     "securityGroups": {
       "page": {
         "what": "A security group is a bundle of firewall rules you put on VM network cards. One group (such as web) can go on many VMs, and changing it applies to all of them right away.",
-        "how": "A card with groups drops incoming traffic by default and accepts only what matches an 'in · accept' rule. Outgoing traffic is sent by default and dropped only when it matches an 'out · drop' rule. Replies to allowed traffic, ARP and DHCP replies always pass.\nOn simple network cards the node's nftables applies it; on SDN cards OVN ACLs do, with the same order and defaults. Differences: on SDN cards, removing an allow rule also cuts connections already open, and sending with someone else's address (spoofing) is blocked.",
+        "how": "A card with groups drops new incoming connections by default and accepts only what matches an 'in · accept' rule. Outgoing traffic is sent by default and dropped only when it matches an 'out · drop' rule. Replies to allowed traffic, ARP and DHCP replies always pass.\nOn simple network cards the node's nftables applies it; on SDN cards OVN ACLs do, with the same order and defaults. Differences: on SDN cards, removing an allow rule also cuts connections already open. Spoofing protection is separate from groups: simple cards block other MAC addresses; SDN cards always block other MAC and IP addresses, even without a group.",
         "when": "When a VM should open only the ports it needs (for example 443 for a web server, SSH only from the office).",
         "diagram": "securityGroup",
         "caution": "A card whose groups have no rules drops all incoming traffic, SSH included. Groups used by VM cards cannot be deleted."
       },
       "rules": {
         "what": "A rule says 'accept (or drop) traffic in this direction, with this protocol and port, from or to these addresses'.",
-        "how": "Direction: in (to the VM) or out (from the VM).\nAction: accept or drop.\nProtocol: TCP, UDP, ICMP or any.\nPorts: one such as 22, or a range such as 8000-8080. Empty means all ports.\nRemote address: the other side's address range (CIDR). Empty means anywhere.\nRules are checked from the top and the first match decides; reorder them with the arrows.",
+        "how": "Direction: in (to the VM) or out (from the VM).\nAction: accept or drop.\nProtocol: TCP, UDP, ICMP (IPv4), ICMPv6 or any.\nPorts: one such as 22, or a range such as 8000-8080. Empty means all ports.\nRemote address: the other side's address range (CIDR). Empty means anywhere.\nRules are checked from the top and the first match decides; reorder them with the arrows.",
         "when": "Web server: in · accept · TCP · 443. SSH from the office only: in · accept · TCP · 22 · 203.0.113.0/24.",
         "example": "in accept TCP 22 10.0.0.0/8\nin accept TCP 443 (anywhere)\nout drop TCP 25 (block sending mail)",
         "diagram": "securityGroup",
@@ -803,13 +808,45 @@
         "uefiVars": {
           "what": "A small file where UEFI firmware stores boot entries, Secure Boot keys and similar settings. Created when the VM first boots."
         }
+      },
+      "bootOrder": {
+        "what": "The order of devices the VM looks for an OS on when it starts.",
+        "how": "Devices are tried from the top and the first bootable one is used. A device left out is never booted from.",
+        "when": "Put the CD-ROM first while installing the OS, and the disk first afterwards (otherwise the installer may start again).",
+        "caution": "A new order applies from the next start of the VM."
+      },
+      "restart": {
+        "what": "Whether Orbivisor starts the VM again on the same node when it stops with an error (for example QEMU crashed).",
+        "how": "Never (default): leave it stopped and show the last error.\nOn failure: start it again after an error stop. A shutdown from inside the guest is not restarted.",
+        "when": "For VMs that must always run. To start it on another node when its node dies, turn on automatic recovery (HA) instead."
+      },
+      "power": {
+        "what": "Whether Orbivisor keeps this VM on or off. It can differ from whether it is running right now (the state).",
+        "how": "The start and stop buttons change it, and after a node reboot or a stop Orbivisor brings the VM back to it.",
+        "caution": "Shutting the OS down inside the guest also sets it to off."
+      },
+      "lastError": {
+        "what": "The last error while starting or running the VM.",
+        "how": "When Orbivisor cannot start the VM, or the VM stops with an error, the reason stays here. It clears after the next successful start.",
+        "when": "Look here first when a VM does not start. The full steps are in the task history."
+      },
+      "haError": {
+        "what": "Why automatic recovery (HA) could not restart or move this VM.",
+        "how": "It is set when a node died and there was no place to start the VM (memory, a 'hard' placement rule, a restricted HA group, no disk replica), or starting failed. It clears when you fix the cause and start the VM again.",
+        "when": "Look here when an HA VM stayed off.",
+        "diagram": "haFencing"
+      },
+      "guestAddresses": {
+        "what": "The addresses the guest's network cards actually use.",
+        "how": "Reported by the guest agent (qemu-guest-agent), so addresses changed inside the guest show too. Empty without the agent.",
+        "caution": "On SDN networks only the address Orbivisor assigned can talk — if another address shows here, fix the guest's settings."
       }
     },
     "templates": {
       "page": {
         "what": "A template is a VM frozen as a master copy. Use it to create many VMs with the same OS and settings quickly.",
         "how": "Deploying makes linked clones that store only their changes on top of the template disk, so it takes seconds. On pools without linked clones the disk is copied in full.",
-        "when": "Downloading an OS image from the image library creates a template right away. You can also stop a VM you installed and choose Convert to template.",
+        "when": "When downloading an OS image from the image library, turn on 'Make a template after download' to get a template. You can also stop a VM you installed and choose Convert to template.",
         "caution": "A template with linked clones left can't be deleted or turned back into a VM."
       },
       "mode": {
@@ -868,7 +905,7 @@
       "guestWatch": {
         "what": "Watches whether the guest OS hangs and force-restarts the VM if it stops answering.",
         "how": "It asks the guest agent regularly. After a first answer, silence for the set time triggers a restart. During a guest reboot it waits for the agent to answer again.",
-        "caution": "qemu-guest-agent must be installed and running in the guest."
+        "caution": "qemu-guest-agent must be installed and running in the guest. It works only for VMs with automatic recovery (HA) on; after the restart limit the VM is moved to another node."
       },
       "tpm": {
         "what": "A virtual TPM chip that keeps encryption keys safe.",
@@ -904,7 +941,7 @@
       },
       "ciUserData": {
         "what": "(Advanced) Write the cloud-init configuration yourself.",
-        "how": "user-data replaces everything built from the fields above (start with #cloud-config). vendor-data runs alongside it — use it to add packages or commands.",
+        "how": "user-data replaces the #cloud-config built from the fields above (user, password, SSH keys, host name); start it with #cloud-config. Addresses and DNS (network-config) are still built from the fields. vendor-data runs alongside it — use it to add packages or commands.",
         "example": "#cloud-config\npackages: [nginx]\nruncmd: [systemctl enable --now nginx]"
       },
       "diskVolume": {
@@ -996,7 +1033,7 @@
       },
       "emulator": {
         "what": "(Advanced) Where QEMU's own work (I/O and so on) runs, apart from the vCPUs.",
-        "when": "For dedicated-CPU VMs, 'one more dedicated CPU' keeps the vCPUs undisturbed."
+        "when": "For dedicated-CPU VMs, 'Own dedicated CPU' keeps the vCPUs undisturbed."
       },
       "nodes": {
         "what": "(Advanced) Large servers split CPUs and memory into cells (NUMA nodes); memory in the same cell is faster. This decides whether the guest sees cells too.",
@@ -1009,8 +1046,8 @@
         "caution": "Reserve hugepages in the node's host resources first, or the VM won't start."
       },
       "listCpus": {
-        "what": "vCPU slot numbers placed in this guest NUMA node.",
-        "example": "0-3 or 0,1,4"
+        "what": "How many vCPU slots this guest NUMA node gets. It must be a multiple of the slots per socket; nodes take sockets in order.",
+        "example": "2 sockets × 4 slots (max 8 vCPUs) → node 0: 4, node 1: 4"
       },
       "listMemory": {
         "what": "Memory in MiB for this guest NUMA node. All nodes together must equal the VM's memory."
@@ -1037,7 +1074,7 @@
     "migrate": {
       "node": {
         "what": "Live migration: moves a running VM to another node without stopping it.",
-        "how": "Memory is copied to the target in rounds; at the end the VM pauses very briefly (about a second) to hand over the rest and continues on the target. Shared-pool disks stay, local disks are copied too.",
+        "how": "Memory is copied to the target in rounds; at the end the VM pauses very briefly to hand over the rest and continues on the target (the more memory a VM changes, the longer the pause). Shared-pool disks stay; local disks are copied too unless the target already has a replica (then the replica is used).",
         "diagram": "liveMigration",
         "caution": "Both nodes need compatible CPU features; nodes you can't pick can't run this VM's CPU."
       },
@@ -1062,13 +1099,13 @@
       "page": {
         "what": "An HA group is the running order for where HA VMs run and where they start again when a node dies.",
         "how": "Each node in the group gets a priority number. HA places the VM on the live node with the largest number. When a higher node returns, the VM moves back by live migration (unless No failback is on).",
-        "when": "For VMs that must run only on certain nodes (licences, GPUs, disks), or that should have a usual home.",
+        "when": "For VMs that should have a usual home and order. If they must run only on certain nodes (licences, GPUs, disks), turn on 'Restricted' — off, they go to other nodes when all group nodes are down.",
         "diagram": "haFencing",
         "caution": "With 'Only on the group's nodes' on, the VM is not started when all those nodes are down."
       },
       "priority": {
         "what": "A number that sets the node order (0–1000).",
-        "how": "Larger goes first. With equal numbers the less loaded node is chosen.",
+        "how": "Larger goes first. With equal numbers, the node with fewer 'if possible' rule penalties wins, then the less loaded node (with the 'balance' policy), then the one with more free memory.",
         "example": "node1=100, node2=50, node3=0 → usually node1; node2 if node1 dies; node3 if both die",
         "when": "Leave all at 0 if order does not matter."
       }
@@ -1076,10 +1113,10 @@
     "lb": {
       "page": {
         "what": "A load balancer has one address clients connect to (VIP) and spreads incoming connections over several member VMs (L4, TCP and UDP).",
-        "how": "Each listener maps 'VIP port → members'. With health checks on, members that stop answering are taken out and put back when they recover. Turn on the external VIP to reach it from outside through a public IP (external address).\nSDN (OVN) handles it on every node, so no extra appliance or VM is needed.",
+        "how": "Each listener maps 'VIP port → members'. With health checks on, members that stop answering are taken out and put back when they recover. Turn on the external VIP to reach it from outside through a floating IP (external address).\nSDN (OVN) handles it on every node, so no extra appliance or VM is needed.",
         "when": "When several web or API servers serve one address, and the service must keep running when one fails.",
         "diagram": "sdn",
-        "caution": "The VIP network must be an SDN network attached to a router. Members' security groups must accept clients and the health check addresses. There is no HTTP-aware (L7) balancing."
+        "caution": "The VIP network must be an SDN (overlay) network attached to a router — not an external (provider) network. Members' security groups must accept clients and the health check addresses. There is no HTTP-aware (L7) balancing."
       },
       "vip": {
         "what": "The VIP (virtual address) is the load balancer's address clients connect to. It belongs to no VM.",
@@ -1105,7 +1142,7 @@
         "how": "Every interval it connects to the member port; no answer within the timeout is a fail. After 'down after' fails in a row the member is out; after 'up after' passes in a row it is back.",
         "when": "Keep it on. Without it, dead members still get connections.",
         "example": "interval 5 s, timeout 3 s, up after 2, down after 3 → a dead member is out in about 15 s",
-        "caution": "Checks come from the network's health check address. If members' security groups block it, every member looks down."
+        "caution": "Checks come from the network's health check address. If members' security groups block it, every member looks down. Members given by IP address instead of VM are not checked and always count as up."
       }
     },
     "haChecks": {
@@ -1124,7 +1161,7 @@
       "kind": {
         "what": "How the connection is checked.",
         "how": "Link: whether the network card has a cable link.\nPing: whether the given addresses (such as the gateway or switch) answer.\nPool: reads a small file on the shared pool or checks its paths.",
-        "when": "Link catches pulled cables; ping sees beyond the switch."
+        "when": "Link catches pulled cables; ping sees beyond the switch; pool checks that one shared storage pool is reachable."
       },
       "onFail": {
         "what": "What happens when the check fails for longer than the wait time.",
@@ -1143,7 +1180,7 @@
     "topology": {
       "page": {
         "what": "The topology draws your network layout. It is for looking, not for changing things.",
-        "how": "At the back: physical (external) networks. Above: routers and their gateway nodes. Below: SDN networks and the VMs on them. On the side: simple networks (bridge, VXLAN). Public IPs and load balancers sit next to the VMs and networks they point to.\nYellow marks need attention (no gateway, not routed and so on).",
+        "how": "At the back: physical (external) networks. Above: routers and their gateway nodes. Below: SDN networks and the VMs on them. On the side: simple networks (bridge, VXLAN). Floating IPs and load balancers sit next to the VMs and networks they point to.\nYellow marks need attention (no gateway, not routed and so on).",
         "when": "To find where the path breaks when a VM cannot reach the outside, or which networks and routers a VM uses.",
         "diagram": "sdn",
         "caution": "Things you are not allowed to see are not drawn (only their count is shown)."
@@ -1151,8 +1188,8 @@
     },
     "users": {
       "page": {
-        "what": "A user is one person who signs in to this cluster. Users here are local users whose passwords the cluster keeps itself (LDAP and OIDC users are connected through sign-in realms).",
-        "how": "The global role is the default right across the cluster.\nAdministrator: everything, including users and settings.\nOperator: creates and changes VMs, volumes, networks and backups.\nViewer: only looks.\nRights added or narrowed per folder or VM are set with roles and groups on the Permissions page.",
+        "what": "A user is one person who signs in to this cluster. Local users (whose passwords the cluster keeps) and every directory (LDAP/OIDC) user who has signed in at least once are listed. Directory users' passwords cannot be changed here; deleting one here also cuts off their sessions and API tokens at once.",
+        "how": "The global role is the default right across the cluster.\nAdministrator: everything, including users and settings.\nOperator: creates and changes VMs, volumes and backups. Can attach VMs to networks but cannot create or change networks.\nViewer: only looks.\nExtra rights per folder or VM are set with roles and groups on the Permissions page.",
         "when": "Make a separate user for each person. When people share an account, the audit log cannot tell who did what.",
         "caution": "Change your own password from the account menu; another administrator changes your role or deletes you."
       }
@@ -1160,7 +1197,7 @@
     "tokens": {
       "page": {
         "what": "An API token is a long secret that programs (scripts, Terraform, Prometheus, orbivisorctl) sign in with instead of a person.",
-        "how": "Send it in the request header Authorization: Bearer <token>. A token follows its creator's role and rights exactly. It is shown once, when created; the server never shows it again.",
+        "how": "Send it in the request header Authorization: Bearer <token>. A token without a scope has its creator's rights (the global role plus folder and VM permissions given to them and their groups). With a scope it only has the rights inside that scope (never more than its creator has). It is shown once, when created; the server never shows it again.",
         "when": "Make a separate token for each automation. If one leaks, delete just that one.",
         "caution": "A token is as good as a password. Never commit it to a code repository."
       }
@@ -1184,11 +1221,11 @@
     "placementRules": {
       "page": {
         "what": "Placement rules say whether VMs should be kept together, kept apart, or kept on certain nodes.",
-        "how": "Rules are checked at VM start, migration, HA recovery and balancing. A 'hard' rule never picks a place that breaks it; an 'if possible' rule gives such places a penalty so they are chosen less.",
-        "example": "Two web VMs on different nodes: 'Different nodes (hard)' + VM tag app=web\nDatabases only on SSD nodes: 'Only on these nodes (hard)' + node tag disk=ssd",
+        "how": "Rules are checked at VM start, migration, HA recovery and balancing. A 'hard' rule never picks a place that breaks it; an 'if possible' rule gives such places a penalty so they are chosen less. But HA recovery may break a rule with 'HA recovery may break this rule' on, and a person can break one with 'Ignore placement rules' in the migrate dialog.",
+        "example": "Two web VMs on different nodes: 'Different nodes (hard)' + VM label app=web\nDatabases only on SSD nodes: 'Only on these nodes (hard)' + node label disk=ssd",
         "when": "With several VMs doing the same job (so one node failure does not take them all), or when VMs need nodes with certain hardware.",
         "diagram": "placement",
-        "caution": "Too strict 'hard' rules can leave HA no place to start a VM when a node dies."
+        "caution": "Too strict 'hard' rules can leave HA no place to start a VM when a node dies — turn on 'HA recovery may break this rule' for such rules."
       },
       "kind": {
         "what": "The relation between VMs, or between VMs and nodes.",
@@ -1198,14 +1235,14 @@
       },
       "weight": {
         "what": "The importance of an 'if possible' rule (1–100).",
-        "how": "Each place that breaks the rule gets this many penalty points, and the node with the fewest points is chosen.",
+        "how": "Each place that breaks the rule gets this many penalty points, and the node with the fewest points is chosen (HA group priority comes first; with equal points, load decides, then free memory).",
         "example": "Web spread 80, same rack 20 → when they clash, web spread wins."
       }
     },
     "placement": {
       "page": {
         "what": "Optimal placement shows the node load and the balancer that evens it out between nodes.",
-        "how": "Nodes send their CPU and memory load every 5 seconds. Every 5 minutes the balancer measures the load difference between nodes and, above the move threshold, works out which VMs to move where. Placement rules are always kept.",
+        "how": "Nodes send their CPU and memory load every 5 seconds. Every 5 minutes the balancer measures the load difference between nodes and, above the move threshold, works out which VMs to move where. It first moves VMs that break a 'hard' rule to a place that fits, and no move may break a 'hard' rule or add 'if possible' penalties.",
         "when": "When load piles up on a few nodes. Start with 'Recommend', check the suggestions, then switch to 'Automatic'.",
         "diagram": "placement",
         "caution": "Moves are live migrations and use the network while memory is copied."
@@ -1217,7 +1254,7 @@
       },
       "policy": {
         "what": "How load is shared out.",
-        "how": "Balance: spread load evenly over all nodes.\nPack: fill busy nodes first and keep the rest empty (to power nodes down at night or for maintenance).",
+        "how": "Balance: spread load evenly over all nodes.\nPack: VMs being started go to the fullest node that still fits. Running VMs are not gathered, so use Drain node to empty a node. With this policy the balancer only fixes rule violations.",
         "when": "Usually Balance."
       },
       "threshold": {
@@ -1231,8 +1268,8 @@
       "page": {
         "what": "A sign-in realm is where passwords are checked. The local realm is checked by this cluster; LDAP and OIDC realms are checked by your company directory or sign-in service.",
         "how": "When a user signs in as kim@corp, the corp realm's directory (or IdP) checks them and the groups they belong to set their role. When the company changes their groups, the role changes at the next sign-in. There is no need to create the users first.",
-        "when": "Use it when there are many people, or when removing a company account must also block sign-in here. After creating one, press Test to check each step.",
-        "caution": "Deleting a realm stops sign-in, sessions and API tokens of its users."
+        "when": "Use it when there are many people, or when sign-in and roles should follow the company directory's accounts and groups. After creating one, press Test to check each step.",
+        "caution": "Deleting or disabling an account in the company directory only blocks new sign-ins. Open sessions (up to 12 hours) and the person's API tokens (they never expire) keep working — to cut them off at once, delete the user on the Users page here (their tokens go with it). Deleting the realm itself stops sign-in, sessions and API tokens of all its users."
       },
       "kind": {
         "what": "How company accounts are checked.",
@@ -1258,14 +1295,14 @@
     "permissions": {
       "page": {
         "what": "A permission is \"to whom · where · which role\". For example: the dev-team group · in the dev folder · operator.",
-        "how": "A user's real rights are their global role plus every permission on them (and their groups). With \"to subfolders\" on, a folder permission also covers the folders and VMs below it. There are no deny permissions, so to narrow access give a smaller role.",
+        "how": "A user's real rights are their global role plus every permission on them (and their groups). A folder permission reaches the VMs, networks, storage and subfolders inside only with 'Apply inside the folder and its subfolders' on — off, it applies to the folder itself only. There are no deny permissions, so to narrow access give a smaller role.",
         "when": "When global roles are too broad — for example, when each team should handle only the VMs in its own folder.",
         "caution": "If you remove a permission that gives you access, you cannot add it back yourself."
       }
     },
     "permissionsPropagate": {
       "what": "Whether a folder permission passes down.",
-      "how": "On: the folder, the folders below it and every VM, network and storage in them.\nOff: the folder itself only (for example renaming it).",
+      "how": "On: the folder, the folders below it and every VM, network and storage in them.\nOff: the folder itself only (for example renaming it) — not even the VMs directly in it.",
       "when": "Usually on."
     },
     "roles": {
@@ -1286,7 +1323,7 @@
     },
     "audit": {
       "page": {
-        "what": "The audit log records every request that reaches this cluster. It is where you find who did what when something goes wrong.",
+        "what": "The audit log records the requests that change something in this cluster (create, change, delete, sign-in) plus console opens and file-restore downloads. Read-only requests (GET) are not kept. It is where you find who did what when something goes wrong.",
         "how": "Each node records the requests it received; this page gathers every node's records in time order. Filter by user or action (for example POST /vms). Records of nodes that did not answer are missing.",
         "when": "To find out why a VM suddenly stopped or a setting changed. For before-and-after values, the settings history page is easier."
       }
@@ -1295,21 +1332,21 @@
       "page": {
         "what": "A task is one piece of work that takes time to finish, such as starting, moving, backing up or restoring a VM.",
         "how": "A request creates a task; the node doing it reports progress; at the end it is done, done with a warning, or failed. A failed task shows why in its error line. Tasks that start on their own (HA recovery, scheduled backups) have \"automatic\" as requester.",
-        "when": "To see what happened after you pressed a button, or why it failed. Failed only collects just the problems."
+        "when": "To see what happened after you pressed a button, or why it failed. The Failed filter shows only the problems."
       }
     },
     "folders": {
       "page": {
         "what": "A folder is a box for VMs (or networks, storage pools). Besides keeping things tidy, it is the unit for permissions and quotas.",
-        "how": "Permissions: a permission on a folder passes down to the folders and items below it.\nQuotas: caps on vCPUs, memory, disk and VM count for the folder and everything below it. Parent folders' caps apply too.\nMoving: drag rows onto a folder on the left, or use Move to folder.",
+        "how": "Permissions: a permission given on a folder with 'Apply inside' passes down to the folders and items below it.\nQuotas (VM folders only): caps on vCPUs, memory, disk and VM count for the folder and everything below it. Parent folders' caps apply too. Network and storage folders pass on permissions only.\nMoving: drag rows onto a folder on the left, or use Move to folder.",
         "when": "Make a folder per team or purpose (production/development), give that team permissions on it, and set a quota.",
         "caution": "Only empty folders can be deleted."
       }
     },
     "history": {
       "page": {
-        "what": "Settings history keeps the before and after of every change to settings such as VMs, networks and rules.",
-        "how": "Each row shows who changed it, when and from where (UI, CLI, YAML apply, Terraform, automatic task). Open a row to compare the changed fields side by side and Restore to go back to that value. You can also restore everything to one point in time.",
+        "what": "Settings history keeps the before and after of each change to settings such as VMs, networks and rules. By default it keeps up to 100 versions per resource, 365 days and 64 MiB in all; older entries are removed.",
+        "how": "Each row shows who changed it, when and from where (UI, CLI, YAML apply, Terraform, automatic task). Open a row to compare the changed fields side by side and Restore to go back to that value. You can also restore everything to one point in time. Secrets (passwords, tokens) are not recorded, so a restore keeps their current value.",
         "when": "\"It worked yesterday but not today\" — find what changed and undo it.",
         "caution": "History starts when the cluster was upgraded to this version."
       }
@@ -1317,7 +1354,7 @@
     "applySets": {
       "page": {
         "what": "Managing settings as code (YAML) means writing settings in files and applying them all at once. Use it to keep several clusters identical or to review changes in Git.",
-        "how": "1. Applying files with orbivisorctl apply --set name -f folder creates a set.\n2. The cluster remembers the set's file values and compares them with the real values.\n3. When someone changes something in the UI, it shows as \"differs from the file\"; apply again to go back to the file, or take the current value as the file value.",
+        "how": "1. Applying files with orbivisorctl apply --set name -f folder creates a set.\n2. The cluster remembers the last applied values and compares them with the real values.\n3. Any later change (UI, CLI or API) shows as drift; apply again to go back to the file, or accept the current values (then update the files with orbivisorctl export --set).",
         "when": "When you want settings in Git to review and reproduce. Not needed if you only use the UI.",
         "diagram": "declarativeApply"
       }

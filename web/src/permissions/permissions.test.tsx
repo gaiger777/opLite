@@ -104,7 +104,9 @@ it("lets a folder delegator who cannot list users add a grant by id", async () =
       .getAllByRole("option")
       .map((o) => o.textContent);
   expect(offered()).toEqual(["Operator"]);
-  await user.click(within(dialog).getByRole("checkbox", { name: /Also apply to subfolders/ }));
+  await user.click(
+    within(dialog).getByRole("checkbox", { name: /Apply inside the folder and its subfolders/ }),
+  );
   expect(offered()).toEqual(["Operator", "vm-user"]);
   await user.selectOptions(role, "vm-user");
   await user.click(within(dialog).getByRole("button", { name: "Add permission" }));

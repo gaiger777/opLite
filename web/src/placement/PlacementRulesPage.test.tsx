@@ -80,11 +80,11 @@ it("creates a node rule chosen by node label and sends only what the kind takes"
   expect(within(dialog).getByText("Name at least two VMs.")).toBeVisible();
   await user.selectOptions(within(dialog).getByLabelText("Rule"), "node-affinity");
   await user.selectOptions(within(dialog).getByLabelText("Choose nodes"), "tag");
-  await user.type(within(dialog).getByLabelText("Node tag"), "rack-a");
+  await user.type(within(dialog).getByLabelText("Node label"), "rack-a");
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByText("Use KEY=VALUE, such as zone=rack-a.")).toBeVisible();
-  await user.clear(within(dialog).getByLabelText("Node tag"));
-  await user.type(within(dialog).getByLabelText("Node tag"), "zone=rack-a");
+  await user.clear(within(dialog).getByLabelText("Node label"));
+  await user.type(within(dialog).getByLabelText("Node label"), "zone=rack-a");
   // hard 규칙에는 벌점이 없고 HA가 어길 수 있는지를 고른다.
   expect(within(dialog).queryByLabelText("Importance")).not.toBeInTheDocument();
   await user.click(within(dialog).getByLabelText("HA recovery may break this rule"));

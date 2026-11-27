@@ -30,7 +30,7 @@
     "sets": {
       "title": "선언 묶음",
       "empty": "선언 묶음이 없습니다.",
-      "emptyHint": "시작하기: ① 지금 설정을 YAML로 내보내기(설정 화면의 ⋯ 메뉴) ② 그 파일을 Git에 두기 ③ orbivisorctl apply --set 이름 -f 폴더.",
+      "emptyHint": "시작하기: ① VM·네트워크 같은 화면의 ⋯ 메뉴 [YAML로 내보내기]나 orbivisorctl export로 지금 설정을 파일로 받기 ② 그 파일을 Git에 두기 ③ orbivisorctl apply --set 이름 -f 폴더.",
       "objects": "객체",
       "lastApplied": "마지막 적용",
       "appliedBy": "{{time}} · {{user}}",

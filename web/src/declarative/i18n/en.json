@@ -30,7 +30,7 @@
     "sets": {
       "title": "Apply sets",
       "empty": "No apply sets.",
-      "emptyHint": "Getting started: 1. Export the current settings as YAML (the ⋯ menu on a settings page) 2. Keep the file in Git 3. orbivisorctl apply --set name -f folder.",
+      "emptyHint": "Getting started: 1. Get the current settings as files with Export as YAML in a page's ⋯ menu (VMs, networks, …) or orbivisorctl export 2. Keep the files in Git 3. orbivisorctl apply --set name -f folder.",
       "objects": "Objects",
       "lastApplied": "Last applied",
       "appliedBy": "{{time}} by {{user}}",

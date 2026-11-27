@@ -324,7 +324,7 @@ export function BackupTable({
         // 저장소 백업은 이 백업이 저장소에 처음 쓴 것과 디스크의 논리 크기다(dedup — 계획 68 §6).
         if (stats) {
           return (
-            <span className="flex flex-col">
+            <span className="flex flex-col" title={t("backups.newDataTitle")}>
               <span>{t("backups.newData", { size: formatBytes(stats.new_bytes) })}</span>
               <span className="text-xs text-muted-foreground">
                 {t("backups.logical", { size: formatBytes(stats.logical_bytes) })}

@@ -53,7 +53,7 @@ function Field({
     <div className="flex flex-col gap-1">
       <dt className="flex items-center gap-1 text-xs text-muted-foreground">
         {label}
-        {help && <InfoButton topic={info ?? ""} label={label} line={help} />}
+        {help && info && <InfoButton topic={info} label={label} line={help} />}
       </dt>
       <dd className="text-sm">{children}</dd>
     </div>
@@ -104,26 +104,18 @@ export function VmGuestCard({ vm }: { vm: Vm }) {
           <Field
             label={t("vms.guest.settings")}
             help={t("help.vms.guest.settings")}
-            info="vms.guest.settings"
+            info="vmForm.guestAgent"
           >
             {settingLine(vm, t)}
           </Field>
           {info && (
             <>
-              <Field label={t("vms.guest.os")} help={t("help.vms.guest.os")} info="vms.guest.os">
-                {guestOs(info) ?? "—"}
-              </Field>
-              <Field
-                label={t("vms.guest.hostname")}
-                help={t("help.vms.guest.hostname")}
-                info="vms.guest.hostname"
-              >
-                {info.hostname ?? "—"}
-              </Field>
+              <Field label={t("vms.guest.os")}>{guestOs(info) ?? "—"}</Field>
+              <Field label={t("vms.guest.hostname")}>{info.hostname ?? "—"}</Field>
               <Field
                 label={t("vms.guest.addresses")}
                 help={t("help.vms.guest.addresses")}
-                info="vms.guest.addresses"
+                info="vms.guestAddresses"
               >
                 {guestAddresses(info).join(", ") || "—"}
               </Field>
@@ -238,30 +230,10 @@ function GuestDetails({ info }: { info: GuestInfo }) {
   return (
     <>
       <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Field label={t("vms.guest.os")} help={t("help.vms.guest.os")} info="vms.guest.os">
-          {guestOs(info) ?? "—"}
-        </Field>
-        <Field
-          label={t("vms.guest.kernel")}
-          help={t("help.vms.guest.kernel")}
-          info="vms.guest.kernel"
-        >
-          {info.os?.kernel ?? "—"}
-        </Field>
-        <Field
-          label={t("vms.guest.hostname")}
-          help={t("help.vms.guest.hostname")}
-          info="vms.guest.hostname"
-        >
-          {info.hostname ?? "—"}
-        </Field>
-        <Field
-          label={t("vms.guest.agentVersion")}
-          help={t("help.vms.guest.agentVersion")}
-          info="vms.guest.agentVersion"
-        >
-          {info.agent_version ?? "—"}
-        </Field>
+        <Field label={t("vms.guest.os")}>{guestOs(info) ?? "—"}</Field>
+        <Field label={t("vms.guest.kernel")}>{info.os?.kernel ?? "—"}</Field>
+        <Field label={t("vms.guest.hostname")}>{info.hostname ?? "—"}</Field>
+        <Field label={t("vms.guest.agentVersion")}>{info.agent_version ?? "—"}</Field>
       </dl>
       <section className="flex flex-col gap-2">
         <h3 id="vm-guest-nics" className="font-medium">
