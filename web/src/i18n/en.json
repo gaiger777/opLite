@@ -2578,7 +2578,8 @@
       "disable": "Turn off Prometheus endpoint",
       "enabled": "The Prometheus endpoint is on.",
       "disabled": "The Prometheus endpoint is off."
-    }
+    },
+    "toc": "Settings contents"
   },
   "audit": {
     "adminOnly": "Only administrators can read the audit log.",

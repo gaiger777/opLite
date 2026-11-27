@@ -2578,7 +2578,8 @@
       "disable": "Prometheus 끝점 끄기",
       "enabled": "Prometheus 끝점을 켰습니다.",
       "disabled": "Prometheus 끝점을 껐습니다."
-    }
+    },
+    "toc": "설정 목차"
   },
   "audit": {
     "adminOnly": "관리자만 감사 로그를 읽을 수 있습니다.",

@@ -680,3 +680,21 @@ it("clears the HA capacity reserve with none", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Save HA capacity" }));
   await vi.waitFor(() => expect(sent).toEqual([{ ha_reserve: "none", ha_start_concurrency: 4 }]));
 });
+
+it("lists the settings cards in a table of contents (plan 77-6)", async () => {
+  server.use(http.get(apiUrl("/settings"), () => HttpResponse.json(DEFAULT)));
+  renderPage(<SettingsPage />);
+  const toc = await screen.findByRole("navigation", { name: "Settings contents" });
+  const links = within(toc).getAllByRole("link");
+  expect(links.map((l) => l.textContent)).toEqual([
+    "Updates",
+    "HA VMs on host shutdown",
+    expect.any(String),
+    expect.any(String),
+    "Usage reports (telemetry)",
+    "Prometheus",
+  ]);
+  for (const link of links) {
+    expect(document.querySelector(link.getAttribute("href")!)).not.toBeNull();
+  }
+});
