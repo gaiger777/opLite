@@ -9482,6 +9482,8 @@ export interface components {
             /** Format: int64 */
             revision: number;
             source: components["schemas"]["ChangeSource"];
+            /** @description `changed` 앞쪽의 짧은 값 칸(숫자·참거짓·짧은 글 — 최대 3개)의 전·후(계획 77-7). 옛 서버는 주지 않는다. */
+            values?: components["schemas"]["Change"][];
         };
         /** @description 이력 줄 목록(새것부터) */
         HistoryList: {
