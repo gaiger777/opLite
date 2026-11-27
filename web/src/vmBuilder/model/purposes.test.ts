@@ -9,6 +9,7 @@ import {
   purposeBlocked,
   PURPOSES,
   webGroup,
+  withImage,
 } from "@/vmBuilder/model/purposes";
 import { nodeRoom, percent, targetNode } from "@/vmBuilder/model/room";
 import { initialState, setName } from "@/vmBuilder/model/state";
@@ -121,6 +122,21 @@ describe("use cards", () => {
       { iso: "alpine", bootOrder: "1" },
       { iso: "alpine", bootOrder: "" },
     ]);
+  });
+
+  it("start from an uploaded image: that volume as the first disk and a NIC (plan 77-8)", () => {
+    const ctx = builderCtx();
+    const s = withImage(start(), ctx, "spare");
+    expect(s.values).toMatchObject({ cores: "2", memory: "4096" });
+    expect(s.values.disks).toEqual([
+      expect.objectContaining({ kind: "existing", volume: "spare" }),
+    ]);
+    expect(s.values.nics).toEqual([expect.objectContaining({ network: "lan" })]);
+    expect(s.missed ?? []).toEqual([]);
+    // 다른 VM이 쓰는 볼륨은 붙이지 않고 알린다.
+    const used = withImage(start(), ctx, "used");
+    expect(used.values.disks).toEqual([]);
+    expect(used.missed).toContain("disk");
   });
 
   it("are blocked without templates, or for Windows without a TPM-capable node", () => {

@@ -14,6 +14,7 @@ import { api, call, setUnauthorizedHandler } from "@/api/client";
 import type { components } from "@/api/schema";
 import type { Principal, SecondFactorPrompt } from "@/api/types";
 import { forgetPlanEdits } from "@/dr/edits";
+import { resetChunked } from "@/storage/chunked";
 import { resetUploads } from "@/storage/upload";
 import { resetTasks } from "@/tasks/tasks";
 
@@ -68,6 +69,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       queryClient.clear();
       resetTasks();
       resetUploads();
+      resetChunked();
       forgetPlanEdits();
       toast.dismiss();
       // 로그아웃하는 중에 받은 401은 직접 로그아웃한 것으로 둔다(로그인이 다시 false로 바꾼다).

@@ -481,7 +481,10 @@
       "importing": "Importing into the volume",
       "checksum": "Fetching the checksum file",
       "template": "Creating the template VM",
-      "guestWriting": "Writing into the guest ({{done}} so far)"
+      "guestWriting": "Writing into the guest ({{done}} so far)",
+      "checking": "Checking the image",
+      "converting": "Converting {{percent}}% ({{done}}/{{total}} GiB)",
+      "finishing": "Finishing the volume"
     },
     "detail": {
       "vms": "VMs: {{vms}}.",
@@ -1449,7 +1452,47 @@
     },
     "isoTitle": "Upload an ISO image",
     "isoDescription": "The file goes to the node you are connected to ({{node}}), so only directory and NFS pools on that node can be chosen. The image is kept as it is (raw).",
-    "noIsoPool": "No directory or NFS pool is available. ISO images can be kept only in directory and NFS pools."
+    "noIsoPool": "No directory or NFS pool is available. ISO images can be kept only in directory and NFS pools.",
+    "item": {
+      "disk": "Image {{name}}",
+      "iso": "ISO {{name}}"
+    },
+    "state": {
+      "cancelled": "Cancelled",
+      "failed": "Failed",
+      "paused": "Paused",
+      "needsFile": "Choose the file again to resume",
+      "done": "Volume ready"
+    },
+    "step": {
+      "upload": "Uploading",
+      "convert": "Convert",
+      "check": "Check",
+      "done": "Done"
+    },
+    "stepsLabel": "Upload steps",
+    "amount": "{{percent}}% · {{sent}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "left": "{{time}} left",
+    "time": {
+      "hm": "{{h}} h {{m}} min",
+      "ms": "{{m}} min {{s}} s",
+      "s": "{{s}} s"
+    },
+    "converting": "Converting the uploaded image into the volume format.",
+    "retrying": "The connection is unstable; sending again. {{error}}",
+    "pause": "Pause",
+    "resume": "Resume upload",
+    "pickToResume": "Choose the same file to resume",
+    "cancel": "Cancel upload",
+    "createVm": "Create a VM with this image",
+    "viewTask": "View task",
+    "dismissNamed": "Close the upload item {{name}}",
+    "otherFile": "This is not the file of this upload. Choose the file you chose first ({{name}}, {{size}}).",
+    "keepsGoing": "The upload goes on if you close this window. You can also follow it in the Tasks and notifications center in the header. If the connection drops, it resumes from what the server received.",
+    "showInCenter": "Show in the notifications center",
+    "close": "Close",
+    "resumeNote": "You started uploading this file before ({{sent}} / {{total}} received). The upload resumes from there."
   },
   "pools": {
     "path": "Directory",
@@ -3609,7 +3652,8 @@
     "retryAfterFixNamed": "Retry after fixing: {{label}}",
     "jobRunning": "The backup schedule is running.",
     "jobDisabled": "The backup schedule is turned off.",
-    "view": "View"
+    "view": "View",
+    "uploads": "Uploads ({{n}})"
   },
   "capacity": {
     "title": "Capacity",

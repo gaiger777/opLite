@@ -242,6 +242,18 @@ export function describeProgress(task: Task, t: TFunction): string | null {
         })
       : t("tasks.progress.downloadingUnknown", { done: gib(done) });
   }
+  // 올린·받은 이미지 가져오기(계획 77-8): 원본 확인 → 변환(qemu-img 진행) → 마무리
+  if (progress?.stage === "converting") {
+    const { done_bytes: done, total_bytes: total } = progress;
+    return t("tasks.progress.converting", {
+      percent: bytePercent(done, total),
+      done: gib(done),
+      total: gib(total),
+    });
+  }
+  if (progress?.stage === "checking" || progress?.stage === "finishing") {
+    return t(`tasks.progress.${progress.stage}`);
+  }
   // 체크섬 파일 받기(받기 전), 확인·가져오기, 받은 디스크로 템플릿 만들기(계획 58)
   if (
     progress?.stage === "checksum" ||
