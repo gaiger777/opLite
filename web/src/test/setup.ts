@@ -23,6 +23,8 @@ import certsEn from "@/certs/i18n/en.json";
 import certsKo from "@/certs/i18n/ko.json";
 import physicalEn from "@/physical/i18n/en.json";
 import physicalKo from "@/physical/i18n/ko.json";
+import drEn from "@/dr/i18n/en.json";
+import drKo from "@/dr/i18n/ko.json";
 
 // 늦게 받는 문구(클러스터 지도 — `clusterMap/strings.ts`, 끌기 틀 — `dnd/strings.ts`, VM 빌더 —
 // `vmBuilder/strings.ts`, VMware 이전 — `vmware/strings.ts`, VM 내보내기 — `exports/strings.ts`, 설정 기록·선언 묶음·인증서 —
@@ -37,6 +39,7 @@ for (const [en, ko] of [
   [declarativeEn, declarativeKo],
   [certsEn, certsKo],
   [physicalEn, physicalKo],
+  [drEn, drKo],
 ] as const) {
   i18n.addResourceBundle("en", "translation", en, false, false);
   i18n.addResourceBundle("ko", "translation", ko, false, false);

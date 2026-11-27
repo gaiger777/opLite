@@ -65,7 +65,7 @@ it("watches from the oldest list revision and applies changes", async () => {
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,router,floating-ip,load-balancer,network-migration,backup-store,vmware-source,vmware-migration,vmware-vm,apply-set,acme-account,acme-dns,certificate,settings&since=7",
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,router,floating-ip,load-balancer,network-migration,backup-store,vmware-source,vmware-migration,vmware-vm,apply-set,acme-account,acme-dns,certificate,recovery-plan,dr-run,settings&since=7",
   );
 });
 

@@ -21,6 +21,8 @@ import certsEn from "@/certs/i18n/en.json";
 import certsKo from "@/certs/i18n/ko.json";
 import physicalEn from "@/physical/i18n/en.json";
 import physicalKo from "@/physical/i18n/ko.json";
+import drEn from "@/dr/i18n/en.json";
+import drKo from "@/dr/i18n/ko.json";
 
 function keys(value: unknown, prefix = ""): string[] {
   if (typeof value !== "object" || value === null) {
@@ -56,6 +58,8 @@ it("has the same keys in every language", () => {
     [certsEn, certsKo, "certs"],
     // 운영자 대시보드(계획 75 — `physical/strings.ts`)
     [physicalEn, physicalKo, "physical"],
+    // DR(계획 76 — `dr/strings.ts`)
+    [drEn, drKo, "dr"],
   ] as const) {
     expect(keys(two).sort()).toEqual(keys(one).sort());
     expect(Object.keys(one)).toEqual([top]);

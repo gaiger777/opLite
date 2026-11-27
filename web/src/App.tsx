@@ -41,6 +41,15 @@ function vmwarePage(name: "MigrationsPage" | "MigrationWizard" | "MigrationPage"
   };
 }
 
+/** DR(계획 76)의 보기 하나. 목록·계획·실행은 한 조각(`dr/pages`)이고 문구(첫 화면 묶음 밖)를 더한 뒤 그린다. */
+function drPage(name: "PlansPage" | "NewPlanPage" | "PlanPage" | "RunPage") {
+  return async () => {
+    const m = await import("@/dr/pages");
+    await m.loadDrStrings();
+    return { Component: m[name] };
+  };
+}
+
 /**
  * 설정 기록·선언 묶음·인증서(계획 73)의 보기 하나. 세 영역의 보기는 한 조각(`history/pages`)이고 문구(첫 화면 묶음 밖)를 더한
  * 뒤 그린다.
@@ -174,6 +183,11 @@ export const appRoutes: RouteObject[] = [
                 path: "backup-stores",
                 lazy: page(() => import("@/backupStores/BackupStoresPage"), "BackupStoresPage"),
               },
+              // DR 복구 계획·실행(계획 76): 데이터 보호 영역의 DR 탭(사이드바 항목이 아니다)
+              { path: "dr-plans", lazy: drPage("PlansPage") },
+              { path: "dr-plans/-new", lazy: drPage("NewPlanPage") },
+              { path: "dr-plans/:name", lazy: drPage("PlanPage") },
+              { path: "dr-runs/:id", lazy: drPage("RunPage") },
               {
                 path: "networks",
                 lazy: page(() => import("@/networks/NetworksPage"), "NetworksPage"),

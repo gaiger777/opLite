@@ -1,0 +1,264 @@
+{
+  "dr": {
+    "upgrading": "Some nodes do not support DR plans yet ({{nodes}}). Upgrade them before changing or running plans.",
+    "rto": "RTO {{time}}",
+    "rpoMeter": "{{ok}}/{{total}} within RPO",
+    "rpoMeterLabel": "VMs within RPO",
+    "plans": {
+      "description": "Recovery plans bring the VMs of a remote (production) cluster back up on this cluster, group by group.",
+      "new": "New plan",
+      "newTitle": "New recovery plan",
+      "newDescription": "Pick the production cluster, the boot groups and how networks and IPs change on this cluster.",
+      "empty": "No recovery plans",
+      "emptyHint": "Replicate backups of a remote cluster here, then make a plan to test and run failover."
+    },
+    "plan": {
+      "source": "Source cluster",
+      "vms": "VMs",
+      "rpo": "RPO",
+      "lastTest": "Last test",
+      "running": "Running",
+      "neverTested": "Never tested",
+      "summary": "From {{source}} · restores to {{pool}}",
+      "openRun": "Open the running run"
+    },
+    "tab": {
+      "overview": "Overview",
+      "plan": "Plan",
+      "runs": "Runs"
+    },
+    "action": {
+      "test": "Test",
+      "failover": "Failover",
+      "cleanup": "Clean up",
+      "cancel": "Cancel run",
+      "reprotect": "Reprotect"
+    },
+    "test": {
+      "started": "Test failover of {{name}} started."
+    },
+    "failover": {
+      "title": "Fail over {{name}}",
+      "description": "The VMs of {{source}} are restored and started on this cluster in group order, with this plan's networks and IPs.",
+      "confirm": "Fail over",
+      "mode": "Mode",
+      "modes": {
+        "planned": "Planned migration",
+        "disaster": "Disaster"
+      },
+      "modeHint": {
+        "planned": "The source must be reachable: its VMs are shut down in reverse group order, backed up once more and replicated here first. No data is lost.",
+        "disaster": "Use the newest recovery point already on this cluster. The source is not contacted."
+      },
+      "disasterWarning": "Anything written on the source after its last replicated backup is lost. If the source is still running, both copies will run — shut it down first.",
+      "after": "HA stays off on the recovered VMs. Turn it on after the failover.",
+      "started": "Failover of {{name}} started."
+    },
+    "cleanup": {
+      "title": "Clean up the test of {{name}}",
+      "description": "Stops and deletes the VMs the last test made and removes its isolated networks. VMs made by a failover are not touched.",
+      "started": "Cleanup of {{name}} started."
+    },
+    "cancel": {
+      "title": "Cancel the run of {{name}}",
+      "description": "The run stops after the current step; running tasks finish. A cancelled test still needs a cleanup.",
+      "done": "Cancelling the run of {{name}}."
+    },
+    "delete": {
+      "button": "Delete plan",
+      "description": "Deletes the plan and its run history. VMs and networks it made stay.",
+      "done": "{{name}} deleted."
+    },
+    "reprotect": {
+      "title": "Reprotect {{name}}",
+      "description": "Creates backup job {{job}} for the recovered VMs that replicates to the remote, to prepare failing back.",
+      "submit": "Create job",
+      "remote": "Replicate to",
+      "pool": "Remote backup pool",
+      "poolHint": "Backup pool on that remote cluster",
+      "backupPool": "Local backup pool",
+      "backupPoolHint": "Empty: the plan's pool",
+      "at": "Daily at (UTC)",
+      "done": "Backup job {{job}} is set."
+    },
+    "edit": {
+      "basics": "Basics",
+      "sourceHint": "The production cluster, registered as a remote. Its copies here are the recovery points.",
+      "choose": "Choose…",
+      "pool": "Restore pool",
+      "folder": "Folder",
+      "folderHint": "Folder for VMs made by a failover. Empty: the backed up VM's folder.",
+      "rpo": "RPO target (hours)",
+      "rpoHint": "Alert when a recovery point is older. 0 turns it off.",
+      "onTimeout": "When a VM fails or times out",
+      "groups": "Boot groups",
+      "addGroup": "Add group",
+      "groupN": "Group {{n}}",
+      "groupLabel": "Group {{n}}: {{name}}",
+      "groupName": "Group name",
+      "wait": "Ready when",
+      "timeout": "Timeout (s)",
+      "delay": "Delay after (s)",
+      "moveUp": "Move {{name}} up",
+      "moveDown": "Move {{name}} down",
+      "removeGroup": "Remove {{name}}",
+      "noVms": "No VMs in this group yet.",
+      "vmsOf": "VMs of {{name}}",
+      "addVms": "Add VMs",
+      "vmPool": "Pool",
+      "planPool": "Plan's pool",
+      "anyNode": "Any",
+      "live": "Live restore",
+      "removeVm": "Remove {{name}}",
+      "ipRulesOf": "IP rules of {{name}}",
+      "nic": "NIC",
+      "address": "Address",
+      "gateway": "Gateway",
+      "dns": "DNS",
+      "removeIp": "Remove IP rule {{n}}",
+      "addIp": "Add IP rule",
+      "networks": "Network map",
+      "networksHint": "Source network → network on this cluster. Unlisted networks keep their name.",
+      "securityGroups": "Security group map",
+      "securityGroupsHint": "Source security group → security group on this cluster. Unlisted groups keep their name.",
+      "testNetworks": "Test network map",
+      "testNetworksHint": "Network used by tests. Unlisted source networks get an isolated SDN network during the test.",
+      "addMapping": "Add",
+      "noMappings": "None",
+      "mapFrom": "Source name {{n}}",
+      "mapTo": "Name here {{n}}",
+      "removeMapping": "Remove mapping {{n}}",
+      "saved": "{{name}} saved.",
+      "created": "{{name}} created.",
+      "reload": "Reload",
+      "fix": "Fix the marked fields."
+    },
+    "pick": {
+      "title": "Add VMs to {{group}}",
+      "description": "VMs of {{source}} and its copies on this cluster.",
+      "noSource": "Choose the source cluster first. Only copies on this cluster are listed.",
+      "filter": "Filter",
+      "list": "VMs",
+      "add_one": "Add {{count}} VM",
+      "add_other": "Add {{count}} VMs",
+      "none": "No VMs to add.",
+      "onSource": "on source",
+      "notOnSource": "not on source",
+      "copyAt": "copy {{time}}",
+      "noCopy": "no copy here",
+      "remoteFailed": "Could not list the source's VMs ({{error}}). Copies on this cluster are still listed."
+    },
+    "invalid": {
+      "required": "Required.",
+      "name": "Use 1–63 lowercase letters, digits and '-'.",
+      "rpo": "Hours from 0 to 8760.",
+      "groups": "A plan has 1 to 32 groups.",
+      "tooManyVms": "A plan has at most 500 VMs.",
+      "duplicateGroup": "Another group has this name.",
+      "duplicateVm": "A VM is in more than one group.",
+      "emptyGroup": "Add at least one VM.",
+      "timeout": "Seconds from 10 to 86400.",
+      "delay": "Seconds from 0 to 3600.",
+      "nic": "NIC number from 0 to 15.",
+      "address": "Address/prefix, for example 10.20.0.5/24.",
+      "time": "HH:MM"
+    },
+    "report": {
+      "protection": "Protection",
+      "target": "Target {{time}}",
+      "noTarget": "No RPO target",
+      "vm": "VM",
+      "point": "Recovery point",
+      "pointAt": "Taken",
+      "age": "Age",
+      "status": "Status",
+      "ok": "Within RPO",
+      "tests": "Recent tests",
+      "lastFailover": "Last failover",
+      "noFailover": "No failover yet.",
+      "sourceMissing": "Remote {{source}} is not registered. No VM has a recovery point."
+    },
+    "issue": {
+      "no-recovery-point": "No recovery point",
+      "over-rpo": "Over RPO"
+    },
+    "runs": {
+      "empty": "No runs yet.",
+      "kind": "Run",
+      "started": "Started",
+      "rto": "RTO",
+      "prepare": "prepare {{time}}",
+      "failedVms": "Failed VMs"
+    },
+    "run": {
+      "title": "{{kind}} · {{plan}}",
+      "started": "Started {{time}}",
+      "finished": "finished {{time}}",
+      "plan": "Plan {{name}}",
+      "prepare": "Source prepare",
+      "nextGroup": "Next group at",
+      "cancelling": "Cancel requested — stopping after the current step.",
+      "stopping": "A VM failed or timed out; the remaining VMs are skipped.",
+      "bubbles": "Isolated networks",
+      "bubbleFor": "for {{network}}",
+      "group": "Group {{n}}: {{name}}",
+      "waitFor": "ready when: {{wait}}",
+      "noSteps": "No VMs.",
+      "from": "from {{backup}}",
+      "task": "Task"
+    },
+    "kind": {
+      "test": "Test failover",
+      "failover-planned": "Planned migration",
+      "failover-disaster": "Disaster failover",
+      "cleanup": "Cleanup"
+    },
+    "runState": {
+      "running": "Running",
+      "succeeded": "Succeeded",
+      "partial": "Partial",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "phase": {
+      "pending": "Pending",
+      "preparing": "Preparing source",
+      "restoring": "Restoring",
+      "starting": "Starting",
+      "waiting": "Waiting",
+      "ready": "Ready",
+      "failed": "Failed",
+      "timed_out": "Timed out",
+      "skipped": "Skipped",
+      "deleting": "Deleting",
+      "deleted": "Deleted"
+    },
+    "wait": {
+      "running": "VM running",
+      "guest": "Guest agent answers",
+      "ip": "Guest reports its IP"
+    },
+    "onTimeout": {
+      "continue": "Continue with the rest",
+      "stop": "Stop and skip the rest"
+    },
+    "bubble": {
+      "pending": "creating",
+      "ready": "ready",
+      "removed": "removed",
+      "failed": "failed"
+    },
+    "errors": {
+      "dr_source_missing": "The source remote is not registered on this cluster.",
+      "dr_run_active": "Another run of this plan is still going. Wait for it or cancel it.",
+      "dr_cleanup_required": "The last test left VMs or networks behind. Clean up first.",
+      "dr_test_network_required": "SDN is not set up here: map every source network in the test network map.",
+      "dr_name_taken": "A VM with that name already exists here.",
+      "dr_confirm_mismatch": "Type the plan name exactly.",
+      "dr_source_unreachable": "The source cluster cannot be reached. A planned migration needs it; use disaster mode if it is down.",
+      "dr_no_active_run": "No run is going.",
+      "dr_nothing_to_clean": "Nothing is left from the last test.",
+      "dr_no_recovered_vms": "No VMs were recovered by a failover of this plan yet."
+    }
+  }
+}

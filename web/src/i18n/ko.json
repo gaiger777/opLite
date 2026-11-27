@@ -255,6 +255,7 @@
     "floatingIps": "유동 IP",
     "loadBalancers": "부하 분산",
     "topology": "토폴로지",
+    "dr": "DR",
     "backupStores": "백업 저장소",
     "clusterMap": "지도",
     "clusterMapKeywords": "지도, 클러스터 보기, 3d, map",

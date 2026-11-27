@@ -40,7 +40,10 @@ export type Kind =
   // ACME 계정·DNS 공급자·인증서(계획 73, 루트 — 읽기 `cluster.read`(가린 보기), 쓰기 `cluster.admin`)
   | "acme-account"
   | "acme-dns"
-  | "certificate";
+  | "certificate"
+  // 복구 계획·DR 실행(계획 76, 루트 — 읽기 `cluster.read`, 쓰기·실행 `cluster.admin`)
+  | "recovery-plan"
+  | "dr-run";
 
 /** 권한(계획 62 설계 §6.2). 이름은 서버의 `Privilege`와 같다. */
 export const PRIVILEGES = [

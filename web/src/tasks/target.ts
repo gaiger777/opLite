@@ -136,8 +136,8 @@ export function alertHref(subject: AlertSubject): string {
       return "/settings/certificates";
     case "apply_set":
       return `/apply-sets/${enc(subject.name)}`;
-    // 복구 계획(계획 76): DR 화면(6단계)이 생기기 전에는 데이터 보호의 백업 목록
+    // 복구 계획(계획 76): 데이터 보호 › DR의 그 계획(개요 탭이 보호 상태·보고)
     case "recovery_plan":
-      return "/backups";
+      return `/dr-plans/${enc(subject.name)}`;
   }
 }

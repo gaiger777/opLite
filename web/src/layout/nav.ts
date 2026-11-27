@@ -144,6 +144,8 @@ export const AREAS: NavArea[] = [
       // 백업 저장소(계획 68 — 중복 제거·암호화·S3). 사이드바 항목이 아니라 보호 영역의 탭이다.
       { to: "/backup-stores", key: "nav.backupStores", kind: "backup-store" },
       { to: "/remotes", key: "nav.replication", kind: "remote" },
+      // DR 복구 계획·실행(계획 76). 사이드바 항목이 아니라 보호 영역의 탭이고, 실행 화면(`/dr-runs/<id>`)도 이 탭에 속한다.
+      { to: "/dr-plans", key: "nav.dr", kind: "recovery-plan", match: ["/dr-plans", "/dr-runs"] },
       { to: "/ha-groups", key: "nav.haGroups", kind: "ha-group" },
       { to: "/ha-checks", key: "nav.haChecks", kind: "ha-check" },
       {

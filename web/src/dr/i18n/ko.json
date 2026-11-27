@@ -1,0 +1,264 @@
+{
+  "dr": {
+    "upgrading": "DR 계획을 모르는 노드가 있습니다({{nodes}}). 계획을 바꾸거나 돌리기 전에 업그레이드하세요.",
+    "rto": "RTO {{time}}",
+    "rpoMeter": "{{ok}}/{{total}} RPO 지킴",
+    "rpoMeterLabel": "RPO를 지키는 VM",
+    "plans": {
+      "description": "복구 계획은 원격(운영) 클러스터의 VM을 그룹 차례로 이 클러스터에 되살립니다.",
+      "new": "새 계획",
+      "newTitle": "새 복구 계획",
+      "newDescription": "운영 클러스터, 부팅 그룹, 이 클러스터에서 바꿀 네트워크·IP를 고릅니다.",
+      "empty": "복구 계획 없음",
+      "emptyHint": "원격 클러스터의 백업을 이곳으로 복제한 뒤 계획을 만들어 시험하고 장애 조치합니다."
+    },
+    "plan": {
+      "source": "운영 클러스터",
+      "vms": "VM",
+      "rpo": "RPO",
+      "lastTest": "마지막 시험",
+      "running": "도는 실행",
+      "neverTested": "시험한 적 없음",
+      "summary": "{{source}}에서 · {{pool}}로 복원",
+      "openRun": "도는 실행 열기"
+    },
+    "tab": {
+      "overview": "개요",
+      "plan": "계획",
+      "runs": "실행"
+    },
+    "action": {
+      "test": "시험",
+      "failover": "장애 조치",
+      "cleanup": "뒷정리",
+      "cancel": "실행 취소",
+      "reprotect": "다시 보호"
+    },
+    "test": {
+      "started": "{{name}} 시험 장애 조치를 시작했습니다."
+    },
+    "failover": {
+      "title": "{{name}} 장애 조치",
+      "description": "{{source}}의 VM을 이 계획의 네트워크·IP로 그룹 차례대로 이 클러스터에 복원하고 시작합니다.",
+      "confirm": "장애 조치",
+      "mode": "방식",
+      "modes": {
+        "planned": "계획된 이전",
+        "disaster": "재해"
+      },
+      "modeHint": {
+        "planned": "운영 쪽에 닿아야 합니다: 그 VM을 그룹 역순으로 끄고 마지막 백업을 떠 이곳으로 복제한 뒤 넘깁니다. 데이터를 잃지 않습니다.",
+        "disaster": "이 클러스터에 이미 있는 가장 새 복구 지점으로 곧장 넘깁니다. 운영 쪽에 묻지 않습니다."
+      },
+      "disasterWarning": "운영 쪽의 마지막 복제 백업 뒤에 쓴 것은 잃습니다. 운영 쪽이 아직 돌고 있으면 두 벌이 함께 돕니다 — 먼저 끄세요.",
+      "after": "되살린 VM의 HA는 꺼져 있습니다. 장애 조치 뒤에 켜세요.",
+      "started": "{{name}} 장애 조치를 시작했습니다."
+    },
+    "cleanup": {
+      "title": "{{name}} 시험 뒷정리",
+      "description": "마지막 시험이 만든 VM을 끄고 지우며 격리 네트워크를 지웁니다. 장애 조치로 만든 VM은 건드리지 않습니다.",
+      "started": "{{name}} 뒷정리를 시작했습니다."
+    },
+    "cancel": {
+      "title": "{{name}} 실행 취소",
+      "description": "지금 단계 뒤에 멈춥니다. 진행 중인 Task는 끝까지 갑니다. 취소한 시험도 뒷정리가 필요합니다.",
+      "done": "{{name}} 실행을 취소하는 중입니다."
+    },
+    "delete": {
+      "button": "계획 지우기",
+      "description": "계획과 실행 기록을 지웁니다. 계획이 만든 VM·네트워크는 그대로 둡니다.",
+      "done": "{{name}}을(를) 지웠습니다."
+    },
+    "reprotect": {
+      "title": "{{name}} 다시 보호",
+      "description": "되돌리기를 준비하려고 되살린 VM에 원격으로 복제하는 백업 작업 {{job}}을 만듭니다.",
+      "submit": "작업 만들기",
+      "remote": "복제할 곳",
+      "pool": "원격 백업 풀",
+      "poolHint": "그 원격 클러스터의 백업 풀",
+      "backupPool": "이곳 백업 풀",
+      "backupPoolHint": "비우면 계획의 풀",
+      "at": "매일(UTC)",
+      "done": "백업 작업 {{job}}을 정했습니다."
+    },
+    "edit": {
+      "basics": "기본",
+      "sourceHint": "원격으로 등록한 운영 클러스터. 이곳에 있는 그 클러스터의 사본이 복구 지점입니다.",
+      "choose": "고르세요…",
+      "pool": "복원 풀",
+      "folder": "폴더",
+      "folderHint": "장애 조치로 만든 VM의 폴더. 비우면 백업한 VM의 폴더입니다.",
+      "rpo": "RPO 목표(시간)",
+      "rpoHint": "복구 지점이 이보다 오래되면 경보합니다. 0이면 끕니다.",
+      "onTimeout": "VM이 실패하거나 시간을 넘기면",
+      "groups": "부팅 그룹",
+      "addGroup": "그룹 더하기",
+      "groupN": "그룹 {{n}}",
+      "groupLabel": "그룹 {{n}}: {{name}}",
+      "groupName": "그룹 이름",
+      "wait": "준비된 때",
+      "timeout": "시간 초과(초)",
+      "delay": "다음 그룹 앞 쉼(초)",
+      "moveUp": "{{name}} 위로",
+      "moveDown": "{{name}} 아래로",
+      "removeGroup": "{{name}} 지우기",
+      "noVms": "아직 이 그룹에 VM이 없습니다.",
+      "vmsOf": "{{name}}의 VM",
+      "addVms": "VM 더하기",
+      "vmPool": "풀",
+      "planPool": "계획의 풀",
+      "anyNode": "아무 곳",
+      "live": "라이브 복원",
+      "removeVm": "{{name}} 빼기",
+      "ipRulesOf": "{{name}}의 IP 규칙",
+      "nic": "NIC",
+      "address": "주소",
+      "gateway": "게이트웨이",
+      "dns": "DNS",
+      "removeIp": "IP 규칙 {{n}} 지우기",
+      "addIp": "IP 규칙 더하기",
+      "networks": "네트워크 맵",
+      "networksHint": "원본 네트워크 → 이 클러스터의 네트워크. 없는 네트워크는 같은 이름입니다.",
+      "securityGroups": "보안 그룹 맵",
+      "securityGroupsHint": "원본 보안 그룹 → 이 클러스터의 보안 그룹. 없는 그룹은 같은 이름입니다.",
+      "testNetworks": "시험 네트워크 맵",
+      "testNetworksHint": "시험이 쓰는 네트워크. 없는 원본 네트워크는 시험 동안 격리 SDN 네트워크를 받습니다.",
+      "addMapping": "더하기",
+      "noMappings": "없음",
+      "mapFrom": "원본 이름 {{n}}",
+      "mapTo": "이곳 이름 {{n}}",
+      "removeMapping": "맵 {{n}} 지우기",
+      "saved": "{{name}}을(를) 저장했습니다.",
+      "created": "{{name}}을(를) 만들었습니다.",
+      "reload": "다시 읽기",
+      "fix": "표시한 칸을 고치세요."
+    },
+    "pick": {
+      "title": "{{group}}에 VM 더하기",
+      "description": "{{source}}의 VM과 이 클러스터에 있는 그 사본입니다.",
+      "noSource": "먼저 운영 클러스터를 고르세요. 이 클러스터의 사본만 보입니다.",
+      "filter": "거르기",
+      "list": "VM",
+      "add_one": "VM {{count}}개 더하기",
+      "add_other": "VM {{count}}개 더하기",
+      "none": "더할 VM이 없습니다.",
+      "onSource": "운영 쪽에 있음",
+      "notOnSource": "운영 쪽에 없음",
+      "copyAt": "사본 {{time}}",
+      "noCopy": "이곳에 사본 없음",
+      "remoteFailed": "운영 쪽 VM 목록을 읽지 못했습니다({{error}}). 이 클러스터의 사본은 그대로 보입니다."
+    },
+    "invalid": {
+      "required": "꼭 넣으세요.",
+      "name": "소문자·숫자·'-'로 1~63자.",
+      "rpo": "0~8760시간.",
+      "groups": "계획의 그룹은 1~32개입니다.",
+      "tooManyVms": "계획의 VM은 500개까지입니다.",
+      "duplicateGroup": "같은 이름의 그룹이 있습니다.",
+      "duplicateVm": "한 VM이 두 그룹에 있습니다.",
+      "emptyGroup": "VM을 하나 이상 더하세요.",
+      "timeout": "10~86400초.",
+      "delay": "0~3600초.",
+      "nic": "NIC 번호 0~15.",
+      "address": "주소/접두 길이(예: 10.20.0.5/24).",
+      "time": "HH:MM"
+    },
+    "report": {
+      "protection": "보호 상태",
+      "target": "목표 {{time}}",
+      "noTarget": "RPO 목표 없음",
+      "vm": "VM",
+      "point": "복구 지점",
+      "pointAt": "만든 때",
+      "age": "나이",
+      "status": "상태",
+      "ok": "RPO 지킴",
+      "tests": "최근 시험",
+      "lastFailover": "지난 장애 조치",
+      "noFailover": "아직 장애 조치가 없습니다.",
+      "sourceMissing": "원격 {{source}}이(가) 등록돼 있지 않습니다. 복구 지점이 있는 VM이 없습니다."
+    },
+    "issue": {
+      "no-recovery-point": "복구 지점 없음",
+      "over-rpo": "RPO 넘음"
+    },
+    "runs": {
+      "empty": "아직 실행이 없습니다.",
+      "kind": "실행",
+      "started": "시작",
+      "rto": "RTO",
+      "prepare": "준비 {{time}}",
+      "failedVms": "실패한 VM"
+    },
+    "run": {
+      "title": "{{kind}} · {{plan}}",
+      "started": "{{time}} 시작",
+      "finished": "{{time}} 끝남",
+      "plan": "계획 {{name}}",
+      "prepare": "운영 쪽 준비",
+      "nextGroup": "다음 그룹 시작",
+      "cancelling": "취소를 받았습니다 — 지금 단계 뒤에 멈춥니다.",
+      "stopping": "실패하거나 시간을 넘긴 VM이 있어 남은 VM을 건너뜁니다.",
+      "bubbles": "격리 네트워크",
+      "bubbleFor": "{{network}} 대신",
+      "group": "그룹 {{n}}: {{name}}",
+      "waitFor": "준비된 때: {{wait}}",
+      "noSteps": "VM 없음.",
+      "from": "{{backup}}에서",
+      "task": "Task"
+    },
+    "kind": {
+      "test": "시험 장애 조치",
+      "failover-planned": "계획된 이전",
+      "failover-disaster": "재해 장애 조치",
+      "cleanup": "뒷정리"
+    },
+    "runState": {
+      "running": "도는 중",
+      "succeeded": "성공",
+      "partial": "일부 성공",
+      "failed": "실패",
+      "cancelled": "취소됨"
+    },
+    "phase": {
+      "pending": "기다림",
+      "preparing": "운영 쪽 준비",
+      "restoring": "복원",
+      "starting": "시작",
+      "waiting": "준비 기다림",
+      "ready": "준비됨",
+      "failed": "실패",
+      "timed_out": "시간 초과",
+      "skipped": "건너뜀",
+      "deleting": "지우는 중",
+      "deleted": "지움"
+    },
+    "wait": {
+      "running": "VM이 돎",
+      "guest": "게스트 에이전트가 답함",
+      "ip": "게스트가 IP를 알림"
+    },
+    "onTimeout": {
+      "continue": "나머지를 계속",
+      "stop": "멈추고 나머지를 건너뜀"
+    },
+    "bubble": {
+      "pending": "만드는 중",
+      "ready": "준비됨",
+      "removed": "지움",
+      "failed": "실패"
+    },
+    "errors": {
+      "dr_source_missing": "운영 클러스터 원격이 이 클러스터에 등록돼 있지 않습니다.",
+      "dr_run_active": "이 계획의 다른 실행이 아직 돕니다. 끝나기를 기다리거나 취소하세요.",
+      "dr_cleanup_required": "지난 시험이 남긴 VM이나 네트워크가 있습니다. 먼저 뒷정리하세요.",
+      "dr_test_network_required": "이곳에 SDN이 없습니다: 시험 네트워크 맵에 모든 원본 네트워크를 정하세요.",
+      "dr_name_taken": "그 이름의 VM이 이미 이곳에 있습니다.",
+      "dr_confirm_mismatch": "계획 이름을 그대로 치세요.",
+      "dr_source_unreachable": "운영 클러스터에 닿지 않습니다. 계획된 이전은 운영 쪽이 필요합니다. 내려갔으면 재해 방식을 쓰세요.",
+      "dr_no_active_run": "도는 실행이 없습니다.",
+      "dr_nothing_to_clean": "지난 시험이 남긴 것이 없습니다.",
+      "dr_no_recovered_vms": "이 계획의 장애 조치로 되살린 VM이 아직 없습니다."
+    }
+  }
+}

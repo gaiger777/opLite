@@ -255,6 +255,7 @@
     "floatingIps": "Floating IPs",
     "loadBalancers": "Load balancers",
     "topology": "Topology",
+    "dr": "DR",
     "backupStores": "Backup stores",
     "clusterMap": "Map",
     "clusterMapKeywords": "map, topology, 3d, cluster view",

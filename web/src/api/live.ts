@@ -42,6 +42,9 @@ export const VIEW_KINDS = [
   "acme-account",
   "acme-dns",
   "certificate",
+  // 계획 76: 복구 계획(보호 상태는 리더가 status에 쓴다)과 DR 실행(엔진이 진행을 쓴다)
+  "recovery-plan",
+  "dr-run",
 ] as const;
 export type ViewKind = (typeof VIEW_KINDS)[number];
 
@@ -68,6 +71,9 @@ export const REFRESH_ON: Partial<Record<ViewKind | WatchKind, readonly (readonly
   "acme-account": [["acme-accounts"]],
   "acme-dns": [["acme-dns"]],
   certificate: [["certificates"]],
+  // 실행이 바뀌면 계획의 지금 실행·마지막 시험과 보고도 바뀐다.
+  "recovery-plan": [["dr-plans"]],
+  "dr-run": [["dr-runs"], ["dr-plans"]],
   // VM 내보내기(계획 72)는 watch 종류가 아니다 — 내보내기·지우기 Task가 바뀌면 목록을 다시 읽는다.
   task: [["vm-exports"]],
   network: [["network-topology"], ["load-balancers"]],

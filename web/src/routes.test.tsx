@@ -229,6 +229,17 @@ it.each([
   ).toEqual(views);
 });
 
+// DR(계획 76)은 데이터 보호 영역의 탭이고, 실행 화면도 그 탭에 속한다(사이드바 항목이 아니다).
+it("opens /dr-plans as a tab of the protection area", async () => {
+  server.use(http.get(apiUrl("/dr-plans"), () => HttpResponse.json({ revision: 1, items: [] })));
+  renderApp("/dr-plans");
+  expect(
+    await screen.findByRole("heading", { level: 1, name: "DR" }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  const tabs = screen.getByRole("navigation", { name: "Protection menu" });
+  expect(within(tabs).getByRole("link", { name: "DR" })).toHaveAttribute("aria-current", "page");
+});
+
 it.each([
   ["/infra", "/nodes"],
   ["/protect", "/backups"],
