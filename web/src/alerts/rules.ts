@@ -33,6 +33,9 @@ export const CONDITION_KINDS: readonly ConditionKind[] = [
   // 링크(계획 75 §3.4) — 리더가 노드 상태의 포트·본딩으로 평가한다.
   "node_link_down",
   "bond_degraded",
+  // DR(계획 76 §3.4) — 리더가 복구 계획의 보호 상태와 실행으로 평가한다.
+  "dr_rpo_exceeded",
+  "dr_run_failed",
 ];
 export const LINK_ROLES: readonly LinkRole[] = ["uplink", "any"];
 export const NODE_METRICS: readonly NodeMetric[] = [
@@ -61,8 +64,14 @@ export function isEvent(kind: ConditionKind): boolean {
     kind === "task_failed" ||
     kind === "ha_recovery" ||
     kind === "backup_job_failed" ||
-    kind === "sdn_gateway_failover"
+    kind === "sdn_gateway_failover" ||
+    kind === "dr_run_failed"
   );
+}
+
+/** DR 조건(서버 `AlertCondition::is_dr`) — 노드·VM이 아니라 복구 계획(`plans`, 비면 모두)으로 거른다. */
+export function isDr(kind: ConditionKind): kind is "dr_rpo_exceeded" | "dr_run_failed" {
+  return kind === "dr_rpo_exceeded" || kind === "dr_run_failed";
 }
 
 /** 백업 저장소 조건(서버 `AlertCondition::is_backup_store`) — 노드·VM으로 거르지 않는다. */
@@ -90,7 +99,7 @@ export function isSdn(kind: ConditionKind): boolean {
  * 준비 안 됨 — 나머지는 서버가 400 `NodesFilter`)
  */
 export function takesNodes(kind: ConditionKind): boolean {
-  if (kind === "backup_job_failed" || isBackupStore(kind)) {
+  if (kind === "backup_job_failed" || isBackupStore(kind) || isDr(kind)) {
     return false;
   }
   return (
@@ -162,6 +171,8 @@ export interface RuleForm {
   /** 노드·VM 이름(쉼표로 나눔, 비면 모두) */
   nodes: string;
   vms: string;
+  /** DR 조건의 복구 계획 이름(쉼표로 나눔, 비면 모두) */
+  plans: string;
   /** 폼이 고치지 않는 조건(인증서 조건 — `CONDITION_KINDS` 밖)의 받은 값. 고치면 그대로 돌려보낸다(문턱값을 지키려고). */
   rawCondition?: AlertCondition;
 }
@@ -186,6 +197,7 @@ export function emptyRuleForm(): RuleForm {
     sendResolved: true,
     nodes: "",
     vms: "",
+    plans: "",
   };
 }
 
@@ -202,6 +214,9 @@ export function ruleFormOf(rule: AlertRule): RuleForm {
     ...(c.kind === "pool_usage" && { percent: String(c.percent) }),
     ...(c.kind === "task_failed" && { ops: (c.ops ?? []).join(", ") }),
     ...(c.kind === "node_link_down" && { ports: c.ports ?? "", role: c.role ?? "uplink" }),
+    ...((c.kind === "dr_rpo_exceeded" || c.kind === "dr_run_failed") && {
+      plans: (c.plans ?? []).join(", "),
+    }),
     ...(!CONDITION_KINDS.includes(c.kind) && { rawCondition: c }),
     forSecs: String(spec.for_secs),
     severity: spec.severity,
@@ -257,6 +272,12 @@ export function checkRuleForm(form: RuleForm, taken: string[] | null): Record<st
   ) {
     errors.ports = "alerts.rules.errors.ports";
   }
+  if (
+    isDr(form.kind) &&
+    splitNames(form.plans).some((p) => !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(p))
+  ) {
+    errors.plans = "alerts.rules.errors.plans";
+  }
   if (!isEvent(form.kind)) {
     const f = integer(form.forSecs);
     if (f === null || f > 86_400) {
@@ -293,6 +314,11 @@ function conditionOf(form: RuleForm): AlertCondition {
     case "node_link_down": {
       const ports = form.ports.trim();
       return { kind: "node_link_down", role: form.role, ...(ports !== "" && { ports }) };
+    }
+    case "dr_rpo_exceeded":
+    case "dr_run_failed": {
+      const plans = splitNames(form.plans);
+      return plans.length > 0 ? { kind: form.kind, plans } : { kind: form.kind };
     }
     // 인증서 조건(계획 73)은 아직 폼에 없다(CONDITION_KINDS 밖). 받은 조건을 그대로, 없으면 서버 기본값으로 보낸다.
     case "certificate_expiring":

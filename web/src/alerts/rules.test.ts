@@ -3,6 +3,7 @@ import {
   checkRuleForm,
   CONDITION_KINDS,
   emptyRuleForm,
+  isDr,
   isEvent,
   isLink,
   isSdn,
@@ -175,4 +176,33 @@ it("keeps a certificate rule's threshold when another field is edited", () => {
   expect(ruleSpecOf({ ...ruleFormOf(expiring), kind: "node_offline" }).condition).toEqual({
     kind: "node_offline",
   });
+});
+
+it("edits the DR conditions with a plan filter (plan 76)", () => {
+  expect(CONDITION_KINDS.filter(isDr)).toEqual(["dr_rpo_exceeded", "dr_run_failed"]);
+  expect(takesNodes("dr_rpo_exceeded")).toBe(false);
+  // 실행 실패는 한 번 울리는 이벤트, RPO 넘음은 이어지는 상태
+  expect(isEvent("dr_run_failed")).toBe(true);
+  expect(isEvent("dr_rpo_exceeded")).toBe(false);
+  const form = {
+    ...emptyRuleForm(),
+    name: "dr",
+    targets: ["ops"],
+    nodes: "node-a",
+    vms: "web",
+    kind: "dr_rpo_exceeded" as const,
+  };
+  const all = ruleSpecOf(form);
+  expect(all.condition).toEqual({ kind: "dr_rpo_exceeded" });
+  expect(all).not.toHaveProperty("nodes");
+  expect(all).not.toHaveProperty("vms");
+  const some = ruleSpecOf({ ...form, kind: "dr_run_failed", plans: "web-tier, db-tier" });
+  expect(some.condition).toEqual({ kind: "dr_run_failed", plans: ["web-tier", "db-tier"] });
+  expect(some.for_secs).toBe(0);
+  const back = ruleFormOf(rule({ condition: some.condition, for_secs: 0 }));
+  expect([back.kind, back.plans]).toEqual(["dr_run_failed", "web-tier, db-tier"]);
+  expect(checkRuleForm({ ...form, plans: "Web Tier" }, [])).toEqual({
+    plans: "alerts.rules.errors.plans",
+  });
+  expect(checkRuleForm({ ...form, plans: "web-tier" }, [])).toEqual({});
 });

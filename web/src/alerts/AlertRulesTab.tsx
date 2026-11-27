@@ -19,6 +19,7 @@ import {
   CONDITION_KINDS,
   emptyRuleForm,
   isBackupStore,
+  isDr,
   isEvent,
   isSdn,
   LINK_ROLES,
@@ -74,6 +75,11 @@ export function conditionText(t: TFunction, c: AlertCondition): string {
           : "alerts.condition.node_link_down",
       );
       return c.ports ? `${text} (${c.ports})` : text;
+    }
+    case "dr_rpo_exceeded":
+    case "dr_run_failed": {
+      const text = t(`alerts.condition.${c.kind}`);
+      return c.plans?.length ? `${text} (${c.plans.join(", ")})` : text;
     }
     default:
       return t(`alerts.condition.${c.kind}`);
@@ -265,7 +271,8 @@ function RuleDialog({
 
   const input = (
     id: string,
-    key: "value" | "percent" | "ops" | "ports" | "forSecs" | "repeatSecs" | "nodes" | "vms",
+    key:
+      "value" | "percent" | "ops" | "ports" | "forSecs" | "repeatSecs" | "nodes" | "vms" | "plans",
     label: string,
     hint?: string,
   ) => (
@@ -316,7 +323,9 @@ function RuleDialog({
               setErrors({});
             }}
           >
-            {CONDITION_KINDS.filter((kind) => !isSdn(kind) && !isBackupStore(kind)).map((kind) => (
+            {CONDITION_KINDS.filter(
+              (kind) => !isSdn(kind) && !isBackupStore(kind) && !isDr(kind),
+            ).map((kind) => (
               <NativeSelectOption key={kind} value={kind}>
                 {t(`alerts.kind.${kind}`)}
               </NativeSelectOption>
@@ -332,6 +341,14 @@ function RuleDialog({
             {/* 백업 저장소 묶음(계획 68) */}
             <optgroup label={t("alerts.backupGroup")}>
               {CONDITION_KINDS.filter(isBackupStore).map((kind) => (
+                <NativeSelectOption key={kind} value={kind}>
+                  {t(`alerts.kind.${kind}`)}
+                </NativeSelectOption>
+              ))}
+            </optgroup>
+            {/* DR 묶음(계획 76) */}
+            <optgroup label={t("alerts.drGroup")}>
+              {CONDITION_KINDS.filter(isDr).map((kind) => (
                 <NativeSelectOption key={kind} value={kind}>
                   {t(`alerts.kind.${kind}`)}
                 </NativeSelectOption>
@@ -470,6 +487,8 @@ function RuleDialog({
           input("rule-nodes", "nodes", t("alerts.rules.nodes"), t("alerts.rules.namesHint"))}
         {aboutVms(form.kind) &&
           input("rule-vms", "vms", t("alerts.rules.vms"), t("alerts.rules.namesHint"))}
+        {isDr(form.kind) &&
+          input("rule-plans", "plans", t("alerts.rules.plans"), t("alerts.rules.namesHint"))}
         <div className="flex items-center gap-2">
           <Checkbox
             id="rule-enabled"

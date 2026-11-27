@@ -256,3 +256,63 @@ it("hides the rules tab from users with alert.read only in a folder", async () =
   expect(await screen.findByRole("tab", { name: "Active" })).toBeInTheDocument();
   await waitFor(() => expect(screen.queryByRole("tab", { name: "Rules" })).not.toBeInTheDocument());
 });
+
+it("offers the DR conditions with a recovery plan filter (plan 76)", async () => {
+  const sent: unknown[] = [];
+  server.use(
+    rules([]),
+    http.get(apiUrl("/notification-targets"), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [
+          {
+            id: "t1",
+            name: "ops-mail",
+            revision: 1,
+            enabled: true,
+            target: {
+              kind: "webhook",
+              url: "https://h/…",
+              format: "json",
+              header_names: [],
+              has_token: false,
+            },
+          },
+        ],
+      }),
+    ),
+    http.post(apiUrl("/alert-rules"), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json(RULE, { status: 201 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<AlertsPage />, { path: "/alerts", url: "/alerts?tab=rules" });
+  await user.click(await screen.findByRole("button", { name: "Create rule" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create alert rule" });
+  await user.type(within(dialog).getByLabelText("Name"), "dr-runs");
+  const condition = within(dialog).getByLabelText("Condition");
+  expect(within(condition).getByRole("group", { name: "DR" })).toBeInTheDocument();
+  await user.selectOptions(condition, "dr_run_failed");
+  // 계획으로 거르고, 노드로는 거르지 않는다
+  expect(within(dialog).queryByLabelText("Only nodes")).not.toBeInTheDocument();
+  await user.type(within(dialog).getByLabelText("Only recovery plans"), "web-tier");
+  await user.click(within(dialog).getByRole("checkbox", { name: "ops-mail" }));
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  await waitFor(() =>
+    expect(sent).toEqual([
+      {
+        name: "dr-runs",
+        spec: {
+          enabled: true,
+          condition: { kind: "dr_run_failed", plans: ["web-tier"] },
+          for_secs: 0,
+          severity: "warning",
+          targets: ["ops-mail"],
+          repeat_secs: 14_400,
+          send_resolved: true,
+        },
+      },
+    ]),
+  );
+});

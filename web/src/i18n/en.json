@@ -3239,6 +3239,7 @@
       "sendResolved": "Notify when resolved",
       "nodes": "Only nodes",
       "vms": "Only VMs",
+      "plans": "Only recovery plans",
       "namesHint": "Names separated by commas. Leave empty for all.",
       "enabled": "Rule is on",
       "errors": {
@@ -3249,7 +3250,8 @@
         "ports": "Use 1-64 characters without spaces, '/' or ':' (* and ? are allowed).",
         "forSecs": "Enter whole seconds from 0 to 86400.",
         "repeatSecs": "Enter 0, or whole seconds from 60 to 604800.",
-        "targets": "Choose 1 to 16 notification targets."
+        "targets": "Choose 1 to 16 notification targets.",
+        "plans": "Recovery plan names: 1–63 lowercase letters, digits and '-', separated by commas."
       }
     },
     "targets": {
@@ -3332,7 +3334,8 @@
       "empty": "No notification targets."
     },
     "sdnGroup": "SDN (OVN)",
-    "backupGroup": "Backup stores"
+    "backupGroup": "Backup stores",
+    "drGroup": "DR"
   },
   "empty": {
     "docs": "Read the guide"
