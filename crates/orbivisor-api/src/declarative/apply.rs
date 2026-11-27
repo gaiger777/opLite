@@ -445,14 +445,10 @@ pub(crate) async fn wait_task(cluster: &Cluster, id: Uuid) -> Result<(), ApiErro
 
 /// 진행(`n/m 동작 종류 이름`). 실패는 경고만.
 async fn progress(cluster: &Cluster, task: Uuid, stage: &str, done: u64, total: u64) {
-    let status = TaskStatus {
-        state: TaskState::Running,
-        error: None,
-        progress: Some(TaskProgress {
-            stage: stage.into(),
-            done_bytes: done,
-            total_bytes: total,
-        }),
+    let progress = TaskProgress {
+        stage: stage.into(),
+        done_bytes: done,
+        total_bytes: total,
     };
     for _ in 0..5 {
         let Ok(Some(current)) = cluster.get::<TaskSpec>(task) else {
@@ -461,6 +457,7 @@ async fn progress(cluster: &Cluster, task: Uuid, stage: &str, done: u64, total: 
         if current.status.state != TaskState::Running {
             return;
         }
+        let status = TaskStatus::running(Some(progress.clone()), Some(&current.status));
         match cluster
             .update_status_checked::<TaskSpec>(task, current.revision, &status)
             .await

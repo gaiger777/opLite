@@ -777,11 +777,7 @@ async fn retry_init(
 /// 노드가 돌아와도 실행기가 `pending`이 아닌 Task를 시작하지 않는다). 이미 돌고 있던 Task는 부트스트랩 Task가
 /// 스스로 멈춘다.
 async fn abandon_tasks(cluster: &Cluster, ceph: Uuid, old: Uuid, to: &str) -> Result<(), ApiError> {
-    let failed = TaskStatus {
-        state: orbivisor_types::task::TaskState::Failed,
-        error: Some(format!("the Ceph bootstrap was moved to node {to:?}")),
-        progress: None,
-    };
+    let error = format!("the Ceph bootstrap was moved to node {to:?}");
     loop {
         let tasks: Vec<Task> = unfinished(cluster, ceph)?
             .into_iter()
@@ -790,6 +786,11 @@ async fn abandon_tasks(cluster: &Cluster, ceph: Uuid, old: Uuid, to: &str) -> Re
         let Some(t) = tasks.first() else {
             return Ok(());
         };
+        let failed = TaskStatus::finished(
+            orbivisor_types::task::TaskState::Failed,
+            Some(error.clone()),
+            Some(&t.status),
+        );
         match cluster
             .update_status_checked::<TaskSpec>(t.id, t.revision, &failed)
             .await

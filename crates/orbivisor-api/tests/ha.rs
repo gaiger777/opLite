@@ -336,6 +336,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
                 state: TaskState::Failed,
                 error: Some("node failed failed; the VM was recovered by HA".into()),
                 progress: None,
+                ..Default::default()
             }
         );
     }
@@ -352,6 +353,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     };
     let op = TaskOp::VmHaRecover { from: failed };
     assert_eq!(
@@ -740,6 +742,7 @@ async fn fails_a_task_of_the_failed_node_created_before_the_spec_write() {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
             progress: None,
+            ..Default::default()
         }
     );
     manager.shutdown().await;
@@ -944,6 +947,7 @@ async fn finishes_a_spec_write_settled_by_a_new_term() {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
             progress: None,
+            ..Default::default()
         }
     );
     // 한 번만 한다.
@@ -1374,6 +1378,7 @@ async fn a_refused_failback_is_not_retried_every_tick() {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster
         .update_status::<TaskSpec>(busy, &done)
@@ -1610,6 +1615,7 @@ async fn failing_back_to_the_node_it_left_counts_as_a_relocation() {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster
         .update_status::<TaskSpec>(task, &done)
@@ -2296,7 +2302,13 @@ fn power_off_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
         .filter(|t| matches!(t.spec.op, TaskOp::NodePowerOff { .. }))
         .map(|t| {
             assert_eq!(t.spec.node, t.spec.target);
-            (t.spec.target, t.spec.op, t.status)
+            // 기록 Task는 끝난 시각을 적는다(계획 77). 비교에서는 뺀다.
+            assert!(t.status.finished_at.is_some());
+            let status = TaskStatus {
+                finished_at: None,
+                ..t.status
+            };
+            (t.spec.target, t.spec.op, status)
         })
         .collect()
 }
@@ -2332,6 +2344,7 @@ async fn powers_off_a_node_past_fence_after_once_and_recovers_without_waiting() 
                 state: TaskState::Succeeded,
                 error: None,
                 progress: None,
+                ..Default::default()
             }
         )]
     );
@@ -2660,7 +2673,13 @@ fn check_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
         .filter(|t| matches!(t.spec.op, TaskOp::HaCheck { .. }))
         .map(|t| {
             assert_eq!(t.spec.node, t.spec.target);
-            (t.spec.target, t.spec.op, t.status)
+            // 기록 Task는 끝난 시각을 적는다(계획 77). 비교에서는 뺀다.
+            assert!(t.status.finished_at.is_some());
+            let status = TaskStatus {
+                finished_at: None,
+                ..t.status
+            };
+            (t.spec.target, t.spec.op, status)
         })
         .collect()
 }
@@ -2670,6 +2689,7 @@ fn succeeded() -> TaskStatus {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     }
 }
 
@@ -2808,6 +2828,7 @@ async fn a_fence_check_powers_off_the_node_or_records_that_it_cannot() {
                     state: TaskState::Failed,
                     error: Some("mgmt is down; no power fencing configured".into()),
                     progress: None,
+                    ..Default::default()
                 },
             ),
         ]
@@ -3392,6 +3413,7 @@ async fn a_node_that_does_not_stop_the_vm_is_powered_off_or_left_alone() {
             state: TaskState::Failed,
             error: Some(detail.into()),
             progress: None,
+            ..Default::default()
         },
     )));
     // 펜싱이 없는 노드의 VM은 요청을 남긴 채 그대로다.

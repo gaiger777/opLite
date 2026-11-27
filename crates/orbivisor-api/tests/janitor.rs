@@ -138,6 +138,7 @@ async fn task_with_id(
             state,
             error: None,
             progress: None,
+            ..Default::default()
         };
         env.cluster
             .update_status::<TaskSpec>(t.id, &t.status)

@@ -344,6 +344,7 @@ async fn put_task(
         state,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster.create(&task).await.unwrap();
     json!({ "id": task.id })
@@ -462,6 +463,7 @@ async fn backup_interrupted_by_a_restart_is_failed_and_cleaned_up() {
         state: TaskState::Running,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster
         .update_status::<TaskSpec>(task_id, &running)

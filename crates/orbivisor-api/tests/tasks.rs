@@ -34,6 +34,7 @@ async fn tasks_left_running_by_a_previous_opld_are_failed() {
                 state: TaskState::Running,
                 error: None,
                 progress: None,
+                ..Default::default()
             };
             cluster.create(&task).await.unwrap();
             *slot.lock().unwrap() = Some(task.id);
@@ -277,6 +278,7 @@ async fn task_on(env: &Env, op: TaskOp, target: Uuid, node: Uuid, state: TaskSta
         state,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster.create(&task).await.unwrap();
 }

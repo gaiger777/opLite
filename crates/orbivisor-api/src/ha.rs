@@ -1024,11 +1024,7 @@ async fn record_power_off(
     );
     record.name = record.id.to_string();
     // 실행기는 끝난 Task를 실행하지 않는다.
-    record.status = TaskStatus {
-        state,
-        error,
-        progress: None,
-    };
+    record.status = TaskStatus::finished(state, error, None);
     if let Err(e) = create(ctx, &record).await {
         tracing::warn!(node = %node, error = %e, "cannot record the node power-off task");
     }
@@ -2023,7 +2019,7 @@ async fn finish(ctx: Ctx<'_>, vm: &Vm, failed: &Node, target: Uuid) {
     );
     record.name = record.id.to_string();
     // 실행기는 끝난 Task를 실행하지 않는다.
-    record.status.state = TaskState::Succeeded;
+    record.status = TaskStatus::finished(TaskState::Succeeded, None, None);
     if let Err(e) = create(ctx, &record).await {
         tracing::warn!(vm = %vm.name, error = %e, "cannot record HA recovery task");
     }
@@ -2031,11 +2027,7 @@ async fn finish(ctx: Ctx<'_>, vm: &Vm, failed: &Node, target: Uuid) {
 
 /// Task를 실패로 끝낸다. 그사이 바뀌었으면 다시 읽어 끝나지 않았을 때만 다시 쓴다.
 async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
-    let status = TaskStatus {
-        state: TaskState::Failed,
-        error: Some(error.into()),
-        progress: None,
-    };
+    let status = TaskStatus::finished(TaskState::Failed, Some(error.into()), Some(&task.status));
     let mut revision = task.revision;
     for _ in 0..TASK_FAIL_ATTEMPTS {
         match update_status_checked::<TaskSpec>(ctx, task.id, revision, &status).await {

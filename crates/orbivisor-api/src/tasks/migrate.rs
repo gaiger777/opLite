@@ -749,14 +749,10 @@ pub(super) async fn write_progress(
     stage: &str,
     progress: MirrorProgress,
 ) -> bool {
-    let status = TaskStatus {
-        state: TaskState::Running,
-        error: None,
-        progress: Some(TaskProgress {
-            stage: stage.into(),
-            done_bytes: progress.done_bytes,
-            total_bytes: progress.total_bytes,
-        }),
+    let progress = TaskProgress {
+        stage: stage.into(),
+        done_bytes: progress.done_bytes,
+        total_bytes: progress.total_bytes,
     };
     loop {
         let current = match ctx.cluster.get::<TaskSpec>(task) {
@@ -770,6 +766,7 @@ pub(super) async fn write_progress(
         if current.status.state != TaskState::Running {
             return false;
         }
+        let status = TaskStatus::running(Some(progress.clone()), Some(&current.status));
         match ctx
             .cluster
             .update_status_checked::<TaskSpec>(task, current.revision, &status)

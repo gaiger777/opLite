@@ -452,6 +452,7 @@ async fn create_exclusive(
         task.labels
             .insert(crate::tasks::REQUESTED_BY.to_string(), user.to_string());
     }
+    crate::tasks::label_task(&state.cluster, &mut task);
     let pending = SdnPending {
         op: op.clone(),
         node,
@@ -648,11 +649,7 @@ fn moved_init(state: &AppState, sdn: &Sdn, node: &Node) -> Result<Option<Uuid>, 
 /// 첫 세우기를 노드 `old`에서 `to`로 옮겼으면 `old`의 끝나지 않은 SDN Task를 실패로 끝낸다(리비전 확인 쓰기). 이미 돌고
 /// 있던 Task는 자리를 잃어 스스로 멈춘다.
 async fn abandon_tasks(cluster: &Cluster, old: Uuid, to: &str) -> Result<(), ApiError> {
-    let failed = TaskStatus {
-        state: orbivisor_types::task::TaskState::Failed,
-        error: Some(format!("the SDN (OVN) setup was moved to node {to:?}")),
-        progress: None,
-    };
+    let error = format!("the SDN (OVN) setup was moved to node {to:?}");
     loop {
         let tasks: Vec<Task> = unfinished(cluster)?
             .into_iter()
@@ -661,6 +658,11 @@ async fn abandon_tasks(cluster: &Cluster, old: Uuid, to: &str) -> Result<(), Api
         let Some(t) = tasks.first() else {
             return Ok(());
         };
+        let failed = TaskStatus::finished(
+            orbivisor_types::task::TaskState::Failed,
+            Some(error.clone()),
+            Some(&t.status),
+        );
         match cluster
             .update_status_checked::<TaskSpec>(t.id, t.revision, &failed)
             .await

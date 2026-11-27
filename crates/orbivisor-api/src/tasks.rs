@@ -67,6 +67,58 @@ use crate::volumes::{block_pool_kind, usable_node};
 /// Task를 만든 API 요청의 사용자 id를 담는 레이블(요청 밖에서 만든 Task — 스케줄러·HA·정리 작업 — 에는 없다)
 pub const REQUESTED_BY: &str = "requested-by";
 
+/// 요청한 사용자의 이름(계획 77 — 만들 때의 스냅숏, 웹이 사용자 목록 없이 보인다)
+pub const REQUESTED_BY_NAME: &str = "requested-by-name";
+/// 대상의 이름과 종류(계획 77 — 만들 때의 스냅숏, 대상을 지운 뒤에도 이름이 남는다)
+pub const TARGET_NAME: &str = "target-name";
+pub const TARGET_KIND: &str = "target-kind";
+
+/// Task 대상이 될 수 있는 종류(id가 종류를 넘어 고유하므로 처음 찾은 것이 대상이다)
+const TARGET_KINDS: [Kind; 24] = [
+    Kind::Vm,
+    Kind::Volume,
+    Kind::Backup,
+    Kind::VmImport,
+    Kind::Node,
+    Kind::BackupStore,
+    Kind::VmwareMigration,
+    Kind::VmwareVm,
+    Kind::VmExport,
+    Kind::ApplySet,
+    Kind::Certificate,
+    Kind::Network,
+    Kind::StoragePool,
+    Kind::Snapshot,
+    Kind::BackupJob,
+    Kind::Router,
+    Kind::LoadBalancer,
+    Kind::NetworkMigration,
+    Kind::RecoveryPlan,
+    Kind::DrRun,
+    Kind::Remote,
+    Kind::HaGroup,
+    Kind::Ceph,
+    Kind::Sdn,
+];
+
+/// 요청자 이름·대상 이름 레이블을 단다(계획 77). 레이블이라 옛 노드도 그대로 읽고, 실행기가 status를 다시 써도 남는다.
+pub(crate) fn label_task(cluster: &Cluster, task: &mut Task) {
+    if let Some(p) = crate::audit::principal() {
+        task.labels.insert(REQUESTED_BY_NAME.to_string(), p.name);
+    }
+    if task.spec.target.is_nil() {
+        return;
+    }
+    for kind in TARGET_KINDS {
+        if let Ok(Some(raw)) = cluster.get_raw(kind, task.spec.target) {
+            task.labels.insert(TARGET_NAME.to_string(), raw.name);
+            task.labels
+                .insert(TARGET_KIND.to_string(), kind.as_str().to_string());
+            return;
+        }
+    }
+}
+
 /// 새 Task를 저장소에 만든다. 이름은 id 문자열이다. API 요청 안이면 요청한 사용자를 [`REQUESTED_BY`] 레이블에 둔다.
 pub(crate) async fn create_task(
     cluster: &Cluster,
@@ -123,6 +175,7 @@ pub(crate) async fn create_task_with_id(
         task.labels
             .insert(REQUESTED_BY.to_string(), user.to_string());
     }
+    label_task(cluster, &mut task);
     task.revision = cluster.create(&task).await?;
     Ok(task)
 }
@@ -1090,11 +1143,8 @@ fn keeps_downloaded(ctx: &Ctx, task: &Task) -> bool {
 /// 실패로 끝냈거나 Task가 지워졌으면 `false`로, 실행하지 않는다. `running`으로 읽히면 응답을 잃은
 /// 앞의 쓰기가 적용된 것이다(`running`은 이 노드만 쓴다). 기록될 때까지 다시 시도한다.
 async fn begin(ctx: &Ctx, id: Uuid) -> bool {
-    let running = TaskStatus {
-        state: TaskState::Running,
-        error: None,
-        progress: None,
-    };
+    // 시작 시각(계획 77)
+    let running = TaskStatus::running(None, None);
     loop {
         let current = match ctx.cluster.get::<TaskSpec>(id) {
             Ok(Some(task)) => task,
@@ -1128,11 +1178,14 @@ async fn begin(ctx: &Ctx, id: Uuid) -> bool {
 
 /// 저장소에 기록될 때까지 다시 시도한다. 실행기가 멈추면 이 future도 함께 멈춘다.
 async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>) {
-    let status = TaskStatus {
-        state,
-        error,
-        progress: None,
-    };
+    // 끝 시각을 적고 시작 시각은 잇는다(계획 77). 읽지 못하면 끝 시각만.
+    let prev = ctx
+        .cluster
+        .get::<TaskSpec>(id)
+        .ok()
+        .flatten()
+        .map(|t| t.status);
+    let status = TaskStatus::finished(state, error, prev.as_ref());
     loop {
         match ctx.cluster.update_status::<TaskSpec>(id, &status).await {
             Ok(_) => return,

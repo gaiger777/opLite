@@ -422,6 +422,7 @@ async fn put_task(env: &Env, op: TaskOp, target: Uuid, state: TaskState) -> Valu
         state,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster.create(&task).await.unwrap();
     json!({ "id": task.id })
@@ -631,6 +632,7 @@ async fn run_and_delete_need_an_idle_import() {
             state: TaskState::Failed,
             error: None,
             progress: None,
+            ..Default::default()
         };
         env.cluster
             .update_status::<TaskSpec>(task.id, &status)

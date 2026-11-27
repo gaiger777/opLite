@@ -724,6 +724,7 @@ async fn upgrade_checks_the_node_the_caller_and_other_upgrades() {
                 state: TaskState::Succeeded,
                 error: None,
                 progress: None,
+                ..Default::default()
             },
         )
         .await
@@ -1127,6 +1128,7 @@ async fn the_agent_skips_checks_while_the_node_is_upgrading() {
                 state: TaskState::Succeeded,
                 error: None,
                 progress: None,
+                ..Default::default()
             },
         )
         .await

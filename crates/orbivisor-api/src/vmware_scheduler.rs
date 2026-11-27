@@ -655,6 +655,7 @@ mod tests {
             state: TaskState::Running,
             error: None,
             progress: None,
+            ..Default::default()
         };
         t
     }

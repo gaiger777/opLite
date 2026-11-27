@@ -484,6 +484,7 @@ mod tests {
             state,
             error: None,
             progress: None,
+            ..Default::default()
         };
         t
     }

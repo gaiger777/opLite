@@ -31,6 +31,7 @@ async fn finish_tasks(env: &Env) {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     };
     for task in tasks {
         env.cluster

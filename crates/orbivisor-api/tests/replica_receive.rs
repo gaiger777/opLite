@@ -146,6 +146,7 @@ impl Setup {
             state: TaskState::Failed,
             error: Some("interrupted".into()),
             progress: None,
+            ..Default::default()
         };
         self.env
             .cluster

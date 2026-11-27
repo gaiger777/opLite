@@ -1974,6 +1974,7 @@ async fn progress_does_not_revive_a_finished_task() {
         state: TaskState::Failed,
         error: Some("ended elsewhere".into()),
         progress: None,
+        ..Default::default()
     };
     a.cluster
         .update_status::<TaskSpec>(id, &failed)

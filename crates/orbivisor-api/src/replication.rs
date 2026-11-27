@@ -533,6 +533,7 @@ mod tests {
             state: TaskState::Succeeded,
             error: None,
             progress: None,
+            ..Default::default()
         };
         let p = plan(
             1 << 40,

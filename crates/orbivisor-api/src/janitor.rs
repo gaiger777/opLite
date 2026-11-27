@@ -484,11 +484,14 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
             revision,
             error,
         } => {
-            let status = TaskStatus {
-                state: TaskState::Failed,
-                error: Some(error.clone()),
-                progress: None,
-            };
+            // 시작 시각은 잇는다(계획 77 — 읽은 것과 revision이 다르면 어차피 쓰기가 거절된다).
+            let prev = cluster
+                .get::<TaskSpec>(*id)
+                .ok()
+                .flatten()
+                .map(|t| t.status);
+            let status =
+                TaskStatus::finished(TaskState::Failed, Some(error.clone()), prev.as_ref());
             cluster
                 .update_status_checked::<TaskSpec>(*id, *revision, &status)
                 .await
@@ -617,6 +620,7 @@ mod tests {
             state,
             error: None,
             progress: None,
+            ..Default::default()
         };
         t
     }
@@ -1081,6 +1085,7 @@ mod tests {
             state: TaskState::Running,
             error: None,
             progress: None,
+            ..Default::default()
         };
         cluster
             .update_status_checked::<TaskSpec>(t.id, t.revision, &running)

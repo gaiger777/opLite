@@ -432,6 +432,7 @@ async fn unfinished_snapshots_of_this_node_are_removed_at_startup() {
                 state: TaskState::Running,
                 error: None,
                 progress: None,
+                ..Default::default()
             };
             cluster.create(&task).await.unwrap();
             // 이 노드에서 돌던 꺼진 VM을 다른 노드로 옮겼다. 디스크는 그 노드에 있다.
@@ -881,6 +882,7 @@ async fn task_failed_by_someone_else_before_it_starts_is_not_run() {
         state: TaskState::Failed,
         error: Some(format!("node {} is offline", env.node)),
         progress: None,
+        ..Default::default()
     };
     env.cluster
         .update_status::<TaskSpec>(second.id, &failed)
@@ -1462,6 +1464,7 @@ async fn block_tags_of_pending_backups_are_kept_at_startup() {
                 state: TaskState::Running,
                 error: None,
                 progress: None,
+                ..Default::default()
             };
             env.cluster
                 .update_status::<TaskSpec>(task.id, &running)

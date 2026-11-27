@@ -705,6 +705,7 @@ async fn waits_for_resizes_of_its_disks() {
             state,
             error: None,
             progress: None,
+            ..Default::default()
         };
         cluster.create(&task).await.unwrap();
     }
@@ -727,6 +728,7 @@ async fn waits_for_resizes_of_its_disks() {
         state: TaskState::Running,
         error: None,
         progress: None,
+        ..Default::default()
     };
     cluster
         .update_status::<TaskSpec>(task.id, &status)
@@ -748,6 +750,7 @@ async fn waits_for_resizes_of_its_disks() {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     };
     cluster
         .update_status::<TaskSpec>(task.id, &status)
@@ -769,6 +772,7 @@ async fn waits_for_resizes_of_its_disks() {
         state: TaskState::Running,
         error: None,
         progress: None,
+        ..Default::default()
     };
     cluster.create(&flatten).await.unwrap();
     let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &Activations::default())

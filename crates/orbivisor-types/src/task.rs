@@ -519,6 +519,46 @@ pub struct TaskStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub progress: Option<TaskProgress>,
+    /// 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub started_at: Option<u64>,
+    /// 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub finished_at: Option<u64>,
+}
+
+impl TaskStatus {
+    /// 끝난 상태: 지금을 `finished_at`에, 앞 상태(`prev`)의 `started_at`은 그대로 둔다.
+    pub fn finished(state: TaskState, error: Option<String>, prev: Option<&TaskStatus>) -> Self {
+        Self {
+            state,
+            error,
+            progress: None,
+            started_at: prev.and_then(|p| p.started_at),
+            finished_at: Some(now_ms()),
+        }
+    }
+
+    /// 실행 중인 상태(진행률과 함께): 앞 상태의 `started_at`을 그대로 둔다(없으면 지금).
+    pub fn running(progress: Option<TaskProgress>, prev: Option<&TaskStatus>) -> Self {
+        Self {
+            state: TaskState::Running,
+            error: None,
+            progress,
+            started_at: Some(prev.and_then(|p| p.started_at).unwrap_or_else(now_ms)),
+            finished_at: None,
+        }
+    }
+}
+
+/// 지금 시각(유닉스 ms). 시계가 1970년 전이면 0
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트
@@ -997,6 +1037,7 @@ mod tests {
                 done_bytes: 1 << 30,
                 total_bytes: 4 << 30,
             }),
+            ..Default::default()
         };
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(
@@ -1008,6 +1049,34 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<TaskStatus>(json).unwrap(), st);
+    }
+
+    /// 계획 77: 시작·끝 시각은 있을 때만 쓰고, 옛 노드의 status(시각 없음)도 읽는다. 끝낼 때 시작 시각을 잇는다.
+    #[test]
+    fn status_times_are_optional_and_carried_over() {
+        let json = serde_json::to_value(TaskStatus::default()).unwrap();
+        assert!(
+            json.get("started_at").is_none() && json.get("finished_at").is_none(),
+            "{json}"
+        );
+        let running = TaskStatus::running(None, None);
+        let started = running.started_at.unwrap();
+        assert!(started > 0);
+        assert_eq!(
+            TaskStatus::running(None, Some(&running)).started_at,
+            Some(started)
+        );
+        let done = TaskStatus::finished(TaskState::Failed, Some("x".into()), Some(&running));
+        assert_eq!(done.started_at, Some(started));
+        assert!(done.finished_at.unwrap() >= started);
+        assert_eq!(done.progress, None);
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json["started_at"], serde_json::json!(started));
+        assert_eq!(serde_json::from_value::<TaskStatus>(json).unwrap(), done);
+        // 옛 노드가 시작한 Task(시각 없음)를 끝내면 끝 시각만 있다.
+        let old = TaskStatus::finished(TaskState::Succeeded, None, Some(&TaskStatus::default()));
+        assert_eq!(old.started_at, None);
+        assert!(old.finished_at.is_some());
     }
 
     #[test]

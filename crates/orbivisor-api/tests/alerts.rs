@@ -448,6 +448,7 @@ async fn failed_task(env: &Env, op: TaskOp) -> Uuid {
         state: TaskState::Failed,
         error: Some("disk on fire".into()),
         progress: None,
+        ..Default::default()
     };
     env.cluster.create(&task).await.unwrap();
     task.id

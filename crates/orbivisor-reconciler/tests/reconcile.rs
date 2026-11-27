@@ -1444,6 +1444,7 @@ async fn start_waits_for_a_resize_of_its_disk() {
         state: TaskState::Succeeded,
         error: None,
         progress: None,
+        ..Default::default()
     };
     env.cluster
         .update_status::<TaskSpec>(task.id, &status)

@@ -98,6 +98,7 @@ async fn finish(env: &Env, task: &Value) {
         state: orbivisor_types::task::TaskState::Failed,
         error: Some("test".into()),
         progress: None,
+        ..Default::default()
     };
     env.cluster
         .update_status::<orbivisor_types::task::TaskSpec>(id, &status)

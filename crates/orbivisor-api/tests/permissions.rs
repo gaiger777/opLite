@@ -1772,6 +1772,15 @@ async fn token_cap_task_requester_and_console_revocation() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     assert_eq!(task["labels"]["requested-by"], w.alice_id, "{task}");
+    // 계획 77: 요청한 사용자의 이름, 대상(복제 원본 VM)의 이름·종류도 만들 때 적어 둔다. 끝나면 시작·끝 시각이 있다.
+    assert_eq!(task["labels"]["requested-by-name"], "alice", "{task}");
+    assert_eq!(task["labels"]["target-name"], "a2", "{task}");
+    assert_eq!(task["labels"]["target-kind"], "vm", "{task}");
+    let done = w.admin.wait_task(&task).await;
+    let started = done["status"]["started_at"].as_u64().expect("started_at");
+    let finished = done["status"]["finished_at"].as_u64().expect("finished_at");
+    assert!(started <= finished, "{done}");
+    assert_eq!(done["labels"]["target-name"], "a2", "{done}");
 
     // 콘솔: 열린 뒤 그룹 grant가 빠지면 닫힌다.
     let tmp = tempfile::Builder::new()
