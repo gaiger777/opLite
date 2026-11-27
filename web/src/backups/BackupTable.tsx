@@ -120,6 +120,7 @@ export function BackupTable({
   labelledBy,
   showVm = false,
   url = false,
+  emptyState,
 }: {
   backups: Backup[];
   query: { isPending: boolean; isError: boolean; error: unknown };
@@ -127,6 +128,8 @@ export function BackupTable({
   showVm?: boolean;
   /** 화면의 주 목록이면 검색·정렬을 주소에 두고 목록 단축키를 받는다. */
   url?: boolean;
+  /** 정말 빈 목록일 때 표 대신 그릴 안내(EmptyState) */
+  emptyState?: React.ReactNode;
 }) {
   const { t, i18n } = useTranslation();
   const perms = usePermissions();
@@ -604,6 +607,7 @@ export function BackupTable({
         rowName={(backup) => backup.name}
         query={query}
         empty={t("backups.empty")}
+        emptyState={emptyState}
         labelledBy={labelledBy}
         state={url ? state : undefined}
         search={url ? (backup) => `${backup.name} ${backup.spec.vm_name}` : undefined}
@@ -747,7 +751,12 @@ function RestoreDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="restore-name" label={t("backups.newName")} error={errors.name}>
+      <Field
+        id="restore-name"
+        label={t("backups.newName")}
+        error={errors.name}
+        help={t("help.backups.restoreName")}
+      >
         {(a11y) => (
           <Input
             id="restore-name"
@@ -758,7 +767,12 @@ function RestoreDialog({
         )}
       </Field>
       {!pools.isSuccess && <ListPending error={pools.error} />}
-      <Field id="restore-pool" label={t("backups.diskPool")} error={errors.pool}>
+      <Field
+        id="restore-pool"
+        label={t("backups.diskPool")}
+        error={errors.pool}
+        help={t("help.backups.restorePool")}
+      >
         {(a11y) => (
           <NativeSelect
             id="restore-pool"
@@ -787,6 +801,7 @@ function RestoreDialog({
               id={`restore-net-${i}`}
               label={t("backups.networkFor", { name: from })}
               error={errors[`net-${from}`]}
+              help={t("help.backups.restoreNetwork")}
             >
               {(a11y) => (
                 <NativeSelect
@@ -818,6 +833,7 @@ function RestoreDialog({
               id={`restore-sg-${i}`}
               label={t("backups.securityGroupFor", { name: from })}
               error={errors[`sg-${from}`]}
+              help={t("help.backups.restoreSecurityGroup")}
             >
               {(a11y) => (
                 <NativeSelect
@@ -900,19 +916,26 @@ function StoreTargetDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="move-store" label={t("backups.store")}>
-        <NativeSelect
-          id="move-store"
-          className="w-full"
-          value={store}
-          onChange={(e) => setStore(e.target.value)}
-        >
-          {stores.map((s) => (
-            <NativeSelectOption key={s.id} value={s.name}>
-              {s.name}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
+      <Field
+        id="move-store"
+        label={t("backups.store")}
+        help={t(kind === "convert" ? "help.backups.convertStore" : "help.backups.copyStore")}
+      >
+        {(a11y) => (
+          <NativeSelect
+            id="move-store"
+            className="w-full"
+            value={store}
+            onChange={(e) => setStore(e.target.value)}
+            {...a11y}
+          >
+            {stores.map((s) => (
+              <NativeSelectOption key={s.id} value={s.name}>
+                {s.name}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        )}
       </Field>
     </FormDialog>
   );
@@ -985,6 +1008,7 @@ function ReplicateDialog({
         id="replicate"
         label={t("backups.remote")}
         none={t("backups.chooseRemote")}
+        help={t("help.backups.replicateRemote")}
         kind={toStore ? "store" : "pool"}
         fingerprint={fingerprint}
         value={target}

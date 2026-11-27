@@ -12,6 +12,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
@@ -80,6 +81,8 @@ export function HaChecksPage() {
       <PageHeader
         id="ha-checks-title"
         title={t("nav.haChecks")}
+        help="haChecks"
+        intro={t("help.haChecks.intro")}
         actions={
           write && (
             <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -100,94 +103,119 @@ export function HaChecksPage() {
           )
         }
       />
-      <p className="text-sm text-muted-foreground">{t("haChecks.pageHint")}</p>
-      <Table aria-labelledby="ha-checks-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("haChecks.role")}</TableHead>
-            <TableHead>{t("haChecks.target")}</TableHead>
-            <TableHead>{t("haChecks.onFail")}</TableHead>
-            <TableHead>{t("haChecks.grace")}</TableHead>
-            <TableHead>{t("haChecks.overrides")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
+      {checks.isSuccess && list.length === 0 ? (
+        <EmptyState
+          title={t("haChecks.empty")}
+          description={t("help.haChecks.empty")}
+          diagram="haFencing"
+          help="haChecks.page"
+          action={
+            write && (
+              <Button
+                disabled={!nodes.isSuccess || !pools.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("haChecks.createTitle")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="ha-checks-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("haChecks.role")}</TableHead>
+              <TableHead>{t("haChecks.target")}</TableHead>
+              <TableHead>{t("haChecks.onFail")}</TableHead>
+              <TableHead>{t("haChecks.grace")}</TableHead>
+              <TableHead>{t("haChecks.overrides")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
+              {write && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={write ? 8 : 7} query={checks} empty={t("haChecks.empty")} />
             )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={write ? 8 : 7} query={checks} empty={t("haChecks.empty")} />
-          )}
-          {list.map((check) => {
-            const s = check.spec;
-            const overrides = Object.entries(s.nodes ?? {}).sort(([a], [b]) => a.localeCompare(b));
-            return (
-              <TableRow key={check.id}>
-                <TableCell className="font-medium">{check.name}</TableCell>
-                <TableCell>{t(`haChecks.roles.${s.role}`)}</TableCell>
-                <TableCell className="font-mono text-xs">{targetText(s.target)}</TableCell>
-                <TableCell>
-                  {s.on_fail ? (
-                    t(`haChecks.actions.${s.on_fail}`)
-                  ) : (
-                    <>
-                      {t(`haChecks.actions.${defaultAction(s.role)}`)}
-                      <span className="ml-1 text-xs text-muted-foreground">
-                        {t("haChecks.roleDefault")}
-                      </span>
-                    </>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {t("haChecks.seconds", { n: s.grace_secs ?? DEFAULT_GRACE_SECS })}
-                </TableCell>
-                <TableCell className="font-mono text-xs">
-                  {overrides.map(([node, target]) => `${node}=${targetText(target)}`).join(", ") ||
-                    "—"}
-                </TableCell>
-                <TableCell>
-                  {/* 서버는 켜짐(기본)을 쓰지 않는다. */}
-                  <Badge variant={(s.enabled ?? true) ? "default" : "outline"}>
-                    {t((s.enabled ?? true) ? "haChecks.enabled" : "haChecks.disabled")}
-                  </Badge>
-                </TableCell>
-                {write && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("haChecks.editNamed", { name: check.name })}
-                      disabled={!nodes.isSuccess || !pools.isSuccess}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setEditing(check);
-                      }}
-                    >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("haChecks.deleteNamed", { name: check.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setDeleting(check);
-                        setDeleteOpen(true);
-                      }}
-                    >
-                      <Trash2 />
-                    </Button>
+            {list.map((check) => {
+              const s = check.spec;
+              const overrides = Object.entries(s.nodes ?? {}).sort(([a], [b]) =>
+                a.localeCompare(b),
+              );
+              return (
+                <TableRow key={check.id}>
+                  <TableCell className="font-medium">{check.name}</TableCell>
+                  <TableCell>{t(`haChecks.roles.${s.role}`)}</TableCell>
+                  <TableCell className="font-mono text-xs">{targetText(s.target)}</TableCell>
+                  <TableCell>
+                    {s.on_fail ? (
+                      t(`haChecks.actions.${s.on_fail}`)
+                    ) : (
+                      <>
+                        {t(`haChecks.actions.${defaultAction(s.role)}`)}
+                        <span className="ml-1 text-xs text-muted-foreground">
+                          {t("haChecks.roleDefault")}
+                        </span>
+                      </>
+                    )}
                   </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                  <TableCell>
+                    {t("haChecks.seconds", { n: s.grace_secs ?? DEFAULT_GRACE_SECS })}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">
+                    {overrides
+                      .map(([node, target]) => `${node}=${targetText(target)}`)
+                      .join(", ") || "—"}
+                  </TableCell>
+                  <TableCell>
+                    {/* 서버는 켜짐(기본)을 쓰지 않는다. */}
+                    <Badge variant={(s.enabled ?? true) ? "default" : "outline"}>
+                      {t((s.enabled ?? true) ? "haChecks.enabled" : "haChecks.disabled")}
+                    </Badge>
+                  </TableCell>
+                  {write && (
+                    <TableCell className="text-right whitespace-nowrap">
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("haChecks.editNamed", { name: check.name })}
+                        disabled={!nodes.isSuccess || !pools.isSuccess}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setEditing(check);
+                        }}
+                      >
+                        <Pencil />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("haChecks.deleteNamed", { name: check.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setDeleting(check);
+                          setDeleteOpen(true);
+                        }}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       <p className="text-sm text-muted-foreground">{t("haChecks.autoNote")}</p>
       {editing !== undefined && (
         <CheckDialog
@@ -402,7 +430,12 @@ function CheckDialog({
         ))}
       </datalist>
       {!check && (
-        <Field id="check-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="check-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.haChecks.name")}
+        >
           {(a11y) => (
             <Input
               id="check-name"
@@ -413,7 +446,12 @@ function CheckDialog({
           )}
         </Field>
       )}
-      <Field id="check-role" label={t("haChecks.role")} help={t(`haChecks.roleHint.${form.role}`)}>
+      <Field
+        id="check-role"
+        label={t("haChecks.role")}
+        help={t(`haChecks.roleHint.${form.role}`)}
+        info="haChecks.role"
+      >
         {(a11y) => (
           <NativeSelect
             id="check-role"
@@ -434,6 +472,7 @@ function CheckDialog({
         id="check-kind"
         label={t("haChecks.targetKind")}
         help={t(`haChecks.kindHint.${form.kind}`)}
+        info="haChecks.kind"
       >
         {(a11y) => (
           <NativeSelect
@@ -462,7 +501,13 @@ function CheckDialog({
         />
         {errors.target && <p className="text-xs text-destructive">{t(errors.target)}</p>}
       </div>
-      <Field id="check-on-fail" label={t("haChecks.onFail")} error={errors.onFail}>
+      <Field
+        id="check-on-fail"
+        label={t("haChecks.onFail")}
+        error={errors.onFail}
+        help={t("help.haChecks.onFail")}
+        info="haChecks.onFail"
+      >
         {(a11y) => (
           <NativeSelect
             id="check-on-fail"
@@ -489,6 +534,7 @@ function CheckDialog({
         label={t("haChecks.graceLabel")}
         error={errors.grace}
         help={t("haChecks.graceHint")}
+        info="haChecks.grace"
       >
         {(a11y) => (
           <Input

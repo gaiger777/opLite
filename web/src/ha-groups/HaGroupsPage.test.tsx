@@ -167,3 +167,13 @@ it("lets only admins change groups", async () => {
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Edit HA group rack" })).not.toBeInTheDocument();
 });
+
+it("explains HA groups and offers to create one when there are none", async () => {
+  mockLists({ "ha-group": [], node: NODES, vm: [] });
+  renderPage(<HaGroupsPage />);
+  expect(await screen.findByText("No HA groups.")).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Create HA group" }));
+  expect(await screen.findByRole("dialog", { name: "Create HA group" })).toBeVisible();
+});

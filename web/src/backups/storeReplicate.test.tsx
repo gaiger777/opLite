@@ -83,7 +83,7 @@ it("a store job copies to a remote store and a changed target clears the remote 
   );
   renderPage(<BackupJobsPage />);
   await user.click(await screen.findByRole("button", { name: "Create" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  const dialog = await screen.findByRole("dialog", { name: "Create backup schedule" });
   await user.type(within(dialog).getByLabelText("Name"), "offsite");
   await user.type(within(dialog).getByLabelText("Time (UTC)"), "03:00");
   // 풀 작업은 원격의 백업 풀을 고른다.
@@ -188,7 +188,7 @@ it("asks again for the remote target when a late list changes a new job's target
   );
   renderPage(<BackupJobsPage />);
   await user.click(await screen.findByRole("button", { name: "Create" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  const dialog = await screen.findByRole("dialog", { name: "Create backup schedule" });
   await user.type(within(dialog).getByLabelText("Name"), "offsite");
   await user.type(within(dialog).getByLabelText("Time (UTC)"), "03:00");
   await within(dialog).findByRole("option", { name: "dr" });

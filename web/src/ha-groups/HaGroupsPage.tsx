@@ -9,7 +9,9 @@ import { useList } from "@/api/live";
 import type { HaGroup } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
@@ -58,6 +60,8 @@ export function HaGroupsPage() {
       <PageHeader
         id="ha-groups-title"
         title={t("nav.haGroups")}
+        help="haGroups"
+        intro={t("haGroups.pageHint")}
         actions={
           write && (
             <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -77,81 +81,105 @@ export function HaGroupsPage() {
           )
         }
       />
-      <p className="text-sm text-muted-foreground">{t("haGroups.pageHint")}</p>
-      <Table aria-labelledby="ha-groups-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("haGroups.nodes")}</TableHead>
-            <TableHead>{t("haGroups.options")}</TableHead>
-            <TableHead>{t("haGroups.vms")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
+      {groups.isSuccess && list.length === 0 ? (
+        <EmptyState
+          title={t("haGroups.empty")}
+          description={t("help.haGroups.empty")}
+          diagram="haFencing"
+          help="haGroups.page"
+          action={
+            write && (
+              <Button
+                disabled={!nodes.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("haGroups.createTitle")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="ha-groups-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("haGroups.nodes")}</TableHead>
+              <TableHead>{t("haGroups.options")}</TableHead>
+              <TableHead>{t("haGroups.vms")}</TableHead>
+              {write && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={write ? 5 : 4} query={groups} empty={t("haGroups.empty")} />
             )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={write ? 5 : 4} query={groups} empty={t("haGroups.empty")} />
-          )}
-          {list.map((group) => {
-            const users = groupVms(group, vms.data ?? []);
-            return (
-              <TableRow key={group.id}>
-                <TableCell className="font-medium">{group.name}</TableCell>
-                <TableCell>
-                  {byPriority(group.spec.nodes)
-                    .map((n) => t("haGroups.nodePriority", { node: n.node, n: n.priority ?? 0 }))
-                    .join(", ")}
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap gap-1">
-                    {group.spec.restricted && (
-                      <Badge variant="outline">{t("haGroups.restricted")}</Badge>
-                    )}
-                    {group.spec.nofailback && (
-                      <Badge variant="outline">{t("haGroups.nofailback")}</Badge>
-                    )}
-                    {!group.spec.restricted && !group.spec.nofailback && "—"}
-                  </div>
-                </TableCell>
-                {/* VM 목록을 다 읽기 전에는 모른다. */}
-                <TableCell>{vms.isSuccess ? users.join(", ") || "—" : "—"}</TableCell>
-                {write && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("haGroups.editNamed", { name: group.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setEditing(group);
-                      }}
-                    >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("haGroups.deleteNamed", { name: group.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setDeleting(group);
-                        setDeleteOpen(true);
-                      }}
-                    >
-                      <Trash2 />
-                    </Button>
-                    <RowConfigMenu target={{ kind: "ha-group", id: group.id, name: group.name }} />
+            {list.map((group) => {
+              const users = groupVms(group, vms.data ?? []);
+              return (
+                <TableRow key={group.id}>
+                  <TableCell className="font-medium">{group.name}</TableCell>
+                  <TableCell>
+                    {byPriority(group.spec.nodes)
+                      .map((n) => t("haGroups.nodePriority", { node: n.node, n: n.priority ?? 0 }))
+                      .join(", ")}
                   </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      {group.spec.restricted && (
+                        <Badge variant="outline">{t("haGroups.restricted")}</Badge>
+                      )}
+                      {group.spec.nofailback && (
+                        <Badge variant="outline">{t("haGroups.nofailback")}</Badge>
+                      )}
+                      {!group.spec.restricted && !group.spec.nofailback && "—"}
+                    </div>
+                  </TableCell>
+                  {/* VM 목록을 다 읽기 전에는 모른다. */}
+                  <TableCell>{vms.isSuccess ? users.join(", ") || "—" : "—"}</TableCell>
+                  {write && (
+                    <TableCell className="text-right whitespace-nowrap">
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("haGroups.editNamed", { name: group.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setEditing(group);
+                        }}
+                      >
+                        <Pencil />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("haGroups.deleteNamed", { name: group.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setDeleting(group);
+                          setDeleteOpen(true);
+                        }}
+                      >
+                        <Trash2 />
+                      </Button>
+                      <RowConfigMenu
+                        target={{ kind: "ha-group", id: group.id, name: group.name }}
+                      />
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {editing !== undefined && (
         <GroupDialog
           group={editing}
@@ -247,7 +275,12 @@ function GroupDialog({
       onSubmit={submit}
     >
       {!group && (
-        <Field id="group-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="group-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.haGroups.name")}
+        >
           {(a11y) => (
             <Input
               id="group-name"
@@ -259,7 +292,14 @@ function GroupDialog({
         </Field>
       )}
       <fieldset className="flex flex-col gap-1.5">
-        <legend className="mb-1.5 text-sm font-medium">{t("haGroups.nodes")}</legend>
+        <legend className="mb-1.5 flex items-center gap-1 text-sm font-medium">
+          {t("haGroups.nodes")}
+          <InfoButton
+            topic="haGroups.priority"
+            label={t("haGroups.nodes")}
+            line={t("haGroups.nodesHint")}
+          />
+        </legend>
         {names.map((node) => {
           const on = node in form.nodes;
           return (

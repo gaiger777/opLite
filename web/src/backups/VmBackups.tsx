@@ -9,7 +9,9 @@ import { usePermissions, useVmCan } from "@/auth/usePermissions";
 import { backupPools, newestFirst } from "@/backups/backups";
 import { BackupTable } from "@/backups/BackupTable";
 import { type BackupStore, useBackupStores } from "@/backupStores/stores";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
@@ -63,7 +65,33 @@ export function VmBackups({ vm }: { vm: Vm }) {
           {t(restoring ? "liveRestore.blockedBackup" : "backups.busy")}
         </p>
       )}
-      <BackupTable backups={mine} query={backups} labelledBy="vm-backups" />
+      <BackupTable
+        backups={mine}
+        query={backups}
+        labelledBy="vm-backups"
+        emptyState={
+          <EmptyState
+            title={t("backups.empty")}
+            description={t("help.backups.vmEmpty")}
+            diagram="backupChain"
+            help="backups.page"
+            action={
+              can("backup.create") && (
+                <Button
+                  disabled={busy || !pools.isSuccess || !backups.isSuccess}
+                  onClick={(e) => {
+                    opener.current = e.currentTarget;
+                    setCreating(true);
+                  }}
+                >
+                  <Archive />
+                  {t("backups.create")}
+                </Button>
+              )
+            }
+          />
+        }
+      />
       {creating && (
         <CreateBackupDialog
           vm={vm}
@@ -145,23 +173,31 @@ function CreateBackupDialog({
       {target === "" ? (
         <p className="text-sm text-muted-foreground">{t("backups.noPools")}</p>
       ) : stores.length === 0 ? (
-        <Field id="backup-pool" label={t("backups.pool")}>
-          <NativeSelect
-            id="backup-pool"
-            className="w-full"
-            value={target}
-            onChange={(e) => setChosen(e.target.value)}
-          >
-            {pools.map((p) => (
-              <NativeSelectOption key={p.id} value={`pool:${p.name}`}>
-                {p.name}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field id="backup-pool" label={t("backups.pool")} help={t("help.backups.pool")}>
+          {(a11y) => (
+            <NativeSelect
+              id="backup-pool"
+              className="w-full"
+              value={target}
+              onChange={(e) => setChosen(e.target.value)}
+              {...a11y}
+            >
+              {pools.map((p) => (
+                <NativeSelectOption key={p.id} value={`pool:${p.name}`}>
+                  {p.name}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
       ) : (
         // 백업 풀 | 저장소(계획 68 §14 웹)
-        <Field id="backup-target" label={t("backups.target")} help={t("backups.targetHint")}>
+        <Field
+          id="backup-target"
+          label={t("backups.target")}
+          help={t("backups.targetHint")}
+          info="backups.target"
+        >
           {(a11y) => (
             <NativeSelect
               id="backup-target"
@@ -215,6 +251,7 @@ function CreateBackupDialog({
             onCheckedChange={(on) => setIncremental(on === true)}
           />
           <Label htmlFor="backup-incremental">{t("backups.incremental")}</Label>
+          <InfoButton topic="backups.incremental" label={t("backups.incremental")} />
         </div>
         <p id="backup-incremental-hint" className="text-xs text-muted-foreground">
           {t(kind === "store" ? "backups.incrementalStoreHint" : "backups.incrementalHint")}

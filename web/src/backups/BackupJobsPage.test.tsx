@@ -49,7 +49,7 @@ function cells(table: HTMLElement, name: string) {
 it("lists jobs with their schedule, retention and runs in UTC", async () => {
   mockLists({ "backup-job": [off, running, nightly] });
   renderPage(<BackupJobsPage />);
-  const table = await screen.findByRole("table", { name: "Backup jobs" });
+  const table = await screen.findByRole("table", { name: "Backup schedules" });
   await within(table).findByText("nightly");
   const job = cells(table, "nightly");
   expect(job("VMs")).toHaveTextContent("tier=prod");
@@ -86,7 +86,7 @@ it("lists jobs with their schedule, retention and runs in UTC", async () => {
 it("shows where a job copies its backups", async () => {
   mockLists({ "backup-job": [copying] });
   renderPage(<BackupJobsPage />);
-  const table = await screen.findByRole("table", { name: "Backup jobs" });
+  const table = await screen.findByRole("table", { name: "Backup schedules" });
   await within(table).findByText("offsite");
   expect(cells(table, "offsite")("Remote copy")).toHaveTextContent("dr / dr-bk");
 });
@@ -103,7 +103,7 @@ it("creates a job that copies its backups to a remote cluster", async () => {
   );
   renderPage(<BackupJobsPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Create" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  const dialog = await screen.findByRole("dialog", { name: "Create backup schedule" });
   await userEvent.type(within(dialog).getByLabelText("Name"), "offsite");
   await userEvent.type(within(dialog).getByLabelText("Time (UTC)"), "03:00");
   await within(dialog).findByRole("option", { name: "dr" });
@@ -116,7 +116,7 @@ it("creates a job that copies its backups to a remote cluster", async () => {
     "dr-bk2",
   );
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-  expect(await screen.findByText("Backup job offsite created.")).toBeInTheDocument();
+  expect(await screen.findByText("Backup schedule offsite created.")).toBeInTheDocument();
   expect(body).toMatchObject({
     name: "offsite",
     spec: { pool: "bk", replicate: { remote: "dr", pool: "dr-bk2" } },
@@ -146,7 +146,7 @@ it("turns off copying to a remote cluster", async () => {
     within(dialog).queryByLabelText("Backup pool on the remote cluster"),
   ).not.toBeInTheDocument();
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await screen.findByText("Backup job offsite saved.")).toBeInTheDocument();
+  expect(await screen.findByText("Backup schedule offsite saved.")).toBeInTheDocument();
   expect(body).toEqual({ replicate: null });
 });
 
@@ -165,7 +165,7 @@ it("creates a job after checking the form", async () => {
   );
   renderPage(<BackupJobsPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Create" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  const dialog = await screen.findByRole("dialog", { name: "Create backup schedule" });
   // 백업 풀만 고를 수 있다.
   expect(
     within(within(dialog).getByLabelText("Backup pool"))
@@ -176,21 +176,23 @@ it("creates a job after checking the form", async () => {
   await userEvent.selectOptions(within(dialog).getByLabelText("VMs to back up"), "labels");
   await userEvent.type(within(dialog).getByLabelText("Time (UTC)"), "25:00");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-  expect(within(dialog).getByText("A backup job with this name already exists.")).toBeVisible();
-  expect(within(dialog).getByText("Enter at least one KEY=VALUE label.")).toBeVisible();
+  expect(
+    within(dialog).getByText("A backup schedule with this name already exists."),
+  ).toBeVisible();
+  expect(within(dialog).getByText("Enter at least one KEY=VALUE tag.")).toBeVisible();
   expect(within(dialog).getByText("Enter a time from 00:00 to 23:59.")).toBeVisible();
 
   await userEvent.clear(within(dialog).getByLabelText("Name"));
   await userEvent.type(within(dialog).getByLabelText("Name"), "prod");
   await userEvent.selectOptions(within(dialog).getByLabelText("Backup pool"), "bk2");
-  await userEvent.type(within(dialog).getByLabelText("Labels"), "tier=prod");
+  await userEvent.type(within(dialog).getByLabelText("Tags"), "tier=prod");
   await userEvent.clear(within(dialog).getByLabelText("Time (UTC)"));
   await userEvent.type(within(dialog).getByLabelText("Time (UTC)"), "01:30");
   await userEvent.click(within(dialog).getByLabelText("Sat"));
   await userEvent.type(within(dialog).getByLabelText("Last"), "2");
   await userEvent.type(within(dialog).getByLabelText("Monthly"), "6");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-  expect(await screen.findByText("Backup job prod created.")).toBeInTheDocument();
+  expect(await screen.findByText("Backup schedule prod created.")).toBeInTheDocument();
   expect(body).toEqual({
     name: "prod",
     spec: {
@@ -216,7 +218,7 @@ it("edits a job and sends only what changed", async () => {
   renderPage(<BackupJobsPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Edit nightly" }));
   const dialog = await screen.findByRole("dialog", { name: "Edit nightly" });
-  expect(within(dialog).getByLabelText("Labels")).toHaveValue("tier=prod");
+  expect(within(dialog).getByLabelText("Tags")).toHaveValue("tier=prod");
   expect(within(dialog).getByLabelText("Mon")).toBeChecked();
   expect(within(dialog).getByLabelText("Weekly")).toHaveValue("4");
   // 바꾼 것이 없으면 저장하지 않는다.
@@ -224,7 +226,7 @@ it("edits a job and sends only what changed", async () => {
   await userEvent.click(within(dialog).getByLabelText("Mon"));
   await userEvent.click(within(dialog).getByLabelText("Run on schedule"));
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await screen.findByText("Backup job nightly saved.")).toBeInTheDocument();
+  expect(await screen.findByText("Backup schedule nightly saved.")).toBeInTheDocument();
   expect(body).toEqual({ schedule: { at: "03:00", days: ["wed"] }, enabled: false });
 });
 
@@ -250,7 +252,7 @@ it("runs a job now and explains a refusal", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Run nightly now" }));
   expect(
     await screen.findByText(
-      /^The backup job is already running\. Wait for the run to finish\. Details: /,
+      /^The backup schedule is already running\. Wait for the run to finish\. Details: /,
     ),
   ).toBeInTheDocument();
 });
@@ -265,11 +267,15 @@ it("deletes a job after confirming and keeps its backups", async () => {
     }),
   );
   renderPage(<BackupJobsPage />);
-  await userEvent.click(await screen.findByRole("button", { name: "Delete backup job nightly" }));
-  const dialog = await screen.findByRole("alertdialog", { name: "Delete backup job nightly?" });
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Delete backup schedule nightly" }),
+  );
+  const dialog = await screen.findByRole("alertdialog", {
+    name: "Delete backup schedule nightly?",
+  });
   expect(dialog).toHaveTextContent("The backups it made are kept.");
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
-  expect(await screen.findByText("Backup job nightly deleted.")).toBeInTheDocument();
+  expect(await screen.findByText("Backup schedule nightly deleted.")).toBeInTheDocument();
   expect(deleted).toBe(true);
 });
 
@@ -297,7 +303,7 @@ it("makes incremental backups between full ones", async () => {
     }),
   );
   renderPage(<BackupJobsPage />);
-  const table = await screen.findByRole("table", { name: "Backup jobs" });
+  const table = await screen.findByRole("table", { name: "Backup schedules" });
   await within(table).findByText("daily");
   expect(cells(table, "daily")("Schedule (UTC)")).toHaveTextContent(
     "Incremental, full after 6 incremental backups",
@@ -323,7 +329,7 @@ it("makes incremental backups between full ones", async () => {
     "dr-bk",
   );
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await screen.findByText("Backup job weekly saved.")).toBeInTheDocument();
+  expect(await screen.findByText("Backup schedule weekly saved.")).toBeInTheDocument();
   expect(body).toEqual({ full_every: 6, replicate: { remote: "dr", pool: "dr-bk" } });
 });
 
@@ -360,4 +366,15 @@ it("explains the remote picker to users who cannot read remotes", async () => {
   expect(await screen.findByText(/choosing a remote cluster needs permission/)).toBeInTheDocument();
   expect(screen.queryByLabelText("Copy to a remote cluster")).not.toBeInTheDocument();
   expect(asked).toBe(false);
+});
+
+it("explains backup schedules and offers to create one when there are none", async () => {
+  mockLists({ "backup-job": [], "storage-pool": [pool("bk", { backups: true })] });
+  renderPage(<BackupJobsPage />);
+  expect(await screen.findByText("No backup schedules.")).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.getByRole("heading", { name: "Backup schedules" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Create backup schedule" }));
+  expect(await screen.findByRole("dialog", { name: "Create backup schedule" })).toBeVisible();
 });

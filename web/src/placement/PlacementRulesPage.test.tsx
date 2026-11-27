@@ -47,7 +47,7 @@ it("lists rules with their kind, VMs, nodes, weight and state", async () => {
   expect(s("Rule")).toHaveTextContent("Different nodes (hard)");
   expect(s("VMs")).toHaveTextContent("web1, web2");
   expect(s("Nodes")).toHaveTextContent("—");
-  expect(s("Weight")).toHaveTextContent("—");
+  expect(s("Importance")).toHaveTextContent("—");
   expect(s("State")).toHaveTextContent("On");
   const z = cells(table, "zone");
   expect(z("VMs")).toHaveTextContent("app=db");
@@ -55,7 +55,7 @@ it("lists rules with their kind, VMs, nodes, weight and state", async () => {
   expect(z("State")).toHaveTextContent("OnHA may break");
   const p = cells(table, "prefer");
   expect(p("Rule")).toHaveTextContent("On these nodes if possible");
-  expect(p("Weight")).toHaveTextContent("20");
+  expect(p("Importance")).toHaveTextContent("20");
   expect(p("State")).toHaveTextContent("Off");
 });
 
@@ -80,13 +80,13 @@ it("creates a node rule chosen by node label and sends only what the kind takes"
   expect(within(dialog).getByText("Name at least two VMs.")).toBeVisible();
   await user.selectOptions(within(dialog).getByLabelText("Rule"), "node-affinity");
   await user.selectOptions(within(dialog).getByLabelText("Choose nodes"), "tag");
-  await user.type(within(dialog).getByLabelText("Node label"), "rack-a");
+  await user.type(within(dialog).getByLabelText("Node tag"), "rack-a");
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByText("Use KEY=VALUE, such as zone=rack-a.")).toBeVisible();
-  await user.clear(within(dialog).getByLabelText("Node label"));
-  await user.type(within(dialog).getByLabelText("Node label"), "zone=rack-a");
+  await user.clear(within(dialog).getByLabelText("Node tag"));
+  await user.type(within(dialog).getByLabelText("Node tag"), "zone=rack-a");
   // hard 규칙에는 벌점이 없고 HA가 어길 수 있는지를 고른다.
-  expect(within(dialog).queryByLabelText("Weight")).not.toBeInTheDocument();
+  expect(within(dialog).queryByLabelText("Importance")).not.toBeInTheDocument();
   await user.click(within(dialog).getByLabelText("HA recovery may break this rule"));
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(await screen.findByText("Placement rule zone created.")).toBeInTheDocument();
@@ -144,7 +144,7 @@ it("turns a soft rule back on and changes its weight", async () => {
   const dialog = await screen.findByRole("dialog", { name: "Edit prefer" });
   expect(within(dialog).getByLabelText("node-b")).toBeChecked();
   expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
-  const weight = within(dialog).getByLabelText("Weight");
+  const weight = within(dialog).getByLabelText("Importance");
   await user.clear(weight);
   await user.type(weight, "101");
   await user.click(within(dialog).getByLabelText("On (an off rule is ignored)"));
@@ -180,4 +180,15 @@ it("lets only admins change rules", async () => {
   expect(
     screen.queryByRole("button", { name: "Delete placement rule spread" }),
   ).not.toBeInTheDocument();
+});
+
+it("explains placement rules with examples and offers to create one when there are none", async () => {
+  mockLists({ "placement-rule": [], node: NODES });
+  renderPage(<PlacementRulesPage />);
+  expect(await screen.findByText("No placement rules.")).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.getByText(/For example 'the two web VMs on different nodes'/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Create placement rule" }));
+  expect(await screen.findByRole("dialog", { name: "Create placement rule" })).toBeVisible();
 });

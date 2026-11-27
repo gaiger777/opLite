@@ -132,7 +132,7 @@ export function RestoreToVmDialog({
       <Field
         id="fr-vm"
         label={t("fileRestore.vm")}
-        help={running.length === 0 ? t("fileRestore.noRunningVms") : undefined}
+        help={t(running.length === 0 ? "fileRestore.noRunningVms" : "help.fileRestore.vm")}
       >
         {(a11y) => (
           <NativeSelect

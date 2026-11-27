@@ -125,6 +125,7 @@ export function RemoteTargetFields({
             id={`${id}-pool`}
             label={t(kind === "store" ? "backups.remoteStore" : "backups.remotePool")}
             error={errors.pool}
+            help={t(kind === "store" ? "help.backups.remoteStore" : "help.backups.remotePool")}
           >
             {(a11y) => (
               <NativeSelect

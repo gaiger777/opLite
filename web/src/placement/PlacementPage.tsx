@@ -85,7 +85,7 @@ export function PlacementPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title={t("nav.placement")} description={t("placement.pageHint")} />
+      <PageHeader title={t("nav.placement")} help="placement" intro={t("help.placement.intro")} />
       {!s ? (
         // 리더에 묻지 못하면(503 `placement_unavailable`) 그 문구를 보인다.
         <ListPending error={status.error} />
@@ -328,6 +328,7 @@ function SettingsCard({ onSaved }: { onSaved(): Promise<void> }) {
             id="placement-mode"
             label={t("placement.mode")}
             help={t(`placement.modeHint.${values.mode}`)}
+            info="placement.mode"
           >
             {(a11y) => (
               <NativeSelect
@@ -349,6 +350,7 @@ function SettingsCard({ onSaved }: { onSaved(): Promise<void> }) {
             id="placement-policy"
             label={t("placement.policy")}
             help={t(`placement.policyHint.${values.policy}`)}
+            info="placement.policy"
           >
             {(a11y) => (
               <NativeSelect
@@ -371,6 +373,7 @@ function SettingsCard({ onSaved }: { onSaved(): Promise<void> }) {
             label={t("placement.threshold")}
             error={shown ?? undefined}
             help={t("placement.thresholdHint")}
+            info="placement.threshold"
           >
             {(a11y) => (
               <Input

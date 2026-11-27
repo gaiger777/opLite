@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 
 import { useList } from "@/api/live";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -85,7 +86,12 @@ export function PlanEditor({
         </h2>
         <div className="grid gap-3 sm:grid-cols-2">
           {isNew && (
-            <Field id={`${id}-name`} label={t("common.name")} error={errors.name}>
+            <Field
+              id={`${id}-name`}
+              label={t("common.name")}
+              error={errors.name}
+              help={t("dr.help.name")}
+            >
               {(a11y) => (
                 <Input
                   id={`${id}-name`}
@@ -102,6 +108,7 @@ export function PlanEditor({
             label={t("dr.plan.source")}
             error={errors.source}
             help={t("dr.edit.sourceHint")}
+            info="dr.source"
           >
             {(a11y) => (
               <NativeSelect
@@ -122,7 +129,12 @@ export function PlanEditor({
               </NativeSelect>
             )}
           </Field>
-          <Field id={`${id}-pool`} label={t("dr.edit.pool")} error={errors.pool}>
+          <Field
+            id={`${id}-pool`}
+            label={t("dr.edit.pool")}
+            error={errors.pool}
+            help={t("dr.help.pool")}
+          >
             {(a11y) => (
               <NativeSelect
                 id={`${id}-pool`}
@@ -172,6 +184,7 @@ export function PlanEditor({
             label={t("dr.edit.rpo")}
             error={errors.rpo}
             help={t("dr.edit.rpoHint")}
+            info="dr.rpo"
           >
             {(a11y) => (
               <Input
@@ -183,27 +196,31 @@ export function PlanEditor({
               />
             )}
           </Field>
-          <Field id={`${id}-timeout`} label={t("dr.edit.onTimeout")}>
-            <NativeSelect
-              id={`${id}-timeout`}
-              className="w-full"
-              value={draft.onTimeout}
-              onChange={(e) => set({ onTimeout: e.target.value as Draft["onTimeout"] })}
-            >
-              {ON_TIMEOUT.map((v) => (
-                <NativeSelectOption key={v} value={v}>
-                  {t(`dr.onTimeout.${v}`)}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+          <Field id={`${id}-timeout`} label={t("dr.edit.onTimeout")} help={t("dr.help.onTimeout")}>
+            {(a11y) => (
+              <NativeSelect
+                id={`${id}-timeout`}
+                className="w-full"
+                value={draft.onTimeout}
+                onChange={(e) => set({ onTimeout: e.target.value as Draft["onTimeout"] })}
+                {...a11y}
+              >
+                {ON_TIMEOUT.map((v) => (
+                  <NativeSelectOption key={v} value={v}>
+                    {t(`dr.onTimeout.${v}`)}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
         </div>
       </section>
 
       <section aria-labelledby={`${id}-groups`} className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 id={`${id}-groups`} className="text-base font-semibold">
+          <h2 id={`${id}-groups`} className="flex items-center gap-1 text-base font-semibold">
             {t("dr.edit.groups")}
+            <InfoButton topic="dr.groups" label={t("dr.edit.groups")} />
           </h2>
           {!readOnly && (
             <Button
@@ -365,7 +382,12 @@ function GroupCard({
         )}
       </div>
       <div className="mt-2 grid gap-3 sm:grid-cols-4">
-        <Field id={`${id}-name`} label={t("dr.edit.groupName")} error={errors[`${at}.name`]}>
+        <Field
+          id={`${id}-name`}
+          label={t("dr.edit.groupName")}
+          error={errors[`${at}.name`]}
+          help={t("dr.help.groupName")}
+        >
           {(a11y) => (
             <Input
               id={`${id}-name`}
@@ -376,21 +398,29 @@ function GroupCard({
             />
           )}
         </Field>
-        <Field id={`${id}-wait`} label={t("dr.edit.wait")}>
-          <NativeSelect
-            id={`${id}-wait`}
-            className="w-full"
-            value={group.wait}
-            onChange={(e) => onChange({ wait: e.target.value as GroupDraft["wait"] })}
-          >
-            {WAITS.map((w) => (
-              <NativeSelectOption key={w} value={w}>
-                {t(`dr.wait.${w}`)}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field id={`${id}-wait`} label={t("dr.edit.wait")} help={t("dr.help.wait")} info="dr.wait">
+          {(a11y) => (
+            <NativeSelect
+              id={`${id}-wait`}
+              className="w-full"
+              value={group.wait}
+              onChange={(e) => onChange({ wait: e.target.value as GroupDraft["wait"] })}
+              {...a11y}
+            >
+              {WAITS.map((w) => (
+                <NativeSelectOption key={w} value={w}>
+                  {t(`dr.wait.${w}`)}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
-        <Field id={`${id}-timeout`} label={t("dr.edit.timeout")} error={errors[`${at}.timeout`]}>
+        <Field
+          id={`${id}-timeout`}
+          label={t("dr.edit.timeout")}
+          error={errors[`${at}.timeout`]}
+          help={t("dr.help.timeout")}
+        >
           {(a11y) => (
             <Input
               id={`${id}-timeout`}
@@ -401,7 +431,12 @@ function GroupCard({
             />
           )}
         </Field>
-        <Field id={`${id}-delay`} label={t("dr.edit.delay")} error={errors[`${at}.delay`]}>
+        <Field
+          id={`${id}-delay`}
+          label={t("dr.edit.delay")}
+          error={errors[`${at}.delay`]}
+          help={t("dr.help.delay")}
+        >
           {(a11y) => (
             <Input
               id={`${id}-delay`}

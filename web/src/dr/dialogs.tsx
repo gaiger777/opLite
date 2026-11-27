@@ -575,6 +575,7 @@ export function ReprotectDialog({ plan, onClose }: { plan: RecoveryPlan; onClose
         id={`${id}-target`}
         label={t("dr.reprotect.remote")}
         none={t("dr.edit.choose")}
+        help={t("dr.help.reprotectRemote")}
         value={target}
         errors={{ remote: errors.remote, pool: errors.pool }}
         onChange={setTarget}

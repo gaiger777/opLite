@@ -21,6 +21,7 @@ import {
   type WizardStep,
 } from "@/backupStores/stores";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -134,19 +135,26 @@ export function VerifyFields({
               />
             )}
           </Field>
-          <Field id={`${id}-mode`} label={t("backupStores.verifyMode")}>
-            <NativeSelect
-              id={`${id}-mode`}
-              className="w-full"
-              value={form.verifyMode}
-              onChange={(e) => onChange({ verifyMode: e.target.value as VerifyMode })}
-            >
-              {(["full", "metadata"] as const).map((mode) => (
-                <NativeSelectOption key={mode} value={mode}>
-                  {t(`backupStores.mode.${mode}`)}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+          <Field
+            id={`${id}-mode`}
+            label={t("backupStores.verifyMode")}
+            help={t("help.backupStores.verifyMode")}
+          >
+            {(a11y) => (
+              <NativeSelect
+                id={`${id}-mode`}
+                className="w-full"
+                value={form.verifyMode}
+                onChange={(e) => onChange({ verifyMode: e.target.value as VerifyMode })}
+                {...a11y}
+              >
+                {(["full", "metadata"] as const).map((mode) => (
+                  <NativeSelectOption key={mode} value={mode}>
+                    {t(`backupStores.mode.${mode}`)}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
           <div className="flex items-center gap-2">
             <Checkbox
@@ -370,9 +378,9 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
     id: string,
     key: keyof StoreForm,
     label: string,
-    extra: { hint?: string; placeholder?: string; type?: string } = {},
+    extra: { hint?: string; placeholder?: string; type?: string; info?: string } = {},
   ) => (
-    <Field id={id} label={label} error={errors[key]} help={extra.hint}>
+    <Field id={id} label={label} error={errors[key]} help={extra.hint} info={extra.info}>
       {(a11y) => (
         <Input
           id={id}
@@ -390,17 +398,27 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
   );
   return (
     <>
-      {text("store-name", "name", t("common.name"))}
-      <Field id="store-backend" label={t("backupStores.backend")}>
-        <NativeSelect
-          id="store-backend"
-          className="w-full"
-          value={form.backend}
-          onChange={(e) => onChange({ backend: e.target.value as StoreForm["backend"] })}
-        >
-          <NativeSelectOption value="pool">{t("backupStores.backendKind.pool")}</NativeSelectOption>
-          <NativeSelectOption value="s3">{t("backupStores.backendKind.s3")}</NativeSelectOption>
-        </NativeSelect>
+      {text("store-name", "name", t("common.name"), { hint: t("help.backupStores.name") })}
+      <Field
+        id="store-backend"
+        label={t("backupStores.backend")}
+        help={t("help.backupStores.backend")}
+        info="backupStores.backend"
+      >
+        {(a11y) => (
+          <NativeSelect
+            id="store-backend"
+            className="w-full"
+            value={form.backend}
+            onChange={(e) => onChange({ backend: e.target.value as StoreForm["backend"] })}
+            {...a11y}
+          >
+            <NativeSelectOption value="pool">
+              {t("backupStores.backendKind.pool")}
+            </NativeSelectOption>
+            <NativeSelectOption value="s3">{t("backupStores.backendKind.s3")}</NativeSelectOption>
+          </NativeSelect>
+        )}
       </Field>
       {form.backend === "pool" ? (
         pools.length === 0 ? (
@@ -441,8 +459,12 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
             placeholder: "https://s3.example.com",
             hint: t("backupStores.endpointHint"),
           })}
-          {text("store-region", "region", t("backupStores.region"))}
-          {text("store-bucket", "bucket", t("backupStores.bucket"))}
+          {text("store-region", "region", t("backupStores.region"), {
+            hint: t("help.backupStores.region"),
+          })}
+          {text("store-bucket", "bucket", t("backupStores.bucket"), {
+            hint: t("help.backupStores.bucket"),
+          })}
           {text("store-prefix", "prefix", t("backupStores.prefix"), {
             hint: t("backupStores.prefixHint"),
           })}
@@ -454,7 +476,9 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
             />
             <Label htmlFor="store-path-style">{t("backupStores.pathStyle")}</Label>
           </div>
-          {text("store-access-key", "accessKeyId", t("backupStores.accessKeyId"))}
+          {text("store-access-key", "accessKeyId", t("backupStores.accessKeyId"), {
+            hint: t("help.backupStores.accessKeyId"),
+          })}
           {text("store-secret-key", "secretKey", t("backupStores.secretKey"), {
             type: "password",
             hint: t("backupStores.secretHint"),
@@ -520,7 +544,10 @@ function EncryptionStep({ form, errors, onChange }: StepProps) {
   return (
     <>
       <fieldset className="flex flex-col gap-2">
-        <legend className="mb-1.5 text-sm font-medium">{t("backupStores.encryption")}</legend>
+        <legend className="mb-1.5 flex items-center gap-1 text-sm font-medium">
+          {t("backupStores.encryption")}
+          <InfoButton topic="backupStores.encryption" label={t("backupStores.encryption")} />
+        </legend>
         {choices.map((choice) => (
           <label key={choice} className="flex items-start gap-2 text-sm">
             <input
@@ -613,7 +640,8 @@ function ScheduleStep({ form, errors, onChange }: StepProps) {
         id="store-gc-at"
         label={t("backupStores.gcAt")}
         error={errors.gcAt}
-        help={t("backupJobs.atHint")}
+        help={t("help.backupStores.gcAt")}
+        info="backupStores.gc"
       >
         {(a11y) => (
           <Input

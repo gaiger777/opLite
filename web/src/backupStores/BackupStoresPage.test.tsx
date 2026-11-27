@@ -73,6 +73,7 @@ it("shows the empty state", async () => {
   const { container } = renderPage(<BackupStoresPage />);
   expect(await screen.findByText("No backup stores")).toBeVisible();
   expect(screen.getByRole("button", { name: "Create a backup store" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
   await expectNoAxeViolations(container);
 });
 
@@ -87,7 +88,7 @@ it("lists stores with backend, encryption, usage, GC and verify state", async ()
   expect(local).toHaveTextContent("12");
   expect(local).toHaveTextContent("4 GiB");
   expect(local).toHaveTextContent("3.3×");
-  expect(local).toHaveTextContent("Removed 3 chunks (12 MiB)");
+  expect(local).toHaveTextContent("Removed 3 pieces (12 MiB)");
   expect(local).toHaveTextContent("Verified");
   expect(local).toHaveTextContent("Ready");
   const dr = within(table).getByRole("button", { name: "Open s3-dr" }).closest("tr")!;
@@ -95,8 +96,8 @@ it("lists stores with backend, encryption, usage, GC and verify state", async ()
   expect(dr).toHaveTextContent("https://s3.example.com/bk/orbi");
   expect(dr).toHaveTextContent("Encrypted");
   expect(dr).toHaveTextContent("ab:cd:ef:01…");
-  expect(dr).toHaveTextContent("GC: sweeping");
-  expect(dr).toHaveTextContent("2 bad chunks");
+  expect(dr).toHaveTextContent("Cleanup: removing unused pieces");
+  expect(dr).toHaveTextContent("2 bad pieces");
   expect(dr).toHaveTextContent("Failed");
   expect(dr).toHaveTextContent("store.json is unreadable");
   await expectNoAxeViolations(container);
@@ -142,7 +143,7 @@ it("creates an encrypted store and does not close until the recovery key is stor
   expect(within(wizard).getByText("4. Recovery key")).toBeVisible();
   await user.click(within(wizard).getByRole("button", { name: "Next" }));
   // ③ 일정의 기본: GC 매일 05:00, 검증 일요일 06:00
-  expect(within(wizard).getByLabelText("GC time (UTC)")).toHaveValue("05:00");
+  expect(within(wizard).getByLabelText("Cleanup time (UTC)")).toHaveValue("05:00");
   expect(within(wizard).getByLabelText("Verify time (UTC)")).toHaveValue("06:00");
   await user.click(within(wizard).getByRole("button", { name: "Create" }));
   // ④ 복구 키
@@ -270,13 +271,13 @@ it("opens the drawer with schedules, node reachability and the key card", async 
   const sheet = await screen.findByRole("dialog", { name: "Backup store s3-dr" });
   expect(sheet).toHaveTextContent("Owner clusterprod");
   expect(sheet).toHaveTextContent("Sun 06:00 UTC");
-  expect(sheet).toHaveTextContent("Verify again after 30 days, Full (read every chunk)");
+  expect(sheet).toHaveTextContent("Verify again after 30 days, Full (read every piece)");
   const reach = within(sheet).getByRole("table", { name: "Reachable from nodes" });
   expect(reach).toHaveTextContent("node-a");
   expect(reach).toHaveTextContent("Unreachable");
   expect(reach).toHaveTextContent("connection refused");
   // 읽기 전용: GC는 없고 스캔·넘겨받기가 있다. escrow는 쓰지 않는다.
-  expect(within(sheet).queryByRole("button", { name: "Run GC now" })).toBeNull();
+  expect(within(sheet).queryByRole("button", { name: "Clean up now" })).toBeNull();
   expect(within(sheet).getByRole("button", { name: "Take over" })).toBeVisible();
   expect(within(sheet).queryByRole("button", { name: "Escrow in the store" })).toBeNull();
   expect(within(sheet).getByText(FP)).toBeVisible();
@@ -317,7 +318,7 @@ it("runs GC and verification now and takes over a read-only store", async () => 
   await user.click(await screen.findByRole("button", { name: "Open local" }));
   let sheet = await screen.findByRole("dialog", { name: "Backup store local" });
   expect(within(sheet).getByText("This store is not encrypted.")).toBeVisible();
-  await user.click(within(sheet).getByRole("button", { name: "Run GC now" }));
+  await user.click(within(sheet).getByRole("button", { name: "Clean up now" }));
   await user.click(within(sheet).getByRole("button", { name: "Verify now" }));
   await waitFor(() => expect(calls).toEqual(["gc", "verify"]));
   await user.keyboard("{Escape}");
