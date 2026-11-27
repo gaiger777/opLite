@@ -9,6 +9,8 @@ export type StoragePool = Schemas["Resource_StoragePoolSpec_StoragePoolStatus"];
 export type Network = Schemas["Resource_NetworkSpec_NetworkStatus"];
 export type Node = Schemas["Resource_NodeSpec_NodeStatus"];
 export type Task = Schemas["Resource_TaskSpec_TaskStatus"];
+/** 실패한 Task의 원인 코드와 값(계획 77-2) */
+export type TaskFailure = Schemas["TaskFailure"];
 export type Snapshot = Schemas["Resource_SnapshotSpec_SnapshotStatus"];
 export type Backup = Schemas["Resource_BackupSpec_BackupStatus"];
 export type BackupJob = Schemas["Resource_BackupJobSpec_BackupJobStatus"];

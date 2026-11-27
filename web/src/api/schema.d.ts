@@ -11924,6 +11924,8 @@ export interface components {
                 status: {
                     /** @default null */
                     error: string | null;
+                    /** @description 실패의 원인 코드와 값(계획 77-2). `error` 원문은 그대로 남긴다(옛 노드·코드 없는 실패는 원문만). */
+                    failure?: components["schemas"]["TaskFailure"];
                     /**
                      * Format: int64
                      * @description 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
@@ -17012,6 +17014,8 @@ export interface components {
             status: {
                 /** @default null */
                 error: string | null;
+                /** @description 실패의 원인 코드와 값(계획 77-2). `error` 원문은 그대로 남긴다(옛 노드·코드 없는 실패는 원문만). */
+                failure?: components["schemas"]["TaskFailure"];
                 /**
                  * Format: int64
                  * @description 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
@@ -18821,6 +18825,22 @@ export interface components {
             /** @enum {string} */
             kind: "webhook";
         });
+        /** @description 실패한 Task의 구조 오류. 옛 노드는 모르고 `error` 문자열만 남긴다(웹은 그때 원문만 보인다). */
+        TaskFailure: {
+            /**
+             * @description 원인 코드(`code::*`, 예: `migration_tls_missing`). 웹은 모르는 코드면 원문만 보인다.
+             * @default
+             */
+            code: string;
+            /** @description 사람에게 보일 값(노드·풀·VM·네트워크 이름, 필요한·남은 바이트 …). 문구의 `{{이름}}` 자리에 들어간다. */
+            params?: {
+                [key: string]: string;
+            };
+            /** @description 같은 요청을 다시 내면 될 수 있는 실패(잠깐의 바쁨·끊김·시간 초과). 아니면 먼저 원인을 고쳐야 한다. */
+            retryable?: boolean;
+            /** @description 실패한 단계(예: 적용의 "step 1/3 (create AlertRule \"x\")") */
+            step?: string;
+        };
         TaskOp: {
             /** @enum {string} */
             kind: "vm-start";
@@ -19178,6 +19198,8 @@ export interface components {
         TaskStatus: {
             /** @default null */
             error: string | null;
+            /** @description 실패의 원인 코드와 값(계획 77-2). `error` 원문은 그대로 남긴다(옛 노드·코드 없는 실패는 원문만). */
+            failure?: components["schemas"]["TaskFailure"];
             /**
              * Format: int64
              * @description 끝난 시각(유닉스 ms, 계획 77). 끝나지 않았거나 옛 노드가 끝낸 Task에는 없다.
