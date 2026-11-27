@@ -3,14 +3,17 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import type { RecoveryPlanSpec } from "@/dr/api";
-import { NewPlanPage, PlanPage } from "@/dr/PlanPage";
+import { forgetPlanEdits, NewPlanPage, PlanPage } from "@/dr/PlanPage";
 import { expectNoAxeViolations } from "@/test/axe";
 import { DR_NODE, plan, PLAN_ID, report, run, RUN_ID } from "@/test/dr";
-import { backup, pool, remote, vm } from "@/test/fixtures";
+import { DR_TEST_LABEL } from "@/dr/model";
+import { backup, backupJob, pool, remote, sdnNetwork, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
 const VIEWER = { ...ADMIN, role: "viewer" as const };
+
+beforeEach(() => forgetPlanEdits());
 
 function setup() {
   const prodVm = vm("db9", "running");
@@ -99,7 +102,76 @@ it("saves the whole plan with If-Match after moving a group up", async () => {
   await expectNoAxeViolations(container);
 });
 
-it("tells about a conflicting change and reloads the plan", async () => {
+it("saves again with the new revision when only the status moved", async () => {
+  const user = userEvent.setup();
+  setup();
+  const sent: (string | null)[] = [];
+  server.use(
+    http.put(apiUrl(`/dr-plans/${PLAN_ID}`), async ({ request }) => {
+      const ifMatch = request.headers.get("If-Match");
+      sent.push(ifMatch);
+      if (ifMatch === "4") {
+        return HttpResponse.json(
+          { code: "revision_mismatch", message: "revision mismatch" },
+          { status: 409 },
+        );
+      }
+      const body = (await request.json()) as { spec: RecoveryPlanSpec };
+      return HttpResponse.json(plan("web-tier", { revision: 8, spec: body.spec }));
+    }),
+    // 보호 상태만 바뀌어 판이 7이 됐다(spec은 그대로)
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}`), () =>
+      HttpResponse.json(plan("web-tier", { revision: 7, status: { protection: [] } })),
+    ),
+  );
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier?tab=plan" });
+  await user.click(await screen.findByRole("button", { name: "Move web up" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(sent).toEqual(["4", "7"]));
+  expect((await screen.findAllByText("web-tier saved.")).length).toBeGreaterThan(0);
+  expect(screen.queryByText(/Someone else changed it first/)).not.toBeInTheDocument();
+});
+
+it("on a real conflict offers to overwrite or to reload", async () => {
+  const user = userEvent.setup();
+  setup();
+  const sent: (string | null)[] = [];
+  server.use(
+    http.put(apiUrl(`/dr-plans/${PLAN_ID}`), async ({ request }) => {
+      const ifMatch = request.headers.get("If-Match");
+      sent.push(ifMatch);
+      if (ifMatch === "4") {
+        return HttpResponse.json(
+          { code: "revision_mismatch", message: "revision mismatch" },
+          { status: 409 },
+        );
+      }
+      const body = (await request.json()) as { spec: RecoveryPlanSpec };
+      return HttpResponse.json(plan("web-tier", { revision: 10, spec: body.spec }));
+    }),
+    // 다른 사람이 RPO를 바꿨다
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}`), () =>
+      HttpResponse.json(plan("web-tier", { revision: 9, spec: { rpo_target_secs: 3600 } })),
+    ),
+  );
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier?tab=plan" });
+  await user.click(await screen.findByRole("button", { name: "Move web up" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(await screen.findByText(/Someone else changed it first/)).toBeInTheDocument();
+  // 고친 것은 그대로다
+  const order = () =>
+    screen
+      .getAllByRole("listitem", { name: /^Group \d: / })
+      .map((g) => g.getAttribute("aria-label"));
+  expect(order()).toEqual(["Group 1: web", "Group 2: db"]);
+  await user.click(screen.getByRole("button", { name: "Overwrite with mine" }));
+  await waitFor(() => expect(sent).toEqual(["4", "9"]));
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "Overwrite with mine" })).not.toBeInTheDocument(),
+  );
+});
+
+it("reloads the plan and drops the draft on a conflict when asked", async () => {
   const user = userEvent.setup();
   setup();
   server.use(
@@ -109,14 +181,66 @@ it("tells about a conflicting change and reloads the plan", async () => {
         { status: 409 },
       ),
     ),
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}`), () =>
+      HttpResponse.json(plan("web-tier", { revision: 9, spec: { rpo_target_secs: 3600 } })),
+    ),
   );
   renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier?tab=plan" });
   await user.click(await screen.findByRole("button", { name: "Move web up" }));
   await user.click(screen.getByRole("button", { name: "Save" }));
-  expect(await screen.findByText(/Someone else changed it first/)).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Reload" }));
+  await user.click(await screen.findByRole("button", { name: "Reload (discard my changes)" }));
   const groups = screen.getAllByRole("listitem", { name: /^Group \d: / });
   expect(groups.map((g) => g.getAttribute("aria-label"))).toEqual(["Group 1: db", "Group 2: web"]);
+});
+
+it("keeps the draft when leaving the plan tab and coming back", async () => {
+  const user = userEvent.setup();
+  setup();
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier?tab=plan" });
+  await user.click(await screen.findByRole("button", { name: "Move web up" }));
+  await user.click(screen.getByRole("tab", { name: "Overview" }));
+  expect(await screen.findByRole("table", { name: "Protection" })).toBeInTheDocument();
+  await user.click(screen.getByRole("tab", { name: "Plan" }));
+  const groups = await screen.findAllByRole("listitem", { name: /^Group \d: / });
+  expect(groups.map((g) => g.getAttribute("aria-label"))).toEqual(["Group 1: web", "Group 2: db"]);
+  await user.click(screen.getByRole("button", { name: "Discard changes" }));
+  await waitFor(() =>
+    expect(
+      screen
+        .getAllByRole("listitem", { name: /^Group \d: / })
+        .map((g) => g.getAttribute("aria-label")),
+    ).toEqual(["Group 1: db", "Group 2: web"]),
+  );
+});
+
+it("marks half-written map rows and warns about a test network failovers use", async () => {
+  const user = userEvent.setup();
+  setup();
+  const sent: unknown[] = [];
+  server.use(
+    http.put(apiUrl(`/dr-plans/${PLAN_ID}`), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json(plan());
+    }),
+  );
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier?tab=plan" });
+  await screen.findByRole("button", { name: "Move web up" });
+  const tests = screen.getByRole("region", { name: "Test network map" });
+  await user.click(within(tests).getByRole("button", { name: "Add" }));
+  await user.type(within(tests).getByLabelText("Source name 1"), "lan");
+  await user.type(within(tests).getByLabelText("Name here 1"), "dr-lan");
+  // 경고만 한다(고르는 것은 운영자다)
+  expect(within(tests).getByText(/Failovers use this network too/)).toBeInTheDocument();
+  await user.click(within(tests).getByRole("button", { name: "Add" }));
+  await user.type(within(tests).getByLabelText("Source name 2"), "db");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(within(tests).getByText("Fill in both names or remove the row.")).toBeInTheDocument();
+  expect(within(tests).getByLabelText("Name here 2")).toHaveAttribute("aria-invalid", "true");
+  expect(sent).toHaveLength(0);
+  await user.click(within(tests).getByRole("button", { name: "Remove mapping 2" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent[0]).toMatchObject({ spec: { test_networks: { lan: "dr-lan" } } });
 });
 
 it("adds VMs from the source and its copies here", async () => {
@@ -247,28 +371,121 @@ it("keeps the plan read-only while some nodes lack DR plans", async () => {
   expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
 });
 
-it("lists what the cleanup removes", async () => {
+it("lists what the cleanup removes by the test label, like the server", async () => {
   const user = userEvent.setup();
   setup();
-  server.use(
-    http.get(apiUrl(`/dr-plans/${PLAN_ID}/runs`), () =>
-      HttpResponse.json({
-        revision: 1,
-        items: [
-          run({
-            status: {
-              state: "succeeded",
-              bubbles: [{ name: "drt-web-tier-0", source: "lan", state: "ready" }],
-            },
-          }),
-        ],
-      }),
-    ),
-  );
+  const mine = { [DR_TEST_LABEL]: "web-tier" };
+  mockLists({
+    vm: [vm("db1-drt", "running", { labels: mine }), vm("web1-drt", "running")],
+    network: [{ ...sdnNetwork("drt-web-tier-0"), labels: mine }],
+  });
   renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier" });
   await user.click(await screen.findByRole("button", { name: "Clean up" }));
   const dialog = await screen.findByRole("alertdialog", { name: "Clean up the test of web-tier" });
   const impact = await within(dialog).findByRole("list");
   expect(impact).toHaveTextContent("db1-drt");
   expect(impact).toHaveTextContent("drt-web-tier-0");
+  // 라벨이 없는 VM은 서버가 지우지 않으므로 보이지 않는다
+  expect(impact).not.toHaveTextContent("web1-drt");
+});
+
+it("disables the cleanup when no test left anything", async () => {
+  setup();
+  mockLists({ vm: [vm("db1-drt", "running")], network: [] });
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Clean up" })).toBeDisabled());
+});
+
+it("shows the gaps and the VMs to shut down before a failover", async () => {
+  const user = userEvent.setup();
+  setup();
+  server.use(
+    http.get(apiUrl("/dr-plans/web-tier/report"), () =>
+      HttpResponse.json(
+        report({
+          protection: [
+            { vm: "db1", ok: true, backup: "db1-copy", age_secs: 3600 },
+            { vm: "web1", ok: false, issue: "over-rpo", backup: "w", age_secs: 34 * 3600 },
+            { vm: "web2", ok: false, issue: "no-recovery-point" },
+          ],
+        }),
+      ),
+    ),
+  );
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier" });
+  await screen.findByRole("table", { name: "Protection" });
+  await user.click(screen.getByRole("button", { name: "Failover" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Fail over web-tier" });
+  const impact = within(dialog).getByRole("list");
+  expect(impact).toHaveTextContent("3 VMs in 2 groups");
+  expect(impact).toHaveTextContent("No recovery point (not recovered): web2");
+  expect(impact).toHaveTextContent("Older than the RPO target: web1 1d 10h");
+  expect(impact).not.toHaveTextContent("Shut down on");
+  // 모드는 기본값이 없다
+  await user.type(within(dialog).getByLabelText(/Type/), "web-tier");
+  expect(within(dialog).getByRole("button", { name: "Fail over" })).toBeDisabled();
+  await user.click(within(dialog).getByRole("radio", { name: /Planned/ }));
+  expect(impact).toHaveTextContent("Shut down on prod: db1, web1, web2");
+  expect(within(dialog).getByRole("button", { name: "Fail over" })).toBeEnabled();
+  expect(within(dialog).queryByText(/No data is lost/)).not.toBeInTheDocument();
+});
+
+it("fills the reprotect dialog from the existing job and keeps its retention", async () => {
+  const user = userEvent.setup();
+  setup();
+  mockLists({
+    "storage-pool": [pool("local"), pool("bk", { backups: true })],
+    "backup-job": [
+      backupJob("dr-reprotect-web-tier", 1, {
+        spec: {
+          pool: "bk",
+          schedule: { at: "04:30", days: ["sat"] },
+          keep: { last: 5, daily: 7, weekly: 0, monthly: 2 },
+          replicate: { remote: "prod", pool: "prod-bk" },
+        },
+      }),
+    ],
+  });
+  server.use(
+    http.get(apiUrl("/dr-plans/web-tier/report"), () =>
+      HttpResponse.json(
+        report({
+          last_failover: {
+            id: RUN_ID,
+            name: "f",
+            kind: "failover-disaster",
+            state: "succeeded",
+            started_at: 1,
+            failed_vms: [],
+          },
+        }),
+      ),
+    ),
+    http.get(apiUrl("/remotes/prod/api/storage-pools"), () =>
+      HttpResponse.json({ revision: 1, items: [pool("prod-bk", { backups: true })] }),
+    ),
+  );
+  const sent: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/dr-plans/${PLAN_ID}/actions/reprotect`), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json(backupJob("dr-reprotect-web-tier", 1));
+    }),
+  );
+  renderPage(<PlanPage />, { path: "/dr-plans/:name", url: "/dr-plans/web-tier" });
+  await user.click(await screen.findByRole("button", { name: "Reprotect" }));
+  const dialog = await screen.findByRole("dialog", { name: "Reprotect web-tier" });
+  expect(await within(dialog).findByLabelText("Daily at (UTC)")).toHaveValue("04:30");
+  await user.click(within(dialog).getByRole("button", { name: "Create job" }));
+  await waitFor(() =>
+    expect(sent).toEqual([
+      {
+        remote: "prod",
+        pool: "prod-bk",
+        backup_pool: "bk",
+        schedule: { at: "04:30", days: ["sat"] },
+        keep: { last: 5, daily: 7, weekly: 0, monthly: 2 },
+      },
+    ]),
+  );
 });

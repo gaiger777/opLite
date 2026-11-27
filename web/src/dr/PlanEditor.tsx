@@ -1,3 +1,4 @@
+import { cn } from "cn";
 import { ArrowDown, ArrowUp, Plus, Trash2, X } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -19,11 +20,13 @@ import {
   newVm,
   ON_TIMEOUT,
   type Pair,
+  testNetworkIssues,
   type VmDraft,
   WAITS,
 } from "@/dr/model";
 import { VmPickerDialog } from "@/dr/VmPickerDialog";
 import type { RemoteView } from "@/remotes/remotes";
+import { useRouted } from "@/routing/routing";
 
 type Errors = Record<string, string>;
 
@@ -51,6 +54,7 @@ export function PlanEditor({
   const pools = useList("storage-pool");
   const networks = useList("network");
   const groups = useList("security-group");
+  const routed = useRouted();
   const [picking, setPicking] = useState<number | null>(null);
   const set = (patch: Partial<Draft>) => onChange({ ...draft, ...patch });
   const setGroup = (i: number, patch: Partial<GroupDraft>) =>
@@ -59,6 +63,18 @@ export function PlanEditor({
   const poolNames = (pools.data ?? []).map((p) => p.name).sort();
   const networkNames = (networks.data ?? []).map((n) => n.name).sort();
   const groupNames = (groups.data ?? []).map((g) => g.name).sort();
+  const rowErrors = (at: string) =>
+    Object.fromEntries(
+      Object.entries(errors).flatMap(([k, v]) => {
+        const m = new RegExp(`^${at}(\\d+)$`).exec(k);
+        return m ? [[Number(m[1]), t(v)]] : [];
+      }),
+    );
+  const isolation = Object.fromEntries(
+    Object.entries(
+      testNetworkIssues(draft, networks.data, new Set((routed.data ?? []).map((r) => r.network))),
+    ).map(([i, issue]) => [Number(i), t(`dr.edit.notIsolated.${issue}`)]),
+  );
 
   return (
     <fieldset disabled={readOnly} className="flex min-w-0 flex-col gap-6">
@@ -215,6 +231,7 @@ export function PlanEditor({
         hint={t("dr.edit.networksHint")}
         pairs={draft.networks}
         targets={networkNames}
+        errors={rowErrors("net")}
         readOnly={readOnly}
         onChange={(networks) => set({ networks })}
       />
@@ -223,6 +240,7 @@ export function PlanEditor({
         hint={t("dr.edit.securityGroupsHint")}
         pairs={draft.securityGroups}
         targets={groupNames}
+        errors={rowErrors("sg")}
         readOnly={readOnly}
         onChange={(securityGroups) => set({ securityGroups })}
       />
@@ -231,6 +249,8 @@ export function PlanEditor({
         hint={t("dr.edit.testNetworksHint")}
         pairs={draft.testNetworks}
         targets={networkNames}
+        errors={rowErrors("tnet")}
+        warnings={isolation}
         readOnly={readOnly}
         onChange={(testNetworks) => set({ testNetworks })}
       />
@@ -574,12 +594,17 @@ function VmRow({
   );
 }
 
-/** 원본 이름 → DR 이름 맵 표. 대상 칸은 이 클러스터의 이름을 제안한다(`datalist`). */
+/**
+ * 원본 이름 → DR 이름 맵 표. 대상 칸은 이 클러스터의 이름을 제안한다(`datalist`). 줄마다 오류(반쯤 쓴 줄·겹친 원본·이름 모양)와
+ * 경고(시험망 격리)를 그 줄 밑에 글로 보인다.
+ */
 function MapTable({
   title,
   hint,
   pairs,
   targets,
+  errors,
+  warnings = {},
   readOnly,
   onChange,
 }: {
@@ -587,6 +612,10 @@ function MapTable({
   hint: string;
   pairs: Pair[];
   targets: string[];
+  /** 줄 번호 → 번역한 오류 */
+  errors: Record<number, string>;
+  /** 줄 번호 → 번역한 경고 */
+  warnings?: Record<number, string>;
   readOnly: boolean;
   onChange(pairs: Pair[]): void;
 }) {
@@ -628,6 +657,8 @@ function MapTable({
                 aria-label={t("dr.edit.mapFrom", { n: i + 1 })}
                 className="h-8 w-40"
                 value={p.from}
+                aria-invalid={errors[i] ? true : undefined}
+                aria-describedby={errors[i] || warnings[i] ? `${id}-note${i}` : undefined}
                 onChange={(e) => set(i, { from: e.target.value })}
               />
               <span aria-hidden>→</span>
@@ -636,6 +667,8 @@ function MapTable({
                 className="h-8 w-40"
                 list={`${id}-targets`}
                 value={p.to}
+                aria-invalid={errors[i] ? true : undefined}
+                aria-describedby={errors[i] || warnings[i] ? `${id}-note${i}` : undefined}
                 onChange={(e) => set(i, { to: e.target.value })}
               />
               {!readOnly && (
@@ -648,6 +681,17 @@ function MapTable({
                 >
                   <X />
                 </Button>
+              )}
+              {(errors[i] || warnings[i]) && (
+                <span
+                  id={`${id}-note${i}`}
+                  className={cn(
+                    "basis-full text-xs",
+                    errors[i] ? "text-destructive" : "text-warning-fg",
+                  )}
+                >
+                  {errors[i] ?? warnings[i]}
+                </span>
               )}
             </li>
           ))}

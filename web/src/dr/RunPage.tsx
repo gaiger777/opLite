@@ -13,11 +13,24 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
-import { type DrRun, type DrStep, localized, refreshDr, useRun } from "@/dr/api";
-import { CLEANUP_DOTS, formatDuration, PHASE_DOTS, rtoClock } from "@/dr/model";
-import { PhaseChip, PhaseDots, RunStateChip, useNow } from "@/dr/parts";
+import {
+  type DrPhase,
+  type DrRun,
+  type DrStep,
+  localized,
+  oldNodes,
+  refreshDr,
+  usePlan,
+  useRun,
+} from "@/dr/api";
+import { CLEANUP_DOTS, failedPhase, formatDuration, PHASE_DOTS, rtoClock } from "@/dr/model";
+import { UpgradeNotice } from "@/dr/PlansPage";
+import { cancelText, PhaseChip, PhaseDots, RunStateChip, useNow } from "@/dr/parts";
 import { formatTime } from "@/lib/format";
 import { TaskStateBadge } from "@/tasks/TasksPage";
+
+/** 복원이 끝난 단계 */
+const AFTER_RESTORE: ReadonlySet<DrPhase> = new Set(["starting", "waiting", "ready", "timed_out"]);
 
 interface Band {
   name: string;
@@ -58,14 +71,22 @@ function RunView({ run }: { run: DrRun }) {
   const perms = usePermissions();
   const queryClient = useQueryClient();
   const tasks = useList("task");
+  const nodes = useList("node");
+  const old = oldNodes(nodes.data);
   const [cancelling, setCancelling] = useState(false);
   const status = run.status;
+  const cleanup = run.spec.kind === "cleanup";
+  // 취소한 시험이 끝나면 서버가 뒷정리를 저절로 시작한다: 계획의 지금 실행으로 가는 길(리뷰 1 웹 4)
+  const plan = usePlan(
+    run.spec.kind === "test" && status.state === "cancelled" ? run.spec.plan : undefined,
+  );
+  const autoCleanup = plan.data?.status.run !== run.id ? plan.data?.status.run : undefined;
   const live = status.state === "running";
   const now = useNow(live);
   const rto = rtoClock(status, now);
   const time = (s: number) => formatTime(new Date(s * 1000), i18n.language);
   const taskOf = (id: string | undefined) => tasks.data?.find((task) => task.id === id);
-  const dots = run.spec.kind === "cleanup" ? CLEANUP_DOTS : PHASE_DOTS;
+  const dots = cleanup ? CLEANUP_DOTS : PHASE_DOTS;
   const canCancel = live && !status.cancel_requested && perms.can("operate", "recovery-plan");
 
   return (
@@ -97,16 +118,29 @@ function RunView({ run }: { run: DrRun }) {
           )
         }
       />
+      {live && <UpgradeNotice old={old} />}
+      {autoCleanup && (
+        <p role="status" className="text-sm">
+          <Link to={`/dr-runs/${autoCleanup}`} className="underline-offset-4 hover:underline">
+            {t("dr.run.openCleanup")}
+          </Link>
+        </p>
+      )}
       <dl className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
         <div>
-          <dt className="text-muted-foreground">{t("dr.runs.rto")}</dt>
+          {/* 뒷정리에는 RTO가 없다: 걸린 시간(리뷰 1 웹 13) */}
+          <dt className="text-muted-foreground">{t(cleanup ? "dr.run.elapsed" : "dr.runs.rto")}</dt>
           <dd
             className="text-2xl font-semibold tabular-nums"
             // 1초마다 바뀌는 시계를 화면 읽기 프로그램이 읽지 않게(상태 칩이 상태를 알린다)
             aria-live="off"
             data-testid="rto-clock"
           >
-            {rto !== undefined ? formatDuration(rto) : "—"}
+            {cleanup
+              ? formatDuration((status.finished_at ?? now) - status.started_at)
+              : rto !== undefined
+                ? formatDuration(rto)
+                : "—"}
           </dd>
         </div>
         {status.prepare_secs !== undefined && (
@@ -187,6 +221,13 @@ function RunView({ run }: { run: DrRun }) {
                 <ul className="mt-2 flex flex-col divide-y">
                   {band.steps.map((s) => {
                     const task = taskOf(s.task);
+                    const failedAt = cleanup
+                      ? "deleting"
+                      : failedPhase(s, tasks.data, status.started_at);
+                    // 새 VM은 복원이 끝난 뒤에만 이 실행의 것이다(이름이 겹쳐 실패했으면 남의 VM — 리뷰 1 웹 2).
+                    const restored =
+                      AFTER_RESTORE.has(s.phase) ||
+                      (s.phase === "failed" && failedAt !== undefined && failedAt !== "restoring");
                     return (
                       <li
                         key={s.vm}
@@ -194,9 +235,16 @@ function RunView({ run }: { run: DrRun }) {
                         className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm"
                       >
                         <span className="min-w-28 font-medium">{s.vm}</span>
-                        <PhaseDots phase={s.phase} dots={dots} />
+                        <PhaseDots phase={s.phase} dots={dots} last={failedAt} />
                         <PhaseChip phase={s.phase} />
-                        {s.new_vm && run.spec.kind !== "cleanup" && (
+                        {s.phase === "preparing" && s.prepare && (
+                          <span className="text-xs text-muted-foreground">
+                            {t(`dr.prepare.${s.prepare.stage}`)}
+                            {s.prepare.source_backup &&
+                              ` · ${t("dr.run.sourceBackup", { backup: s.prepare.source_backup })}`}
+                          </span>
+                        )}
+                        {s.new_vm && !cleanup && restored && (
                           <Link
                             to={`/vms/${encodeURIComponent(s.new_vm)}`}
                             className="underline-offset-4 hover:underline"
@@ -234,7 +282,7 @@ function RunView({ run }: { run: DrRun }) {
         open={cancelling}
         onOpenChange={setCancelling}
         title={t("dr.cancel.title", { name: run.spec.plan_name })}
-        description={t("dr.cancel.description")}
+        description={cancelText(t, run.spec.kind)}
         confirmLabel={t("dr.action.cancel")}
         onConfirm={async () => {
           try {

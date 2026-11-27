@@ -47,22 +47,33 @@
         "disaster": "Disaster"
       },
       "modeHint": {
-        "planned": "The source must be reachable: its VMs are shut down in reverse group order, backed up once more and replicated here first. No data is lost.",
+        "planned": "The source must be reachable: its VMs are shut down in reverse group order (forced off after 5 minutes — then only crash-consistent), backed up once more and replicated here first. If a VM cannot be prepared after it was shut down, it is started again on the source.",
         "disaster": "Use the newest recovery point already on this cluster. The source is not contacted."
       },
-      "disasterWarning": "Anything written on the source after its last replicated backup is lost. If the source is still running, both copies will run — shut it down first.",
+      "disasterWarning": "Anything written on the source after its last replicated backup is lost. If the source is still running, both copies will run — shut it down first. When the source comes back, its VMs may start by themselves: isolate it before reconnecting.",
       "after": "HA stays off on the recovered VMs. Turn it on after the failover.",
-      "started": "Failover of {{name}} started."
+      "started": "Failover of {{name}} started.",
+      "chooseMode": "Choose a mode.",
+      "impactVms": "{{vms}} VMs in {{groups}} groups",
+      "noPoint": "No recovery point (not recovered): {{vms}}",
+      "overRpo": "Older than the RPO target: {{vms}}",
+      "willStop": "Shut down on {{source}}: {{vms}}",
+      "andMore_one": "and {{count}} more",
+      "andMore_other": "and {{count}} more"
     },
     "cleanup": {
       "title": "Clean up the test of {{name}}",
       "description": "Stops and deletes the VMs the last test made and removes its isolated networks. VMs made by a failover are not touched.",
-      "started": "Cleanup of {{name}} started."
+      "started": "Cleanup of {{name}} started.",
+      "nothing": "Nothing left over from tests."
     },
     "cancel": {
       "title": "Cancel the run of {{name}}",
-      "description": "The run stops after the current step; running tasks finish. A cancelled test still needs a cleanup.",
-      "done": "Cancelling the run of {{name}}."
+      "description": "The run stops after the current step; running tasks finish.",
+      "done": "Cancelling the run of {{name}}.",
+      "afterTest": "When the test ends, its cleanup starts by itself.",
+      "afterFailover": "VMs the failover already made stay (they are not deleted).",
+      "afterCleanup": "Whatever is not deleted yet stays for the next cleanup."
     },
     "delete": {
       "button": "Delete plan",
@@ -74,12 +85,12 @@
       "description": "Creates backup job {{job}} for the recovered VMs that replicates to the remote, to prepare failing back.",
       "submit": "Create job",
       "remote": "Replicate to",
-      "pool": "Remote backup pool",
-      "poolHint": "Backup pool on that remote cluster",
       "backupPool": "Local backup pool",
-      "backupPoolHint": "Empty: the plan's pool",
+      "backupPoolHint": "Backup pool here that keeps the recovered VMs' backups",
       "at": "Daily at (UTC)",
-      "done": "Backup job {{job}} is set."
+      "done": "Backup job {{job}} is set.",
+      "days": "Only on: {{days}}",
+      "keepHint": "Old backups beyond these counts are deleted. All zero keeps every backup."
     },
     "edit": {
       "basics": "Basics",
@@ -122,7 +133,7 @@
       "securityGroups": "Security group map",
       "securityGroupsHint": "Source security group → security group on this cluster. Unlisted groups keep their name.",
       "testNetworks": "Test network map",
-      "testNetworksHint": "Network used by tests. Unlisted source networks get an isolated SDN network during the test.",
+      "testNetworksHint": "Network used by tests. Unlisted source networks get an isolated SDN network during the test. A test network must not reach production: test VMs keep the production IPs.",
       "addMapping": "Add",
       "noMappings": "None",
       "mapFrom": "Source name {{n}}",
@@ -130,8 +141,16 @@
       "removeMapping": "Remove mapping {{n}}",
       "saved": "{{name}} saved.",
       "created": "{{name}} created.",
-      "reload": "Reload",
-      "fix": "Fix the marked fields."
+      "reload": "Reload (discard my changes)",
+      "fix": "Fix the marked fields.",
+      "overwrite": "Overwrite with mine",
+      "discard": "Discard changes",
+      "notIsolated": {
+        "failover": "Failovers use this network too: the test VMs would meet production with the same IPs.",
+        "routed": "This network has a router: the test may reach other networks.",
+        "provider": "This is an uplink (provider) network: the test reaches the physical network.",
+        "physical": "This is a bridge network, not SDN: it may share a physical L2 with production."
+      }
     },
     "pick": {
       "title": "Add VMs to {{group}}",
@@ -161,7 +180,9 @@
       "delay": "Seconds from 0 to 3600.",
       "nic": "NIC number from 0 to 15.",
       "address": "Address/prefix, for example 10.20.0.5/24.",
-      "time": "HH:MM"
+      "time": "HH:MM",
+      "mapHalf": "Fill in both names or remove the row.",
+      "mapDuplicate": "This source is already mapped above."
     },
     "report": {
       "protection": "Protection",
@@ -205,7 +226,10 @@
       "waitFor": "ready when: {{wait}}",
       "noSteps": "No VMs.",
       "from": "from {{backup}}",
-      "task": "Task"
+      "task": "Task",
+      "elapsed": "Elapsed",
+      "openCleanup": "Open the cleanup that started after the cancel",
+      "sourceBackup": "backup {{backup}}"
     },
     "kind": {
       "test": "Test failover",
@@ -259,6 +283,13 @@
       "dr_no_active_run": "No run is going.",
       "dr_nothing_to_clean": "Nothing is left from the last test.",
       "dr_no_recovered_vms": "No VMs were recovered by a failover of this plan yet."
+    },
+    "prepare": {
+      "shutdown": "shutting down on the source",
+      "stop": "forcing off on the source",
+      "backup": "backing up on the source",
+      "replicate": "replicating here",
+      "done": "prepared"
     }
   }
 }

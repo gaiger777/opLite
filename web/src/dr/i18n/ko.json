@@ -47,22 +47,33 @@
         "disaster": "재해"
       },
       "modeHint": {
-        "planned": "운영 쪽에 닿아야 합니다: 그 VM을 그룹 역순으로 끄고 마지막 백업을 떠 이곳으로 복제한 뒤 넘깁니다. 데이터를 잃지 않습니다.",
+        "planned": "운영 쪽에 닿아야 합니다: 그 VM을 그룹 역순으로 끄고(5분 안에 꺼지지 않으면 강제로 끔 — 그러면 crash 수준의 일관성) 마지막 백업을 떠 이곳으로 복제한 뒤 넘깁니다. 끈 뒤 준비가 실패한 VM은 운영 쪽에서 다시 켭니다.",
         "disaster": "이 클러스터에 이미 있는 가장 새 복구 지점으로 곧장 넘깁니다. 운영 쪽에 묻지 않습니다."
       },
-      "disasterWarning": "운영 쪽의 마지막 복제 백업 뒤에 쓴 것은 잃습니다. 운영 쪽이 아직 돌고 있으면 두 벌이 함께 돕니다 — 먼저 끄세요.",
+      "disasterWarning": "운영 쪽의 마지막 복제 백업 뒤에 쓴 것은 잃습니다. 운영 쪽이 아직 돌고 있으면 두 벌이 함께 돕니다 — 먼저 끄세요. 운영 쪽이 돌아오면 그 VM이 스스로 켜질 수 있으니 다시 잇기 전에 격리하세요.",
       "after": "되살린 VM의 HA는 꺼져 있습니다. 장애 조치 뒤에 켜세요.",
-      "started": "{{name}} 장애 조치를 시작했습니다."
+      "started": "{{name}} 장애 조치를 시작했습니다.",
+      "chooseMode": "방식을 고르세요.",
+      "impactVms": "그룹 {{groups}}개의 VM {{vms}}개",
+      "noPoint": "복구 지점 없음(되살리지 못함): {{vms}}",
+      "overRpo": "RPO 목표보다 오래됨: {{vms}}",
+      "willStop": "{{source}}에서 끌 VM: {{vms}}",
+      "andMore_one": "외 {{count}}개",
+      "andMore_other": "외 {{count}}개"
     },
     "cleanup": {
       "title": "{{name}} 시험 뒷정리",
       "description": "마지막 시험이 만든 VM을 끄고 지우며 격리 네트워크를 지웁니다. 장애 조치로 만든 VM은 건드리지 않습니다.",
-      "started": "{{name}} 뒷정리를 시작했습니다."
+      "started": "{{name}} 뒷정리를 시작했습니다.",
+      "nothing": "시험이 남긴 것이 없습니다."
     },
     "cancel": {
       "title": "{{name}} 실행 취소",
-      "description": "지금 단계 뒤에 멈춥니다. 진행 중인 Task는 끝까지 갑니다. 취소한 시험도 뒷정리가 필요합니다.",
-      "done": "{{name}} 실행을 취소하는 중입니다."
+      "description": "지금 단계 뒤에 멈춥니다. 진행 중인 Task는 끝까지 갑니다.",
+      "done": "{{name}} 실행을 취소하는 중입니다.",
+      "afterTest": "시험이 끝나면 뒷정리가 저절로 시작됩니다.",
+      "afterFailover": "장애 조치가 이미 만든 VM은 남습니다(지우지 않음).",
+      "afterCleanup": "아직 지우지 못한 것은 다음 뒷정리에 남습니다."
     },
     "delete": {
       "button": "계획 지우기",
@@ -74,12 +85,12 @@
       "description": "되돌리기를 준비하려고 되살린 VM에 원격으로 복제하는 백업 작업 {{job}}을 만듭니다.",
       "submit": "작업 만들기",
       "remote": "복제할 곳",
-      "pool": "원격 백업 풀",
-      "poolHint": "그 원격 클러스터의 백업 풀",
       "backupPool": "이곳 백업 풀",
-      "backupPoolHint": "비우면 계획의 풀",
+      "backupPoolHint": "되살린 VM의 백업을 둘 이곳의 백업 풀",
       "at": "매일(UTC)",
-      "done": "백업 작업 {{job}}을 정했습니다."
+      "done": "백업 작업 {{job}}을 정했습니다.",
+      "days": "이 요일만: {{days}}",
+      "keepHint": "이 수를 넘는 옛 백업은 지웁니다. 모두 0이면 하나도 지우지 않습니다."
     },
     "edit": {
       "basics": "기본",
@@ -122,7 +133,7 @@
       "securityGroups": "보안 그룹 맵",
       "securityGroupsHint": "원본 보안 그룹 → 이 클러스터의 보안 그룹. 없는 그룹은 같은 이름입니다.",
       "testNetworks": "시험 네트워크 맵",
-      "testNetworksHint": "시험이 쓰는 네트워크. 없는 원본 네트워크는 시험 동안 격리 SDN 네트워크를 받습니다.",
+      "testNetworksHint": "시험이 쓰는 네트워크. 없는 원본 네트워크는 시험 동안 격리 SDN 네트워크를 받습니다. 시험 네트워크는 운영과 닿지 않는 네트워크여야 합니다 — 시험 VM은 운영과 같은 IP로 뜹니다.",
       "addMapping": "더하기",
       "noMappings": "없음",
       "mapFrom": "원본 이름 {{n}}",
@@ -130,8 +141,16 @@
       "removeMapping": "맵 {{n}} 지우기",
       "saved": "{{name}}을(를) 저장했습니다.",
       "created": "{{name}}을(를) 만들었습니다.",
-      "reload": "다시 읽기",
-      "fix": "표시한 칸을 고치세요."
+      "reload": "다시 읽기(고친 것 버림)",
+      "fix": "표시한 칸을 고치세요.",
+      "overwrite": "내 것으로 덮기",
+      "discard": "고친 것 버리기",
+      "notIsolated": {
+        "failover": "장애 조치도 이 네트워크를 씁니다: 시험 VM이 같은 IP로 운영과 만납니다.",
+        "routed": "라우터가 붙은 네트워크입니다: 시험이 다른 네트워크에 닿을 수 있습니다.",
+        "provider": "업링크(공급자) 네트워크입니다: 시험이 물리망에 닿습니다.",
+        "physical": "SDN이 아닌 브리지 네트워크입니다: 운영과 물리 L2를 함께 쓸 수 있습니다."
+      }
     },
     "pick": {
       "title": "{{group}}에 VM 더하기",
@@ -161,7 +180,9 @@
       "delay": "0~3600초.",
       "nic": "NIC 번호 0~15.",
       "address": "주소/접두 길이(예: 10.20.0.5/24).",
-      "time": "HH:MM"
+      "time": "HH:MM",
+      "mapHalf": "두 이름을 모두 넣거나 줄을 지우세요.",
+      "mapDuplicate": "이 원본은 위 줄에 이미 있습니다."
     },
     "report": {
       "protection": "보호 상태",
@@ -205,7 +226,10 @@
       "waitFor": "준비된 때: {{wait}}",
       "noSteps": "VM 없음.",
       "from": "{{backup}}에서",
-      "task": "Task"
+      "task": "Task",
+      "elapsed": "걸린 시간",
+      "openCleanup": "취소 뒤 시작한 뒷정리 열기",
+      "sourceBackup": "백업 {{backup}}"
     },
     "kind": {
       "test": "시험 장애 조치",
@@ -259,6 +283,13 @@
       "dr_no_active_run": "도는 실행이 없습니다.",
       "dr_nothing_to_clean": "지난 시험이 남긴 것이 없습니다.",
       "dr_no_recovered_vms": "이 계획의 장애 조치로 되살린 VM이 아직 없습니다."
+    },
+    "prepare": {
+      "shutdown": "운영 쪽에서 끄는 중",
+      "stop": "운영 쪽에서 강제로 끄는 중",
+      "backup": "운영 쪽에서 백업하는 중",
+      "replicate": "이곳으로 복제하는 중",
+      "done": "준비됨"
     }
   }
 }

@@ -35,10 +35,19 @@ import {
   useReport,
 } from "@/dr/api";
 import { FailoverDialog, ReprotectDialog } from "@/dr/dialogs";
-import { type Draft, emptyDraft, formatDuration, toDraft, toSpec, validate } from "@/dr/model";
+import {
+  type Draft,
+  emptyDraft,
+  formatDuration,
+  sameSpec,
+  testLeftovers,
+  toDraft,
+  toSpec,
+  validate,
+} from "@/dr/model";
 import { PlanEditor } from "@/dr/PlanEditor";
 import { UpgradeNotice } from "@/dr/PlansPage";
-import { RpoBar, RunStateChip } from "@/dr/parts";
+import { cancelText, RpoBar, RunStateChip } from "@/dr/parts";
 import { formatTime } from "@/lib/format";
 import { useRemotes } from "@/remotes/remotes";
 
@@ -71,6 +80,8 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
   const report = useReport(plan.name);
   const runs = usePlanRuns(plan.id);
   const nodes = useList("node");
+  const vms = useList("vm");
+  const networks = useList("network");
   const old = oldNodes(nodes.data);
   const ready = nodes.data !== undefined && old.length === 0;
   const write = perms.can("write", "recovery-plan");
@@ -79,15 +90,10 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
   const [busy, setBusy] = useState(false);
   const tab: Tab = TABS.find((id) => id === params.get("tab")) ?? "overview";
   const running = plan.status.run;
-  const latestTest = runs.data?.find((r) => r.spec.kind === "test");
-  const leftovers = latestTest
-    ? [
-        ...(latestTest.status.steps ?? []).flatMap((s) => (s.new_vm ? [s.new_vm] : [])),
-        ...(latestTest.status.bubbles ?? [])
-          .filter((b) => b.state !== "removed")
-          .map((b) => b.name),
-      ]
-    : [];
+  const runningKind = runs.data?.find((r) => r.id === running)?.spec.kind;
+  // 서버가 지울 것과 같은 기준(시험 라벨이 이 계획인 VM·네트워크 — 리뷰 1 웹 3). 남은 것이 없으면 뒷정리를 막는다.
+  const leftovers = testLeftovers(plan.name, vms.data, networks.data);
+  const nothingToClean = vms.data !== undefined && networks.data !== undefined && !leftovers.length;
   const openRun = (run: DrRun) => void navigate(`/dr-runs/${run.id}`);
 
   async function test() {
@@ -112,7 +118,12 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
         <FlaskConical />
         {t("dr.action.test")}
       </Button>
-      <Button variant="outline" disabled={!!running} onClick={() => setDialog("cleanup")}>
+      <Button
+        variant="outline"
+        disabled={!!running || nothingToClean}
+        title={nothingToClean ? t("dr.cleanup.nothing") : undefined}
+        onClick={() => setDialog("cleanup")}
+      >
         <Eraser />
         {t("dr.action.cleanup")}
       </Button>
@@ -203,7 +214,12 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
       </Tabs>
 
       {dialog === "failover" && (
-        <FailoverDialog plan={plan} onClose={() => setDialog(null)} onStarted={openRun} />
+        <FailoverDialog
+          plan={plan}
+          report={report.data}
+          onClose={() => setDialog(null)}
+          onStarted={openRun}
+        />
       )}
       {dialog === "reprotect" && <ReprotectDialog plan={plan} onClose={() => setDialog(null)} />}
       <ConfirmDialog
@@ -231,7 +247,7 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
         open={dialog === "cancel"}
         onOpenChange={(open) => !open && setDialog(null)}
         title={t("dr.cancel.title", { name: plan.name })}
-        description={t("dr.cancel.description")}
+        description={cancelText(t, runningKind)}
         confirmLabel={t("dr.action.cancel")}
         onConfirm={async () => {
           try {
@@ -433,26 +449,70 @@ function RunsTable({
   );
 }
 
-/** 계획 탭: 편집과 저장(PUT 통째, `If-Match`). 다른 사람이 먼저 바꿨으면 알리고 다시 읽기를 준다. */
+/** 고치는 중인 초안: 편집을 시작한 때의 계획(`base`)과 그 판. 계획 탭을 떠났다 와도 같은 세션이면 남는다(리뷰 1 웹 7). */
+interface Edit {
+  draft: Draft;
+  base: RecoveryPlan["spec"];
+  revision: number;
+}
+const edits = new Map<string, Edit>();
+
+/** 시험이 서로의 초안을 보지 않게 */
+export function forgetPlanEdits() {
+  edits.clear();
+}
+
+/**
+ * 계획 탭: 편집과 저장(PUT 통째, `If-Match`). 계획의 판은 status 쓰기(보호 상태·실행)로도 오르므로, 409이면 계획을 다시 읽어
+ * spec이 편집을 시작한 때와 같으면 새 판으로 한 번 더 저장한다. spec이 바뀌었으면 그때만 알리고 "내 것으로 덮기"와 "다시 읽기
+ * (고친 것 버림)"를 준다(리뷰 1 웹 1).
+ */
 function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const remotes = useRemotes();
-  const [draft, setDraft] = useState<Draft>(() => toDraft(plan.name, plan.spec));
-  const [revision, setRevision] = useState(plan.revision);
+  // 고치지 않았으면 늘 지금 계획을 보인다. 초안은 spec이 바뀔 때만 다시 만든다(그룹 key가 그리기마다 바뀌지 않게).
+  const specKey = JSON.stringify(plan.spec);
+  const [fresh, setFresh] = useState(() => ({
+    key: specKey,
+    draft: toDraft(plan.name, plan.spec),
+  }));
+  if (fresh.key !== specKey) {
+    setFresh({ key: specKey, draft: toDraft(plan.name, plan.spec) });
+  }
+  const [stored, setStored] = useState(() => edits.get(plan.id));
+  const edit: Edit = stored ?? { draft: fresh.draft, base: plan.spec, revision: plan.revision };
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [failure, setFailure] = useState<{ message: string; conflict: boolean } | null>(null);
+  const [failure, setFailure] = useState<{ message: string; latest?: RecoveryPlan } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  function reload() {
-    setDraft(toDraft(plan.name, plan.spec));
-    setRevision(plan.revision);
-    setErrors({});
-    setFailure(null);
+  function keep(next: Edit | undefined) {
+    if (next) {
+      edits.set(plan.id, next);
+    } else {
+      edits.delete(plan.id);
+    }
+    setStored(next);
   }
 
-  async function save() {
-    const found = validate(draft, false);
+  async function discard() {
+    keep(undefined);
+    setErrors({});
+    setFailure(null);
+    await refreshDr(queryClient);
+  }
+
+  const put = (revision: number) =>
+    call(
+      api.PUT("/dr-plans/{key}", {
+        params: { path: { key: plan.id }, header: { "If-Match": revision } },
+        body: { labels: plan.labels, spec: toSpec(edit.draft) },
+      }),
+    );
+  const conflict = (err: unknown) => err instanceof ApiError && err.code === "revision_mismatch";
+
+  async function save(over?: RecoveryPlan) {
+    const found = validate(edit.draft, false);
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return;
@@ -460,20 +520,27 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
     setBusy(true);
     setFailure(null);
     try {
-      const saved = await call(
-        api.PUT("/dr-plans/{key}", {
-          params: { path: { key: plan.id }, header: { "If-Match": revision } },
-          body: { labels: plan.labels, spec: toSpec(draft) },
-        }),
-      );
-      setRevision(saved.revision);
+      try {
+        await put(over ? over.revision : edit.revision);
+      } catch (err) {
+        if (over || !conflict(err)) {
+          throw err;
+        }
+        const latest = await call(
+          api.GET("/dr-plans/{key}", { params: { path: { key: plan.id } } }),
+        );
+        if (!sameSpec(latest.spec, edit.base)) {
+          setFailure({ message: drErrorText(t, err), latest });
+          return;
+        }
+        // 바뀐 것은 status뿐이다: 새 판으로 다시 저장한다.
+        await put(latest.revision);
+      }
       toast.success(t("dr.edit.saved", { name: plan.name }));
       await refreshDr(queryClient);
+      keep(undefined);
     } catch (err) {
-      setFailure({
-        message: drErrorText(t, err),
-        conflict: err instanceof ApiError && err.code === "revision_mismatch",
-      });
+      setFailure({ message: drErrorText(t, err) });
     } finally {
       setBusy(false);
     }
@@ -482,8 +549,8 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
   return (
     <div className="flex flex-col gap-4 pt-2">
       <PlanEditor
-        draft={draft}
-        onChange={setDraft}
+        draft={edit.draft}
+        onChange={(draft) => keep({ ...edit, draft })}
         isNew={false}
         readOnly={readOnly || busy}
         errors={errors}
@@ -492,10 +559,27 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
       {failure && (
         <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
           <span>{failure.message}</span>
-          {failure.conflict && (
-            <Button type="button" variant="outline" size="sm" onClick={reload}>
-              {t("dr.edit.reload")}
-            </Button>
+          {failure.latest && (
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() => void save(failure.latest)}
+              >
+                {t("dr.edit.overwrite")}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() => void discard()}
+              >
+                {t("dr.edit.reload")}
+              </Button>
+            </>
           )}
         </div>
       )}
@@ -505,10 +589,15 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
         </p>
       )}
       {!readOnly && (
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button disabled={busy} onClick={() => void save()}>
             {t("common.save")}
           </Button>
+          {stored && (
+            <Button variant="outline" disabled={busy} onClick={() => void discard()}>
+              {t("dr.edit.discard")}
+            </Button>
+          )}
         </div>
       )}
     </div>

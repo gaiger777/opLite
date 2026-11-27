@@ -1,19 +1,27 @@
 import { REFRESH_ON, VIEW_KINDS } from "@/api/live";
-import type { Backup } from "@/api/types";
+import type { Backup, Network, Task } from "@/api/types";
+import type { DrStep } from "@/dr/api";
 import {
   candidates,
+  DR_TEST_LABEL,
   emptyDraft,
+  failedPhase,
   formatDuration,
   moveGroup,
   newVm,
   phaseDots,
+  protectionGaps,
   rpoCounts,
   rtoClock,
+  sameSpec,
+  testLeftovers,
+  testNetworkIssues,
   toDraft,
   toSpec,
   validate,
 } from "@/dr/model";
 import { planSpec } from "@/test/dr";
+import { providerNetwork, sdnNetwork, vm } from "@/test/fixtures";
 
 it("round-trips a plan through the editor draft", () => {
   const spec = planSpec({ security_groups: { web: "dr-web" }, folder: "dr/prod" });
@@ -155,7 +163,10 @@ it("draws phase dots", () => {
   expect(phaseDots("starting")).toEqual(["done", "current", "todo", "todo"]);
   expect(phaseDots("ready")).toEqual(["done", "done", "done", "done"]);
   expect(phaseDots("timed_out")).toEqual(["done", "done", "failed", "todo"]);
-  expect(phaseDots("failed")).toEqual(["failed", "todo", "todo", "todo"]);
+  // 실패한 단계를 모르면 점은 모두 빈 칸(칩이 실패를 알린다), 알면 그 점이 빨갛다
+  expect(phaseDots("failed")).toEqual(["todo", "todo", "todo", "todo"]);
+  expect(phaseDots("failed", undefined, "restoring")).toEqual(["failed", "todo", "todo", "todo"]);
+  expect(phaseDots("failed", undefined, "starting")).toEqual(["done", "failed", "todo", "todo"]);
   expect(phaseDots("skipped")).toEqual(["todo", "todo", "todo", "todo"]);
   expect(phaseDots("deleted", ["deleting", "deleted"])).toEqual(["done", "done"]);
 });
@@ -174,4 +185,138 @@ it("refreshes plans and runs on watch events", () => {
   expect(VIEW_KINDS).toContain("dr-run");
   expect(REFRESH_ON["recovery-plan"]).toEqual([["dr-plans"]]);
   expect(REFRESH_ON["dr-run"]).toEqual([["dr-runs"], ["dr-plans"]]);
+});
+
+it("checks half-written, misnamed and repeated map rows instead of dropping them", () => {
+  const draft = {
+    ...emptyDraft(),
+    source: "prod",
+    pool: "local",
+    groups: [{ ...emptyDraft().groups[0]!, vms: [newVm("db1")] }],
+    networks: [
+      { from: "lan", to: "dr-lan" },
+      { from: "lan", to: "dr-other" },
+      { from: " ", to: "" },
+    ],
+    securityGroups: [{ from: "web", to: "" }],
+    testNetworks: [{ from: "Lan", to: "iso" }],
+  };
+  expect(validate(draft, false)).toEqual({
+    net1: "dr.invalid.mapDuplicate",
+    sg0: "dr.invalid.mapHalf",
+    tnet0: "dr.invalid.name",
+  });
+});
+
+it("compares plan specs regardless of key order", () => {
+  const spec = planSpec();
+  const shuffled = Object.fromEntries(Object.entries(spec).reverse());
+  expect(sameSpec(spec, shuffled)).toBe(true);
+  expect(sameSpec(spec, { ...spec, folder: undefined })).toBe(true);
+  expect(sameSpec(spec, { ...spec, rpo_target_secs: 1 })).toBe(false);
+});
+
+it("warns about test networks that can reach production", () => {
+  const draft = {
+    ...emptyDraft(),
+    networks: [{ from: "lan", to: "dr-lan" }],
+    testNetworks: [
+      { from: "lan", to: "dr-lan" },
+      { from: "db", to: "db" },
+      { from: "a", to: "routed" },
+      { from: "b", to: "ext" },
+      { from: "c", to: "br0" },
+      { from: "d", to: "iso" },
+      { from: "e", to: "unknown" },
+    ],
+  };
+  const networks = [
+    sdnNetwork("routed"),
+    providerNetwork("ext", "physnet1"),
+    { ...sdnNetwork("br0"), spec: { bridge: "br0" } } as Network,
+    sdnNetwork("iso"),
+  ];
+  expect(testNetworkIssues(draft, networks, new Set(["routed"]))).toEqual({
+    0: "failover",
+    1: "failover",
+    2: "routed",
+    3: "provider",
+    4: "physical",
+  });
+});
+
+it("lists protection gaps and test leftovers by label", () => {
+  expect(
+    protectionGaps([
+      { vm: "a", ok: true, age_secs: 10 },
+      { vm: "b", ok: false },
+      { vm: "c", ok: false, age_secs: 90_000 },
+    ]),
+  ).toEqual({ missing: ["b"], over: [{ vm: "c", age: 90_000 }] });
+  const mine = { [DR_TEST_LABEL]: "web-tier" };
+  expect(
+    testLeftovers(
+      "web-tier",
+      [
+        vm("web1-drt", "running", { labels: mine }),
+        // 이름만 시험 VM 같은 남의 VM은 세지 않는다(서버 기준)
+        vm("web2-drt", "running"),
+        vm("db1-drt", "stopped", { labels: { [DR_TEST_LABEL]: "other" } }),
+      ],
+      [{ ...sdnNetwork("drt-web-tier-1"), labels: mine }, sdnNetwork("drt-web-tier-2")],
+    ),
+  ).toEqual(["drt-web-tier-1", "web1-drt"]);
+});
+
+/** 시각 `secs`에 만든 UUIDv7 모양의 Task */
+function taskAt(
+  secs: number,
+  n: number,
+  op: Task["spec"]["op"],
+  target: string,
+  state: Task["status"]["state"],
+): Task {
+  const ms = (secs * 1000).toString(16).padStart(12, "0");
+  return {
+    id: `${ms.slice(0, 8)}-${ms.slice(8)}-7000-8000-${String(n).padStart(12, "0")}`,
+    name: "t",
+    revision: 1,
+    labels: {},
+    spec: { node: "n", op, target },
+    status: { state, error: null },
+  } as Task;
+}
+
+it("finds the phase a VM failed in from the tasks", () => {
+  const step: DrStep = {
+    group: "db",
+    vm: "db1",
+    phase: "failed",
+    at: 2000,
+    new_vm: "db1-drt",
+    backup: "db1-copy",
+    backup_id: "b-1",
+  };
+  const restore = (state: Task["status"]["state"], at = 1500) =>
+    taskAt(
+      at,
+      1,
+      { kind: "backup-restore", backup: "b-1", name: "db1-drt", pool: "p" },
+      "vm-1",
+      state,
+    );
+  const start = (state: Task["status"]["state"]) =>
+    taskAt(1600, 2, { kind: "vm-start" }, "vm-1", state);
+  expect(failedPhase(step, [], 1000)).toBeUndefined();
+  expect(failedPhase(step, [restore("failed")], 1000)).toBe("restoring");
+  // 앞 실행의 Task는 보지 않는다
+  expect(failedPhase(step, [restore("failed", 500)], 1000)).toBeUndefined();
+  expect(failedPhase(step, [restore("succeeded")], 1000)).toBe("starting");
+  expect(failedPhase(step, [restore("succeeded"), start("failed")], 1000)).toBe("starting");
+  expect(failedPhase(step, [restore("succeeded"), start("succeeded")], 1000)).toBe("waiting");
+  // 운영 쪽 준비에서 실패했으면 DR 쪽 단계는 없다
+  expect(
+    failedPhase({ ...step, prepare: { stage: "backup" } }, [restore("failed")], 1000),
+  ).toBeUndefined();
+  expect(failedPhase({ ...step, phase: "timed_out" }, [], 1000)).toBe("waiting");
 });

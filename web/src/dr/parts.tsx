@@ -1,10 +1,26 @@
 import { cn } from "cn";
+import type { TFunction } from "i18next";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { StatusChip } from "@/components/StatusChip";
-import type { DrPhase, DrRunState, VmProtection } from "@/dr/api";
-import { type DotState, PHASE_TONE, phaseDots, rpoCounts, RUN_TONE } from "@/dr/model";
+import type { DrPhase, DrRunKind, DrRunState, VmProtection } from "@/dr/api";
+import { type DotState, isFailover, PHASE_TONE, phaseDots, rpoCounts, RUN_TONE } from "@/dr/model";
+
+/**
+ * 취소 확인의 설명: 실행 종류마다 취소 뒤 일(리뷰 1 웹 4) — 시험은 끝나면 뒷정리가 저절로 시작되고, 장애 조치가 만든 VM은
+ * 남으며, 뒷정리는 남은 것을 다음 뒷정리로 지운다. 종류를 모르면 앞 문장만.
+ */
+export function cancelText(t: TFunction, kind: DrRunKind | undefined): string {
+  const after = !kind
+    ? ""
+    : kind === "test"
+      ? t("dr.cancel.afterTest")
+      : isFailover(kind)
+        ? t("dr.cancel.afterFailover")
+        : t("dr.cancel.afterCleanup");
+  return after ? `${t("dr.cancel.description")} ${after}` : t("dr.cancel.description");
+}
 
 /** 실행 상태 칩 */
 export function RunStateChip({ state }: { state: DrRunState }) {
@@ -38,9 +54,18 @@ const DOT: Record<DotState, string> = {
  * VM 하나의 단계 점(복원 → 시작 → 기다림 → 준비). 점은 꾸밈이고 뜻은 옆의 단계 칩이 글로 전한다(색만으로 전하지 않는다).
  * 점마다 단계 이름을 `title`로 단다.
  */
-export function PhaseDots({ phase, dots }: { phase: DrPhase; dots: readonly DrPhase[] }) {
+export function PhaseDots({
+  phase,
+  dots,
+  last,
+}: {
+  phase: DrPhase;
+  dots: readonly DrPhase[];
+  /** 실패한 단계(모르면 없음 — 점을 모두 빈 칸으로) */
+  last?: DrPhase;
+}) {
   const { t } = useTranslation();
-  const states = phaseDots(phase, dots);
+  const states = phaseDots(phase, dots, last);
   return (
     <span aria-hidden className="inline-flex items-center gap-1">
       {dots.map((d, i) => (

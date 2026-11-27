@@ -1,10 +1,11 @@
 // 복구 계획 편집(계획 76 §4)의 순수 함수: 계획 ↔ 편집 초안, 검사(서버 `RecoveryPlanSpec::validate`의 형식 검사와 같은 범위),
 // VM 고르기 후보, 실행 단계 점, 시간 글. 화면은 이것을 그리기만 한다.
-import type { Backup } from "@/api/types";
+import type { Backup, Network, Task, Vm } from "@/api/types";
 import type {
   DrPhase,
   DrRunKind,
   DrRunState,
+  DrStep,
   DrWait,
   OnTimeout,
   RecoveryPlanSpec,
@@ -24,6 +25,8 @@ export const DEFAULT_TIMEOUT_SECS = 600;
 export const MAX_NIC = 15;
 /** 시험 VM 이름의 꼬리(서버 `TEST_VM_SUFFIX`) */
 export const TEST_VM_SUFFIX = "-drt";
+/** 시험이 만든 VM·거품 네트워크의 라벨(서버 `DR_TEST_LABEL`, 값은 계획 이름) */
+export const DR_TEST_LABEL = "orbivisor.io/dr-test";
 
 export const WAITS: readonly DrWait[] = ["running", "guest", "ip"];
 export const ON_TIMEOUT: readonly OnTimeout[] = ["continue", "stop"];
@@ -220,7 +223,7 @@ function intIn(text: string, min: number, max: number): boolean {
 
 /**
  * 초안 검사. 칸 → 오류 번역 키(`dr.invalid.*`). 칸 이름: `name`, `source`, `pool`, `rpo`, `groups`, `g{i}.name`, `g{i}.timeout`,
- * `g{i}.delay`, `g{i}.vms`, `g{i}.v{j}.ip{k}`, `vms`(겹침).
+ * `g{i}.delay`, `g{i}.vms`, `g{i}.v{j}.ip{k}`, `vms`(겹침), 맵 줄 `net{i}`·`sg{i}`·`tnet{i}`(네트워크·보안 그룹·시험 네트워크).
  */
 export function validate(draft: Draft, isNew: boolean): Record<string, string> {
   const errors: Record<string, string> = {};
@@ -281,6 +284,9 @@ export function validate(draft: Draft, isNew: boolean): Record<string, string> {
       });
     });
   });
+  checkMap(draft.networks, "net", errors);
+  checkMap(draft.securityGroups, "sg", errors);
+  checkMap(draft.testNetworks, "tnet", errors);
   const seen = new Set<string>();
   for (const g of draft.groups) {
     for (const v of g.vms) {
@@ -291,6 +297,174 @@ export function validate(draft: Draft, isNew: boolean): Record<string, string> {
     }
   }
   return errors;
+}
+
+/**
+ * 맵 줄 검사: 둘 다 비면 버리는 줄이고, 한쪽만 찼으면 오류(말없이 버리지 않게), 이름 모양, 같은 원본은 한 줄만(뒤 것이 몰래
+ * 이기지 않게).
+ */
+function checkMap(list: Pair[], at: string, errors: Record<string, string>) {
+  const froms = new Set<string>();
+  list.forEach((p, i) => {
+    const from = p.from.trim();
+    const to = p.to.trim();
+    if (!from && !to) {
+      return;
+    }
+    if (!from || !to) {
+      errors[`${at}${i}`] = "dr.invalid.mapHalf";
+    } else if (!NAME.test(from) || !NAME.test(to)) {
+      errors[`${at}${i}`] = "dr.invalid.name";
+    } else if (froms.has(from)) {
+      errors[`${at}${i}`] = "dr.invalid.mapDuplicate";
+    }
+    froms.add(from);
+  });
+}
+
+/** 키 차례와 상관없이 같은 값인지(서버가 준 두 계획 spec을 견준다 — 편집 충돌 판단) */
+export function sameSpec(a: unknown, b: unknown): boolean {
+  return stable(a) === stable(b);
+}
+
+function stable(v: unknown): string {
+  if (Array.isArray(v)) {
+    return `[${v.map(stable).join(",")}]`;
+  }
+  if (v && typeof v === "object") {
+    return `{${Object.entries(v as Record<string, unknown>)
+      .filter(([, x]) => x !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, x]) => `${JSON.stringify(k)}:${stable(x)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/** 시험망 경고의 까닭(서버는 막지 않는다 — 고르는 것은 운영자다) */
+export type TestNetIssue = "failover" | "routed" | "provider" | "physical";
+
+/**
+ * 시험 네트워크 맵의 줄마다 격리가 깨질 수 있는 까닭(리뷰 1 웹 9): 대상이 장애 조치가 쓰는 네트워크(`networks` 맵의 대상,
+ * 또는 맵에 없는 원본과 같은 이름), 라우터 인터페이스, 공급자(업링크) 네트워크, SDN이 아닌 브리지(물리 L2)이면. 모르는
+ * 네트워크는 보지 않는다.
+ */
+export function testNetworkIssues(
+  draft: Draft,
+  networks: readonly Network[] | undefined,
+  routed: ReadonlySet<string>,
+): Record<number, TestNetIssue> {
+  const mapped = new Map(
+    draft.networks.filter((p) => p.from.trim()).map((p) => [p.from.trim(), p.to.trim()]),
+  );
+  const failover = new Set(mapped.values());
+  const byName = new Map((networks ?? []).map((n) => [n.name, n]));
+  const out: Record<number, TestNetIssue> = {};
+  draft.testNetworks.forEach((p, i) => {
+    const from = p.from.trim();
+    const to = p.to.trim();
+    if (!to) {
+      return;
+    }
+    if (failover.has(to) || (from === to && !mapped.has(from))) {
+      out[i] = "failover";
+      return;
+    }
+    const net = byName.get(to);
+    if (!net) {
+      return;
+    }
+    if (net.spec.sdn?.provider) {
+      out[i] = "provider";
+    } else if (!net.spec.sdn) {
+      out[i] = "physical";
+    } else if (routed.has(to)) {
+      out[i] = "routed";
+    }
+  });
+  return out;
+}
+
+/** 장애 조치 확인에 보일 보호 상태의 빈 곳: 복구 지점이 없는 VM과 RPO를 넘은 VM(나이) */
+export function protectionGaps(protection: readonly VmProtection[] | undefined) {
+  const bad = (protection ?? []).filter((p) => !p.ok);
+  return {
+    missing: bad.filter((p) => p.age_secs === undefined).map((p) => p.vm),
+    over: bad.filter((p) => p.age_secs !== undefined).map((p) => ({ vm: p.vm, age: p.age_secs! })),
+  };
+}
+
+/**
+ * 뒷정리가 지울 것(서버 `leftovers`와 같은 기준 — 시험 라벨이 이 계획인 VM과 네트워크). 이미 받은 목록에서 센다.
+ */
+export function testLeftovers(
+  plan: string,
+  vms: readonly Vm[] | undefined,
+  networks: readonly Network[] | undefined,
+): string[] {
+  const mine = (labels: Record<string, string> | undefined) => labels?.[DR_TEST_LABEL] === plan;
+  return [
+    ...(vms ?? []).filter((v) => mine(v.labels)).map((v) => v.name),
+    ...(networks ?? []).filter((n) => mine(n.labels)).map((n) => n.name),
+  ].sort();
+}
+
+/** UUIDv7의 만든 시각(초) */
+function uuidSecs(id: string): number {
+  return parseInt(id.replace(/-/g, "").slice(0, 12), 16) / 1000;
+}
+
+const RESTORE_OPS = new Set(["backup-restore", "backup-live-restore"]);
+
+/**
+ * 실패한 VM이 어느 단계에서 실패했는지(리뷰 1 웹 6). 실행 기록은 실패할 때 Task를 비우므로 Task 목록에서 찾는다: 이 실행이
+ * 시작한 뒤 그 백업으로 그 이름을 만든 복원 Task가 실패했으면 `restoring`, 성공했으면 그 VM의 `vm-start` Task가 실패한 때
+ * `starting`, 시작도 끝났으면(또는 라이브 복원) `waiting`이다. 운영 쪽 준비에서 실패했거나 Task를 찾지 못하면 모른다
+ * (undefined — 점을 모두 빈 칸으로 두고 칩만 보인다).
+ */
+export function failedPhase(
+  step: DrStep,
+  tasks: readonly Task[] | undefined,
+  startedAt: number,
+): DrPhase | undefined {
+  if (step.phase === "timed_out") {
+    return "waiting";
+  }
+  if (step.phase !== "failed" || !step.new_vm || !step.backup_id) {
+    return undefined;
+  }
+  if (step.prepare && step.prepare.stage !== "done") {
+    return undefined;
+  }
+  const since = (task: Task) => uuidSecs(task.id) + 1 >= startedAt;
+  const latest = (list: Task[]) => list.sort((a, b) => (a.id < b.id ? 1 : -1))[0];
+  const restore = latest(
+    (tasks ?? []).filter((task) => {
+      const op = task.spec.op as { kind: string; name?: string; backup?: string };
+      return (
+        RESTORE_OPS.has(op.kind) &&
+        op.name === step.new_vm &&
+        op.backup === step.backup_id &&
+        since(task)
+      );
+    }),
+  );
+  if (!restore || restore.status.state === "pending" || restore.status.state === "running") {
+    return undefined;
+  }
+  if (restore.status.state === "failed") {
+    return "restoring";
+  }
+  if (restore.spec.op.kind === "backup-live-restore") {
+    return "waiting";
+  }
+  const start = latest(
+    (tasks ?? []).filter(
+      (task) =>
+        task.spec.op.kind === "vm-start" && task.spec.target === restore.spec.target && since(task),
+    ),
+  );
+  return start?.status.state === "succeeded" ? "waiting" : "starting";
 }
 
 /** 초안의 모든 VM 이름 */
@@ -362,8 +536,8 @@ export type DotState = "done" | "current" | "failed" | "todo";
 
 /**
  * 단계 점마다 상태. 끝난 단계는 `done`, 지금 단계는 `current`(실패·시간 초과면 그 앞까지 `done`이고 다음 점이 `failed`),
- * 건너뛴 VM과 아직 시작 전(`pending`·`preparing`)은 모두 `todo`다. 실패한 단계는 정확히 모르므로 마지막으로 본 단계
- * (`last`)가 있으면 그 점이 `failed`다.
+ * 건너뛴 VM과 아직 시작 전(`pending`·`preparing`)은 모두 `todo`다. 실패는 실패한 단계(`last` — [`failedPhase`])의 점이
+ * `failed`이고, 모르면 모두 `todo`다(칩이 실패를 알린다).
  */
 export function phaseDots(
   phase: DrPhase,
@@ -371,8 +545,10 @@ export function phaseDots(
   last?: DrPhase,
 ): DotState[] {
   if (phase === "failed" || phase === "timed_out") {
-    const at = phase === "timed_out" ? dots.indexOf("waiting") : last ? dots.indexOf(last) : 0;
-    const failAt = at < 0 ? 0 : at;
+    const failAt = dots.indexOf(phase === "timed_out" ? "waiting" : (last ?? phase));
+    if (failAt < 0) {
+      return dots.map(() => "todo");
+    }
     return dots.map((_, i) => (i < failAt ? "done" : i === failAt ? "failed" : "todo"));
   }
   const at = dots.indexOf(phase);

@@ -3,10 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { REFRESH_ON } from "@/api/live";
+import type { Task } from "@/api/types";
 import type { DrRun } from "@/dr/api";
 import { RunPage } from "@/dr/RunPage";
 import { expectNoAxeViolations } from "@/test/axe";
-import { NOW, PLAN_ID, run, RUN_ID } from "@/test/dr";
+import { DR_NODE, NOW, plan, PLAN_ID, run, RUN_ID } from "@/test/dr";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -113,7 +114,7 @@ it("shows a cleanup run as one band of deleted VMs", async () => {
       spec: { kind: "cleanup" },
       status: {
         state: "succeeded",
-        rto_secs: 20,
+        finished_at: NOW,
         steps: [{ vm: "db1-drt", phase: "deleted", at: NOW }],
       },
     }),
@@ -121,4 +122,130 @@ it("shows a cleanup run as one band of deleted VMs", async () => {
   open();
   const band = await screen.findByRole("listitem", { name: "Cleanup" });
   expect(within(band).getByRole("listitem", { name: "db1-drt" })).toHaveTextContent("Deleted");
+  // 뒷정리에는 RTO가 없다: 걸린 시간
+  expect(screen.getByText("Elapsed")).toBeInTheDocument();
+  expect(screen.queryByText("RTO")).not.toBeInTheDocument();
+  expect(screen.getByTestId("rto-clock")).toHaveTextContent("1m 30s");
+});
+
+/** 시각 `secs`에 만든 UUIDv7 모양의 Task */
+function taskAt(secs: number, n: number, op: Task["spec"]["op"], state: Task["status"]["state"]) {
+  const ms = (secs * 1000).toString(16).padStart(12, "0");
+  return {
+    id: `${ms.slice(0, 8)}-${ms.slice(8)}-7000-8000-${String(n).padStart(12, "0")}`,
+    name: "t",
+    revision: 1,
+    labels: {},
+    spec: { node: "n", op, target: "019a0f3c-0000-7000-8000-0000000000f1" },
+    status: { state, error: state === "failed" ? "boom" : null },
+  } as Task;
+}
+
+const dotStates = (item: HTMLElement) =>
+  [...item.querySelectorAll("[data-state]")].map((d) => d.getAttribute("data-state"));
+
+it("marks the phase a VM failed in and hides a new VM the run never made", async () => {
+  setup(
+    run({
+      status: {
+        state: "partial",
+        finished_at: NOW,
+        steps: [
+          {
+            group: "db",
+            vm: "db1",
+            phase: "failed",
+            at: NOW - 10,
+            new_vm: "db1-drt",
+            backup: "db1-copy",
+            backup_id: "b-1",
+            error: "start failed",
+          },
+          // 이름이 겹쳐 복원 요청이 거절됐다(Task 없음): 그 이름의 VM은 남의 것이다
+          {
+            group: "web",
+            vm: "web1",
+            phase: "failed",
+            at: NOW - 10,
+            new_vm: "web1-drt",
+            backup_id: "b-2",
+            error: "name taken",
+          },
+          { group: "web", vm: "web2", phase: "skipped", at: NOW - 10 },
+        ],
+      },
+    }),
+  );
+  mockLists({
+    task: [
+      taskAt(
+        NOW - 60,
+        1,
+        { kind: "backup-restore", backup: "b-1", name: "db1-drt", pool: "local" },
+        "succeeded",
+      ),
+      taskAt(NOW - 30, 2, { kind: "vm-start" }, "failed"),
+    ],
+  });
+  open();
+  const db1 = await screen.findByRole("listitem", { name: "db1" });
+  await waitFor(() => expect(dotStates(db1)).toEqual(["done", "failed", "todo", "todo"]));
+  expect(within(db1).getByRole("link", { name: "db1-drt" })).toBeInTheDocument();
+  const web1 = screen.getByRole("listitem", { name: "web1" });
+  expect(dotStates(web1)).toEqual(["todo", "todo", "todo", "todo"]);
+  expect(web1).toHaveTextContent("Failed");
+  expect(within(web1).queryByRole("link", { name: "web1-drt" })).not.toBeInTheDocument();
+});
+
+it("tells the source prepare stage of a planned migration", async () => {
+  setup(
+    run({
+      spec: { kind: "failover-planned" },
+      status: {
+        steps: [
+          {
+            group: "db",
+            vm: "db1",
+            phase: "preparing",
+            at: NOW - 10,
+            prepare: { stage: "replicate", source_backup: "db1-final" },
+          },
+        ],
+      },
+    }),
+  );
+  open();
+  expect(await screen.findByRole("listitem", { name: "db1" })).toHaveTextContent(
+    "replicating here · backup db1-final",
+  );
+});
+
+it("shows the upgrade notice while the engine waits for old nodes", async () => {
+  setup();
+  mockLists({
+    node: [{ ...DR_NODE, name: "node-b", status: { ...DR_NODE.status, features: [] } }],
+  });
+  open();
+  expect(await screen.findByText(/do not support DR plans yet \(node-b\)/)).toBeInTheDocument();
+});
+
+it("tells that a cancelled test cleans up by itself and links that cleanup", async () => {
+  const user = userEvent.setup();
+  const next = setup();
+  const CLEANUP = "019a0f3c-0000-7000-8076-0000000000b2";
+  server.use(
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}`), () =>
+      HttpResponse.json(plan("web-tier", { status: { run: CLEANUP } })),
+    ),
+  );
+  const { queryClient } = open();
+  await user.click(await screen.findByRole("button", { name: "Cancel run" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Cancel the run of web-tier" });
+  expect(dialog).toHaveTextContent("When the test ends, its cleanup starts by itself.");
+  await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  next(run({ status: { state: "cancelled", finished_at: NOW } }));
+  await queryClient.invalidateQueries({ queryKey: REFRESH_ON["dr-run"]![0] });
+  expect(
+    await screen.findByRole("link", { name: "Open the cleanup that started after the cancel" }),
+  ).toHaveAttribute("href", `/dr-runs/${CLEANUP}`);
 });
