@@ -1,9 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { FileSearch, RefreshCw } from "lucide-react";
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
+import { useList } from "@/api/live";
 import type { AuditEntry } from "@/api/types";
 import { auditOutcome, describeAudit } from "@/audit/describe";
 import { usePrincipal } from "@/auth/AuthProvider";
@@ -97,6 +98,9 @@ export function AuditPage() {
   const [filter, setFilter] = useState({ user: "", action: "" });
   const [opened, setOpened] = useState<AuditEntry | null>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
+  // id로 부른 VM(콘솔 열기 등)을 이름으로 — 이미 받는 VM 목록
+  const vms = useList("vm");
+  const names = useMemo(() => new Map((vms.data ?? []).map((vm) => [vm.id, vm.name])), [vms.data]);
   const audit = useQuery({
     queryKey: ["audit", range, filter],
     queryFn: () =>
@@ -145,7 +149,7 @@ export function AuditPage() {
       className: "whitespace-normal",
       cell: (entry) => {
         // 사람 말(라우트 → 문구 표, 계획 77-7). 표에 없는 동작은 원문 그대로. 원문·전체는 줄을 열어 본다.
-        const named = describeAudit(entry, t);
+        const named = describeAudit(entry, t, names);
         return (
           <>
             {/* 키보드로도 열 수 있게 단추로 둔다. 누르면 행의 onClick이 연다. */}
@@ -306,7 +310,7 @@ export function AuditPage() {
           >
             <DialogHeader>
               <DialogTitle className="break-words">
-                {describeAudit(opened, t) ?? t("audit.entryTitle")}
+                {describeAudit(opened, t, names) ?? t("audit.entryTitle")}
               </DialogTitle>
             </DialogHeader>
             <EntrySummary entry={opened} />

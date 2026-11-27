@@ -24,8 +24,14 @@ export function routeParams(template: string, path: string): Record<string, stri
   return out;
 }
 
-/** 동작의 사람 말. 표에 없으면 null(부르는 쪽이 원문을 보인다). */
-export function describeAudit(entry: AuditEntry, t: TFunction): string | null {
+/**
+ * 동작의 사람 말. 표에 없으면 null(부르는 쪽이 원문을 보인다). `names`는 id → 이름(콘솔처럼 id로 부른 VM — 이미 받은 목록).
+ */
+export function describeAudit(
+  entry: AuditEntry,
+  t: TFunction,
+  names?: ReadonlyMap<string, string>,
+): string | null {
   const space = entry.action.indexOf(" ");
   if (space < 0) {
     const key = `auditOps.system.${entry.action}`;
@@ -33,6 +39,9 @@ export function describeAudit(entry: AuditEntry, t: TFunction): string | null {
   }
   const template = entry.action.slice(space + 1);
   const params = routeParams(template, entry.path);
+  if (params.key && names?.has(params.key)) {
+    params.key = names.get(params.key)!;
+  }
   const verb = params.action
     ? t(`auditOps.vmAction.${params.action}`, { defaultValue: params.action })
     : undefined;

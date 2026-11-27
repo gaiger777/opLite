@@ -52,6 +52,11 @@ it("fills the route's slots from the real path", () => {
     ),
   ).toBe("zap VM <b>");
   expect(describeAudit(entry("POST /nope", "/nope"), t)).toBeNull();
+  // id로 부른 VM은 아는 이름으로
+  const id = "019a0f3c-0000-7000-8000-000000000001";
+  expect(
+    describeAudit(entry("GET /vms/{key}/console", `/vms/${id}/console`), t, new Map([[id, "web"]])),
+  ).toBe("VM web 콘솔 열기");
 });
 
 it("names every route that changes something (OpenAPI) and the console", () => {
