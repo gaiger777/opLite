@@ -23,7 +23,7 @@ it("adds the history, apply set and certificate strings of both languages when t
   // 보기 이름·팔레트 별칭·⋯ 메뉴 두 줄은 첫 화면 묶음에 있다
   expect(fresh.i18n.t("nav.history")).toBe("변경 기록");
   expect(fresh.i18n.t("nav.certificatesKeywords")).toContain("ACME");
-  expect(fresh.i18n.t("configMenu.history")).toBe("설정 기록…");
+  expect(fresh.i18n.t("configMenu.history")).toBe("변경 기록…");
   expect(fresh.i18n.t("configMenu.yaml")).toBe("YAML로 내보내기");
   await loadDeclarativeStrings();
   expect(fresh.i18n.t("history.point.title")).toBe("한 시점으로 되돌리기");

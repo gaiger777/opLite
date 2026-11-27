@@ -46,9 +46,9 @@ it("opens the resource's config history drawer from the VM menu", async () => {
   const asked = mockConfig();
   const { container } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
   await user.click(await screen.findByRole("button", { name: "Actions for web" }));
-  await user.click(screen.getByRole("menuitem", { name: "Config history…" }));
-  const drawer = await screen.findByRole("dialog", { name: "Config history of web" });
-  const list = await within(drawer).findByRole("list", { name: "Config history of web" });
+  await user.click(screen.getByRole("menuitem", { name: "Change history…" }));
+  const drawer = await screen.findByRole("dialog", { name: "Change history of web" });
+  const list = await within(drawer).findByRole("list", { name: "Change history of web" });
   expect(within(list).getAllByRole("button")).toHaveLength(3);
   expect(asked).toEqual([`vm/${WEB_ID}`]);
   await expectNoAxeViolations(container);
@@ -58,7 +58,7 @@ it("opens the resource's config history drawer from the VM menu", async () => {
     await within(drawer).findByRole("table", { name: "Changed fields of web" }),
   ).toHaveTextContent("8 GiB");
   await user.click(within(drawer).getByRole("button", { name: "All changes" }));
-  expect(within(drawer).getByRole("list", { name: "Config history of web" })).toBeInTheDocument();
+  expect(within(drawer).getByRole("list", { name: "Change history of web" })).toBeInTheDocument();
 });
 
 it("exports the VM as YAML from its menu", async () => {
@@ -92,10 +92,10 @@ it("adds the same two items to a list row menu", async () => {
   renderPage(<HaGroupsPage />, { path: "/ha-groups" });
   await user.click(await screen.findByRole("button", { name: "More for rack-a" }));
   expect(screen.getAllByRole("menuitem").map((m) => m.textContent)).toEqual([
-    "Config history…",
+    "Change history…",
     "Export as YAML",
   ]);
-  await user.click(screen.getByRole("menuitem", { name: "Config history…" }));
-  await screen.findByRole("dialog", { name: "Config history of rack-a" });
+  await user.click(screen.getByRole("menuitem", { name: "Change history…" }));
+  await screen.findByRole("dialog", { name: "Change history of rack-a" });
   await waitFor(() => expect(asked).toEqual([`ha-group/${group.id}`]));
 });

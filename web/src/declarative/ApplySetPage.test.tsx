@@ -108,9 +108,7 @@ it("compares file and actual values, shows who changed them and adopts the chose
   expect(memory).toHaveTextContent("4 GiB");
   expect(memory).toHaveTextContent("8 GiB");
   expect(memory).toHaveTextContent("differs");
-  expect(within(compare).getByRole("row", { name: /vCPUs/ })).toHaveTextContent(
-    "vCPUsdiffers24",
-  );
+  expect(within(compare).getByRole("row", { name: /vCPUs/ })).toHaveTextContent("vCPUsdiffers24");
   expect(within(compare).getByRole("row", { name: /labels.tier/ })).not.toHaveTextContent(
     "differs",
   );
@@ -202,7 +200,7 @@ function mockAdopt(set: ReturnType<typeof lanDeletedSet>) {
   return sent;
 }
 
-it("adopts all only after confirming, with an empty body so the server picks what the caller may update", async () => {
+it("adopts all only after confirming, sending exactly the confirmed resources", async () => {
   const user = userEvent.setup();
   const sent = mockAdopt(lanDeletedSet());
   renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
@@ -217,7 +215,8 @@ it("adopts all only after confirming, with an empty body so the server picks wha
   expect(confirm).not.toHaveTextContent("stray");
   expect(sent).toEqual([]);
   await user.click(within(confirm).getByRole("button", { name: "Keep current values" }));
-  await waitFor(() => expect(sent).toEqual([{}]));
+  // "모두"도 확인 대화상자에 보인 것의 id — 그 뒤 새로 생긴 드리프트까지 받아들이지 않는다
+  await waitFor(() => expect(sent).toEqual([{ objects: [WEB_ID, LAN_ID] }]));
 });
 
 it("lets an object deleted outside the set be chosen and adopted", async () => {
@@ -320,4 +319,98 @@ it("explains how to start when there are no sets", async () => {
   expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
   // 그림은 화면 위 설명에 늘 있다
   expect(document.querySelector("[data-slot=diagram]")).not.toBeNull();
+});
+
+/** 묶음 하나와 지금 매니페스트(서버가 id를 주면 `ids`) */
+function mockSet(set: ReturnType<typeof applySet>, documents: unknown[], ids?: string[]) {
+  mockLists({});
+  server.use(
+    http.get(apiUrl("/manifests"), () =>
+      HttpResponse.json({ revision: 9, documents, ...(ids && { ids }) }),
+    ),
+    http.get(apiUrl("/apply-sets/:key"), () => HttpResponse.json(set)),
+  );
+}
+
+it("does not call resources the same before the server has compared the set", async () => {
+  // 적용 직후 검사 전(또는 리더가 바뀜): `status.drift`가 없다
+  mockSet(applySet("web-prod", { drift: undefined }), [...LIVE_MANIFESTS]);
+  const { container } = renderPage(<ApplySetPage />, {
+    path: "/apply-sets/:name",
+    url: "/apply-sets/web-prod",
+  });
+  const table = await screen.findByRole("table", { name: "Resources managed by web-prod" });
+  for (const name of [/web/, /lan/]) {
+    const row = within(table).getByRole("row", { name });
+    expect(row).toHaveTextContent("Not compared yet (next check)");
+    expect(row).not.toHaveTextContent("Same");
+  }
+  // 화면 자체 비교는 참고로만: 다른 칸은 "달라 보임(참고)", 서버 판단이 아니라고 적는다
+  const compare = await screen.findByRole("table", { name: "VM web: file and actual values" });
+  const details = compare.closest("details")!;
+  expect(details).toHaveAttribute("open");
+  expect(details).toHaveTextContent("For reference: 2 fields look different");
+  expect(details).toHaveTextContent("has not compared this set with its files yet");
+  expect(details).toHaveTextContent("not the server's");
+  const memory = await within(compare).findByRole("row", { name: /memory_mib/ });
+  expect(memory).toHaveTextContent("looks different (reference)");
+  expect(details).not.toHaveTextContent("all the same");
+  // 같아 보이는 리소스는 접고 "모두 같음"이라 하지 않는다
+  const lan = screen.getByRole("table", { name: "Network lan: file and actual values" });
+  expect(lan.closest("details")).not.toHaveAttribute("open");
+  expect(lan.closest("details")).not.toHaveTextContent("all the same");
+  await expectNoAxeViolations(container);
+});
+
+it("highlights only the fields the server reported when it gave paths", async () => {
+  // 서버는 vCPU만 다르다고 했다 — 화면 비교로는 메모리도 달라 보이지만(서버는 기본값·차례를 맞춘 뒤 견준다) 강조하지 않는다
+  const set = applySet("web-prod", {
+    drift: {
+      checked_at: AT,
+      revision: 90,
+      items: [{ kind: "vm", id: WEB_ID, name: "web", state: "modified", paths: ["vcpus"] }],
+    },
+  });
+  mockSet(set, [...LIVE_MANIFESTS]);
+  renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
+  const compare = await screen.findByRole("table", { name: "VM web: file and actual values" });
+  expect(compare.closest("details")).toHaveTextContent("1 field differs");
+  expect(compare.closest("details")).not.toHaveTextContent("For reference");
+  expect(within(compare).getByRole("row", { name: /vCPUs/ })).toHaveTextContent("differs");
+  expect(within(compare).getByRole("row", { name: /memory_mib/ })).not.toHaveTextContent("differs");
+});
+
+it("pairs resources by their recorded id, so a rename or a name swap is caught", async () => {
+  const A = "019a0f3c-0000-7000-8073-0000000000b1";
+  const B = "019a0f3c-0000-7000-8073-0000000000b2";
+  const vm = (id: string, name: string, memory: number) => ({
+    kind: "vm" as const,
+    id,
+    name,
+    revision: 70,
+    declared: { spec: { memory_mib: memory } },
+  });
+  const set = applySet("web-prod");
+  set.status.objects = [vm(A, "a", 1024), vm(B, "b", 2048)];
+  // 밖에서 둘이 이름을 맞바꿨다: 지금 "b"가 A(1 GiB), "a"가 B(2 GiB)
+  const doc = (name: string, memory: number) => ({
+    apiVersion: "orbivisor.io/v1",
+    kind: "Vm",
+    metadata: { name },
+    spec: { memory_mib: memory },
+  });
+  mockSet(set, [doc("a", 2048), doc("b", 1024)], [B, A]);
+  renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
+  const table = await screen.findByRole("table", { name: "Resources managed by web-prod" });
+  const a = await within(table).findByRole("row", { name: /file: a →/ });
+  expect(a).toHaveTextContent("Renamed (file: a → now: b)");
+  // 링크는 지금 이름으로
+  expect(within(a).getByRole("link", { name: "a" })).toHaveAttribute("href", "/vms/b");
+  const compareA = await screen.findByRole("table", { name: "VM a: file and actual values" });
+  expect(compareA.closest("details")).toHaveAttribute("open");
+  expect(compareA.closest("details")).toHaveTextContent("Renamed (file: a → now: b)");
+  // 같은 리소스(A)의 값과 견준다 — 이름으로 짝지었다면 B의 2 GiB였을 것
+  const memory = await within(compareA).findByRole("row", { name: /memory_mib/ });
+  expect(memory).toHaveTextContent(/1 GiB.*1 GiB/);
+  expect(memory).not.toHaveTextContent("2 GiB");
 });

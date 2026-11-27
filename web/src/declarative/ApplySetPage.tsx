@@ -26,13 +26,14 @@ import {
 import {
   type AppliedObject,
   type DriftItem,
+  fetchSetLive,
   fetchSetManifests,
   type Manifest,
   refreshApplySets,
   useApplySet,
 } from "@/declarative/api";
 import { DriftChip, LastApplied, useManagedSummary } from "@/declarative/ApplySetsPage";
-import { compareDeclared, liveOf } from "@/declarative/compare";
+import { compareDeclared, liveOf, sameValue } from "@/declarative/compare";
 import { ExportYamlDialog } from "@/declarative/ExportYamlDialog";
 import { actorName, canRestoreAnything, refreshHistory } from "@/history/api";
 import { FieldCell } from "@/history/ChangeTable";
@@ -41,14 +42,21 @@ import { formatTime } from "@/lib/format";
 import { kindHref } from "@/tasks/target";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
 
-type RowState = DriftItem["state"] | "same";
+/** 줄 상태: 서버 드리프트가 알린 것, 견준 뒤 알리지 않은 것은 같음, 아직 견주지 않은 묶음은 모두 "아직 비교 전" */
+type RowState = DriftItem["state"] | "same" | "unchecked";
 
 const TONE: Record<RowState, StatusTone> = {
   same: "success",
   modified: "warning",
   missing: "danger",
   unmanaged: "neutral",
+  unchecked: "neutral",
 };
+
+/** 리소스 줄의 상태(`checked` — 서버가 이 묶음을 한 번이라도 견주었나: `status.drift`가 있다) */
+function rowState(row: Row, checked: boolean): RowState {
+  return row.item?.state ?? (checked ? "same" : "unchecked");
+}
 
 /** 견주어 보일 리소스 수(묶음은 1000개까지 — 넘으면 CLI `drift`로) */
 const COMPARED = 50;
@@ -59,6 +67,22 @@ interface Row {
   name: string;
   item?: DriftItem;
   declared?: unknown;
+}
+
+/** 밖에서 이름을 바꿨으면 지금 이름(파일·묶음은 옛 이름 — 서버 드리프트는 이름을 견주지 않는다) */
+function renamedTo(row: Row, live: Manifest | undefined): string | undefined {
+  const now = live?.metadata.name ?? row.item?.name;
+  return now !== undefined && now !== row.name ? now : undefined;
+}
+
+/** "이름이 바뀜(파일: a → 지금: b)" */
+function Renamed({ from, to }: { from: string; to: string }) {
+  const { t } = useTranslation();
+  return (
+    <p className="text-xs break-all text-warning-fg">
+      {t("declarative.set.renamed", { from, to })}
+    </p>
+  );
 }
 
 /** 받아들일 수 있는 드리프트 줄(관리 밖은 묶음에 없어 받아들일 것이 없다) */
@@ -121,17 +145,21 @@ function ObjectCompare({
   row,
   live,
   loading,
+  checked,
 }: {
   row: Row;
   live: Manifest | undefined;
   loading: boolean;
+  checked: boolean;
 }) {
   const { t } = useTranslation();
   const kind = kindName(row.kind, t);
-  const state: RowState = row.item?.state ?? "same";
-  // 서버 드리프트가 판단의 기준이다: 같다고 한 리소스는 강조하지 않고, 다르다고 한 리소스는 여기서 다르게 보인 칸과 서버가
-  // 알린 칸(저장 꼴 경로 — 같은 경로이거나 그 위·아래 칸)을 함께 강조한다.
+  const state = rowState(row, checked);
+  // 서버 드리프트가 기준이다(서버는 기본값·목록 차례·서버가 지키는 칸을 맞춘 뒤 견준다): 같다고 한 리소스는 강조하지 않고,
+  // 다르다고 하며 칸(저장 꼴 경로 — 같은 경로이거나 그 위·아래 칸)을 알렸으면 그 칸만 강조한다. 화면 자체 비교(`covers`)는
+  // 서버가 칸을 알리지 않았을 때(아직 견주지 않은 묶음, 칸 없는 "다름"·"없음"·"관리 밖")만 쓰고, 그때 "다름"은 참고다.
   const serverPaths = row.item?.paths ?? [];
+  const byServer = state === "modified" && serverPaths.length > 0;
   const touched = (path: string) =>
     serverPaths.some(
       (p) =>
@@ -142,15 +170,18 @@ function ObjectCompare({
     );
   const rows = (row.declared === undefined ? [] : compareDeclared(row.declared, live)).map((r) => ({
     ...r,
-    differs: state !== "same" && !r.secret && (r.differs || touched(r.path)),
+    differs: !r.secret && state !== "same" && (byServer ? touched(r.path) : r.differs),
   }));
   const differ = rows.filter((r) => r.differs).length;
   const gone = state === "missing";
+  // 서버 판단이 아닌 강조(밖에서 지운 것은 서버가 없다고 했으니 모든 칸이 다른 것이 맞다)
+  const hint = differ > 0 && !byServer && !gone;
   // 서버가 다르다고 했는데 여기서 고를 칸이 없으면(이름이 다른 저장 꼴 경로) 서버 경로를 그대로 보인다
-  const serverOnly = state === "modified" && differ === 0 ? serverPaths : [];
+  const serverOnly = byServer && differ === 0 ? serverPaths : [];
+  const renamed = renamedTo(row, live);
   return (
     <details
-      open={state !== "same"}
+      open={(state !== "same" && state !== "unchecked") || differ > 0 || renamed !== undefined}
       className="rounded-md border open:pb-2"
       aria-label={t("declarative.set.compareOf", { kind, name: row.name })}
     >
@@ -160,14 +191,19 @@ function ObjectCompare({
         <StatusChip tone={TONE[state]}>{t(`declarative.state.${state}`)}</StatusChip>
         <span className="text-xs text-muted-foreground">
           {differ > 0
-            ? t("declarative.set.paths", { count: differ })
+            ? t(hint ? "declarative.set.pathsHint" : "declarative.set.paths", { count: differ })
             : state === "same" && rows.length > 0
               ? t("declarative.set.sameCount", { count: rows.length })
               : ""}
         </span>
       </summary>
       <div className="flex flex-col gap-2 px-3">
+        {renamed !== undefined && <Renamed from={row.name} to={renamed} />}
         {row.item && <ChangedBy item={row.item} />}
+        {state === "unchecked" && (
+          <p className="text-xs text-muted-foreground">{t("declarative.set.uncheckedHint")}</p>
+        )}
+        {hint && <p className="text-xs text-muted-foreground">{t("declarative.set.webHint")}</p>}
         {state === "unmanaged" && (
           <p className="text-xs text-muted-foreground">{t("declarative.set.unmanagedHint")}</p>
         )}
@@ -199,7 +235,13 @@ function ObjectCompare({
                         <FieldCell path={r.path} />
                         {r.differs && (
                           <span className="mt-0.5 inline-block rounded-sm border border-warning px-1 text-[11px] font-medium text-warning-fg">
-                            {t("declarative.set.differs")}
+                            {t(hint ? "declarative.set.differsHint" : "declarative.set.differs")}
+                          </span>
+                        )}
+                        {/* 서버는 다르다는데 두 값이 같게 보이면 가린 값(알림 대상 URL·머리 — 서버가 양쪽을 같게 가린다) */}
+                        {byServer && r.differs && sameValue(r.file, r.live) && (
+                          <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                            {t("declarative.set.masked")}
                           </span>
                         )}
                       </TableCell>
@@ -287,13 +329,15 @@ export function ApplySetPage() {
   // 실제 값: 묶음이 기억하는 리소스의 지금 매니페스트(볼 수 있는 것만) — 묶음 revision이 바뀌면 다시 읽는다
   const manifests = useQuery({
     queryKey: ["set-manifests", name, set.data?.revision],
-    queryFn: () => fetchSetManifests(name),
+    queryFn: () => fetchSetLive(name),
     enabled: set.data !== undefined,
   });
   if (set.data === undefined) {
     return <ListPending error={set.error} />;
   }
   const s = set.data;
+  // 서버가 이 묶음을 견준 적이 없으면(적용 직후 검사 전·리더가 바뀜·옛 리더) 줄은 "같음"이 아니라 "아직 비교 전"
+  const checked = s.status.drift !== undefined && s.status.drift !== null;
   const drift = new Map((s.status.drift?.items ?? []).map((d) => [d.id, d]));
   const objects: AppliedObject[] = [...(s.status.objects ?? [])].sort(
     (a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name),
@@ -333,15 +377,16 @@ export function ApplySetPage() {
   const compared = [...rows]
     .sort((a, b) => Number(b.item !== undefined) - Number(a.item !== undefined))
     .slice(0, COMPARED);
-  const documents = manifests.data ?? [];
+  const live = manifests.data ?? { documents: [] };
   const revert = t("declarative.set.revertCommand", { name: s.name });
 
   async function adopt() {
-    // "모두"는 빈 본문 — 서버가 부른 이가 보고 바꿀 수 있는 것만(밖에서 지운 것 포함) 받아들인다
+    // 확인 대화상자에 보인 것(`targets`)만 id로 보낸다 — "모두"도 빈 본문이 아니다(대화상자를 연 뒤 새로 생긴 드리프트까지
+    // 받아들이지 않게). 서버는 그 가운데 부른 이가 보고 바꿀 수 있는 것만 받아들인다.
     await call(
       api.POST("/apply-sets/{key}/adopt", {
         params: { path: { key: s.id } },
-        body: selecting ? { objects: picked.map((r) => r.id) } : {},
+        body: { objects: targets.map((r) => r.id) },
       }),
     );
     toast.success(t("declarative.set.adopted", { name: s.name }));
@@ -458,8 +503,10 @@ export function ApplySetPage() {
             </TableHeader>
             <TableBody>
               {rows.map((row) => {
-                const state: RowState = row.item?.state ?? "same";
-                const href = state === "missing" ? undefined : kindHref(row.kind, row.id, row.name);
+                const state = rowState(row, checked);
+                const now = renamedTo(row, liveOf(row as AppliedObject, live, row.item?.name));
+                const href =
+                  state === "missing" ? undefined : kindHref(row.kind, row.id, now ?? row.name);
                 return (
                   <TableRow key={row.id}>
                     {adoptable && (
@@ -482,6 +529,7 @@ export function ApplySetPage() {
                       ) : (
                         row.name
                       )}
+                      {now !== undefined && <Renamed from={row.name} to={now} />}
                     </TableCell>
                     <TableCell>
                       <StatusChip tone={TONE[state]}>{t(`declarative.state.${state}`)}</StatusChip>
@@ -511,8 +559,9 @@ export function ApplySetPage() {
           <ObjectCompare
             key={row.id}
             row={row}
-            live={liveOf(row as AppliedObject, documents)}
+            live={liveOf(row as AppliedObject, live, row.item?.name)}
             loading={manifests.data === undefined && !manifests.isError}
+            checked={checked}
           />
         ))}
       </section>

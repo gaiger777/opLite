@@ -71,7 +71,23 @@ it("finds an object's manifest by kind and name, folders by their parent too", (
     revision: 1,
     declared: folder ? { metadata: { folder } } : {},
   });
-  expect(liveOf(obj("vm"), docs)).toBe(docs[0]);
-  expect(liveOf(obj("folder", "/b"), docs)).toBe(docs[2]);
-  expect(liveOf(obj("folder", "/c"), docs)).toBeUndefined();
+  // 옛 서버(id 없음): 종류·이름으로
+  expect(liveOf(obj("vm"), { documents: docs })).toBe(docs[0]);
+  expect(liveOf(obj("folder", "/b"), { documents: docs })).toBe(docs[2]);
+  expect(liveOf(obj("folder", "/c"), { documents: docs })).toBeUndefined();
+  // 드리프트가 알린 지금 이름이 있으면 그 이름으로
+  expect(liveOf({ ...obj("vm"), name: "old" }, { documents: docs }, "web")).toBe(docs[0]);
+});
+
+it("pairs by the recorded id when the server gives ids, even if two resources swapped names", () => {
+  const a = live({ metadata: { name: "b" }, spec: { memory_mib: 1 } });
+  const b = live({ metadata: { name: "a" }, spec: { memory_mib: 2 } });
+  // 묶음은 a(id-a)·b(id-b)로 적용했다 — 밖에서 둘이 이름을 맞바꿨다
+  const set = { documents: [a, b], ids: ["id-a", "id-b"] };
+  const obj = (id: string, name: string) => ({ kind: "vm" as const, id, name, declared: {} });
+  expect(liveOf(obj("id-a", "a"), set)).toBe(a);
+  expect(liveOf(obj("id-b", "b"), set)).toBe(b);
+  expect(liveOf(obj("id-c", "a"), set)).toBeUndefined();
+  // 이름으로 짝지었다면 거꾸로 짝지었을 것
+  expect(liveOf(obj("id-a", "a"), { documents: [a, b] })).toBe(b);
 });

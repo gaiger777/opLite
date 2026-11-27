@@ -101,10 +101,17 @@ export function fetchManifest(kind: string, key: string): Promise<Manifest> {
   return call(api.GET("/manifests/{kind}/{key}", { params: { path: { kind, key } } }));
 }
 
-/** 적용 묶음이 기억하는 리소스들의 매니페스트 */
-export async function fetchSetManifests(set: string): Promise<Manifest[]> {
+/** 적용 묶음이 기억하는 리소스들의 매니페스트와 그 id(같은 차례 — 옛 서버는 id가 없다) */
+export async function fetchSetLive(
+  set: string,
+): Promise<{ documents: Manifest[]; ids?: string[] }> {
   const list = await call(api.GET("/manifests", { params: { query: { apply_set: set } } }));
-  return list.documents;
+  return { documents: list.documents, ids: list.ids };
+}
+
+/** 적용 묶음이 기억하는 리소스들의 매니페스트(YAML 내보내기) */
+export async function fetchSetManifests(set: string): Promise<Manifest[]> {
+  return (await fetchSetLive(set)).documents;
 }
 
 /** Terraform이 관리하는 객체(레이블 `orbivisor.io/managed-by=terraform`) */

@@ -129,15 +129,33 @@ export function compareDeclared(declared: unknown, live: Manifest | undefined): 
   return out;
 }
 
-/** 묶음 객체의 지금 매니페스트(종류·이름 — 폴더는 든 폴더까지 같은 것) */
-export function liveOf(obj: AppliedObject, documents: readonly Manifest[]): Manifest | undefined {
+/** 지금 리소스들: 매니페스트와 같은 차례의 id(계획 77-7 서버 — 옛 서버는 없다) */
+export interface LiveSet {
+  documents: readonly Manifest[];
+  ids?: readonly string[];
+}
+
+/**
+ * 묶음 객체의 지금 매니페스트. 서버가 id를 주면 묶음이 기록한 id로 짝짓는다(밖에서 이름을 바꾸거나 둘이 이름을 맞바꿔도
+ * 같은 리소스). 옛 서버는 종류·이름(`name` — 드리프트가 알린 지금 이름이 있으면 그것)으로, 폴더는 든 폴더까지 같은 것.
+ */
+export function liveOf(
+  obj: Pick<AppliedObject, "id" | "kind" | "name" | "declared">,
+  live: LiveSet,
+  name = obj.name,
+): Manifest | undefined {
+  const { documents, ids } = live;
+  if (ids && ids.length === documents.length) {
+    const at = ids.indexOf(obj.id);
+    return at < 0 ? undefined : documents[at];
+  }
   const kind = manifestKind(obj.kind);
   const declaredFolder = (obj.declared as { metadata?: { folder?: string } } | undefined)?.metadata
     ?.folder;
   return documents.find(
     (m) =>
       m.kind === kind &&
-      m.metadata.name === obj.name &&
+      m.metadata.name === name &&
       (kind !== "Folder" || (m.metadata.folder ?? "/") === (declaredFolder ?? "/")),
   );
 }
