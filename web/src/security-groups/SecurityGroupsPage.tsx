@@ -48,7 +48,7 @@ export function SecurityGroupsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="security-groups-title"
-        title={t("nav.securityGroups")}
+        title={t("nav.item.securityGroups")}
         help="securityGroups"
         intro={t("help.securityGroups.intro")}
         actions={

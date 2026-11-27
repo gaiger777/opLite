@@ -119,7 +119,7 @@ it("lists catalog images by architecture with downloads in progress", async () =
   });
   const arches = mockCatalog([entry(), custom]);
   renderPage(<ImagesPage />, { as: OPERATOR });
-  const table = await screen.findByRole("table", { name: "Image library" });
+  const table = await screen.findByRole("table", { name: "OS images" });
   const ubuntu = (await within(table).findByText("Ubuntu 24.04 LTS")).closest("tr")!;
   expect(ubuntu).toHaveTextContent("Built in");
   expect(ubuntu).toHaveTextContent("Publisher's checksum file");
@@ -223,7 +223,7 @@ it("explains the catalog to users without root system.read", async () => {
   );
   renderPage(<ImagesPage />, { as: { ...OPERATOR, role: "none" } });
   expect(await screen.findByText(/needs permission to read the system/)).toBeInTheDocument();
-  expect(screen.queryByRole("table", { name: "Image library" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("table", { name: "OS images" })).not.toBeInTheDocument();
   expect(asked).toBe(false);
 });
 
@@ -281,7 +281,7 @@ it("lets admins add and remove custom entries", async () => {
   );
   renderPage(<ImagesPage />);
   const user = userEvent.setup();
-  const table = await screen.findByRole("table", { name: "Image library" });
+  const table = await screen.findByRole("table", { name: "OS images" });
   const ubuntu = (await within(table).findByText("Ubuntu 24.04 LTS")).closest("tr")!;
   // 내장 항목은 지울 수 없다.
   expect(within(ubuntu).queryByRole("button", { name: /^Delete/ })).not.toBeInTheDocument();

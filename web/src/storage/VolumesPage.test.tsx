@@ -31,7 +31,7 @@ it("lists volumes with their size, state and VM", async () => {
   };
   mockLists({ volume: [volume("root", "local"), importing], vm: [web], node: [NODE] });
   renderPage(<VolumesPage />);
-  const table = await screen.findByRole("table", { name: "Volumes" });
+  const table = await screen.findByRole("table", { name: "Disks (volumes)" });
   const root = (await within(table).findByText("root")).closest("tr")!;
   expect(root).toHaveTextContent("16 GiB");
   expect(root).toHaveTextContent("1 GiB");
@@ -306,7 +306,7 @@ it("leaves ISO images out unless asked", async () => {
     node: [NODE],
   });
   renderPage(<VolumesPage />);
-  const table = await screen.findByRole("table", { name: "Volumes" });
+  const table = await screen.findByRole("table", { name: "Disks (volumes)" });
   await within(table).findByText("root");
   expect(within(table).queryByText("alpine")).not.toBeInTheDocument();
   const user = userEvent.setup();
@@ -383,7 +383,7 @@ it("shows linked clones' bases and flattens a stopped VM's disk", async () => {
     }),
   );
   renderPage(<VolumesPage />);
-  const table = await screen.findByRole("table", { name: "Volumes" });
+  const table = await screen.findByRole("table", { name: "Disks (volumes)" });
   const baseColumn = within(table)
     .getAllByRole("columnheader")
     .findIndex((h) => h.textContent === "Clone source (template)");

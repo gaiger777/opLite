@@ -273,7 +273,7 @@ export function VolumesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="volumes-title"
-        title={t("nav.volumes")}
+        title={t("nav.item.volumes")}
         help="volumes"
         intro={t("help.volumes.intro")}
         actions={

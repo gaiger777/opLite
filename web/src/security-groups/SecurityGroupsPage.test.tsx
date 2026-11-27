@@ -25,7 +25,7 @@ const web = vm("web", "running", {
 it("lists groups with their rule counts and the VMs that use them", async () => {
   mockLists({ "security-group": [ssh, securityGroup("empty")], vm: [web] });
   renderPage(<SecurityGroupsPage />);
-  const table = await screen.findByRole("table", { name: "Security groups" });
+  const table = await screen.findByRole("table", { name: "Firewall (security groups)" });
   const headers = within(table).getAllByRole("columnheader");
   const cell = (row: HTMLElement, name: string) =>
     within(row).getAllByRole("cell")[headers.findIndex((h) => h.textContent === name)];
@@ -129,7 +129,7 @@ it("counts the simple and SDN interfaces that use a group", async () => {
   };
   mockLists({ "security-group": [ssh], vm: [both], network: [tenant] });
   renderPage(<SecurityGroupsPage />);
-  const table = await screen.findByRole("table", { name: "Security groups" });
+  const table = await screen.findByRole("table", { name: "Firewall (security groups)" });
   const row = (await within(table).findByRole("link", { name: "ssh" })).closest("tr")!;
   expect(await within(row).findByText("1 simple · 1 SDN")).toBeVisible();
   // SDN 카드와의 차이(OVN ACL)는 화면 도움말 패널로 옮겼다.

@@ -80,7 +80,7 @@ export function HaChecksPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="ha-checks-title"
-        title={t("nav.haChecks")}
+        title={t("nav.item.haChecks")}
         help="haChecks"
         intro={t("help.haChecks.intro")}
         actions={

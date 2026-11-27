@@ -38,7 +38,7 @@ it("lists ISO images with their pool, node and VMs", async () => {
     ],
   });
   renderPage(<IsosPage />);
-  const table = await screen.findByRole("table", { name: "ISO images" });
+  const table = await screen.findByRole("table", { name: "ISO files" });
   // 디스크 볼륨은 보이지 않는다.
   await within(table).findByText("alpine");
   expect(within(table).queryByText("root")).not.toBeInTheDocument();

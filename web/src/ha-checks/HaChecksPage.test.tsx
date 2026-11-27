@@ -54,7 +54,7 @@ it("lists checks with their target, reaction and grace", async () => {
   mockLists({ node: NODES, "storage-pool": POOLS });
   checks(stor, lan);
   renderPage(<HaChecksPage />);
-  const table = await screen.findByRole("table", { name: "HA checks" });
+  const table = await screen.findByRole("table", { name: "Failure detection (HA checks)" });
   await within(table).findByText("stor");
   const s = cells(table, "stor");
   expect(s("What it checks")).toHaveTextContent("Shared storage connection");
@@ -269,7 +269,7 @@ it("lets only admins change checks", async () => {
   mockLists({ node: NODES, "storage-pool": POOLS });
   checks(stor);
   renderPage(<HaChecksPage />, { as: OPERATOR });
-  const table = await screen.findByRole("table", { name: "HA checks" });
+  const table = await screen.findByRole("table", { name: "Failure detection (HA checks)" });
   await within(table).findByText("stor");
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Edit HA check stor" })).not.toBeInTheDocument();

@@ -33,7 +33,7 @@ it("lists tasks newest first and filters failures", async () => {
   expect(rows[2]).toHaveTextContent("node-a");
   expect(rows[2]).toHaveTextContent("no firmware");
 
-  expect(screen.getByRole("table", { name: "Tasks" })).toBeInTheDocument();
+  expect(screen.getByRole("table", { name: "Task history" })).toBeInTheDocument();
   expect(rows[2]!.querySelector("time")).toHaveAttribute("datetime", "2025-10-23T04:03:37.104Z");
 
   await userEvent.click(screen.getByLabelText("Failed only"));

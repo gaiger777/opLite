@@ -64,7 +64,7 @@ export function IsosPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="isos-title"
-        title={t("nav.isos")}
+        title={t("nav.item.isos")}
         help="isos"
         intro={t("help.isos.intro")}
         actions={

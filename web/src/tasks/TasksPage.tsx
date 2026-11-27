@@ -250,7 +250,7 @@ export function TasksPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="tasks-title"
-        title={t("nav.tasks")}
+        title={t("nav.item.tasks")}
         help="tasks"
         intro={t("help.tasks.intro")}
         actions={

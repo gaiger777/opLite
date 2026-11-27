@@ -59,7 +59,7 @@ export function HaGroupsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="ha-groups-title"
-        title={t("nav.haGroups")}
+        title={t("nav.item.haGroups")}
         help="haGroups"
         intro={t("haGroups.pageHint")}
         actions={

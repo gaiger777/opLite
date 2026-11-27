@@ -63,7 +63,7 @@ export function ImagesPage() {
   if (!readable) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.images")} help="images" intro={t("help.images.intro")} />
+        <PageHeader title={t("nav.item.images")} help="images" intro={t("help.images.intro")} />
         <p className="text-sm text-muted-foreground">{t("images.needsRead")}</p>
       </div>
     );
@@ -73,7 +73,7 @@ export function ImagesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="images-title"
-        title={t("nav.images")}
+        title={t("nav.item.images")}
         help="images"
         intro={t("help.images.intro")}
         actions={
