@@ -44,11 +44,18 @@ export function Breadcrumbs() {
             key={i}
             className={cn(
               "flex min-w-0 items-center gap-1",
-              i < crumbs.length - 2 && "hidden md:flex",
+              // 휴대폰은 지금 화면 이름 하나만(계획 77-6 — "Settin… › Gene…"처럼 둘 다 잘리던 것)
+              i < crumbs.length - 1 && "hidden md:flex",
             )}
           >
             {i > 0 && (
-              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+              <ChevronRight
+                className={cn(
+                  "size-3.5 shrink-0 text-muted-foreground",
+                  i === crumbs.length - 1 && "max-md:hidden",
+                )}
+                aria-hidden
+              />
             )}
             {crumb.to ? (
               <Link

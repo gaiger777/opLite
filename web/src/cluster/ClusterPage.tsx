@@ -10,6 +10,7 @@ import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { usePermissions } from "@/auth/usePermissions";
 import { CopyButton } from "@/components/CopyButton";
+import { DataTable } from "@/components/data-table/DataTable";
 import { Diagram } from "@/help/Diagram";
 import { ClusterCpuSection } from "@/cpu/ClusterCpuSection";
 import { Field } from "@/components/Field";
@@ -29,14 +30,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
 
@@ -120,44 +113,73 @@ export function ClusterPage() {
         <h2 id="cluster-members" className="font-medium">
           {t("cluster.members")}
         </h2>
-        <Table aria-labelledby="cluster-members">
-          <TableHeader>
-            <TableRow>
-              <TableHead>{t("common.name")}</TableHead>
-              <TableHead>{t("common.state")}</TableHead>
-              <TableHead>{t("cluster.role")}</TableHead>
-              <TableHead>{t("nodes.fencing")}</TableHead>
-              <TableHead>{t("nodes.address")}</TableHead>
-              <TableHead>{t("cluster.clusterAddress")}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {members.map((m) => (
-              <TableRow key={m.id}>
-                <TableCell className="font-medium">
+        {/* 휴대폰은 카드(주소들은 "자세히"), 넓은 화면은 표(계획 77-6 — 390px에서 표가 화면 밖으로 넘치던 것) */}
+        <DataTable
+          id="cluster-members"
+          rows={members}
+          rowId={(m) => m.id}
+          rowName={(m) => m.name ?? m.id.slice(-8)}
+          labelledBy="cluster-members"
+          empty="—"
+          columns={[
+            {
+              id: "name",
+              header: t("common.name"),
+              className: "font-medium",
+              cell: (m) => (
+                <>
                   {m.name ?? m.id.slice(-8)}
                   {m.id === here && (
                     <span className="ml-2 text-xs text-muted-foreground">
                       {t("nodes.thisNode")}
                     </span>
                   )}
-                </TableCell>
-                <TableCell>
-                  <Badge variant={m.online ? "default" : "destructive"}>
-                    {t(m.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
-                  </Badge>
-                </TableCell>
-                <TableCell>
+                </>
+              ),
+            },
+            {
+              id: "state",
+              header: t("common.state"),
+              cell: (m) => (
+                <Badge variant={m.online ? "default" : "destructive"}>
+                  {t(m.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
+                </Badge>
+              ),
+            },
+            {
+              id: "role",
+              header: t("cluster.role"),
+              cell: (m) => (
+                <>
                   {m.id === leader ? t("cluster.leader") : t(`cluster.${m.role}`)}
                   {m.witness && (
                     <Badge variant="outline" className="ml-2">
                       {t("dashboard.witness")}
                     </Badge>
                   )}
-                </TableCell>
-                <TableCell>{m.fencing ? t(`nodes.fencingMode.${m.fencing}`) : "—"}</TableCell>
-                <TableCell className="font-mono text-xs">{m.address ?? "—"}</TableCell>
-                <TableCell className="font-mono text-xs">
+                </>
+              ),
+            },
+            {
+              id: "fencing",
+              header: t("nodes.fencing"),
+              priority: 2,
+              cell: (m) => (m.fencing ? t(`nodes.fencingMode.${m.fencing}`) : "—"),
+            },
+            {
+              id: "address",
+              header: t("nodes.address"),
+              priority: 2,
+              className: "font-mono text-xs",
+              cell: (m) => m.address ?? "—",
+            },
+            {
+              id: "cluster-address",
+              header: t("cluster.clusterAddress"),
+              priority: 2,
+              className: "font-mono text-xs",
+              cell: (m) => (
+                <>
                   {m.cluster_address}
                   {/* 둘째 링크부터(넘어갈 링크)는 우선 링크 아래 작게 */}
                   {m.cluster_addresses.slice(1).map((link) => (
@@ -165,14 +187,16 @@ export function ClusterPage() {
                       {link}
                     </div>
                   ))}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+                </>
+              ),
+            },
+          ]}
+        />
         <div className="flex flex-wrap items-center gap-4">
           <Diagram id="quorum" className="w-full max-w-xs" />
-          <p className="min-w-0 flex-1 text-sm text-muted-foreground">{t("cluster.membersNote")}</p>
+          <p className="min-w-0 flex-1 basis-60 text-sm text-muted-foreground">
+            {t("cluster.membersNote")}
+          </p>
         </div>
       </section>
       <ClusterCpuSection />
