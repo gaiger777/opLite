@@ -226,11 +226,11 @@ it("refuses linked clones a disk cannot have and stops after a refused deploy", 
 
 it("shows templates in the VM list and blocks starting them", async () => {
   mockLists({ vm: [tmpl, web1], volume: [root], node: [NODE] });
-  renderPage(<VmListPage />);
+  // "템플릿만 보기" 단추는 뺐다(계획 77-6, 템플릿 화면이 따로) — 주소 거름은 그대로다.
+  renderPage(<VmListPage />, { url: "/?template=1" });
   const row = (await screen.findByRole("link", { name: "tmpl" })).closest("tr")!;
   expect(within(row).getByText("Template")).toBeInTheDocument();
   const user = userEvent.setup();
-  await user.click(screen.getByRole("button", { name: "Templates only" }));
   expect(screen.queryByRole("link", { name: "web-1" })).not.toBeInTheDocument();
   await user.click(within(row).getByRole("button", { name: "Actions for tmpl" }));
   expect(await screen.findByRole("menuitem", { name: /^Start/ })).toHaveAccessibleDescription(
