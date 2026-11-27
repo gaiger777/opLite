@@ -926,9 +926,30 @@ async fn migrates_a_vm_with_local_disks() {
     .await;
     drop(blocked);
 
-    // 포트가 풀리면 옮긴다. 확정 뒤 원본 파일을 지운다.
-    let (out, progress) =
-        watch_progress(c, d.ctl(&["vm", "migrate", "web", "node2", "--pool", "b"])).await;
+    // 포트가 풀리면 옮긴다. 확정 뒤 원본 파일을 지운다. 두 포트가 실제로 bind 될 때까지 기다린다 — 리눅스의
+    // 임시 포트 범위(32768-60999) 안이라 다른 연결이 잠깐 쥘 수 있다. 그 사이에 또 잡혀 같은 오류면 몇 번만
+    // 다시 한다(받는 QEMU가 치워진 뒤에).
+    let ports_free = || (60230..=60231).all(|port| TcpListener::bind(("127.0.0.1", port)).is_ok());
+    let mut retries = 0;
+    let (out, progress) = loop {
+        eventually("migration ports 60230-60231 free", || async {
+            ports_free()
+        })
+        .await;
+        let (out, progress) =
+            watch_progress(c, d.ctl(&["vm", "migrate", "web", "node2", "--pool", "b"])).await;
+        match &out {
+            Err(err) if retries < 3 && err.to_string().contains("no free migration port") => {
+                retries += 1;
+                eventually("receiving QEMU discarded and records removed", || async {
+                    !process_with(&vm_run_dir(&p.d[1], &id))
+                        && p.d.iter().all(|d| disk_records(d) == 0)
+                })
+                .await;
+            }
+            _ => break (out, progress),
+        }
+    };
     assert_eq!(out.unwrap(), "vm web: migrated to node2\n");
     let stages: Vec<&str> = progress
         .iter()
