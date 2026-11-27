@@ -80,6 +80,18 @@ it("shows the tabs of the current area as links", async () => {
   ]);
 });
 
+it("keeps the tab row from overflowing its scroll box (no scrollbar beside the tabs)", async () => {
+  shell("/nodes");
+  const tabs = await screen.findByRole("navigation", { name: "Infrastructure menu" });
+  // 가로로 넘기는 상자(overflow-x auto는 세로도 auto)에 테두리를 두고 탭을 -1px로 겹치면 1px 넘쳐 세로 스크롤바가 생겼다.
+  // 밑줄은 목록 안쪽 그림자이고, 상자 밖으로 내미는 음수 여백이 없다.
+  expect(tabs).toHaveClass("overflow-x-auto");
+  expect(tabs.className).not.toMatch(/\bborder-b\b/);
+  for (const link of within(tabs).getAllByRole("link")) {
+    expect(link.className).not.toMatch(/(^|\s)-m[by]?-/);
+  }
+});
+
 it("switches views inside a tab", async () => {
   shell("/cluster");
   const views = await screen.findByRole("navigation", { name: "Nodes views" });

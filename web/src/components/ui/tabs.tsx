@@ -21,8 +21,11 @@ function Tabs({
   )
 }
 
+// 가로 탭 목록은 화면보다 넓으면 문서가 아니라 목록만 가로로 넘긴다(휴대폰 폭의 VM 상세 탭 열 개가 문서를 넓혀 가로
+// 스크롤이 생겼다). 세로는 숨긴다 — 트리거의 밑줄(::after, bottom -5px)이 1~2px 넘쳐 세로 스크롤바가 생기지 않게. 넘칠 때
+// 왼쪽이 잘리지 않게 가운데가 아니라 처음부터 놓는다(트리거가 flex-1이라 넘치지 않을 때는 같다).
 const tabsListVariants = cva(
-  "group/tabs-list inline-flex w-fit items-center justify-center rounded-lg p-[3px] text-muted-foreground group-data-horizontal/tabs:h-8 group-data-vertical/tabs:h-fit group-data-vertical/tabs:flex-col data-[variant=line]:rounded-none",
+  "group/tabs-list inline-flex w-fit max-w-full items-center justify-start rounded-lg p-[3px] text-muted-foreground group-data-horizontal/tabs:h-8 group-data-horizontal/tabs:overflow-x-auto group-data-horizontal/tabs:overflow-y-hidden group-data-vertical/tabs:h-fit group-data-vertical/tabs:flex-col data-[variant=line]:rounded-none",
   {
     variants: {
       variant: {

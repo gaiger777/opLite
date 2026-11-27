@@ -8,6 +8,8 @@ import { areaOf, tabHome, viewVisible, visibleTabs } from "@/layout/nav";
 /**
  * 영역 탭: 본문 위의 링크 목록이다. 경로가 바뀌므로 `role=tablist`가 아니라 `<nav>`이고 지금 탭은
  * `aria-current="page"`다. 좁은 화면에서는 가로로 스크롤한다. 보이는 탭이 하나뿐이면 그리지 않는다.
+ * 밑줄은 `<nav>`의 테두리가 아니라 목록 안쪽 그림자다: 스크롤 상자(`overflow-x-auto`는 세로도 auto)에서 탭이 `-mb-px`로
+ * 테두리에 겹치면 1px 넘쳐 탭 줄 옆에 세로 스크롤바가 생겼다.
  */
 export function AreaTabs() {
   const { t } = useTranslation();
@@ -24,16 +26,16 @@ export function AreaTabs() {
   return (
     <nav
       aria-label={t("nav.areaMenu", { area: t(hit.area.key) })}
-      className="-mx-1 overflow-x-auto border-b"
+      className="-mx-1 overflow-x-auto"
     >
-      <ul className="flex min-w-max gap-1 px-1">
+      <ul className="flex min-w-max gap-1 px-1 shadow-[inset_0_-1px_0_var(--color-border)]">
         {tabs.map((tab) => (
           <li key={tab.to}>
             <Link
               to={tabHome(tab, gate)}
               aria-current={tab === hit.tab ? "page" : undefined}
               className={cn(
-                "-mb-px flex h-10 items-center border-b-2 border-transparent px-3 text-sm whitespace-nowrap text-muted-foreground hover:text-foreground",
+                "flex h-10 items-center border-b-2 border-transparent px-3 text-sm whitespace-nowrap text-muted-foreground hover:text-foreground",
                 "aria-[current=page]:border-brand aria-[current=page]:font-medium aria-[current=page]:text-foreground",
               )}
             >

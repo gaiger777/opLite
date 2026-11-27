@@ -18,6 +18,7 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { expectNoAxeViolations } from "@/test/axe";
@@ -219,4 +220,28 @@ describe("expectNoAxeViolations", () => {
     );
     await expect(expectNoAxeViolations(container)).rejects.toThrow(/button-name/);
   });
+});
+
+it("scrolls a wide tab list by itself instead of widening the page, without a vertical scrollbar", () => {
+  render(
+    <Tabs defaultValue="a">
+      <TabsList>
+        {["a", "b", "c"].map((v) => (
+          <TabsTrigger key={v} value={v}>
+            {v}
+          </TabsTrigger>
+        ))}
+      </TabsList>
+    </Tabs>,
+  );
+  const list = screen.getByRole("tablist");
+  // 휴대폰 폭의 VM 상세 탭이 문서를 넓혀 가로 스크롤이 생겼고, 트리거 밑줄(::after)이 넘쳐 세로 스크롤바가 생길 수 있었다
+  expect(list).toHaveClass(
+    "max-w-full",
+    "group-data-horizontal/tabs:overflow-x-auto",
+    "group-data-horizontal/tabs:overflow-y-hidden",
+  );
+  // 넘칠 때 왼쪽이 잘리지 않게 처음부터 놓는다
+  expect(list).toHaveClass("justify-start");
+  expect(list).not.toHaveClass("justify-center");
 });
