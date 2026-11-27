@@ -370,7 +370,8 @@ async fn failed_downloads_leave_nothing_behind() {
         task["status"]["failure"]["params"]["url"],
         format!("{base}/missing.iso")
     );
-    assert_eq!(task["status"]["failure"]["retryable"], true);
+    // 404는 다시 받아도 같다(주소를 고친 뒤 다시 — 계획 77-2 리뷰).
+    assert_eq!(task["status"]["failure"].get("retryable"), None);
     assert_cleaned(&env, &admin, "gone").await;
 
     let wrong = "0".repeat(64);

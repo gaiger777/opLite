@@ -249,7 +249,7 @@ async fn removed_node_tasks_fail_at_once() {
     janitor.shutdown().await;
     // 목록에 없는 노드는 id로(계획 77-2)
     let failure = get_task(&env, pending.id).status.failure.unwrap();
-    assert_eq!(failure.code, "node_not_member");
+    assert_eq!(failure.code, "node_removed");
     assert_eq!(failure.params["node"], gone.to_string());
 }
 

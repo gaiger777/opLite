@@ -65,17 +65,16 @@ pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
                 format!("storage pool {name:?} not found"),
             )
         })?;
-    let not_ready = || {
-        TaskFailure::new(code::POOL_NOT_READY)
-            .param("pool", name)
-            .param(
-                "node",
-                super::failure::node_name(&ctx.cluster, ctx.config.node),
-            )
+    // 풀의 노드 목록에 없음(설정)과 그 노드에서 준비 안 됨(마운트 등 — 돌아올 수 있음)은 해결이 다르다.
+    let failure = |code: &str| {
+        TaskFailure::new(code).param("pool", name).param(
+            "node",
+            super::failure::node_name(&ctx.cluster, ctx.config.node),
+        )
     };
     if !pool_listed_on(&pool, ctx.config.node) {
         return Err(coded(
-            not_ready(),
+            failure(code::POOL_NOT_ON_NODE),
             format!("storage pool {name:?} is not available on this node"),
         ));
     }
@@ -86,7 +85,7 @@ pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
         .ok_or("this node is not registered")?;
     if !pool_usable_on(&pool, &me) {
         return Err(coded(
-            not_ready(),
+            failure(code::POOL_NOT_READY),
             format!(
                 "storage pool {name:?} is not ready on this node: {}",
                 pool_error_on(&pool, &me)
@@ -94,6 +93,18 @@ pub(super) fn ready_pool(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
         ));
     }
     Ok(pool)
+}
+
+/// 백업 풀 `pool`의 백업 디렉터리에 쓰다 공간이 바닥났으면 그 풀로 안내하는 원인 코드를 단다(리뷰 I2).
+fn backup_pool_full(ctx: &Ctx, pool: &StoragePool, e: String) -> String {
+    super::failure::if_no_space(e, || {
+        TaskFailure::new(code::BACKUP_POOL_FULL)
+            .param("pool", &pool.name)
+            .param(
+                "node",
+                super::failure::node_name(&ctx.cluster, ctx.config.node),
+            )
+    })
 }
 
 /// 백업 풀 `name`과 이 노드에서 그 풀의 루트. 풀이 이 노드에서 준비되지 않았으면 오류다.
@@ -421,7 +432,7 @@ async fn full_disks(
     disks: &[(Volume, StoragePool)],
     id: Uuid,
     bitmap: Option<&str>,
-    dir: &Path,
+    (dir, backup_pool): (&Path, &StoragePool),
 ) -> Result<(Vec<BackupDisk>, u64, Quiesced), String> {
     use super::snapshot::resume_vm;
     let running = vm.status.phase == VmPhase::Running;
@@ -451,8 +462,11 @@ async fn full_disks(
         Ok(()) => Ok(()),
     };
     let created_at = now_secs();
+    // 임시 스냅샷은 VM 디스크의 풀에 생기므로 공간 없음은 내보내기(백업 풀에 쓰기)에서만 백업 풀 탓이다.
     let exported = match &resumed {
-        Ok(()) => export_disks(ctx, disks, tagged.then_some(&*tag), tagged, dir).await,
+        Ok(()) => export_disks(ctx, disks, tagged.then_some(&*tag), tagged, dir)
+            .await
+            .map_err(|e| backup_pool_full(ctx, backup_pool, e)),
         Err(e) => Err(e.clone()),
     };
     // 임시 스냅샷은 결과와 상관없이 지운다. 남으면 공간만 쓴다(블록 디스크는 태그 청소가 지운다).
@@ -680,10 +694,13 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<Option<St
         }
         let vars = dir.join(VARS_FILE);
         let (disks, created_at, quiesced) = match &plan {
-            Plan::Incremental(p) => incremental_disks(ctx, &vm, p, &bitmap, &dir).await?,
+            // 증분은 VM 디스크에 쓰지 않는다(빈 대상 파일·바뀐 블록·펌웨어 모두 백업 디렉터리에).
+            Plan::Incremental(p) => incremental_disks(ctx, &vm, p, &bitmap, &dir)
+                .await
+                .map_err(|e| backup_pool_full(ctx, &pool, e))?,
             Plan::Full(_) => {
                 let bitmap = bitmaps.then_some(bitmap.as_str());
-                full_disks(ctx, &vm, &disks, id, bitmap, &dir).await?
+                full_disks(ctx, &vm, &disks, id, bitmap, (&dir, &pool)).await?
             }
         };
         let uefi_vars = tokio::fs::try_exists(&vars).await.unwrap_or(false);

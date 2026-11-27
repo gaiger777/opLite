@@ -270,9 +270,14 @@ async fn get(ctx: &Ctx, client: &reqwest::Client, url: &str) -> Result<reqwest::
         .await
         .map_err(|e| failed(&shown, e))?;
     if !response.status().is_success() {
+        // 4xx(없는 파일·권한)는 다시 받아도 같다 — 주소를 고친 뒤 다시 한다.
+        let status = response.status();
         return Err(coded(
-            TaskFailure::new(code::DOWNLOAD_FAILED).param("url", &shown),
-            format!("GET {shown}: HTTP {}", response.status()),
+            TaskFailure {
+                retryable: !status.is_client_error(),
+                ..TaskFailure::new(code::DOWNLOAD_FAILED).param("url", &shown)
+            },
+            format!("GET {shown}: HTTP {status}"),
         ));
     }
     Ok(response)
@@ -324,10 +329,19 @@ async fn fetch(
     let shown = redact_url(url);
     let mut response = get(ctx, client, url).await?;
     let total = response.content_length().unwrap_or(0);
+    // 받는 곳은 풀이 아니라 이 노드의 업로드 디렉터리다(리뷰 I3) — 그 노드·경로로 안내한다.
+    let full = || {
+        TaskFailure::new(code::UPLOAD_DIR_FULL)
+            .param(
+                "node",
+                super::failure::node_name(&ctx.cluster, ctx.config.node),
+            )
+            .param("dir", dir.display())
+    };
     if total > 0 {
         check_space(dir, total, || {
             coded(
-                TaskFailure::new(code::STORAGE_FULL).param("need_bytes", total),
+                full().param("need_bytes", total),
                 format!("not enough free space for a {total}-byte download"),
             )
         })?;
@@ -335,18 +349,20 @@ async fn fetch(
     let mut out = tokio::fs::File::create(file)
         .await
         .map_err(|e| e.to_string())?;
+    // 크기를 알리지 않은 받기는 쓰다가 공간이 바닥날 수 있다(필요한 크기는 모른다).
+    let write_failed = |e: std::io::Error| super::failure::if_no_space(e.to_string(), full);
     let mut hash = algorithm.hasher();
     let mut done = 0u64;
     let mut next_check = SPACE_CHECK_BYTES;
     let mut shown_at = Instant::now();
     while let Some(chunk) = response.chunk().await.map_err(|e| failed(&shown, e))? {
-        out.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        out.write_all(&chunk).await.map_err(write_failed)?;
         hash.update(&chunk);
         done += chunk.len() as u64;
         if let Some(need) = space_to_check(total, done, next_check) {
             check_space(dir, need, || {
                 coded(
-                    TaskFailure::new(code::STORAGE_FULL).param("need_bytes", need),
+                    full().param("need_bytes", need),
                     format!("not enough free space to go on with the download after {done} bytes"),
                 )
             })?;
@@ -363,7 +379,7 @@ async fn fetch(
             shown_at = Instant::now();
         }
     }
-    out.sync_all().await.map_err(|e| e.to_string())?;
+    out.sync_all().await.map_err(write_failed)?;
     Ok((done, hex::encode(hash.finalize())))
 }
 

@@ -25,7 +25,7 @@ use super::plan::{Step, StoredPlan};
 use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::tasks::failure::coded;
+use crate::tasks::failure::{coded, coded_over};
 use orbivisor_types::task_failure::{TaskFailure, code};
 
 /// 쓰기가 만든 Task를 다시 보는 간격
@@ -190,13 +190,15 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
                     step.kind.as_str(),
                     step.name
                 );
-                // 계획을 만든 뒤 대상이 바뀌었으면 충돌, 그 밖은 단계 실패(서버 오류 코드는 `cause`) — 계획 77-2
+                // 계획을 만든 뒤 대상이 바뀌었으면 충돌, 그 밖은 단계 실패(서버 오류 코드는 `cause`) — 계획 77-2.
+                // 처리기가 안에서 단 코드(예: 저장소에 닿지 않음)는 버린다: 단계·항목을 잃고, 만들다 실패한 항목은 아직
+                // 화면에 없다(리뷰 I6).
                 let why = if e.code == "revision_mismatch" {
                     code::APPLY_CONFLICT
                 } else {
                     code::APPLY_STEP_FAILED
                 };
-                failure = Some(coded(
+                failure = Some(coded_over(
                     TaskFailure::new(why)
                         .param("step", format!("{done}/{total}"))
                         .param("action", verb(step.action))

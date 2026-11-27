@@ -440,10 +440,9 @@ async fn send(
         disks: disks.clone(),
     };
     let reply = peers.migrate_incoming(addr, req).await.map_err(|e| {
+        let e = e.to_string();
         coded(
-            TaskFailure::new(code::MIGRATION_TARGET_REFUSED)
-                .param("vm", &vm.name)
-                .param("node", node_name(&ctx.cluster, migration.node)),
+            target_failure(&vm.name, node_name(&ctx.cluster, migration.node), &e),
             format!("the target node cannot receive the VM: {e}"),
         )
     })?;
@@ -458,8 +457,9 @@ async fn send(
         let nbd = reply
             .nbd_port
             .ok_or("the target node did not export the disks to copy")?;
-        let (copied, catch_up) =
-            copy_disks(ctx, vm, migration, host, nbd, &disks, &reply.refused).await?;
+        let (copied, catch_up) = copy_disks(ctx, vm, migration, host, nbd, &disks, &reply.refused)
+            .await
+            .map_err(|e| source_tls(ctx, e))?;
         (Some(copied), catch_up)
     };
     let target = MigrateTarget {
@@ -481,7 +481,7 @@ async fn send(
     ctx.hv
         .migrate(id, &target, &opts)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| source_tls(ctx, e.to_string()))?;
     let incoming = IncomingMigration {
         vm: id,
         task: migration.task,
@@ -491,6 +491,45 @@ async fn send(
         .await
         .map_err(|e| format!("the target node did not receive the VM: {e}"))?;
     Ok(reply.host_placement)
+}
+
+/// QEMU가 TLS 없이 만들어졌을 때 tls-creds 객체를 만들면 내는 원문
+const QEMU_NO_TLS: &str = "TLS credentials support requires";
+
+/// 보내는 쪽(이 노드) QEMU가 TLS를 지원하지 않아 실패했으면 원인 코드를 단다(계획 77-2 리뷰 I2 — 마이그레이션에서만).
+fn source_tls(ctx: &Ctx, e: String) -> String {
+    if !e.contains(QEMU_NO_TLS) {
+        return e;
+    }
+    coded(
+        TaskFailure::new(code::MIGRATION_TLS_MISSING)
+            .param("node", node_name(&ctx.cluster, ctx.config.node)),
+        e,
+    )
+}
+
+/// 받는 노드(`node`)가 받을 준비를 하지 못한 원인: 그 QEMU의 TLS 없음, 받는 포트가 모두 쓰는 중, 받는 주소에서 열지
+/// 못함, 그 밖(까닭은 원문). `e`는 받는 노드가 돌려준 오류다.
+fn target_failure(vm: &str, node: String, e: &str) -> TaskFailure {
+    use orbivisor_driver::migration::{CANNOT_LISTEN_FOR_MIGRATION, NO_FREE_MIGRATION_PORT};
+    let after = |head: &str| e.find(head).map(|i| &e[i + head.len()..]);
+    if e.contains(QEMU_NO_TLS) {
+        TaskFailure::new(code::MIGRATION_TARGET_TLS_MISSING).param("node", node)
+    } else if let Some(rest) = after(NO_FREE_MIGRATION_PORT) {
+        let ports = rest.split(' ').next().unwrap_or_default();
+        TaskFailure::new(code::MIGRATION_NO_PORT)
+            .param("node", node)
+            .param("ports", ports)
+    } else if let Some(rest) = after(CANNOT_LISTEN_FOR_MIGRATION) {
+        let host = rest.find(": ").map_or(rest, |i| &rest[..i]);
+        TaskFailure::new(code::MIGRATION_LISTEN_FAILED)
+            .param("node", node)
+            .param("host", host)
+    } else {
+        TaskFailure::new(code::MIGRATION_TARGET_REFUSED)
+            .param("vm", vm)
+            .param("node", node)
+    }
 }
 
 /// 복사할 디스크의 원본(풀·id·형식)을 이 노드의 기록 파일(`source`)에 쓰고, 대상 풀마다 할당량의 합이
@@ -1373,5 +1412,31 @@ mod tests {
         assert_eq!(addr_host("[fd00::2]:7443"), Some("fd00::2"));
         assert_eq!(addr_host("10.0.0.2"), None);
         assert_eq!(addr_host(":7443"), None);
+    }
+
+    /// 받는 노드의 오류에서 원인을 고른다(계획 77-2 리뷰 I2): TLS 없음·포트 모두 씀·주소에서 못 엶·그 밖
+    #[test]
+    fn target_failures() {
+        use super::target_failure;
+        use orbivisor_types::task_failure::code;
+        let f = |e: &str| target_failure("web", "svc02".into(), e);
+        let tls = f(
+            "HTTP 500: migration failed: QMP command failed: GenericError: TLS credentials support requires GNUTLS",
+        );
+        assert_eq!(tls.code, code::MIGRATION_TARGET_TLS_MISSING);
+        assert_eq!(tls.params["node"], "svc02");
+        let busy = f("migration failed: no free migration port in 60000-60099 on 0.0.0.0");
+        assert_eq!(busy.code, code::MIGRATION_NO_PORT);
+        assert_eq!(busy.params["ports"], "60000-60099");
+        let bind = f(
+            "migration failed: cannot listen for migrations on fd00::2: Cannot assign requested address (os error 49)",
+        );
+        assert_eq!(bind.code, code::MIGRATION_LISTEN_FAILED);
+        assert_eq!(bind.params["host"], "fd00::2");
+        assert!(!bind.retryable);
+        let other = f("pool \"x\" not found");
+        assert_eq!(other.code, code::MIGRATION_TARGET_REFUSED);
+        assert_eq!(other.params["vm"], "web");
+        assert!(!other.retryable);
     }
 }

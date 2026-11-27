@@ -1029,7 +1029,7 @@ async fn fail(
     slot: Option<&failure::Slot>,
 ) {
     // 남은 일을 덧붙이기 전의 원문으로 원인을 고른다(시간 초과·중단은 머리로 안다).
-    let cause = failure::resolve(&error, slot);
+    let cause = failure::resolve(&error, slot, unfinished);
     let error = if unfinished {
         unfinished_error(ctx, task, error).await
     } else {
@@ -1458,6 +1458,25 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
 
 /// VM을 켰다: 원하는 상태와 실제 상태가 모두 running. reconciler가 포기해 원하는 상태를
 /// stopped로 바꿨으면 실패다. 이전 실행의 Failed status는 원하는 상태가 running인 동안 무시한다.
+/// reconciler가 켜지 못하고 남긴 `last_error`의 원인 코드(계획 77-2 리뷰 I1). 머리로 확실히 아는 것만: QEMU가 켜자마자
+/// 끝남, 방화벽(nftables) 없음, 방화벽 규칙을 넣지 못함. CPU·NUMA 배치 불가·복제본 승격 불가·swtpm·vCPU 고정 등은 원문이
+/// 까닭을 말하므로 코드를 달지 않는다.
+fn start_failure(error: &str) -> Option<&'static str> {
+    use orbivisor_reconciler::{
+        FIREWALL_FAILED, NO_FIREWALL, QEMU_START_FAILED, START_FAILED_NOT_QEMU,
+    };
+    if error == NO_FIREWALL {
+        Some(code::VM_NO_FIREWALL)
+    } else if error.starts_with(FIREWALL_FAILED) {
+        Some(code::VM_FIREWALL_FAILED)
+    } else if let Some(rest) = error.strip_prefix(QEMU_START_FAILED) {
+        (!START_FAILED_NOT_QEMU.iter().any(|p| rest.starts_with(p)))
+            .then_some(code::QEMU_START_FAILED)
+    } else {
+        None
+    }
+}
+
 fn started(vm: &Vm) -> Option<Result<(), String>> {
     match (vm.spec.power, vm.status.phase) {
         (PowerState::Running, VmPhase::Running) => Some(Ok(())),
@@ -1467,14 +1486,9 @@ fn started(vm: &Vm) -> Option<Result<(), String>> {
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "VM was stopped".into());
-            // reconciler가 켜지 못하고 포기했다(`failed to start: QEMU failed to start: …`).
-            Some(Err(if error.starts_with("failed to start") {
-                coded(
-                    TaskFailure::new(code::QEMU_START_FAILED).param("vm", &vm.name),
-                    error,
-                )
-            } else {
-                error
+            Some(Err(match start_failure(&error) {
+                Some(code) => coded(TaskFailure::new(code).param("vm", &vm.name), error),
+                None => error,
             }))
         }
         _ => None,
@@ -1691,16 +1705,24 @@ async fn import_volume(
         .check_import_source(source, source_format)
         .await
         .map_err(|e| match e {
-            // 기술자만 있는 VMDK, 기반 파일·외부 데이터 파일이 있는 qcow2(계획 77-2)
-            DriverError::InvalidSpec(_) => {
+            // 기술자만 있는 VMDK, 다른 파일을 가리키는 이미지(-flat·extent), 기반 파일·외부 데이터 파일이 있는 qcow2
+            // (계획 77-2). 경로 검사(`path …`)는 이미지 탓이 아니다.
+            DriverError::InvalidSpec(ref m) if !m.starts_with("path ") => {
                 coded(TaskFailure::new(code::IMAGE_UNSUPPORTED), e.to_string())
             }
             e => e.to_string(),
         })?;
+    // 풀에 쓰다 공간이 바닥나면 그 풀로 안내한다(리뷰 I2 — 원문만으로는 어느 디스크인지 모른다).
     ctx.storage
         .import_volume(&pool, id, source, source_format, volume.spec.format)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            failure::if_no_space(e.to_string(), || {
+                TaskFailure::new(code::POOL_OUT_OF_SPACE)
+                    .param("pool", &pool.name)
+                    .param("node", failure::node_name(&ctx.cluster, ctx.config.node))
+            })
+        })?;
     let _ = tokio::fs::remove_file(source).await;
     mark_ready(ctx, &volume, &pool).await;
     Ok(())
@@ -2158,6 +2180,37 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
 mod tests {
     use super::*;
     use orbivisor_types::node::{FEATURES, Node, NodeSpec, NodeStatus};
+
+    /// 켜기 실패의 원인은 reconciler가 남긴 머리로만 고른다(계획 77-2 리뷰 I1, 문구는 reconciler 시험과 같은 것).
+    #[test]
+    fn start_failures_by_their_head() {
+        let f = start_failure;
+        assert_eq!(
+            f(
+                "failed to start: QEMU failed to start: qemu-system-x86_64: -drive file=/x: Could not open"
+            ),
+            Some(code::QEMU_START_FAILED)
+        );
+        assert_eq!(
+            f("failed to start: firewall: this node has no firewall (nftables)"),
+            Some(code::VM_NO_FIREWALL)
+        );
+        assert_eq!(
+            f("failed to start: firewall: nft: boom; gave up after 3 failures"),
+            Some(code::VM_FIREWALL_FAILED)
+        );
+        for raw in [
+            "failed to start: the VM's node has no CPU catalog; only the host and max CPU models can run there",
+            "failed to start: the VM's node has 100 free 2M hugepages on host NUMA node 0; the VM needs 128 on one",
+            "failed to start: disk \"root\" has no complete replica on node \"node-b\"",
+            "failed to start: QEMU failed to start: swtpm_setup: boom",
+            "failed to start: QEMU failed to start: cannot pin vCPU 3 to CPU 7: EINVAL",
+            "failed to start: timed out waiting for QEMU to start; gave up after 3 failures",
+            "VM crashed; gave up after 3 failures",
+        ] {
+            assert_eq!(f(raw), None, "{raw}");
+        }
+    }
 
     /// 노드 하나짜리 클러스터
     async fn one_node_cluster(dir: &std::path::Path) -> Cluster {

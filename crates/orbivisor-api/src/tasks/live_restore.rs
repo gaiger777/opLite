@@ -347,7 +347,7 @@ async fn ensure_source(ctx: &Ctx, backup: &Backup, id: Uuid) -> Result<bool, Str
             }
             let (_, store) = open_store(ctx, name).await?;
             let (m, _) = read_snapshot(&store, backup).await?;
-            let s = serve(ctx, &store, &m, socket).await?;
+            let s = serve(ctx, (&store, name), &m, socket).await?;
             ctx.live_serving.lock().unwrap().insert(id, s);
             Ok(true)
         }

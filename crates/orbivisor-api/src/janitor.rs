@@ -482,7 +482,7 @@ fn offline_failure(cluster: &Cluster, node: Uuid, error: &str) -> Option<TaskFai
     let code = if error.ends_with(" is offline") {
         code::NODE_OFFLINE
     } else if error.ends_with(" was removed") {
-        code::NODE_NOT_MEMBER
+        code::NODE_REMOVED
     } else {
         return None;
     };

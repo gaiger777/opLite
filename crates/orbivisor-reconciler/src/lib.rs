@@ -26,4 +26,7 @@ pub use guest::GuestInfoSink;
 pub use ha::{HaConfig, HaGuard};
 pub use host_alloc::HostAllocator;
 pub use reconciler::{Reconciler, ReconcilerHandle};
-pub use worker::{LIVE_RESTORE_NOT_STARTED, TEMPLATE_NOT_STARTED};
+pub use worker::{
+    FIREWALL_FAILED, LIVE_RESTORE_NOT_STARTED, NO_FIREWALL, QEMU_START_FAILED,
+    START_FAILED_NOT_QEMU, TEMPLATE_NOT_STARTED,
+};

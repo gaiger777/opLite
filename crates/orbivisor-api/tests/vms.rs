@@ -377,6 +377,11 @@ async fn failed_start_fails_the_task() {
         task["status"]["error"],
         "failed to start: QEMU failed to start: no firmware"
     );
+    // 원인 코드(계획 77-2): QEMU가 켜자마자 끝났다. 다시 해도 같으니 고친 뒤 다시 한다.
+    assert_eq!(
+        task["status"]["failure"],
+        serde_json::json!({ "code": "qemu_start_failed", "params": { "vm": "web" } })
+    );
     let (_, vm) = admin.get("/vms/web").await;
     assert_eq!(vm["spec"]["power"], "stopped");
 }

@@ -60,12 +60,13 @@ pub fn master_key(store: &BackupStore) -> Result<Option<MasterKey>, String> {
 }
 
 /// 저장소 오류의 문구(사용자에게 보이는 Task 오류)
-/// 닿지 않음·거절·깨짐·다른 키는 Task 실패의 원인 코드를 단다(계획 77-2 — Task 밖이면 문구만).
+/// 닿지 않음·거절·공간 없음(디렉터리 저장소)·깨짐·다른 키는 Task 실패의 원인 코드를 단다(계획 77-2 — Task 밖이면 문구만).
 pub fn store_error(store: &str, e: StoreError) -> String {
-    use orbivisor_types::task_failure::{TaskFailure, code};
+    use orbivisor_types::task_failure::{TaskFailure, code, is_no_space};
     let code = match &e {
         StoreError::Unavailable(_) => Some(code::BACKUP_STORE_UNAVAILABLE),
         StoreError::Denied(_) => Some(code::BACKUP_STORE_DENIED),
+        StoreError::Io(m) if is_no_space(m) => Some(code::BACKUP_STORE_FULL),
         StoreError::Corrupt(_) => Some(code::BACKUP_CORRUPT),
         StoreError::KeyMismatch(_) => Some(code::BACKUP_KEY_MISMATCH),
         _ => None,
