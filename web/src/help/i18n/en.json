@@ -1331,7 +1331,7 @@
       "page": {
         "what": "The audit log records the requests that change something in this cluster (create, change, delete, sign-in) plus console opens and file-restore downloads. Read-only requests (GET) are not kept. It is where you find who did what when something goes wrong.",
         "how": "Every node records the requests it receives; this page gathers all nodes' records newest first and names each action in plain words (\"Start VM web-01\"). Filter by user or part of the address (e.g. /vms/web-01 — everything done to that VM); open a row for the result, IP, time taken and the raw request. Nodes that do not answer are missing.",
-        "when": "To find out why a VM suddenly stopped or a setting changed. For before-and-after values, the settings history page is easier."
+        "when": "To find out why a VM suddenly stopped or a setting changed. For before-and-after values, the change history page is easier."
       }
     },
     "tasks": {
@@ -1351,7 +1351,7 @@
     },
     "history": {
       "page": {
-        "what": "Settings history keeps the before and after of each change to settings such as VMs, networks and rules. By default it keeps up to 100 versions per resource, 365 days and 64 MiB in all; older entries are removed.",
+        "what": "Change history keeps the before and after of each change to settings such as VMs, networks and rules. By default it keeps up to 100 versions per resource, 365 days and 64 MiB in all; older entries are removed.",
         "how": "Each row shows who changed it, when and from where (UI, CLI, YAML apply, Terraform, automatic task). Open a row to compare the changed fields side by side and Restore to go back to that value. You can also restore everything to one point in time. Secrets (passwords, tokens) are not recorded, so a restore keeps their current value.",
         "when": "\"It worked yesterday but not today\" — find what changed and undo it.",
         "caution": "History starts when the cluster was upgraded to this version."

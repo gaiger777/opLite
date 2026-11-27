@@ -30,11 +30,40 @@ export function fieldName(path: string, t: TFunction): { label: string; raw: boo
   if (path === "") {
     return { label: t("history.wholeSpec"), raw: false };
   }
+  // 비밀 칸의 표시 조각(`auth.password.$secret`)은 떼고 그 칸 이름으로
+  const base = path.replace(/\.\$secret$/, "");
   const dict = fields(t);
-  const last = path.split(".").at(-1) ?? path;
-  const label = dict[path] ?? dict[last];
-  return label ? { label, raw: false } : { label: path, raw: true };
+  const parts = base.split(".");
+  const last = parts.at(-1) ?? base;
+  let label = dict[base];
+  if (label === undefined && parts.length > 1 && dict[last] !== undefined) {
+    // 끝 조각만 아는 칸: 부모를 알면 "HA 사용 여부", 모르면 맥락 없이도 뜻이 같은 낱말만(알림 대상·종류·상태 같은 낱말은 맥락마다
+    // 달라 원문으로 둔다)
+    const parent = dict[parts.slice(0, -1).join(".")];
+    label = parent
+      ? t("history.fieldIn", { parent, field: dict[last] })
+      : CONTEXTUAL.has(last)
+        ? undefined
+        : dict[last];
+  }
+  return label ? { label, raw: false } : { label: base, raw: true };
 }
+
+/** 맥락마다 뜻이 달라 끝 조각만으로 이름을 붙이지 않는 칸 */
+const CONTEXTUAL: ReadonlySet<string> = new Set([
+  "targets",
+  "kind",
+  "state",
+  "name",
+  "enabled",
+  "members",
+  "nodes",
+  "node",
+  "rules",
+  "role",
+  "vms",
+  "url",
+]);
 
 /** 값을 짧은 글로: 크기 칸(`_mib`·`_gib`·`_bytes`)은 단위, 참거짓은 켬·끔, 비밀 표시는 번역, 없음은 null */
 export function valueText(path: string, value: unknown, t: TFunction): string | null {
@@ -92,7 +121,12 @@ export function changeSummary(entry: HistoryEntry, t: TFunction): string[] {
   const values = new Map((entry.values ?? []).map((c) => [c.path, c]));
   const out = changed.slice(0, SHOWN).map((path) => {
     const c = values.get(path);
-    return c ? changeText(c, t) : t("history.changeField", { field: fieldName(path, t).label });
+    if (c) {
+      return changeText(c, t);
+    }
+    const field = fieldName(path, t).label;
+    // 비밀은 값을 기록하지 않는다("비밀번호 바뀜(값은 기록하지 않음)")
+    return t(path.endsWith(".$secret") ? "history.changeSecret" : "history.changeField", { field });
   });
   if (changed.length > SHOWN) {
     out.push(t("history.more", { count: changed.length - SHOWN }));

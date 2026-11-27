@@ -537,7 +537,7 @@ curl --cacert cluster-ca.pem -H "Authorization: Bearer $ORBIVISOR_TOKEN" -H 'Con
 ### 웹·권한
 
 관리 › 보안·인증서의 "인증서" 탭(`/settings/certificates`)가 계정·DNS 공급자·인증서 목록(노드마다 만료·다음 갱신·오류 칩, "지금 갱신",
-만들기 대화상자 — HTTP-01이면 `http_listen`이 없는 노드 경고)이다([웹 화면](web-ui.md#설정-기록선언-묶음인증서-화면)). 읽기는 루트
+만들기 대화상자 — HTTP-01이면 `http_listen`이 없는 노드 경고)이다([웹 화면](web-ui.md#변경-기록코드로-관리yaml인증서-화면)). 읽기는 루트
 `cluster.read`(가린 보기 — 비밀 칸은 없다), 쓰기·지금 갱신은 루트 `cluster.admin`이다. 감사는 `acme-account create le (letsencrypt,
 tos agreed)`·`certificate create …`·`acme-order NAME issued (serial …, until …)` 꼴이고 EAB·계정 키·DNS 비밀·공유 키는 적지 않는다.
 API는 `/acme-accounts`·`/acme-dns`·`/certificates`(GET·POST, `{key}` GET·PATCH·DELETE), `/certificates/{key}/actions/renew`,

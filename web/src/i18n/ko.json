@@ -184,10 +184,10 @@
     "plan_not_found": "계획이 없습니다(계획은 30분 동안, 그 계획을 세운 노드에만 있습니다). 다시 계획하세요.",
     "plan_blocked": "계획에 막힌 단계가 있어 적용하지 않았습니다: {{message}}",
     "plan_not_started": "서버가 계획을 시작하지 않았습니다.",
-    "history_unavailable": "지금은 설정 기록을 읽을 수 없습니다: {{message}}",
-    "manifest_unsupported": "이 종류는 선언하거나 내보낼 수 없습니다: {{message}}",
+    "history_unavailable": "지금은 변경 기록을 읽을 수 없습니다: {{message}}",
+    "manifest_unsupported": "이 종류는 아직 YAML로 적용하거나 내보낼 수 없습니다: {{message}}",
     "http01_unavailable": "HTTP-01 확인을 받을 수 없습니다: {{message}}",
-    "apply_set_too_large": "적용 묶음이 너무 커서 저장할 수 없습니다: {{message}}",
+    "apply_set_too_large": "YAML 묶음이 너무 커서 저장할 수 없습니다: {{message}}",
     "withDetail": "{{text}} 자세히: {{detail}}"
   },
   "nav": {
@@ -556,7 +556,7 @@
       "related": {
         "backup": "만든 백업",
         "sourceBackup": "원본 백업",
-        "applySet": "선언 묶음",
+        "applySet": "YAML 묶음",
         "plan": "적용 계획",
         "certificate": "인증서",
         "remote": "원격 클러스터",
@@ -570,7 +570,7 @@
         "node": "노드",
         "backup-store": "백업 저장소",
         "backup-job": "백업 작업",
-        "apply-set": "선언 묶음",
+        "apply-set": "YAML 묶음",
         "vm-export": "내보내기",
         "certificate": "인증서",
         "vmware-migration": "VMware 이전",
@@ -618,7 +618,7 @@
     "back": "뒤로"
   },
   "configMenu": {
-    "history": "설정 기록…",
+    "history": "변경 기록…",
     "yaml": "YAML로 내보내기",
     "more": "{{name}} 더 보기",
     "terraform": "Terraform이 관리"

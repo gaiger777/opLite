@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
 
-// 계획 73: 꺼진 VM 하나(Rust 테스트가 CLI로 만듦 — 메모리 256 MiB)의 메모리를 웹 편집으로 바꾸고, VM ⋯ 메뉴의 "설정 기록…"
+// 계획 73: 꺼진 VM 하나(Rust 테스트가 CLI로 만듦 — 메모리 256 MiB)의 메모리를 웹 편집으로 바꾸고, VM ⋯ 메뉴의 "변경 기록…"
 // 서랍에서 두 줄(만듦·바뀜)과 바뀜 줄의 전후 표를 본 뒤, 만든 줄로 되돌린다(서버 계획의 diff를 보고 "Restore"). 되돌린 줄이
 // "restored from"과 함께 생긴다. 보안 탭의 인증서 보기는 빈 목록만 연다(ACME 디렉터리 없음). 메모리가 돌아왔는지는 Rust
 // 테스트(`crates/orbivisord/tests/web.rs`)가 본다.
@@ -39,27 +39,29 @@ test("changes a VM in the web, sees it in the config history and restores it", a
   await page.getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("heading", { name: vm, exact: true })).toBeVisible();
 
-  // ⋯ "설정 기록…": 가장 새 것 먼저 두 줄 — 바뀜(웹)·만듦
-  await vmMenu(page, "Config history…");
-  const drawer = page.getByRole("dialog", { name: `Config history of ${vm}` });
-  const list = drawer.getByRole("list", { name: `Config history of ${vm}` });
+  // ⋯ "변경 기록…": 가장 새 것 먼저 두 줄 — 바뀜(웹)·만듦
+  await vmMenu(page, "Change history…");
+  const drawer = page.getByRole("dialog", { name: `Change history of ${vm}` });
+  const list = drawer.getByRole("list", { name: `Change history of ${vm}` });
   await expect(list.getByRole("button")).toHaveCount(2);
-  await expect(list.getByRole("button").nth(0)).toHaveAccessibleName(/Changed.*Web.*memory_mib/);
+  await expect(list.getByRole("button").nth(0)).toHaveAccessibleName(
+    /Changed.*Web.*memory 256 MiB → 512 MiB/,
+  );
   await expect(list.getByRole("button").nth(1)).toHaveAccessibleName(/Created/);
 
-  // 바뀜 줄의 전후 표: memory_mib 256 → 512
+  // 바뀜 줄의 전후 표: 메모리(memory_mib) 256 MiB → 512 MiB
   await list.getByRole("button").nth(0).click();
   const changes = drawer.getByRole("table", { name: `Changed fields of ${vm}` });
   const row = changes.getByRole("row").filter({ hasText: "memory_mib" });
-  await expect(row.getByRole("cell", { name: "256", exact: true })).toBeVisible();
-  await expect(row.getByRole("cell", { name: "512", exact: true })).toBeVisible();
+  await expect(row.getByRole("cell", { name: "256 MiB", exact: true })).toBeVisible();
+  await expect(row.getByRole("cell", { name: "512 MiB", exact: true })).toBeVisible();
 
   // 만든 줄로 되돌린다: 서버 계획의 diff(512 → 256)를 보고 "Restore"
   await drawer.getByRole("button", { name: "All changes" }).click();
   await list.getByRole("button").nth(1).click();
-  await drawer.getByRole("button", { name: "Restore this revision…" }).click();
+  await drawer.getByRole("button", { name: "Restore these values…" }).click();
   const restore = page.getByRole("dialog", {
-    name: new RegExp(`^Restore ${vm} to revision \\d+\\?$`),
+    name: new RegExp(`^Restore ${vm} to its values at record #\\d+\\?$`),
   });
   await expect(restore).toBeVisible();
   await expect(restore.getByText("memory_mib").first()).toBeVisible();
@@ -72,10 +74,12 @@ test("changes a VM in the web, sees it in the config history and restores it", a
       await page.keyboard.press("Escape");
       await expect(drawer).toBeHidden();
     }
-    await vmMenu(page, "Config history…");
+    await vmMenu(page, "Change history…");
     await expect(list.getByRole("button")).toHaveCount(3, { timeout: 3_000 });
   }).toPass({ timeout: 60_000 });
-  await expect(list.getByRole("button").nth(0)).toHaveAccessibleName(/Changed.*restored from/);
+  await expect(list.getByRole("button").nth(0)).toHaveAccessibleName(
+    /Changed.*restored to earlier record #/,
+  );
   await page.keyboard.press("Escape");
   await expect(drawer).toBeHidden();
 

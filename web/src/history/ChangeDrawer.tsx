@@ -21,7 +21,7 @@ import { ChangeTable } from "@/history/ChangeTable";
 import { kindName } from "@/history/describe";
 import { hasSecret } from "@/history/diff";
 import { RestoreDialog } from "@/history/RestoreDialog";
-import { EntryLine, SourceChip } from "@/history/EntryLine";
+import { EntryLine, SourceChip, useEntryName } from "@/history/EntryLine";
 import { formatTime } from "@/lib/format";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -123,11 +123,12 @@ export function ChangeDetail({ entry }: { entry: HistoryEntry }) {
 /** 설정 기록 화면에서 줄을 누르면 여는 오른쪽 서랍 */
 export function ChangeDrawer({ entry, onClose }: { entry: HistoryEntry; onClose(): void }) {
   const { t } = useTranslation();
+  const name = useEntryName(entry);
   return (
     <Sheet open onOpenChange={(open) => !open && onClose()}>
       <SheetContent className="w-full overflow-y-auto sm:max-w-2xl">
         <SheetTitle className="px-4 pt-4 text-lg break-all">
-          {t("history.drawerTitle", { kind: kindName(entry.kind, t), name: entry.name })}
+          {t("history.drawerTitle", { kind: kindName(entry.kind, t), name })}
         </SheetTitle>
         <SheetDescription className="px-4">
           {t(`history.ops.${entry.op}`)} · {t("history.revisionN", { revision: entry.revision })}

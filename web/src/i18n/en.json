@@ -184,10 +184,10 @@
     "plan_not_found": "The plan is gone (plans last 30 minutes and are kept by the node that made them). Plan again.",
     "plan_blocked": "The plan has blocked steps and was not applied: {{message}}",
     "plan_not_started": "The server did not start the plan.",
-    "history_unavailable": "The configuration history cannot be read right now: {{message}}",
+    "history_unavailable": "The change history cannot be read right now: {{message}}",
     "manifest_unsupported": "This kind cannot be declared or exported: {{message}}",
     "http01_unavailable": "The HTTP-01 challenge cannot be served: {{message}}",
-    "apply_set_too_large": "The apply set is too large to store: {{message}}",
+    "apply_set_too_large": "The YAML set is too large to store: {{message}}",
     "withDetail": "{{text}} Details: {{detail}}"
   },
   "nav": {
@@ -556,7 +556,7 @@
       "related": {
         "backup": "Backup created",
         "sourceBackup": "Source backup",
-        "applySet": "Apply set",
+        "applySet": "YAML set",
         "plan": "Apply plan",
         "certificate": "Certificate",
         "remote": "Remote cluster",
@@ -570,7 +570,7 @@
         "node": "node",
         "backup-store": "backup store",
         "backup-job": "backup job",
-        "apply-set": "apply set",
+        "apply-set": "YAML set",
         "vm-export": "export",
         "certificate": "certificate",
         "vmware-migration": "VMware migration",
@@ -618,7 +618,7 @@
     "back": "Back"
   },
   "configMenu": {
-    "history": "Config history…",
+    "history": "Change history…",
     "yaml": "Export as YAML",
     "more": "More for {{name}}",
     "terraform": "Managed by Terraform"

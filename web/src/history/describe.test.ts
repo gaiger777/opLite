@@ -15,9 +15,24 @@ it("names kinds in plain words, from store and manifest forms", () => {
 it("names fields by path, then by their last part, else keeps the path", () => {
   expect(fieldName("memory_mib", ko)).toEqual({ label: "메모리", raw: false });
   expect(fieldName("cpu.cores", en)).toEqual({ label: "CPU cores", raw: false });
-  expect(fieldName("ha.max_restart", en)).toEqual({ label: "max restarts", raw: false });
+  // 끝 조각만 아는 칸: 부모를 알면 부모와 함께, 모르면 맥락 없이도 뜻이 같은 낱말만
+  expect(fieldName("ha.max_restart", en)).toEqual({ label: "HA max restarts", raw: false });
+  expect(fieldName("zzz.max_restart", en)).toEqual({ label: "max restarts", raw: false });
+  expect(fieldName("ha.enabled", ko)).toEqual({ label: "HA 사용 여부", raw: false });
+  expect(fieldName("zzz.targets", ko)).toEqual({ label: "zzz.targets", raw: true });
   expect(fieldName("labels.tier", ko)).toEqual({ label: "레이블 tier", raw: false });
   expect(fieldName("zzz.qqq", en)).toEqual({ label: "zzz.qqq", raw: true });
+  // 비밀 칸의 표시 조각은 뗀다
+  expect(fieldName("cloud_init.password.$secret", ko)).toEqual({
+    label: "첫 부팅 자동 설정 비밀번호",
+    raw: false,
+  });
+});
+
+it("says a secret changed without its value", () => {
+  expect(changeSummary(entry(1, { changed: ["password.$secret"] }), ko)).toEqual([
+    "비밀번호 바뀜(값은 기록하지 않음)",
+  ]);
 });
 
 it("shows sizes with units, booleans as on/off and secrets as marks", () => {

@@ -571,3 +571,13 @@ it("does not offer the Terraform takeover for other blocks", async () => {
   await within(dialog).findByText(/no vm.config/);
   expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
 });
+
+it("names a folder by its display name, not its id", async () => {
+  const FOLDER = "019a0f3c-0000-7000-8062-000000000001";
+  mockLists({ folder: [{ id: FOLDER, name: FOLDER, spec: { name: "prod", kind: "vm" } }] });
+  mockTimeline([entry(5, { kind: "folder", id: FOLDER, name: FOLDER, op: "create" })]);
+  renderPage(<HistoryPage />, { path: "/history" });
+  const line = await screen.findByRole("button", { name: /Created/ });
+  await waitFor(() => expect(line).toHaveTextContent("prod"));
+  expect(line).not.toHaveTextContent(FOLDER);
+});

@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 
+import { useList } from "@/api/live";
 import { StatusChip, type StatusTone } from "@/components/StatusChip";
 import { actorName, type ChangeSource, type HistoryEntry } from "@/history/api";
 import { changeSummary, kindName } from "@/history/describe";
@@ -20,6 +21,15 @@ const SOURCE_TONE: Record<ChangeSource, StatusTone> = {
   task: "warning",
   system: "warning",
 };
+
+/** 줄의 리소스 이름: 폴더는 저장 이름이 id라 화면 이름(spec.name — 폴더 목록, 지운 폴더는 그대로 id) */
+export function useEntryName(entry: HistoryEntry): string {
+  const folders = useList("folder");
+  if (entry.kind !== "folder") {
+    return entry.name;
+  }
+  return folders.data?.find((f) => f.id === entry.id)?.spec.name ?? entry.name;
+}
 
 /** 출처 칩: 사람 말 이름 + 풀어 쓴 설명(마우스를 올리면) */
 export function SourceChip({ source }: { source: ChangeSource }) {
@@ -46,6 +56,7 @@ export function EntryLine({
 }) {
   const { t, i18n } = useTranslation();
   const summary = changeSummary(entry, t);
+  const name = useEntryName(entry);
   const time = new Date(entry.at_ms);
   return (
     <button
@@ -61,7 +72,7 @@ export function EntryLine({
         {showName && (
           <span className="break-all">
             <span className="text-muted-foreground">{kindName(entry.kind, t)}</span>{" "}
-            <span className="font-medium">{entry.name}</span>
+            <span className="font-medium">{name}</span>
           </span>
         )}
         <span className="text-muted-foreground">{actorName(entry.actor)}</span>
