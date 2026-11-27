@@ -2602,19 +2602,12 @@
     "apply": "Apply",
     "time": "Time",
     "ip": "IP",
-    "target": "Target",
-    "status": "Status",
     "refreshFailed": "Could not read the audit log again. {{error}}",
     "empty": "No audit entries in this range.",
     "unreachable": "No audit entries from these nodes (unreachable): {{nodes}}",
     "disabled": "The audit log is turned off on these nodes: {{nodes}}",
     "truncated": "Showing the newest {{count}} entries. More match; narrow the range or the filters.",
-    "entryTitle": "Audit entry",
-    "actions": {
-      "placement": {
-        "move": "Automatic move by the balancer"
-      }
-    }
+    "entryTitle": "Audit entry"
   },
   "haGroups": {
     "pageHint": "Decides on which nodes, and in what order, a failed node's VMs are started again. The node with the larger number is used first, and VMs move back when it returns.",

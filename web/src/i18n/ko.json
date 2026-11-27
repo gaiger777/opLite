@@ -2602,19 +2602,12 @@
     "apply": "적용",
     "time": "시각",
     "ip": "IP",
-    "target": "대상",
-    "status": "상태",
     "refreshFailed": "감사 로그를 다시 읽지 못했습니다. {{error}}",
     "empty": "이 범위에 감사 기록이 없습니다.",
     "unreachable": "다음 노드의 감사 기록을 읽지 못했습니다: {{nodes}}",
     "disabled": "다음 노드는 감사 로그가 꺼져 있습니다: {{nodes}}",
     "truncated": "최근 {{count}}개만 보입니다. 더 있으니 범위나 거르기를 좁히세요.",
-    "entryTitle": "감사 항목",
-    "actions": {
-      "placement": {
-        "move": "균형 조정기의 자동 옮기기"
-      }
-    }
+    "entryTitle": "감사 항목"
   },
   "haGroups": {
     "pageHint": "노드가 죽었을 때 그 VM을 어느 노드에서, 어떤 차례로 다시 켤지 정합니다. 숫자가 큰 노드부터 쓰고, 그 노드가 돌아오면 VM을 되돌립니다.",

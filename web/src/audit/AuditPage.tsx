@@ -5,7 +5,9 @@ import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
 import type { AuditEntry } from "@/api/types";
+import { auditOutcome, describeAudit } from "@/audit/describe";
 import { usePrincipal } from "@/auth/AuthProvider";
+import { CopyButton } from "@/components/CopyButton";
 import { focusBack } from "@/components/focusBack";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { EmptyState } from "@/components/EmptyState";
@@ -23,6 +25,58 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="grid grid-cols-[7rem_1fr] gap-x-3 text-sm max-sm:grid-cols-1">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words">{children}</dd>
+    </div>
+  );
+}
+
+/** 항목 하나를 사람 말로: 결과·누가·언제·어디서·걸린 시간·자세히, 요청 원문(복사) */
+function EntrySummary({ entry }: { entry: AuditEntry }) {
+  const { t, i18n } = useTranslation();
+  const outcome = auditOutcome(entry.status, t);
+  const raw = entry.method ? `${entry.method} /api/v1${entry.path}` : entry.action;
+  return (
+    <dl className="flex flex-col gap-1">
+      {outcome && (
+        <Row label={t("auditOps.ui.result")}>
+          <span className={outcome.failed ? "font-medium text-destructive" : undefined}>
+            {outcome.text}
+          </span>
+        </Row>
+      )}
+      <Row label={t("auditOps.ui.who")}>
+        {entry.user
+          ? `${entry.user} · ${t(`auditOps.ui.auth.${entry.auth}`)}`
+          : entry.method
+            ? t("auditOps.ui.auth.none")
+            : t("auditOps.ui.byNode")}
+      </Row>
+      <Row label={t("auditOps.ui.when")}>{formatTime(new Date(entry.time), i18n.language)}</Row>
+      <Row label={t("auditOps.ui.where")}>
+        {entry.ip
+          ? t("auditOps.ui.whereValue", { ip: entry.ip, node: entry.node })
+          : t("auditOps.ui.whereNode", { node: entry.node })}
+      </Row>
+      {entry.method && (
+        <Row label={t("auditOps.ui.took")}>
+          {t("auditOps.ui.tookValue", { ms: entry.duration_ms })}
+        </Row>
+      )}
+      {entry.detail && <Row label={t("auditOps.ui.detail")}>{entry.detail}</Row>}
+      <Row label={t("auditOps.ui.raw")}>
+        <span className="inline-flex items-start gap-1">
+          <code className="font-mono text-xs break-all">{raw}</code>
+          <CopyButton text={raw} label={t("auditOps.ui.copyRaw")} />
+        </span>
+      </Row>
+    </dl>
+  );
+}
 
 /** 고를 수 있는 시간 범위(지금부터 거꾸로, 밀리초) */
 const RANGES = { "1h": 3_600_000, "24h": 86_400_000, "7d": 604_800_000 } as const;
@@ -80,56 +134,54 @@ export function AuditPage() {
         return <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>;
       },
     },
-    { id: "node", header: t("common.node"), priority: 2, cell: (entry) => entry.node },
-    { id: "user", header: t("audit.user"), cell: (entry) => entry.user ?? "—" },
     {
-      id: "ip",
-      header: t("audit.ip"),
-      className: "font-mono text-xs",
-      priority: 3,
-      cell: (entry) => entry.ip,
+      id: "user",
+      header: t("audit.user"),
+      cell: (entry) => entry.user ?? (entry.method ? "—" : t("auditOps.ui.byNode")),
     },
     {
       id: "action",
       header: t("audit.action"),
+      className: "whitespace-normal",
       cell: (entry) => {
-        // 노드가 스스로 남긴 항목(예: 균형 조정기의 `placement.move`)은 번역한 이름과 detail을 함께 보인다.
-        const named = `audit.actions.${entry.action}`;
+        // 사람 말(라우트 → 문구 표, 계획 77-7). 표에 없는 동작은 원문 그대로. 원문·전체는 줄을 열어 본다.
+        const named = describeAudit(entry, t);
         return (
           <>
             {/* 키보드로도 열 수 있게 단추로 둔다. 누르면 행의 onClick이 연다. */}
             <button
               type="button"
-              className="text-left font-mono text-xs underline-offset-4 hover:underline"
+              className={
+                named
+                  ? "text-left underline-offset-4 hover:underline"
+                  : "text-left font-mono text-xs underline-offset-4 hover:underline"
+              }
             >
-              {entry.action}
+              {named ?? entry.action}
             </button>
-            {i18n.exists(named) && (
-              <span className="block text-xs text-muted-foreground">{t(named)}</span>
+            {/* 대상이 없는 줄의 짧은 설명(로그인의 username=…, 버린 수) */}
+            {entry.detail && (
+              <span className="block text-xs break-words text-muted-foreground">
+                {entry.detail}
+              </span>
             )}
           </>
         );
       },
     },
     {
-      id: "target",
-      header: t("audit.target"),
-      priority: 2,
-      cell: (entry) => (
-        <>
-          {/* 대상이 없으면 detail(예: audit.dropped의 수, 로그인의 username=…) */}
-          {entry.target ? `${entry.target.kind}/${entry.target.key}` : (entry.detail ?? "—")}
-          {i18n.exists(`audit.actions.${entry.action}`) && entry.target && entry.detail && (
-            <span className="block text-xs text-muted-foreground">{entry.detail}</span>
-          )}
-        </>
-      ),
-    },
-    {
       id: "status",
-      header: t("audit.status"),
+      header: t("auditOps.ui.result"),
       className: (entry) => (entry.status >= 400 ? "font-medium text-destructive" : undefined),
-      cell: (entry) => entry.status,
+      cell: (entry) => auditOutcome(entry.status, t)?.text ?? "—",
+    },
+    { id: "node", header: t("common.node"), priority: 2, cell: (entry) => entry.node },
+    {
+      id: "ip",
+      header: t("audit.ip"),
+      className: "font-mono text-xs",
+      priority: 3,
+      cell: (entry) => entry.ip || "—",
     },
   ];
 
@@ -185,7 +237,8 @@ export function AuditPage() {
             <Label htmlFor="audit-action">{t("audit.action")}</Label>
             <Input
               id="audit-action"
-              placeholder="POST /vms"
+              placeholder={t("auditOps.ui.actionPlaceholder")}
+              title={t("auditOps.ui.actionHint")}
               value={action}
               onChange={(e) => setAction(e.target.value)}
             />
@@ -252,11 +305,17 @@ export function AuditPage() {
             onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
           >
             <DialogHeader>
-              <DialogTitle>{t("audit.entryTitle")}</DialogTitle>
+              <DialogTitle className="break-words">
+                {describeAudit(opened, t) ?? t("audit.entryTitle")}
+              </DialogTitle>
             </DialogHeader>
-            <pre className="max-h-96 overflow-auto rounded-md bg-muted p-2 font-mono text-xs">
-              {JSON.stringify(opened, null, 2)}
-            </pre>
+            <EntrySummary entry={opened} />
+            <details>
+              <summary className="cursor-pointer text-sm">{t("auditOps.ui.rawJson")}</summary>
+              <pre className="mt-2 max-h-80 overflow-auto rounded-md bg-muted p-2 font-mono text-xs">
+                {JSON.stringify(opened, null, 2)}
+              </pre>
+            </details>
             <DialogFooter>
               <Button variant="outline" onClick={() => setOpened(null)}>
                 {t("common.done")}

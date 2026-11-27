@@ -29,6 +29,8 @@ import drEn from "@/dr/i18n/en.json";
 import drKo from "@/dr/i18n/ko.json";
 import helpEn from "@/help/i18n/en.json";
 import helpKo from "@/help/i18n/ko.json";
+import auditEn from "@/audit/i18n/en.json";
+import auditKo from "@/audit/i18n/ko.json";
 import failuresEn from "@/tasks/failures/i18n/en.json";
 import failuresKo from "@/tasks/failures/i18n/ko.json";
 
@@ -49,6 +51,7 @@ for (const [en, ko] of [
   [drEn, drKo],
   [helpEn, helpKo],
   [failuresEn, failuresKo],
+  [auditEn, auditKo],
 ] as const) {
   i18n.addResourceBundle("en", "translation", en, false, false);
   i18n.addResourceBundle("ko", "translation", ko, false, false);

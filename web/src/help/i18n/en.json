@@ -1329,7 +1329,7 @@
     "audit": {
       "page": {
         "what": "The audit log records the requests that change something in this cluster (create, change, delete, sign-in) plus console opens and file-restore downloads. Read-only requests (GET) are not kept. It is where you find who did what when something goes wrong.",
-        "how": "Each node records the requests it received; this page gathers every node's records in time order. Filter by user or action (for example POST /vms). Records of nodes that did not answer are missing.",
+        "how": "Every node records the requests it receives; this page gathers all nodes' records newest first and names each action in plain words (\"Start VM web-01\"). Filter by user or part of the address (e.g. /vms/web-01 — everything done to that VM); open a row for the result, IP, time taken and the raw request. Nodes that do not answer are missing.",
         "when": "To find out why a VM suddenly stopped or a setting changed. For before-and-after values, the settings history page is easier."
       }
     },
