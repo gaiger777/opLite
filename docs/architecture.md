@@ -519,7 +519,7 @@ sequenceDiagram
 | `BackupJobScheduler` | 백업 작업 실행(진행은 Raft에 있어 새 리더가 잇는다), 대상(풀·저장소)마다 보존, 저장소 작업의 `copy_to` 복사 줄 세우기, 백업 저장소의 GC·예약 검증·`verify_new` 검증 Task 만들기(계획 68) | 60초 | `backup_jobs.rs:346,395` |
 | `ReplicationScheduler` | 로컬 디스크 복제 Task 만들기(원본 노드당 2개까지) | 60초 | `replication.rs:175-183,320` |
 | `Balancer` | 부하 불균형 재기, 추천 게시 또는 자동 마이그레이션(계획 53) | 틱 10초, 실행 300초, 리더 된 뒤 첫 실행 60초 안 | `balancer.rs:34,50-57,121` |
-| `AlertEngine`(리더 몫) | `node_offline`, `backup_job_failed`, SDN 조건, `backup_verify_failed`·`backup_store_unavailable`(계획 68), `dr_rpo_exceeded`·`dr_run_failed`(계획 76) 알림. 상태는 `AlertRule.status`(Raft) | 5초 | `alerts/engine.rs:548-588` |
+| `AlertEngine`(리더 몫) | `node_offline`, `backup_job_failed`, SDN 조건, `backup_verify_failed`·`backup_store_unavailable`(계획 68), `dr_rpo_exceeded`·`dr_run_failed`·`dr_source_returned`(계획 76) 알림. 상태는 `AlertRule.status`(Raft) | 5초 | `alerts/engine.rs:548-588` |
 | `VipManager` | VIP마다 들 노드 정하기(`VipHolder`) | 1초 | `vip.rs:34-38,226` |
 | 배치 현황 | 리스로 받은 노드 부하를 다른 노드에 RPC(`ReadPlacement`)로 알려 줌 | 캐시 1초 | `placement_board.rs:154`, `score.rs:299-342` |
 | `TelemetryReporter` | 텔레메트리 보고 | 틱 60초, 24시간마다 | `telemetry.rs:221-229,292` |
@@ -529,7 +529,7 @@ sequenceDiagram
 | `AcmeRenewer` | 인증서마다 할 일(받은 것 없음·이름·키 바뀜·`renew_at` 지남, 물러서는 중 제외)을 순수 함수 `due`·`plan`으로 정해 Task `acme-order` 만들기(노드마다는 그 노드, 공유는 리더 또는 id가 가장 작은 온라인 노드, 클러스터 동시 2), 하루 한 번 ARI 창 다시 묻기, 지난 HTTP-01 답 치우기. 진행은 인증서 status(Raft)에 있어 새 리더가 잇는다(계획 73) | 60초 | `acme/renewer.rs:36` |
 | `VmwareScheduler` | VMware 이전 계획(`running`)의 항목마다 `vmware-sync`(전체·델타)·`vmware-cutover`(예약 전환 `cutover.at`, 항목에 요청 시각을 먼저 적어 한 번만)·`vmware-cleanup`(취소) Task 만들기. 계획의 동시 수·같은 ESXi 호스트·같은 노드 한도(모든 계획의 Task를 셈), 델타·전환이 새 전체 복사보다 먼저. 모든 항목이 끝난 계획을 `finished`로. 진행은 항목(Raft)에 있어 새 리더가 다음 틱에 잇는다(계획 72). 기능 `vmware-migrate`가 모든 노드에 있을 때만 | 15초 | `vmware_scheduler.rs:40-51,383` |
 | `DrProtection` | 복구 계획마다 보호 상태(`status.protection` — VM마다 복구 지점·나이·RPO)를 다시 세어 쓰기: 계획·백업·원격 표시가 바뀌었으면 곧, 아니면 1분마다, 나이만 바뀐 것은 쓰지 않음. dr 쪽 자료와 저장된 원격 CA 지문만 씀(§10.5, 계획 76) | 5초 | `dr/protection.rs:33-34,162` |
-| `DrScheduler` | 도는 DR 실행(`DrRun`)마다 관찰 → 순수 상태 기계 `dr::advance` → 할 일(복원·시작·지우기 Task, 거품 SDN 네트워크, 운영 쪽 프록시 부름) → `record` → 저장(§10.5, 계획 76). 기능 `dr-plans`가 모든 노드에 있을 때만 | 5초 | `dr/scheduler.rs:76,129,167` |
+| `DrScheduler` | 도는 DR 실행(`DrRun`)마다 관찰 → 순수 상태 기계 `dr::advance` → 할 일(복원·시작·지우기 Task, 거품 SDN 네트워크, 운영 쪽 프록시 부름) → `record` → 저장(§10.5, 계획 76). 기능 `dr-plans`가 모든 노드에 있을 때만 | 5초 | `dr/scheduler.rs:86,133,175` |
 | 리스 표 | 노드의 `RenewLease`를 받아 메모리에 기록(§5.1) | 요청마다 | `crates/orbivisor-cluster/src/lease.rs` |
 
 리더 일이 **아닌** 것(오해하기 쉬운 것):
@@ -1271,25 +1271,35 @@ flowchart LR
   네트워크·RTO)이 **복구하는 클러스터**의 Raft에 있다(`crates/orbivisor-types/src/dr.rs`). 운영 클러스터는 원격으로만 가리키고, 복구
   지점은 이 클러스터의 사본 백업 가운데 `origin.ca_fingerprint`가 그 원격의 CA 지문인 것이다(이름이 아니라 CA 지문으로 맞춤).
 - **순수 상태 기계.** `DrRunStatus::start`(복구 지점 고르기, 시험이면 거품 네트워크 대상), `advance(spec, status, observation) → (다음 상태,
-  할 일)`, `record(할 일, 결과)`가 모두 순수 함수다(`dr.rs:1146,1238,1328`). 그룹 차례·동시성(실행마다 `max_parallel`, 노드마다 2)·기다림
+  할 일)`, `record(할 일, 결과)`가 모두 순수 함수다(`dr.rs:1507,1603,1754`). 그룹 차례·동시성(실행마다 `max_parallel`, 노드마다 2)·기다림
   (`running`·`guest`·`ip`)·시간 초과·`on_timeout`·취소·계획된 이전의 운영 쪽 준비(그룹 역순 정지 → 백업 → 복제 → 사본 도착)·뒷정리·RTO가
-  여기 있고, 단위 시험은 관찰을 만들어 넣는다. 같은 입력이면 같은 출력이다.
+  여기 있고, 단위 시험은 관찰을 만들어 넣는다. 같은 입력이면 같은 출력이다. 리뷰 1로 더한 것: 복원 Task가 실패하면 더 오래된 복구
+  지점으로(셋까지, 검증 실패 사본 빼고, `point_in_time` 안에서), 라이브 복원은 VM이 켜지면 기다림으로(복사 Task는 `copy_task`로 따로),
+  계획된 이전의 단계 상한과 끄고 되살리지 못한 운영 VM 다시 켜기(`StartSource`), 멈춤·취소로 건너뛴 VM의 운영 쪽 할 일 버리기, 이미
+  있는 남의 거품 이름 거절, 라벨이 붙어야 끝남, 나아간 시각 `progress_at`.
 - **리더 스케줄러.** `DrScheduler`(§4, 5초)가 도는 실행마다 관찰을 모은다 — 단계의 Task 결과, 이 클러스터의 VM(QEMU·게스트 에이전트의 답과
-  보고한 주소 — 게스트 에이전트 캐시), 네트워크, 백업, 계획된 이전이면 운영 쪽(원격 클라이언트로 `GET /vms`·`/backups`·`/remotes`, 10초
-  제한, 못 읽으면 기다림). 할 일은 지금 길을 그대로 쓴다: 복원은 복원 API의 검사 공용 함수(`start_restore` — 엔진이라 권한 검사는 없음)와
+  보고한 주소 — 게스트 에이전트 캐시, VM id와 라벨), 네트워크(시험 라벨 포함), 백업, 계획된 이전이면 운영 쪽(원격 클라이언트로 `GET
+  /vms`·`/backups`·`/remotes`, 10초 제한, 못 읽으면 기다리고 그 까닭을 단계의 `last_error`에). 운영 쪽 부름의 실패는 상태 코드로 나눈다:
+  닿지 않음·시간 초과·5xx·429는 일시 오류(`DrResult::Retry`), 401·403·404와 다른 4xx는 그 VM의 실패. 계획된 이전은 API가 시작 전에
+  사전 검사한다(토큰 역할 `whoami`, 운영 쪽 원격 목록의 이 클러스터 CA 지문, VM·백업 풀, 받을 풀 — 409 `dr_planned_preflight`). 할 일은 지금 길을 그대로 쓴다: 복원은 복원 API의 검사 공용 함수(`start_restore` — 엔진이라 권한 검사는 없음)와
   복원 맵(§10.3 — Task `backup-restore`·`backup-live-restore`의 `remap`), 시작은 `vm-start`, 뒷정리는 VM 지우기와 볼륨 지우기 Task,
   거품 네트워크는 SDN 네트워크·서브넷 만들기, 운영 쪽은 프록시 부름(정지·백업·복제). 결과를 적은 상태는 revision을 맞춰 저장하고(그사이
   API가 취소 표시만 바꿨으면 합쳐 다시 씀, 아니면 이번 걸음을 버리고 다음 틱에 다시), 끝나면 계획 `status.run`을 비우고 시험이면
-  `last_test`를 적는다. 취소한 시험은 끝난 상태를 먼저 저장한 뒤(독점 값을 풀어야 하므로) 뒷정리 실행을 만든다.
-- **멱등.** 진행은 실행 기록(Raft)에 있어 새 리더가 다음 틱에 잇는다. 할 일을 내기 전에 이미 낸 것을 찾는다: 단계에 든 뒤 만든 같은
-  이름·복구 지점의 복원 Task, 같은 VM의 시작·정지 Task, 운영 쪽은 실행마다 정한 백업 이름(다시 부르면 409 `name_taken` → 그 백업)과 이미
+  `last_test`를 적는다(재해 장애 조치면 되살린 VM을 `status.source_fence_pending`에). 취소한 시험은 끝난 상태를 먼저 저장한 뒤(독점 값을
+  풀어야 하므로) 뒷정리 실행을 만든다. 복원 Task를 내면 그 대상 id(새 VM id)를 단계의 `vm_id`에 적고, 그 VM에 라벨이 붙을 때까지 틱마다
+  단다(장애 조치가 끊은 시험의 VM도). 뒷정리·남은 것(`leftovers`)은 이 `vm_id`와 시험 라벨이 둘 다 맞는 VM만이다.
+- **멱등.** 진행은 실행 기록(Raft)에 있어 새 리더가 다음 틱에 잇는다. 할 일을 내기 전에 이미 낸 것을 찾는다: 실행이 만들어진 뒤(실행 id의
+  uuid v7 시각, 밀리초 — 단계 시각이 아니다: 저장하지 못한 걸음의 단계는 새 리더가 지금 시각으로 다시 든다) 만든 같은 이름·복구 지점의
+  복원 Task, 같은 VM의 시작 Task, 끝나지 않은 정지 Task, 운영 쪽은 실행마다 정한 백업 이름(다시 부르면 409 `name_taken` → 그 백업)과 이미
   이 클러스터로 가는 사본. 그래서 기록을 저장하기 전에 리더가 바뀌어도 같은 일을 두 번 하지 않는다. 남은 틈은 [안내서의
   한계](guide/backup.md#한계와-계획-76이-아직-하지-않는-것)(취소 뒤 뒷정리 실행을 만들기 전, VM을 지운 뒤 볼륨을 지우기 전).
 - **독점 값.** 상태 머신의 배타성 검사(§3.2)가 도는 실행의 계획 id를 `dr-run` 값으로 잡아 계획마다 실행 하나만 둔다
   (`crates/orbivisor-cluster/src/exclusive.rs:27,150`). API는 먼저 `status.run`과 실행 목록을 보고 409 `dr_run_active`를 내고, 둘이 동시에
-  시작하면 상태 머신이 하나를 거절한다.
-- **보호 상태와 경보.** `DrProtection`(§4)이 보호 상태를 쓰고, 경보 엔진의 `dr_rpo_exceeded`가 그것을, `dr_run_failed`가 끝난 실행을 본다
-  (§12.5). 보고 `GET /dr-plans/{key}/report`는 요청 때 다시 센다.
+  시작하면 상태 머신이 하나를 거절한다. 장애 조치만은 도는 시험을 API가 먼저 끝난 상태(`cancelled`·`preempted`)로 써 독점 값을 푼 뒤
+  시작한다 — 그 시험의 스케줄러 걸음은 revision이 어긋나 버려진다.
+- **보호 상태와 경보.** `DrProtection`(§4)이 보호 상태를 쓰고, 경보 엔진의 `dr_rpo_exceeded`가 그것을, `dr_run_failed`가 끝난 실행과
+  `progress_at`이 30분 넘게 그대로인 도는 실행("stalled" — `notified`에 음수 시각으로 적어 같은 멈춤에 한 번)을, `dr_source_returned`가
+  `source_fence_pending`과 원격 상태(`RemotePoller`의 `reachable`)를 본다(§12.5). 보고 `GET /dr-plans/{key}/report`는 요청 때 다시 센다.
 - **섞인 판.** 기능 `dr-plans`(계획·실행·설정 `dr_max_parallel`·DR 경보 조건)와 `restore-remap`(복원 맵)을 모든 온라인 노드가 알아야 쓴다
   (409 `cluster_upgrading`). 운영 쪽은 옛 판이어도 된다(지금 있는 API만 부름). 자세한 것은 [DR 계획 안내](guide/backup.md#dr-계획복구-계획),
   [설계](superpowers/specs/2026-11-27-dr-orchestration-design.md).
