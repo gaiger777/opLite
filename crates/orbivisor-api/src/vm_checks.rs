@@ -398,9 +398,11 @@ pub(crate) async fn check_planned(
 
     let mut vm: Vm = Resource::new(req.name, spec);
     vm.labels = req.labels;
-    // 꺼진 채 노드 없이 만들어도 "켜면 놓일 노드"를 미리 보이므로(계획 77-5) 노드가 없으면 부하를 읽는다.
-    let picks = vm.spec.node.is_none();
-    let off = vm.spec.power != PowerState::Running && picks;
+    // 꺼진 채 노드 없이 만들어도 "켜면 놓일 노드"를 미리 보인다(계획 77-5) — 노드 이름을 볼 수 있는 사용자에게만(못 보면
+    // 어차피 버리므로 스케줄도 부하 읽기도 하지 않는다). 부하 요약은 스케줄할 때만 읽는다.
+    let sees = crate::cpu::sees_node_names(state, principal);
+    let off = vm.spec.power != PowerState::Running && vm.spec.node.is_none();
+    let picks = vm.spec.node.is_none() && (!off || sees);
     let scoring = score::scorer(state, picks).await;
     match prepare_with(state, &mut vm, &scoring.scorer(), &planned) {
         Err(e) => {
@@ -410,7 +412,6 @@ pub(crate) async fn check_planned(
             Ok(Checked::answer(found))
         }
         Ok(()) => {
-            let sees = crate::cpu::sees_node_names(state, principal);
             let name = |id: Option<Uuid>| -> Result<Option<String>, ApiError> {
                 match id {
                     Some(id) if sees => Ok(state.cluster.get::<NodeSpec>(id)?.map(|n| n.name)),
@@ -418,7 +419,7 @@ pub(crate) async fn check_planned(
                 }
             };
             let node = name(vm.spec.node)?;
-            let start_node = if off {
+            let start_node = if off && sees {
                 name(start_node(state, &vm, &scoring.scorer(), &planned)?)?
             } else {
                 None
