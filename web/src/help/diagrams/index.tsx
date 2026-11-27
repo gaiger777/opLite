@@ -559,29 +559,48 @@ function LiveMigration() {
 /** 코드로 관리(선언 적용): 파일 → 차이 → 적용 */
 function DeclarativeApply() {
   const d = useD("declarativeApply");
+  // ① 파일 → ② 차이 보기 → ③ 적용 → ④ 드리프트 감시(화면에서 바꾸면 "파일과 달라짐"으로 되돌아 알림)
   return (
-    <Frame id="declarativeApply" h={150}>
-      <Box x={10} y={30} w={76} h={60} tone="muted" label={d("file")} labelY={44} />
-      <L x={48} y={64} size={9.5} tone="muted">
+    <Frame id="declarativeApply" h={170}>
+      <Step x={14} y={14} n={1} />
+      <Box x={8} y={28} w={70} h={58} tone="muted" label={d("file")} labelY={44} />
+      <L x={43} y={66} size={9.5} tone="muted">
         vms.yaml
       </L>
-      <Arrow x1={88} y1={60} x2={112} y2={60} />
-      <Box x={114} y={22} w={92} h={76} tone="brand" label={d("diff")} labelY={36} />
-      <L x={124} y={56} anchor="start" size={10} tone="ok">
+      <Arrow x1={80} y1={57} x2={100} y2={57} />
+      <Step x={108} y={14} n={2} />
+      <Box x={102} y={28} w={92} h={58} tone="brand" label={d("diff")} labelY={40} />
+      <L x={112} y={54} anchor="start" size={9.5} tone="ok">
         {`+ ${d("add")}`}
       </L>
-      <L x={124} y={72} anchor="start" size={10} tone="warn">
+      <L x={112} y={66} anchor="start" size={9.5} tone="warn">
         {`~ ${d("change")}`}
       </L>
-      <L x={124} y={88} anchor="start" size={10} tone="bad">
+      <L x={112} y={78} anchor="start" size={9.5} tone="bad">
         {`− ${d("remove")}`}
       </L>
-      <Arrow x1={208} y1={60} x2={232} y2={60} tone="ok" label={d("apply")} />
-      <Box x={234} y={30} w={76} h={60} tone="ok" label={d("cluster")} />
-      <L x={160} y={120} size={10}>
+      <Step x={210} y={40} n={3} />
+      <Arrow x1={196} y1={57} x2={226} y2={57} tone="ok" />
+      <L x={211} y={72} size={9.5} tone="ok">
+        {d("apply")}
+      </L>
+      <Box x={228} y={28} w={84} h={58} tone="ok" label={d("cluster")} />
+      <polyline
+        points="270,88 270,104 43,104"
+        fill="none"
+        stroke={STROKE.warn}
+        strokeWidth={1.5}
+        strokeDasharray="4 3"
+      />
+      <Arrow x1={43} y1={104} x2={43} y2={90} tone="warn" dashed />
+      <Step x={30} y={120} n={4} />
+      <L x={44} y={120} anchor="start" size={10} tone="warn">
+        {d("watch")}
+      </L>
+      <L x={160} y={142} size={9.5}>
         {d("note")}
       </L>
-      <L x={160} y={138} size={10} tone="muted">
+      <L x={160} y={158} size={9.5} tone="muted">
         {d("note2")}
       </L>
     </Frame>

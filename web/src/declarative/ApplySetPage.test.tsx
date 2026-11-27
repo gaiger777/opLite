@@ -7,7 +7,8 @@ import { ApplySetPage } from "@/declarative/ApplySetPage";
 import { refreshApplySets } from "@/declarative/api";
 import { ApplySetsPage } from "@/declarative/ApplySetsPage";
 import { expectNoAxeViolations } from "@/test/axe";
-import { applySet, AT, DRIFTED, SET_ID, WEB_ID } from "@/test/declarative";
+import { applySet, AT, DRIFTED, LIVE_MANIFESTS, SET_ID, WEB_ID } from "@/test/declarative";
+import { task } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -19,6 +20,9 @@ const CLEAN = { ...applySet("infra"), id: "019a0f3c-0000-7000-8073-0000000000a2"
 function mockSets() {
   mockLists({});
   server.use(
+    http.get(apiUrl("/manifests"), () =>
+      HttpResponse.json({ revision: 9, documents: LIVE_MANIFESTS }),
+    ),
     http.get(apiUrl("/apply-sets"), () =>
       HttpResponse.json({ revision: 1, items: [DRIFTED, CLEAN] }),
     ),
@@ -28,22 +32,48 @@ function mockSets() {
   );
 }
 
-it("lists apply sets with object counts, the last apply and drift chips, and passes axe", async () => {
+it("explains managing as code and lists sets in plain words, and passes axe", async () => {
   mockSets();
   const { container } = renderPage(<ApplySetsPage />, { path: "/apply-sets" });
-  const table = await screen.findByRole("table", { name: "Apply sets" });
+  // 첫 화면의 그림 설명: 무엇·언제·어떻게 시작과 적용 명령(복사)
+  const about = await screen.findByRole("region", { name: "What is managing as code (YAML)?" });
+  expect(about.querySelector("[data-slot=diagram]")).not.toBeNull();
+  expect(about).toHaveTextContent("What Write settings");
+  expect(about).toHaveTextContent("When To review");
+  expect(about).toHaveTextContent("orbivisorctl apply --set <name> -f <folder>");
+  expect(within(about).getByRole("button", { name: "Copy the command" })).toBeInTheDocument();
+  const table = await screen.findByRole("table", { name: "Managed as code (YAML)" });
   const drifted = within(table).getByRole("row", { name: /web-prod/ });
-  expect(drifted).toHaveTextContent("1 drifted");
+  // 무엇을 관리하나 · 마지막 적용(누가·결과) · 파일과 비교
+  expect(drifted).toHaveTextContent("Network 1 · VM 1");
   expect(drifted).toHaveTextContent("by ci");
+  expect(drifted).toHaveTextContent("Succeeded");
+  expect(drifted).toHaveTextContent("1 differs from the files");
   expect(within(drifted).getByRole("link", { name: "web-prod" })).toHaveAttribute(
     "href",
     "/apply-sets/web-prod",
   );
-  expect(within(table).getByRole("row", { name: /infra/ })).toHaveTextContent("In sync");
+  expect(within(drifted).getByRole("link", { name: "What differs" })).toHaveAttribute(
+    "href",
+    "/apply-sets/web-prod#compare",
+  );
+  expect(within(table).getByRole("row", { name: /infra/ })).toHaveTextContent("Same as the files");
   await expectNoAxeViolations(container);
 });
 
-it("shows each object's state, who changed it, and adopts the chosen ones", async () => {
+it("reads seconds from older servers as the last apply time", async () => {
+  mockLists({});
+  const old = applySet("old", { applied_at: Math.floor((AT - 86_400_000) / 1000) });
+  server.use(
+    http.get(apiUrl("/apply-sets"), () => HttpResponse.json({ revision: 1, items: [old] })),
+  );
+  renderPage(<ApplySetsPage />, { path: "/apply-sets" });
+  const row = await screen.findByRole("row", { name: /old/ });
+  expect(row).toHaveTextContent(String(new Date(AT).getFullYear()));
+  expect(row).not.toHaveTextContent("1970");
+});
+
+it("compares file and actual values, shows who changed them and adopts the chosen ones", async () => {
   const user = userEvent.setup();
   mockSets();
   let adopted: unknown;
@@ -58,31 +88,77 @@ it("shows each object's state, who changed it, and adopts the chosen ones", asyn
     path: "/apply-sets/:name",
     url: "/apply-sets/web-prod",
   });
-  const table = await screen.findByRole("table", { name: "Objects of web-prod" });
+  const table = await screen.findByRole("table", { name: "Resources managed by web-prod" });
   const web = within(table).getByRole("row", { name: /web/ });
+  expect(web).toHaveTextContent("VM");
   expect(web).toHaveTextContent("Different");
-  expect(web).toHaveTextContent("Changed by admin");
-  expect(web).toHaveTextContent("Web UI, revision 81");
-  expect(web).toHaveTextContent("“more memory for the sale”");
-  await user.click(within(web).getByText("2 fields differ"));
-  expect(within(web).getByText("vcpus")).toBeInTheDocument();
+  expect(within(web).getByRole("link", { name: "web" })).toHaveAttribute("href", "/vms/web");
   expect(within(table).getByRole("row", { name: /lan/ })).toHaveTextContent("Same");
-  expect(screen.getByRole("link", { name: "Config history" })).toHaveAttribute(
+  // 두 길: 파일대로 되돌리기(명령 복사) · 지금 값을 파일 값으로 삼기
+  expect(
+    screen.getByText("orbivisorctl apply --set web-prod -f <folder of files>"),
+  ).toBeInTheDocument();
+  // 파일 값 ↔ 실제 값: 다른 리소스는 펼치고, 다른 칸은 강조, 비밀은 견주지 않는다
+  const compare = await screen.findByRole("table", { name: "VM web: file and actual values" });
+  expect(compare.closest("details")).toHaveAttribute("open");
+  expect(compare.closest("details")).toHaveTextContent("Changed by admin");
+  expect(compare.closest("details")).toHaveTextContent("Web UI, record #81");
+  expect(compare.closest("details")).toHaveTextContent("“more memory for the sale”");
+  const memory = await within(compare).findByRole("row", { name: /memory_mib/ });
+  expect(memory).toHaveTextContent("4 GiB");
+  expect(memory).toHaveTextContent("8 GiB");
+  expect(memory).toHaveTextContent("differs");
+  expect(within(compare).getByRole("row", { name: /vcpus/ })).toHaveTextContent(
+    "vCPUsvcpusdiffers24",
+  );
+  expect(within(compare).getByRole("row", { name: /labels.tier/ })).not.toHaveTextContent(
+    "differs",
+  );
+  expect(within(compare).getByRole("row", { name: /cloud_init/ })).toHaveTextContent(
+    "(secret — not compared)",
+  );
+  const lan = screen.getByRole("table", { name: "Network lan: file and actual values" });
+  expect(lan.closest("details")).not.toHaveAttribute("open");
+  expect(screen.getByRole("link", { name: "Change history" })).toHaveAttribute(
     "href",
     "/history?apply_set=web-prod&period=all",
   );
   await expectNoAxeViolations(container);
   await user.click(within(web).getByRole("checkbox", { name: "Choose web" }));
-  await user.click(screen.getByRole("button", { name: "Accept 1 actual value as declared" }));
+  await user.click(
+    screen.getByRole("button", { name: "Keep 1 chosen current value as the file value" }),
+  );
   const confirm = await screen.findByRole("alertdialog", {
-    name: "Accept the actual values in web-prod?",
+    name: "web-prod: keep the current values as the file values?",
   });
-  expect(confirm).toHaveTextContent("vm web: its actual values become the declaration");
-  await user.click(within(confirm).getByRole("button", { name: "Accept" }));
+  expect(confirm).toHaveTextContent("VM web: its current values become the file values");
+  await user.click(within(confirm).getByRole("button", { name: "Keep current values" }));
   await waitFor(() => expect(adopted).toEqual({ objects: [WEB_ID] }));
   expect(
-    await screen.findByText("Apply set web-prod now declares the actual values."),
+    await screen.findByText("web-prod now remembers the current values as its file values."),
   ).toBeInTheDocument();
+});
+
+it("lists the tasks that applied the set, newest first, opening the task drawer", async () => {
+  mockSets();
+  const base = task("t-new", "apply", SET_ID);
+  const mine = {
+    ...base,
+    id: "019a0f3c-0000-7000-8073-0000000000f2",
+    spec: { ...base.spec, op: { kind: "apply", set: SET_ID, plan: "p1" } },
+    // 서버가 만들 때 단 대상 이름(계획 77-1)
+    labels: { "target-name": "web-prod", "target-kind": "apply-set" },
+  } as typeof base;
+  const older = { ...task("t-old", "apply", SET_ID), id: "019a0f3c-0000-7000-8073-0000000000f1" };
+  const other = { ...task("t-other", "apply", "019a0f3c-0000-7000-8073-0000000000ff") };
+  mockLists({ task: [older, other, mine] });
+  renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
+  const applies = await screen.findByRole("table", { name: "Applies" });
+  const rows = within(applies).getAllByRole("row").slice(1);
+  expect(rows).toHaveLength(2);
+  // "web-prod 적용" 대신 무엇인지 보이는 이름, 누르면 Task 서랍(계획 77-1)
+  const link = within(rows[0]!).getByRole("link", { name: "YAML apply — set web-prod" });
+  expect(link).toHaveAttribute("href", expect.stringContaining(`task=${mine.id}`));
 });
 
 const LAN_ID = "019a0f3c-0000-7000-8073-000000000002";
@@ -114,6 +190,9 @@ function mockAdopt(set: ReturnType<typeof lanDeletedSet>) {
   mockLists({});
   const sent: unknown[] = [];
   server.use(
+    http.get(apiUrl("/manifests"), () =>
+      HttpResponse.json({ revision: 9, documents: LIVE_MANIFESTS.slice(0, 1) }),
+    ),
     http.get(apiUrl("/apply-sets/:key"), () => HttpResponse.json(set)),
     http.post(apiUrl("/apply-sets/:key/adopt"), async ({ request }) => {
       sent.push(await request.json());
@@ -128,18 +207,16 @@ it("adopts all only after confirming, with an empty body so the server picks wha
   const sent = mockAdopt(lanDeletedSet());
   renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
   await user.click(
-    await screen.findByRole("button", { name: "Accept all actual values as declared" }),
+    await screen.findByRole("button", { name: "Keep all current values as the file values" }),
   );
   const confirm = await screen.findByRole("alertdialog", {
-    name: "Accept the actual values in web-prod?",
+    name: "web-prod: keep the current values as the file values?",
   });
-  expect(confirm).toHaveTextContent("vm web: its actual values become the declaration");
-  expect(confirm).toHaveTextContent(
-    "network lan: gone from the cluster, so it leaves the apply set",
-  );
+  expect(confirm).toHaveTextContent("VM web: its current values become the file values");
+  expect(confirm).toHaveTextContent("Network lan: gone from the cluster, so it leaves the set");
   expect(confirm).not.toHaveTextContent("stray");
   expect(sent).toEqual([]);
-  await user.click(within(confirm).getByRole("button", { name: "Accept" }));
+  await user.click(within(confirm).getByRole("button", { name: "Keep current values" }));
   await waitFor(() => expect(sent).toEqual([{}]));
 });
 
@@ -147,16 +224,18 @@ it("lets an object deleted outside the set be chosen and adopted", async () => {
   const user = userEvent.setup();
   const sent = mockAdopt(lanDeletedSet());
   renderPage(<ApplySetPage />, { path: "/apply-sets/:name", url: "/apply-sets/web-prod" });
-  const table = await screen.findByRole("table", { name: "Objects of web-prod" });
+  const table = await screen.findByRole("table", { name: "Resources managed by web-prod" });
   const lan = within(table).getByRole("row", { name: /lan/ });
   expect(lan).toHaveTextContent("Missing");
   expect(within(table).queryByRole("checkbox", { name: "Choose stray" })).not.toBeInTheDocument();
   await user.click(within(lan).getByRole("checkbox", { name: "Choose lan" }));
-  await user.click(screen.getByRole("button", { name: "Accept 1 actual value as declared" }));
+  await user.click(
+    screen.getByRole("button", { name: "Keep 1 chosen current value as the file value" }),
+  );
   const confirm = await screen.findByRole("alertdialog");
-  expect(confirm).toHaveTextContent("network lan: gone from the cluster");
-  expect(confirm).not.toHaveTextContent("vm web");
-  await user.click(within(confirm).getByRole("button", { name: "Accept" }));
+  expect(confirm).toHaveTextContent("Network lan: gone from the cluster");
+  expect(confirm).not.toHaveTextContent("VM web");
+  await user.click(within(confirm).getByRole("button", { name: "Keep current values" }));
   await waitFor(() => expect(sent).toEqual([{ objects: [LAN_ID] }]));
 });
 
@@ -168,19 +247,23 @@ it("drops chosen rows that stop drifting on refresh instead of widening to all",
     path: "/apply-sets/:name",
     url: "/apply-sets/web-prod",
   });
-  const table = await screen.findByRole("table", { name: "Objects of web-prod" });
+  const table = await screen.findByRole("table", { name: "Resources managed by web-prod" });
   await user.click(within(table).getByRole("checkbox", { name: "Choose web" }));
-  await user.click(screen.getByRole("button", { name: "Accept 1 actual value as declared" }));
+  await user.click(
+    screen.getByRole("button", { name: "Keep 1 chosen current value as the file value" }),
+  );
   const confirm = await screen.findByRole("alertdialog");
   // 누가 web을 다시 적용해 드리프트 고리가 web을 지웠다 — 지켜보기가 묶음을 다시 받는다
   set.status.drift!.items = set.status.drift!.items!.filter((d) => d.id !== WEB_ID);
   await refreshApplySets(queryClient);
   await waitFor(() =>
-    expect(within(confirm).getByRole("button", { name: "Accept" })).toBeDisabled(),
+    expect(within(confirm).getByRole("button", { name: "Keep current values" })).toBeDisabled(),
   );
-  expect(confirm).not.toHaveTextContent("network lan");
+  expect(confirm).not.toHaveTextContent("Network lan");
   await user.click(within(confirm).getByRole("button", { name: "Cancel" }));
-  expect(screen.getByRole("button", { name: "Accept 0 actual values as declared" })).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Keep 0 chosen current values as the file values" }),
+  ).toBeDisabled();
   expect(sent).toEqual([]);
 });
 
@@ -191,9 +274,9 @@ it("hides adopting from viewers", async () => {
     url: "/apply-sets/web-prod",
     as: VIEWER,
   });
-  await screen.findByRole("table", { name: "Objects of web-prod" });
+  await screen.findByRole("table", { name: "Resources managed by web-prod" });
   expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Keep/ })).not.toBeInTheDocument();
 });
 
 it("exports the set's manifests as YAML to copy or download", async () => {
@@ -226,14 +309,15 @@ it("exports the set's manifests as YAML to copy or download", async () => {
   expect(within(dialog).getByRole("button", { name: "Download" })).toBeInTheDocument();
 });
 
-it("explains apply sets with a picture and the first steps when there are none", async () => {
+it("explains how to start when there are no sets", async () => {
   mockLists({});
   server.use(http.get(apiUrl("/apply-sets"), () => HttpResponse.json({ revision: 1, items: [] })));
   renderPage(<ApplySetsPage />, { path: "/apply-sets" });
-  const empty = (await screen.findByText("No apply sets.")).closest<HTMLElement>(
-    "[data-slot=empty-state]",
-  )!;
+  const empty = (
+    await screen.findByText("No settings are managed as YAML yet.")
+  ).closest<HTMLElement>("[data-slot=empty-state]")!;
   expect(empty).toHaveTextContent("orbivisorctl apply --set name -f folder");
-  expect(empty.querySelector("[data-slot=diagram]")).not.toBeNull();
   expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  // 그림은 화면 위 설명에 늘 있다
+  expect(document.querySelector("[data-slot=diagram]")).not.toBeNull();
 });

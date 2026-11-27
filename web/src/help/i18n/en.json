@@ -99,7 +99,7 @@
         "step3": "Pause very briefly and continue on the new node"
       },
       "declarativeApply": {
-        "alt": "Manage-as-code diagram: the YAML file is compared with the cluster to show what will be added, changed and removed; applying makes the cluster match. Removal happens only with --prune.",
+        "alt": "Manage-as-code diagram: 1 the YAML file is 2 compared with the cluster to show what will change, 3 applying makes the cluster match, 4 later changes in the UI show up as 'differs from the file'.",
         "file": "YAML file",
         "diff": "Compare",
         "add": "add",
@@ -107,8 +107,9 @@
         "remove": "remove",
         "apply": "Apply",
         "cluster": "Cluster",
-        "note": "The file is the 'wanted state'; applying makes the cluster match it. Removal happens only with --prune and an apply set (--set), and only for objects that set applied before and the file no longer has (VMs, volumes and stores also need --prune-data).",
-        "note2": "If anyone changes it after an apply (UI, CLI or API), what differs from the last apply shows as 'drift'."
+        "watch": "Drift watch: UI edits show as 'differs from file'",
+        "note": "File = wanted state. Apply makes the cluster match.",
+        "note2": "Removal happens only with --prune."
       },
       "dedupStore": {
         "alt": "Backup store diagram: three backups repeat the same pieces, but the store keeps each different piece only once.",

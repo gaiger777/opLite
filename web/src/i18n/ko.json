@@ -256,10 +256,10 @@
     "vmwareMigrationsKeywords": "vmware, vcenter, esxi, 이전, 마이그레이션, 따뜻한, 전환",
     "vmwareSourcesKeywords": "vmware, vcenter, esxi, 연결",
     "vmExportsKeywords": "내보내기, export, ova, ovf, vmdk",
-    "history": "설정 기록",
-    "historyKeywords": "설정 기록, 이력, history, 바뀜, revision, 되돌리기, 드리프트, drift",
-    "applySets": "선언 묶음",
-    "applySetsKeywords": "선언 묶음, 적용 묶음, apply set, 선언형, 매니페스트, yaml, gitops, 드리프트, drift",
+    "history": "변경 기록",
+    "historyKeywords": "변경 기록, 설정 기록, 이력, history, 바뀜, revision, 되돌리기, 드리프트, drift",
+    "applySets": "코드로 관리(YAML)",
+    "applySetsKeywords": "코드로 관리, yaml, 선언 묶음, 적용 묶음, apply set, 선언형, 매니페스트, gitops, terraform, 파일과 달라짐, 드리프트, drift",
     "certificates": "인증서",
     "certificatesKeywords": "인증서, certificate, ACME, Let's Encrypt, TLS, https",
     "group": {
@@ -469,6 +469,7 @@
       "vm-export": "VM {{target}} 내보내기",
       "vm-export-delete": "내보내기 {{target}} 삭제",
       "apply": "{{target}} 적용",
+      "apply-set": "YAML 적용 — 묶음 {{target}}",
       "acme-order": "인증서 {{target}} 주문"
     },
     "progress": {

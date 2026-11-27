@@ -21,6 +21,27 @@ export type DriftState = Schemas["DriftState"];
 
 export const APPLY_SETS_KEY = ["apply-sets"] as const;
 
+/**
+ * 마지막 적용 시각(유닉스 밀리초). 계획 77-7 전의 서버는 초로 적었다 — 2001년 전의 밀리초는 없으므로 그보다 작으면 초로
+ * 읽는다(섞인 판·옛 묶음).
+ */
+export function appliedAtMs(set: ApplySet): number | undefined {
+  const at = set.status.applied_at;
+  if (at === undefined || at === null) {
+    return undefined;
+  }
+  return at < 1e12 ? at * 1000 : at;
+}
+
+/** 묶음이 관리하는 종류별 수(많은 차례, 같으면 이름 차례) */
+export function kindCounts(set: ApplySet): [string, number][] {
+  const counts = new Map<string, number>();
+  for (const o of set.status.objects ?? []) {
+    counts.set(o.kind, (counts.get(o.kind) ?? 0) + 1);
+  }
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
 /** 적용 묶음 목록(루트 `system.read`) */
 export function useApplySets(enabled = true) {
   return useQuery({

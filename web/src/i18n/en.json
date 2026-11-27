@@ -256,10 +256,10 @@
     "vmwareMigrationsKeywords": "vmware, vcenter, esxi, migrate, warm, cutover, wave",
     "vmwareSourcesKeywords": "vmware, vcenter, esxi, connection",
     "vmExportsKeywords": "export, ova, ovf, vmdk",
-    "history": "Config history",
+    "history": "Change history",
     "historyKeywords": "history, config history, changes, revision, rollback, restore, drift",
-    "applySets": "Apply sets",
-    "applySetsKeywords": "apply set, declarative, manifest, yaml, gitops, drift",
+    "applySets": "Managed as code (YAML)",
+    "applySetsKeywords": "managed as code, yaml, apply set, declarative, manifest, gitops, terraform, drift",
     "certificates": "Certificates",
     "certificatesKeywords": "certificate, ACME, Let's Encrypt, TLS, https",
     "group": {
@@ -469,6 +469,7 @@
       "vm-export": "Export VM {{target}}",
       "vm-export-delete": "Delete export {{target}}",
       "apply": "Apply {{target}}",
+      "apply-set": "YAML apply — set {{target}}",
       "acme-order": "Order certificate {{target}}"
     },
     "progress": {

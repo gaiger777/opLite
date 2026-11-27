@@ -140,8 +140,11 @@ export function describeTask(
   const arch = op.kind === "cpu-baseline" ? op.arch : undefined;
   const previous = op.kind === "cpu-baseline" ? (op.previous ?? t("cpu.none")) : undefined;
   const current = op.kind === "cpu-baseline" ? (op.current ?? t("cpu.none")) : undefined;
+  // 묶음 적용(계획 73)은 "YAML 적용 — 묶음 web-prod"(계획 77-7 — "web-prod 적용"이 무엇인지 몰랐다). 묶음 없는 적용
+  // (되돌리기 계획)은 그대로.
+  const key = op.kind === "apply" && op.set ? "apply-set" : op.kind;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
-  return t(`tasks.op.${op.kind}`, {
+  return t(`tasks.op.${key}`, {
     target,
     from,
     remote,
