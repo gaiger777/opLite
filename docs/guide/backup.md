@@ -1469,12 +1469,17 @@ orbivisorctl alert rule add-dr-defaults --target ops-mail
   (web2 2d)`(이름은 다섯까지)와 `Plan: /dr-plans/web-tier`(웹 계획 화면의 경로)다. 재해 장애 조치 뒤에는 죽은 prod를 기준으로 세므로
   계속 울린다 — 되돌리기(아래)가 끝날 때까지 그 계획을 규칙의 `plans`에서 빼거나 규칙을 잠시 끈다.
 - **`dr_run_failed {plans?}`**(리더, 이벤트): 실행(시험·장애 조치·뒷정리)이 `failed`·`partial`로 끝나면 한 번. 본문에 실패한 VM과
-  까닭(다섯까지), `Plan: /dr-plans/<계획>`, `Run: /dr-runs/<실행 id>`. 도는 실행이 **30분 넘게 나아가지 않으면**(단계·그룹·거품이
-  바뀌지 않음 — 실행의 `progress_at`) `DR run … stalled: no progress for N min`과 단계의 마지막 일시 오류로 한 번 더 알린다(같은 멈춤에는
-  한 번, 다시 나아갔다 멈추면 또). 계획된 이전 중 prod가 죽은 경우가 이것이다.
+  까닭(다섯까지), 그리고 경고 줄 — `source VM left stopped: db1 (…)`(계획된 이전이 prod VM을 다시 켜지 못함), `restored from an older
+  recovery point: web2 (1440 min older)`, `live restore did not finish copying the disks: …` — 과 `Plan: /dr-plans/<계획>`,
+  `Run: /dr-runs/<실행 id>`. prod VM을 꺼진 채 남긴 **취소한** 계획된 이전도 알린다. 도는 실행이 **30분 넘게 나아가지 않으면**
+  `DR run … stalled: no progress for N min`과 단계의 마지막 일시 오류로 한 번 더 알린다(같은 멈춤에는 한 번, 다시 나아갔다 멈추면 또).
+  나아감(`progress_at`)은 단계·그룹·거품이 바뀐 것과 함께, **도는 Task**(복원·시작·라이브 복원의 디스크 옮기기 — 복원 Task는 진행률을
+  알리지 않으므로 Task가 `running`이면 나아가는 것으로 본다)와 **상한이 있는 기다림**(그룹의 `wait` — `timeout_secs`, 그룹 사이
+  `delay_secs`, 일시 오류 없이 도는 계획된 이전 준비 — 단계 상한)이다. 그런 기다림은 제 상한이 끝낸다. 그래서 큰 복원이 몇 시간 걸려도
+  울리지 않고, 일시 오류를 다시 하는 동안(계획된 이전 중 prod가 죽음 등)이나 Task가 줄만 서 있을 때 운다.
 - **`dr_source_returned {plans?}`**(리더, critical 권함): 재해 장애 조치로 dr에 되살린 VM이 prod에서 아직 멈추지 않았는데
   (`status.source_fence_pending`) prod 원격이 다시 닿으면 firing — 같은 VM이 두 벌 돌 수 있다(아래 "재해 뒤 prod가 돌아올 때").
-  `fence-source`로 목록을 비우면 해소.
+  `fence-source`(그 VM을 멈춤)나 `clear-fence`(운영자가 확인함)로 목록을 비우면 해소.
 - **경보 묶음.** `alert rule add-dr-defaults --target T`(여러 번, API `POST /api/v1/alert-rules/dr-defaults {"targets": [...]}` →
   `{created, existing}`)가 앞의 둘을 warning, `dr-source-returned`를 critical로(모두 `for 0`) 만든다. 같은 이름이 있으면 그대로 둔다. 계획을 거르려면 API로 만든다:
   `{"condition": {"kind": "dr_rpo_exceeded", "plans": ["web-tier"]}, …}`. 홈의 경보 목록과 알림 센터에 그대로 보이고 대상 링크는 그
@@ -1500,17 +1505,23 @@ orbivisorctl dr cleanup web-tier --wait       # 시험 VM을 끄고 지우고 �
 ```
 
 - **운영을 건드리지 않는다.** prod에 묻지 않는다.
-- **복구 지점이 없는 VM.** 하나라도 있으면 **400** `dr_missing_recovery_points`(`details.vms`)로 거절한다. 알고 진행하려면
-  `--allow-missing`(API `{"allow_missing": true}`) — 그 VM은 `skipped`("no recovery point")이고 실패가 아니라 `on_timeout`에 들지 않으며,
-  실행은 다른 VM이 모두 되어도 `partial`이다. `--point-in-time 2026-11-26T00:00:00Z`(API `point_in_time`, 유닉스 초)는 그 시각 이전의
-  가장 새 복구 지점으로 시험한다.
+- **복구 지점이 없는 VM.** 하나라도 있으면 **400** `dr_missing_recovery_points`(`details.vms`)로 거절한다. 알고 진행하려면 그 VM을
+  고른다: `--skip-vm db1`(여러 번, API `{"skip_vms": ["db1"]}`) — 고른 VM만 `skipped`("no recovery point")이고 실패가 아니라
+  `on_timeout`에 들지 않으며, 실행은 다른 VM이 모두 되어도 `partial`이다. 고르지 않은 VM에 복구 지점이 없으면 여전히 400이고, 계획에 없는
+  이름은 400이다. 옛 `--allow-missing`(API `allow_missing: true`)은 복구 지점이 없는 VM을 **모두** 건너뛴다 — 본 목록과 다른 VM까지
+  빠질 수 있어 권하지 않는다. `--point-in-time 2026-11-26T00:00:00Z`(API `point_in_time`, 유닉스 초)는 그 시각 이전의 가장 새 복구
+  지점으로 시험한다(거품 네트워크가 필요한지도 그 사본으로 센다). 누르기 전에 `dr report --point-in-time …`(API `GET
+  /dr-plans/{key}/report?point_in_time=`)이 그 시각 기준의 복구 지점·장애 조치 준비를 보인다.
 - **시험망은 밖과 끊겨 있어야 한다.** 시험 VM은 IP 규칙 그대로(운영과 같은 주소)·같은 호스트 이름으로 뜨고 게스트 서비스도 그대로
   돈다. **`test_networks`의 대상이 브리지(물리망) 네트워크, 공급자(업링크) SDN 네트워크, 라우터에 붙은 네트워크면 400
   `dr_test_network_not_isolated`**(`details.networks`)다. dr LAN이 prod와 L2로 이어져 있으면 IP 충돌과 운영 클라이언트가 시험 DB에 붙는
   일이 생긴다. 그래도 진행하려면 `--allow-routed-test-networks`(API `allow_routed_test_networks`). 거품 네트워크(아래)는 늘 격리다.
 - **이름·폴더·라벨.** 시험 VM은 `<vm>-drt`(63자를 넘으면 줄이고 해시를 끼움), 폴더 `dr-test/<계획>`(없으면 만듦 — 뒷정리는 빈 폴더를
   지우지 않는다), 라벨 `orbivisor.io/dr-test=<계획>`이다. 이름이 이미 쓰인 VM은 그 VM만 실패하고, 그 VM은 이 시험이 만든 것이 아니므로
-  새 VM·뒷정리 대상이 아니다. 같은 VM을 담은 두 계획은 시험 VM 이름이 겹치므로 한쪽 뒷정리 전에 다른 쪽을 시험하면 그 VM이 실패한다.
+  새 VM·뒷정리 대상이 아니다. **한 VM은 한 계획에만 넣는다**: 같은 원격(같은 CA 지문)의 같은 VM을 다른 계획에 넣으면 계획 만들기·바꾸기가
+  **409** `dr_vm_in_other_plan`(`details: {vm, plan}`)이다 — 두 계획이 같은 VM을 되살리면 복원·라벨·시험 VM 이름을 다툰다. 엔진은 복원
+  Task를 실행 라벨 `orbivisor.io/dr-run=<실행 id>`로 찾으므로 다른 실행의 Task를 제 것으로 집지 않는다. 라벨(`orbivisor.io/dr`·
+  `orbivisor.io/dr-test`, 실행 라벨)은 복원 Task가 VM을 만들 때 함께 단다.
 - **장애 조치 준비.** 시험은 거품·시험망으로 가므로 실제 장애 조치의 네트워크 맵은 쓰지 않는다. 그래서 시험을 시작할 때 VM마다 실제
   장애 조치가 쓸 것 — 복구 지점, 그 복구 지점이 쓰는 prod 네트워크의 dr 대상(`networks` 맵, 없으면 같은 이름)과 보안 그룹 대상, 복원
   풀, 노드 — 이 dr에 있는지 보고 실행의 `failover_readiness`(`[{vm, ok, issues: [{kind: recovery-point|network|security-group|pool|node,
@@ -1553,17 +1564,26 @@ orbivisorctl dr failover web-tier --mode planned --confirm web-tier --wait    # 
   `orbivisor.io/dr=<계획>`. 이름이 이미 쓰인 VM은 그 VM만 `failed`(`dr_name_taken`)이고 있던 VM은 건드리지 않는다(실행은
   `partial`). 복원이 늘 그렇듯 새 MAC이고 **HA는 꺼져 있다** — 장애 조치 뒤 켠다.
 - **disaster.** dr에 지금 있는 가장 새 복구 지점으로 곧장 한다. 마지막 복제 뒤에 prod에서 쓴 것은 잃는다. prod가 아직 돌고 있으면
-  두 벌이 함께 도니(같은 IP) 먼저 끈다. 복구 지점이 없는 VM이 있으면 **400** `dr_missing_recovery_points` — `--allow-missing`이면 그 VM만
-  `skipped`(실패가 아니라 `on_timeout: stop`이 나머지를 막지 않는다). 랜섬웨어·논리 손상이 복제됐으면 `--point-in-time <RFC 3339>`(API
-  `point_in_time`)로 그 시각 이전의 가장 새 사본을 고른다(VM마다 따로 고르려면 손으로 `backup restore`). 복원 Task가 실패하면(깨진
-  사본일 수 있다) 그 VM은 다음 오래된 사본으로 다시 한다(써 본 것은 단계의 `tried`, 까닭은 `notes` — 모두 셋까지, 검증 실패 사본은
-  처음부터 쓰지 않는다). 끝나면 되살린 VM을 계획 `status.source_fence_pending`에 적는다(아래 "재해 뒤 prod가 돌아올 때").
+  두 벌이 함께 도니(같은 IP) 먼저 끈다. 복구 지점이 없는 VM이 있으면 **400** `dr_missing_recovery_points` — 시험과 같이 `--skip-vm <VM>`(API
+  `skip_vms`)으로 고른 VM만 `skipped`(실패가 아니라 `on_timeout: stop`이 나머지를 막지 않는다). 랜섬웨어·논리 손상이 복제됐으면
+  `--point-in-time <RFC 3339>`(API `point_in_time`)로 그 시각 이전의 가장 새 사본을 고른다(VM마다 따로 고르려면 손으로 `backup restore` —
+  `dr report --point-in-time`으로 그 시각에 빠지는 VM을 먼저 본다). 복원 Task가 실패하면:
+  일시 오류(자리·할당량·노드가 꺼짐·닿지 않음·시간 초과)면 **같은 사본으로 한 번 더** 하고, 그 밖(깨진 사본일 수 있다)이면 **다음
+  오래된 사본**으로 다시 한다 — 써 본 사본과 같은 전체 백업을 바탕으로 한 증분 사슬은 건너뛴다(깨진 바탕을 다시 읽지 않는다). 써 본 것은
+  단계의 `tried`, 까닭은 `notes`, 사본은 셋까지, 검증 실패 사본은 처음부터 쓰지 않는다. **더 오래된 사본으로 되살린 VM은 RPO보다 많은
+  데이터를 잃는다**: 단계의 `lost_secs`(처음 고른 사본과 쓴 사본의 시각 차)에 적고, 실행은 다른 VM이 모두 되어도 `partial`이며
+  `dr_run_failed`가 운다(그룹 사이에 데이터 시점이 어긋날 수 있다 — 앱에서 확인한다). 실패한 복원이 VM을 남겼으면(라이브 복원은 VM을
+  먼저 만든다) 다시 하기 전에 그 VM(이 실행이 만든 id)을 지운다. 끝나면 이 실행이 만들거나 이어 받은 dr의 VM 모두를 운영 쪽 VM id와
+  함께 계획 `status.source_fence_pending`에 적는다(아래 "재해 뒤 prod가 돌아올 때").
 - **planned 사전 검사.** 시작할 때 prod에 닿아야 하고(저장한 CA·토큰으로 `GET /cluster`, 10초 — 아니면 **409**
   `dr_source_unreachable`, disaster를 쓴다), **prod의 VM을 하나라도 끄기 전에** 끝까지 갈 수 있는지 본다. 하나라도 어긋나면 **409**
   `dr_planned_preflight`(`details.problems: [{code, vm?, message}]`)로 거절하고 아무것도 끄지 않는다: `token_role`(prod 원격 토큰이 admin이
   아님), `no_remote_here`(prod에 이 클러스터 — 같은 CA 지문 — 의 원격이 없음, prod에서 `remote add dr …`), `vm_missing`(계획의 VM이
   prod에 없음), `no_backup_pool`(prod에 그 VM의 지난 백업이 없고 `source_backup_pool`도 없음), `no_receiving_pool`(dr에 사본을 받을 백업
-  풀이 없음), `unreadable`(prod 목록을 읽지 못함).
+  풀이 없음), `unreadable`(prod 목록을 읽지 못함), **dr 쪽** `dr_readiness`(prod VM의 지금 NIC로 본 네트워크 맵 대상·보안 그룹 대상,
+  복원 풀, 노드가 dr에 없음 — 복구 지점은 보지 않는다: 새 사본을 받는다), `dr_name_taken`(dr에 같은 이름의, 이 계획이 되살리지 않은 VM이
+  있음). 준비가 끝난 뒤 dr 복원이 거절되면 prod와 dr 둘 다 꺼지므로 이것을 먼저 본다. 계획된 이전에 `point_in_time`·`skip_vms`·
+  `allow_missing`을 주면 **400**이다(모든 VM의 새 사본을 쓴다).
 - **planned.** VM마다 먼저 prod 쪽을 준비한다(단계 `preparing`, `dr run`의 PHASE에 `preparing (shutdown)`처럼): (1) 그룹
   **역순**으로(뒤 그룹이 모두 꺼진 뒤 앞 그룹) `POST /vms/{vm}/actions/stop`(ACPI), 5분 뒤에도 켜져 있으면 `?mode=force`, (2) 꺼지면
   새 백업 `POST /vms/{vm}/backups` — 그 VM의 가장 새 prod 백업과 같은 풀·저장소에 증분으로(없으면 `source_backup_pool`에), 이름은
@@ -1574,19 +1594,32 @@ orbivisorctl dr failover web-tier --mode planned --confirm web-tier --wait    # 
   dr 쪽 복원·시작에만 든다). 준비 시간은 실행의 `prepare_secs`에 따로 적고 RTO에 든다. prod 쪽은 지금 있는 API만 부르므로 옛 판이어도 된다.
 - **planned의 오류와 되돌림.** prod에 닿지 않거나 시간 초과·5xx면 일시 오류다: 기다리며 60초마다 다시 부르고 단계의 `last_error`·
   `retrying_since`에 적는다(`dr run`에 `db1: retrying since …: cannot read the source cluster: …`, 30분 넘게 나아가지 않으면 경보
-  "stalled"). 401·403·404와 그 밖의 4xx는 그 VM의 실패다. 단계마다 상한이 있다: 처음 shutdown부터 15분 안에 꺼지지 않으면, 백업·복제가
-  하루 안에 끝나지 않으면 그 VM은 `failed`. **이 실행이 끄고 되살리지 못한 VM — 준비에서 실패했거나, `on_timeout: stop`·취소로 복원
-  전에 건너뛴 것 — 은 prod에서 다시 켠다**(`POST /vms/{vm}/actions/start`, 15분까지 다시 함, 단계의 `notes`에 "restarted the source VM …"
-  또는 실패). `on_timeout: stop`이면 준비 실패 하나로 아직 끄지 않은 VM에는 shutdown을 보내지 않는다. 준비가 끝나 dr에서 복원하다
-  실패한 VM은 다시 켜지 않는다(사본은 왔고 앞 그룹이 이미 dr에서 돌 수 있다) — 그 VM은 dr에서 손으로 복원하거나 prod에서 켠다.
+  "stalled"). prod를 읽지 못하는 동안은 단계 상한을 세지 않는다(그동안 prod 쪽 상태를 모른다) — 그래서 오래 닿지 않으면 사람이 취소한다.
+  읽기·부름의 401·403(토큰 만료·취소)·404와 그 밖의 4xx는 그 VM의 실패다. 단계마다 상한이 있다: 처음 shutdown부터 15분 안에 꺼지지
+  않으면, 백업·복제가 하루 안에 끝나지 않으면 그 VM은 `failed`.
+  **준비는 전부 아니면 전무다**: 어느 VM이든 준비(정지·백업·복제)가 실패하면 **`on_timeout`과 상관없이** 하나도 복원하지 않고, 아직 끄지
+  않은 VM에는 shutdown을 보내지 않으며, 실행은 `failed`다(`error`에 "a planned failover recovers all VMs or none"). prod가 살아 있는
+  이전에서는 앱을 두 사이트로 가르지 않는 것이 안전하다. 복원은 모든 VM의 준비가 끝난 뒤에만 시작한다.
+  **이 실행이 끄고 되살리지 못한 VM — 준비에서 실패했거나 그 때문에·취소로 복원 전에 건너뛴 것 — 은 prod에서 다시 켠다**(`POST
+  /vms/{vm}/actions/start`). 닿지 않음·5xx·409 `vm_busy`(이 실행이 낸 prod 백업이 아직 돎)면 물러서며(1~5분) **30분까지** 다시 하고,
+  실행은 다시 켜기가 끝나거나 실패가 적힐 때까지 끝나지 않는다. 켜면 단계의 `notes`에 "restarted the source VM …", 켜지 못하면(4xx·
+  상한) 단계의 `prepare.restart_error`와 `notes`에 적고 경보 본문에 `source VM left stopped: …`이다 — prod에서 손으로 켠다.
+  준비가 끝나 dr에서 복원하다 실패한 VM은 다시 켜지 않는다(사본은 왔고 앞 그룹이 이미 dr에서 돌 수 있다) — 그 VM은 dr에서 손으로
+  복원하거나 prod에서 켠다(사전 검사가 dr 쪽 준비를 보므로 드물다).
   5분 뒤의 강제 정지는 전원을 뽑는 것과 같아(crash-consistent) 그 VM의 마지막 백업도 그 수준이다. 계획된 이전은 끝나면 prod VM이
-  모두 꺼진 상태다(원하는 상태 `stopped` — prod 노드가 다시 켜도 VM은 켜지지 않는다). planned 중에 prod가 죽으면 `dr cancel`(취소한 실행은 끈 VM을
-  한 번만 다시 켜 보고 닿지 않으면 기다리지 않는다) 뒤 disaster로 간다.
+  모두 꺼진 상태다(원하는 상태 `stopped` — prod 노드가 다시 켜도 VM은 켜지지 않는다).
+  **planned 중에 prod와 끊기면** 먼저 prod가 죽었는지, **사이트 사이 링크만 끊겼는지** 확인한다. 역순으로 끄므로 아직 끄지 않은 앞 그룹
+  (대개 db)은 prod에서 아직 돈다 — 링크만 끊긴 채 disaster로 넘기면 그 VM이 두 벌이 된다(다시 이어지면 `dr_source_returned`가 알리지만
+  끊긴 동안은 막을 길이 없다). prod가 죽었으면 `dr cancel` 뒤 disaster로 간다(취소한 실행은 prod에 닿지 않으면 끈 VM을 한 번만 다시 켜
+  보고 기다리지 않는다 — `vm_busy`처럼 prod가 답하면 다시 한다).
 - **라이브 복원**(`live: true`): 복원 Task가 VM을 켜면(Task는 아직 디스크를 옮긴다) 곧 그룹의 기다림으로 넘어가고, RTO도 VM이 켜진
-  때로 센다. 디스크 옮기기가 실패하면 단계의 `notes`에 경고를 적고(VM은 그대로), 실행은 옮기기가 끝나야 끝난다.
+  때로 센다. 디스크 옮기기도 동시성(`dr_max_parallel`·노드당 둘)에 든다 — VM이 켜진 뒤에도 옮기기가 끝나야 다음 복원이 그 자리를 쓴다.
+  디스크 옮기기가 실패하면 단계의 `copy_error`·`notes`에 적고(VM은 디스크를 다 받지 못했다 — 확인한다) 실행은 `partial`이며
+  `dr_run_failed`가 운다. 실행은 옮기기가 끝나야 끝난다.
 - **다시 돌리기.** 부분 실패 뒤 같은 장애 조치를 다시 돌리면 이 계획이 지난번에 되살린 VM(그 이름, 라벨 `orbivisor.io/dr=<계획>`)은
-  다시 만들지 않고 `skipped`("already recovered by this plan")로 지난다 — 잘 되살아난 VM을 지우지 않아도 된다. 라벨이 없는 같은 이름의
-  VM은 여전히 그 VM만 `dr_name_taken`이다.
+  다시 만들지 않는다: 지난 실행에서 **`ready`였던** VM은 `skipped`("already recovered by this plan")로 지나고 되살린 것으로 센다(다른 VM이
+  모두 되면 실행은 `succeeded`). 복원만 되고 켜지 못했거나 기다림에서 실패한 VM은 **이어 받아** 켜고 그룹의 기다림부터 한다(`notes`에
+  "took over VM …"). 잘 되살아난 VM을 지우지 않아도 된다. 라벨이 없는 같은 이름의 VM은 여전히 그 VM만 `dr_name_taken`이다.
 - **동시성.** 그룹 안의 VM은 함께 되살린다: 실행마다 복원·시작·지우기 Task를 `dr_max_parallel`(아래)개까지, 노드마다 둘까지. 그룹의
   모든 VM이 `ready`·`failed`·`timed_out`이 되면 `delay_secs` 뒤 다음 그룹이다.
 - **기다림.** 복원 Task → `vm-start` Task → 그룹의 `wait`: `running`(QEMU가 돔), `guest`(게스트 에이전트가 답함), `ip`(게스트 에이전트가
@@ -1612,28 +1645,32 @@ orbivisorctl dr run web-tier-test-1764205200 --watch     # 이름이나 id, 바�
   없다 — 누르면 그 뒷정리가 도는 동안 **409** `dr_run_active`). 취소한 장애 조치가 이미 만든 VM은 남는다(지우지 않음). 취소한 계획된
   이전은 이 실행이 끄고 아직 되살리지 않은 prod VM을 다시 켠다(위).
 - **실행 기록.** 실행은 리소스 `DrRun`(Raft)이다: `{plan, plan_name, kind, plan_spec(시작한 때의 계획), max_parallel}`과 상태
-  `{state, started_at, finished_at, rto_secs, prepare_secs, group, error, bubbles, steps, progress_at, preempted, preempted_test,
-  failover_readiness}`(실행 spec에는 `allow_missing`·`point_in_time`도). `kind`는 `test`·`failover-planned`·
+  `{state, started_at, finished_at, rto_secs, prepare_secs, group, error, bubbles, steps, progress_at, preempted, preempted_by,
+  preempted_test, failover_readiness}`(실행 spec에는 `skip_vms`·`allow_missing`·`point_in_time`도). `kind`는 `test`·`failover-planned`·
   `failover-disaster`·`cleanup`, `state`는 `running`·`succeeded`·`partial`·`failed`·`cancelled`, VM마다의 `phase`는 `pending`·`preparing`·
   `restoring`·`starting`·`waiting`·`ready`·`failed`·`timed_out`·`skipped`(뒷정리는 `deleting`·`deleted`)이고 그 단계의 Task·새 VM·노드·
   오류가 함께 있다. 단계에는 이 실행이 만든 VM id(`vm_id`), 라이브 복원의 디스크 옮기기(`copy_task`), 써 본 복구 지점(`tried`), 기록
   (`notes`), 다시 해 보는 일시 오류(`last_error`·`retrying_since`), 실패한 단계(`failed_in` — `preparing`·`restoring`·`starting`·
-  `waiting`)도 있다. 이름은 `<계획>-<test|failover|cleanup>-<시작 유닉스 초>`. 계획마다 끝난 실행을 20개만 남긴다. `GET
+  `waiting`), 더 오래된 사본으로 잃은 시간(`lost_secs`), 라이브 복원의 옮기기 실패(`copy_error`), 다시 복원하기 전에 지울 VM
+  (`discard_vm`), prod에서 다시 켜지 못한 까닭(`prepare.restart_error`)도 있다. 이름은 `<계획>-<test|failover|cleanup>-<시작 유닉스 초>`. 계획마다 끝난 실행을 20개만 남긴다. `GET
   /api/v1/dr-plans/{key}/runs`, `GET /api/v1/dr-runs/{key}`, watch 종류 `recovery-plan`·`dr-run`.
 - **RTO.** 실행 시작부터 마지막 VM이 `ready`가 될 때까지(`ready`가 없으면 없음). 계획된 이전은 prod 준비 시간(`prepare_secs`)을 포함한다.
   `succeeded`가 아닌 실행의 RTO는 되살린 VM만으로 센 값이라 실제보다 짧다 — CLI는 `>=14m`으로 보인다.
   시험의 RTO는 실제 장애 때의 어림이다(거품 네트워크를 만드는 시간이 들고 prod 준비는 없다).
 - **계획에 실행 하나.** 계획마다 도는 실행은 하나다(상태 머신의 독점 값 `dr-run` — 다른 실행이 돌면 **409** `dr_run_active`, 장애
-  조치만은 도는 시험을 끊는다). 리더가 바뀌면 새 리더가 실행 기록에서 이어 가고, 이미 낸 복원·시작·정지 Task(실행이 만들어진 뒤에 낸
-  같은 이름·복구 지점의 복원, 같은 VM의 시작 — 저장하지 못한 걸음도)와 prod 쪽 백업·복제를 찾아 다시 내지 않는다.
+  조치만은 도는 시험을 끊는다). 리더가 바뀌면 새 리더가 실행 기록에서 이어 가고, 이미 낸 복원·시작·정지 Task(이 실행의 라벨
+  `orbivisor.io/dr-run`이 달린 같은 이름·복구 지점의 복원, 이 실행이 만든 VM의 시작 — 저장하지 못한 걸음도)와 prod 쪽 백업·복제를 찾아
+  다시 내지 않는다. 다른 계획·실행의 Task는 집지 않는다(한 VM은 한 계획에만 — 위).
 
 ### 되돌리기(failback)와 reprotect
 
 자동 되돌리기는 없다. dr에서 돌던 VM을 prod로 돌려보내는 순서:
 
-1. **prod를 되살린다 — 먼저 막는다.** 아래 "재해 뒤 prod가 돌아올 때"대로 prod의 옛 VM을 멈춘다. 되돌리기는 원래 이름으로 복원하므로
-   그 VM들을 지우거나(데이터는 dr의 것이 새것이다) 이름을 비운다. 새로 만든 prod면 dr에 다시 원격으로 등록한다(`remote set`·`remote
-   add`).
+1. **prod를 되살린다 — 먼저 막는다.** 아래 "재해 뒤 prod가 돌아올 때"대로 **먼저 `dr fence-source`로** prod의 옛 VM을 멈춘다(목록이
+   빈다). 되돌리기는 원래 이름으로 복원하므로 그다음 그 VM들을 지우거나(데이터는 dr의 것이 새것이다) 이름을 비운다. fence 없이 옛 VM을
+   손으로 지웠거나 prod를 새로 만들었으면(dr에 다시 원격으로 등록 — `remote set`·`remote add`) 확인한 뒤 **`dr clear-fence`로** 목록을
+   비운다 — 목록이 남으면 `dr_source_returned`가 계속 운다. fence는 장애 조치 때의 prod VM(id)만 끄므로 4단계에서 같은 이름으로 새로
+   만든 운영 VM은 끄지 않는다(`different_vm`).
 2. **dr에서 다시 보호한다.** `orbivisorctl dr reprotect web-tier --remote prod --pool bk --at 03:00 --keep-daily 7`(API `POST
    /dr-plans/{key}/actions/reprotect {"remote", "pool", "backup_pool"?, "schedule", "keep"}`)가 되살린 VM(라벨 `orbivisor.io/dr=<계획>`)을
    라벨로 고르는 백업 작업 `dr-reprotect-<계획>`을 만들고(이미 있으면 이 값으로 바꾼다 — **200**) 그 백업을 prod의 백업 풀 `pool`로
@@ -1660,9 +1697,16 @@ orbivisorctl dr run web-tier-test-1764205200 --watch     # 이름이나 id, 바�
 - **prod를 망에 다시 잇기 전에** 격리한 채(관리망만) 그 VM들을 멈추고, 백업 작업의 `replicate`를 끈다.
 - 재해 장애 조치가 끝나면 dr은 되살린 VM을 계획 `status.source_fence_pending`에 적는다(`dr report`가 경고로 보인다). prod 원격이 다시
   닿으면 경보 **`dr_source_returned`**(critical)가 울린다. 자동으로는 아무것도 하지 않는다.
-- **`orbivisorctl dr fence-source web-tier`**(API `POST /dr-plans/{key}/actions/fence-source` → `{results: [{vm, ok, error?}], pending}`)가
-  prod에서 그 VM들을 `POST /vms/{vm}/actions/stop?mode=force`로 끄고 원하는 상태를 `stopped`로 둔다(prod 노드가 켜도 다시 켜지지 않는다).
-  prod에 없는 VM도 멈춘 것으로 본다. 멈춘 VM은 목록에서 빠지고 경보가 풀린다. 사전 검사: 목록이 비면 **409** `dr_nothing_to_fence`,
+- 목록은 `[{vm, source_id, ca_fingerprint}]`이다 — 장애 조치 때의 prod VM id(복구 지점 백업의 `spec.vm`)와 prod 원격의 CA 지문.
+  재해 장애 조치가 이 실행으로 만들거나 이어 받은 dr의 VM 모두가 든다(켜지 못한 VM도 — 사람이 켤 수 있다).
+- **`orbivisorctl dr fence-source web-tier`**(API `POST /dr-plans/{key}/actions/fence-source` → `{results: [{vm, ok, result, error?}],
+  pending}`)가 prod에서 **그 id의 VM만** `POST /vms/{id}/actions/stop?mode=force`로 끄고 원하는 상태를 `stopped`로 둔다(prod 노드가 켜도
+  다시 켜지지 않는다). `result`는 `stopped`, `not_found`(prod에 없음), `different_vm`(같은 이름이지만 다른 VM — 되돌리기로 새로 만든 운영
+  VM 등, 끄지 않음), `different_cluster`(prod 원격이 장애 조치 때와 다른 클러스터를 가리킴 — 끄지 않고 목록에 둠), `failed`다. 앞의 셋은
+  목록에서 빠지고, 목록이 비면 경보가 풀린다. 옛 기록(이름만)은 이름으로 끈다.
+- **`orbivisorctl dr clear-fence web-tier`**(API `POST /dr-plans/{key}/actions/clear-fence` → 계획, admin, 감사 `dr-plan clear-fence …`)는
+  prod에 아무것도 하지 않고 목록을 비운다 — 옛 VM이 멈췄거나 없음을 스스로 확인했을 때(fence 없이 지움, 원격을 새 클러스터로 바꿈,
+  `different_cluster`) 쓴다. 사전 검사: 목록이 비면 **409** `dr_nothing_to_fence`,
   prod에 닿지 않으면 **409** `dr_source_unreachable`, 토큰이 viewer면 **409** `dr_fence_preflight`. 일부가 실패하면 그것만 남고 CLI는 끝
   코드 1이다.
 
@@ -1672,8 +1716,8 @@ orbivisorctl dr run web-tier-test-1764205200 --watch     # 이름이나 id, 바�
   `orbivisorctl settings set dr_max_parallel=8`(API `PATCH /api/v1/settings {"dr_max_parallel": 8}`, admin)로 바꾸고, 새로 시작하는
   실행부터 쓴다(실행 spec의 `max_parallel`). 범위 밖이면 **400**, 모든 노드가 `dr-plans`를 알아야 한다(**409** `cluster_upgrading`).
 - **권한.** 계획·실행·보고 읽기는 루트 `cluster.read`(viewer 이상), 계획 만들기·바꾸기·지우기와 시험·장애 조치·뒷정리·취소·reprotect는
-  루트 `cluster.admin`이다(fence-source도). 실행이 내는 복원·시작·지우기는 엔진이 하므로 폴더 권한을 따로 보지 않는다. 감사 로그에
-  `dr-plan create|update|delete|test|failover … <mode>|cleanup|cancel|reprotect|fence-source`가 남는다.
+  루트 `cluster.admin`이다(fence-source·clear-fence도). 실행이 내는 복원·시작·지우기는 엔진이 하므로 폴더 권한을 따로 보지 않는다. 감사 로그에
+  `dr-plan create|update|delete|test|failover … <mode>|cleanup|cancel|reprotect|fence-source|clear-fence`가 남는다.
 - **기능.** 모든 온라인 노드가 기능 `dr-plans`를 알아야 계획을 쓰고 실행을 시작한다(아니면 **409** `cluster_upgrading` — 이름·형식
   검사보다 먼저, 읽기는 된다). 복원 맵(위 "백업과 복원")은 기능 `restore-remap`이다. 웹은 모르는 노드가 있으면 띠로 알리고 쓰기·실행을
   막는다.
@@ -1685,10 +1729,12 @@ orbivisorctl dr run web-tier-test-1764205200 --watch     # 이름이나 id, 바�
 | 400 | `dr_confirm_mismatch` | 장애 조치의 `confirm`이 계획 이름이 아님 |
 | 400 | `dr_test_network_required` | 시험에 거품이 필요한데 SDN이 없음 |
 | 400 | `dr_test_network_not_isolated` | 시험망이 브리지·공급자·라우터 네트워크(`details.networks`, `allow_routed_test_networks`) |
-| 400 | `dr_missing_recovery_points` | 복구 지점이 없는 VM(`details.vms`, `allow_missing`) |
+| 400 | `dr_missing_recovery_points` | 복구 지점이 없는 VM(`details.vms` — `skip_vms`로 고름) |
+| 400 | `invalid_request` | `skip_vms`에 계획에 없는 VM, 계획된 이전에 `point_in_time`·`skip_vms`·`allow_missing` |
 | 404 | `not_found` | 계획·실행이 없음 |
 | 409 | `cluster_upgrading` | `dr-plans`를 모르는 노드가 있음 |
 | 409 | `name_taken` | 같은 이름의 계획이 있음 |
+| 409 | `dr_vm_in_other_plan` | 같은 원격의 같은 VM이 다른 계획에 있음(`details: {vm, plan}`) |
 | 409 | `dr_source_missing` | `source` 원격이 등록돼 있지 않음 |
 | 409 | `dr_run_active` | 그 계획의 실행이 돎(시작·계획 지우기 — 장애 조치는 시험을 끊는다) |
 | 409 | `dr_cleanup_required` | 지난 시험의 VM·네트워크가 남음(시험·계획 지우기 — 먼저 `cleanup`) |
@@ -1703,7 +1749,7 @@ orbivisorctl dr run web-tier-test-1764205200 --watch     # 이름이나 id, 바�
 
   VM 하나의 실패는 실행의 그 단계 `error`에 적는다: `no recovery point`, `dr_name_taken: …`, 복원·시작 Task의 오류, `timed out`, planned의
   `VM … is not on the source cluster`·`source backup …: …`·`the source VM … did not stop within 900 s`·`stopping the source VM …: …`(401·
-  403·404) 등.
+  403·404)·`cannot read the source cluster: … HTTP 401 …`(토큰 거절), 다시 복원하기 전 `cannot delete VM … left by the failed restore` 등.
 
 ### 웹
 
