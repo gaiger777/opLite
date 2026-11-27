@@ -45,7 +45,8 @@ export function FieldCell({ path }: { path: string }) {
   ) : (
     <>
       <span className="break-words">{label}</span>
-      {path && (
+      {/* 사람 말 이름이 경로와 같으면(영어 "disks") 경로를 다시 쓰지 않는다 */}
+      {path && label.toLowerCase() !== path && (
         <span className="block font-mono text-[11px] break-all text-muted-foreground">{path}</span>
       )}
     </>

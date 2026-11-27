@@ -121,7 +121,7 @@ it("opens a drawer with the before/after table, secret marks and a live comparis
   expect(rows[2]).toHaveTextContent("(secret changed)");
   expect(drawer).toHaveTextContent("more memory for the sale");
   await user.selectOptions(within(drawer).getByLabelText("Compare with"), "live");
-  expect(await within(drawer).findByText("vcpus")).toBeInTheDocument();
+  expect(await within(drawer).findByText("vCPUs")).toBeInTheDocument();
   await user.click(within(drawer).getByText("Full configuration at this record"));
   expect(within(drawer).getByText(/Secrets are not kept/)).toBeInTheDocument();
 });

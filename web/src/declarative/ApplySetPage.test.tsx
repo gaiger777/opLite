@@ -108,8 +108,8 @@ it("compares file and actual values, shows who changed them and adopts the chose
   expect(memory).toHaveTextContent("4 GiB");
   expect(memory).toHaveTextContent("8 GiB");
   expect(memory).toHaveTextContent("differs");
-  expect(within(compare).getByRole("row", { name: /vcpus/ })).toHaveTextContent(
-    "vCPUsvcpusdiffers24",
+  expect(within(compare).getByRole("row", { name: /vCPUs/ })).toHaveTextContent(
+    "vCPUsdiffers24",
   );
   expect(within(compare).getByRole("row", { name: /labels.tier/ })).not.toHaveTextContent(
     "differs",
