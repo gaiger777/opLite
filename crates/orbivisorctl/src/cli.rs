@@ -192,6 +192,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BackupJobCmd,
     },
+    /// DR 오케스트레이션(계획 76): 복구 계획(부팅 그룹·네트워크 맵·IP), 시험 장애 조치·장애 조치·뒷정리·취소, 실행 기록,
+    /// RPO/RTO 보고, 되돌리기용 백업 작업
+    Dr {
+        #[command(subcommand)]
+        cmd: crate::dr::DrCmd,
+    },
     /// 다른 하이퍼바이저(VMware)의 VM 가져오기(OVA, ESXi·vCenter)
     Import {
         #[command(subcommand)]
@@ -2915,7 +2921,7 @@ struct VmsArgs {
 
 /// 보존 규칙. 모두 0이면 지우지 않는다.
 #[derive(Args)]
-struct KeepArgs {
+pub(crate) struct KeepArgs {
     /// 최신 N개를 남긴다.
     #[arg(long, value_name = "N")]
     keep_last: Option<u32>,
@@ -2940,7 +2946,7 @@ impl KeepArgs {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum Day {
+pub(crate) enum Day {
     Mon,
     Tue,
     Wed,
@@ -3100,12 +3106,12 @@ fn vms_value(args: &VmsArgs) -> Option<Value> {
     }
 }
 
-fn days_value(days: &[Day]) -> Value {
+pub(crate) fn days_value(days: &[Day]) -> Value {
     json!(days.iter().map(|d| value_name(*d)).collect::<Vec<_>>())
 }
 
 /// 보존 규칙(`keep` 값). 주지 않은 단위는 `current`의 값, 거기도 없으면 0이다.
-fn keep_value(args: &KeepArgs, current: &Value) -> Value {
+pub(crate) fn keep_value(args: &KeepArgs, current: &Value) -> Value {
     let pick = |arg: Option<u32>, field: &str| {
         arg.map_or_else(|| current[field].as_u64().unwrap_or(0), u64::from)
     };
@@ -6833,6 +6839,16 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         Cmd::BackupStore { cmd } => {
             Box::pin(crate::backup_store::backup_store(
                 &client, cmd, json_out, out,
+            ))
+            .await?
+        }
+        Cmd::Dr { cmd } => {
+            Box::pin(crate::dr::dr(
+                &client,
+                cmd,
+                json_out,
+                out,
+                &mut std::io::stderr(),
             ))
             .await?
         }

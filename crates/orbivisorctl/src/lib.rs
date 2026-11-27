@@ -11,6 +11,7 @@ mod config;
 mod console;
 mod cpu;
 mod declarative;
+mod dr;
 #[cfg(test)]
 mod fake_api;
 mod file_restore;

@@ -161,6 +161,13 @@ pub(crate) enum RuleCmd {
         #[arg(long = "target", value_name = "NAME", required = true)]
         targets: Vec<String>,
     },
+    /// 권하는 DR 경보 규칙 둘(`dr-rpo-exceeded`·`dr-run-failed`, 계획 76)을 한 번에 만든다. 같은 이름의 규칙은 그대로
+    /// 둔다.
+    AddDrDefaults {
+        /// 알림 대상 이름(여러 번 줄 수 있다)
+        #[arg(long = "target", value_name = "NAME", required = true)]
+        targets: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -701,12 +708,16 @@ pub(crate) async fn alert(
                 add_default_rules(client, "/alert-rules/link-defaults", targets, json_out, out)
                     .await?;
             }
+            RuleCmd::AddDrDefaults { targets } => {
+                add_default_rules(client, "/alert-rules/dr-defaults", targets, json_out, out)
+                    .await?;
+            }
         },
     }
     Ok(())
 }
 
-/// 권하는 묶음(`sdn-defaults`·`link-defaults`)을 대상과 함께 한 번 보내고 만든 것·그대로 둔 것을 줄마다 알린다.
+/// 권하는 묶음(`sdn-defaults`·`link-defaults`·`dr-defaults`)을 대상과 함께 한 번 보내고 만든 것·그대로 둔 것을 줄마다 알린다.
 async fn add_default_rules(
     client: &Client,
     path: &str,
@@ -1518,6 +1529,41 @@ mod tests {
             "POST /api/v1/alert-rules/link-defaults HTTP/1.1"
         );
         assert_eq!(seen[0].body, json!({ "targets": ["ops"] }));
+    }
+
+    /// `alert rule add-dr-defaults`도 같은 모양으로 `dr-defaults`에 한 번 보낸다(계획 76 §3.4).
+    #[tokio::test]
+    async fn dr_defaults_are_one_request() {
+        let (client, seen) = fake_api(|_, _| {
+            (
+                200,
+                json!({ "created": [{ "name": "dr-rpo-exceeded" }, { "name": "dr-run-failed" }], "existing": [] }),
+            )
+        })
+        .await;
+        assert!(Cli::try_parse_from(["t", "alert", "rule", "add-dr-defaults"]).is_err());
+        let cmd = alert_cmd(&[
+            "rule",
+            "add-dr-defaults",
+            "--target",
+            "ops",
+            "--target",
+            "pager",
+        ]);
+        let mut out = Vec::new();
+        alert(&client, cmd, false, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "alert rule dr-rpo-exceeded created\nalert rule dr-run-failed created\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0].line,
+            "POST /api/v1/alert-rules/dr-defaults HTTP/1.1"
+        );
+        assert_eq!(seen[0].body, json!({ "targets": ["ops", "pager"] }));
     }
 
     /// 활성 경보와 보낸 기록은 표로 보이고 빠진 노드·잘림은 stderr에 알린다. `--since 1h`는 밀리초로 바꿔 보낸다.
