@@ -176,6 +176,7 @@ export function TaskTable({
               <TaskErrorText
                 text={error}
                 warning={task.status.state === "succeeded"}
+                subject={label}
                 className="mt-0.5"
               />
             )}

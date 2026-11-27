@@ -67,5 +67,11 @@ export function openTask(id: string) {
   }
 }
 
+/**
+ * 머리줄 알림 종 단추를 찾는 선택자(그 단추만 `Shift+N` 단축키를 단다). 센터에서 연 서랍을 닫을 때 포커스를 돌려줄
+ * 곳이다 — 누른 링크는 센터와 함께 사라졌다.
+ */
+export const CENTER_BUTTON = '[aria-keyshortcuts="Shift+N"]';
+
 /** Task 상세 서랍을 여는 주소의 쿼리 키 */
 export const TASK_PARAM = "task";

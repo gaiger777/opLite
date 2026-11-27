@@ -225,9 +225,10 @@ export function relatedLinks(task: Task, lookup: TargetLookup): RelatedLink[] {
       out.push({ kind: "remote", name: op.remote, href: `/remotes/${enc(op.remote)}` });
       break;
     case "apply": {
-      // 묶음이 대상이면(늘 그렇다 — 계획 73) 대상 줄이 이미 그 묶음이다.
+      // 묶음이 대상이면(늘 그렇다 — 계획 73) 대상 줄이 이미 그 묶음이다. 아니면 대상 이름 레이블은 묶음이 아니라
+      // 대상의 이름이므로 대신 쓰지 않는다(계획 77-1 리뷰 S3).
       if (op.set && op.set !== task.spec.target) {
-        const set = lookup.named?.get(op.set)?.name ?? task.labels?.[TASK_LABELS.targetName];
+        const set = lookup.named?.get(op.set)?.name;
         out.push(
           set
             ? { kind: "applySet", name: set, href: `/apply-sets/${enc(set)}` }

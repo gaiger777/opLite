@@ -1,5 +1,6 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 
 import type { Task } from "@/api/types";
 import { openTask } from "@/tasks/center";
@@ -14,6 +15,10 @@ const bk = backup("web-1", web, 1);
 // 만든 시각(UUIDv7) 2025-10-23T04:03:37.104Z
 const FAILED = "019a0f3c-8a10-7000-8000-000000000001";
 const OLD = "019a0f3c-8a10-7000-8000-000000000002";
+const RECORD = "019a0f3c-8a10-7000-8000-000000000003";
+const DROPPED = "019a0f3c-8a10-7000-8000-000000000004";
+const WAITING = "019a0f3c-8a10-7000-8000-000000000005";
+const SKEWED = "019a0f3c-8a10-7000-8000-000000000006";
 const LONG =
   "QMP command failed: GenericError: TLS credentials support requires the migration to be configured with tls-creds; " +
   "the object 'migrate-tls' was not found on node svc02 while setting up the outgoing connection (see journalctl -u orbivisord)";
@@ -49,6 +54,47 @@ const TASKS = [
     },
     status: { state: "succeeded", error: null },
   },
+  {
+    // 기록 Task(HA 검사 등): 처음부터 끝난 채 만들어 시작과 끝이 같다.
+    id: RECORD,
+    name: RECORD,
+    revision: 1,
+    spec: { op: { kind: "ha-check" }, target: NODE.id, node: NODE.id },
+    status: {
+      state: "succeeded",
+      error: null,
+      started_at: 1_761_192_218_000,
+      finished_at: 1_761_192_218_000,
+    },
+  },
+  {
+    // 기다리다 정리 작업이 실패로 끝낸 Task: 끝 시각만 있다.
+    id: DROPPED,
+    name: DROPPED,
+    revision: 2,
+    spec: { op: { kind: "vm-start" }, target: web.id, node: NODE.id },
+    status: { state: "failed", error: "node is gone", finished_at: 1_761_192_230_000 },
+  },
+  {
+    id: WAITING,
+    name: WAITING,
+    revision: 1,
+    spec: { op: { kind: "vm-stop" }, target: web.id, node: NODE.id },
+    status: { state: "pending", error: null },
+  },
+  {
+    // 시작과 끝을 다른 노드가 적었고 그 시계가 어긋났다: 끝이 시작보다 앞선다.
+    id: SKEWED,
+    name: SKEWED,
+    revision: 3,
+    spec: { op: { kind: "vm-reboot" }, target: web.id, node: NODE.id },
+    status: {
+      state: "failed",
+      error: "x",
+      started_at: 1_761_192_230_000,
+      finished_at: 1_761_192_229_000,
+    },
+  },
 ] as Task[];
 
 function page(url = "/tasks") {
@@ -70,10 +116,12 @@ it("opens one drawer with who, when, where and the whole error from the task lis
   // 목록의 오류는 잘리지 않고 2줄로 접혀 있다가 펼친다(마우스를 올릴 필요 없이).
   const row = (await screen.findByRole("link", { name: "Back up web" })).closest("tr")!;
   expect(row).toHaveTextContent(LONG);
-  const more = within(row).getByRole("button", { name: "Show all" });
+  // 단추 이름에 무엇의 오류인지 넣고(목록에 여럿이어도 구별된다), 펼치는 글을 가리킨다(리뷰 S6).
+  const more = within(row).getByRole("button", { name: "Show all: Back up web" });
   expect(more).toHaveAttribute("aria-expanded", "false");
+  expect(document.getElementById(more.getAttribute("aria-controls")!)).toHaveTextContent(LONG);
   await userEvent.click(more);
-  expect(within(row).getByRole("button", { name: "Show less" })).toHaveAttribute(
+  expect(within(row).getByRole("button", { name: "Show less: Back up web" })).toHaveAttribute(
     "aria-expanded",
     "true",
   );
@@ -103,10 +151,76 @@ it("opens one drawer with who, when, where and the whole error from the task lis
   expect(drawer).toHaveTextContent("(vm-backup)");
   await expectNoAxeViolations(drawer, { disable: ["region"] });
 
-  // 닫으면 주소에서 빠진다.
+  // 닫으면 주소에서 빠진다. 기록을 바꿔 써서 "뒤로"가 서랍을 다시 열지 않는다(리뷰 S1).
   await userEvent.keyboard("{Escape}");
   await waitFor(() => expect(router.state.location.search).toBe(""));
+  expect(router.state.historyAction).toBe("REPLACE");
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  // 포커스는 연 링크로 돌아간다.
+  await waitFor(() => expect(within(row).getByRole("link", { name: "Back up web" })).toHaveFocus());
+});
+
+/** 주소로 그 Task의 서랍을 열고, 다 읽을 때까지 기다린다 */
+async function drawerOf(id: string) {
+  const view = page(`/tasks?task=${id}`);
+  const drawer = await screen.findByRole("dialog");
+  await within(drawer).findByText(id);
+  return { drawer, unmount: view.unmount };
+}
+
+it("tells a record task, a task that never started and a waiting one apart from an old node", async () => {
+  // 기록 Task: 시작 시각이 있고 걸린 시간은 0초다(리뷰 I1).
+  let open = await drawerOf(RECORD);
+  expect(open.drawer).not.toHaveTextContent("older node version");
+  expect(open.drawer).toHaveTextContent("Took0 s");
+  open.unmount();
+  // 기다리다 끝난 Task: 끝 시각만 있다 — 옛 노드가 아니라 시작하지 않았다.
+  open = await drawerOf(DROPPED);
+  expect(open.drawer).toHaveTextContent("StartedNot started (ended while waiting)");
+  expect(open.drawer).not.toHaveTextContent("older node version");
+  expect(open.drawer).not.toHaveTextContent("Took");
+  open.unmount();
+  open = await drawerOf(WAITING);
+  expect(open.drawer).toHaveTextContent("StartedNot started yet (waiting)");
+  expect(open.drawer).toHaveTextContent("FinishedNot finished yet");
+  open.unmount();
+  // 노드 시계가 어긋나 끝이 시작보다 앞서면 걸린 시간을 보이지 않는다(0초로 속이지 않는다 — 리뷰 S4).
+  open = await drawerOf(SKEWED);
+  expect(open.drawer).toHaveTextContent("Finished");
+  expect(open.drawer).not.toHaveTextContent("Took");
+});
+
+it("gives focus back to the bell when the link that opened the drawer is gone", async () => {
+  // 센터 안의 링크처럼: 누르면 서랍을 열고 자신은 사라진다(리뷰 S2).
+  function Opener() {
+    const [gone, setGone] = useState(false);
+    return gone ? null : (
+      <button
+        type="button"
+        onClick={() => {
+          openTask(FAILED);
+          setGone(true);
+        }}
+      >
+        Open from the center
+      </button>
+    );
+  }
+  renderPage(
+    <>
+      <button type="button" aria-keyshortcuts="Shift+N">
+        Bell
+      </button>
+      <Opener />
+      <TaskDrawer />
+    </>,
+    { path: "/tasks", url: "/tasks" },
+  );
+  await userEvent.click(await screen.findByRole("button", { name: "Open from the center" }));
+  await screen.findByRole("dialog", { name: "Back up web" });
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Bell" })).toHaveFocus());
 });
 
 it("opens from the address and shows what an old task did not record", async () => {

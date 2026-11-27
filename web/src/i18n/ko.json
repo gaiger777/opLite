@@ -473,6 +473,8 @@
     "warning": "경고",
     "errorMore": "전체 보기",
     "errorLess": "접기",
+    "errorMoreOf": "전체 보기: {{name}}",
+    "errorLessOf": "접기: {{name}}",
     "drawer": {
       "title": "작업",
       "description": "무엇을 누가 언제 했고 어떻게 끝났는지입니다. 오류는 서버가 남긴 원문 그대로입니다.",
@@ -494,6 +496,8 @@
       "id": "작업 id",
       "notRecorded": "기록 없음(옛 버전 노드)",
       "notYet": "아직 안 끝남",
+      "notStarted": "시작하지 않음(기다리다 끝남)",
+      "waiting": "아직 시작 안 함(기다리는 중)",
       "secs": "{{s}}초",
       "mins": "{{m}}분 {{s}}초",
       "hours": "{{h}}시간 {{m}}분",

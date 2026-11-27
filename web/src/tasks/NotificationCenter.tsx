@@ -223,7 +223,11 @@ function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string })
             )}
             {progress && <span className="text-xs text-muted-foreground">{progress}</span>}
             {task.status.error && (
-              <TaskErrorText text={task.status.error} warning={task.status.state === "succeeded"} />
+              <TaskErrorText
+                text={task.status.error}
+                warning={task.status.state === "succeeded"}
+                subject={label}
+              />
             )}
             {again && (
               <div className="flex items-center gap-2">

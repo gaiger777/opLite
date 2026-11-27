@@ -693,7 +693,10 @@ it("retries while the node is unreachable but stops on a permission error", asyn
   answer = "denied";
   act(() => vi.advanceTimersByTime(2000));
   expect(await screen.findByText("This browsing session cannot be used")).toBeInTheDocument();
-  expect(screen.getByText("You do not have permission to do this.")).toBeInTheDocument();
+  // 서버의 구체 설명(빠진 권한)을 덧붙인다(계획 77-1 리뷰 S7 — `forbidden`은 늘 같은 글이 아니다).
+  expect(
+    screen.getByText("You do not have permission to do this. Details: missing backup.file_restore"),
+  ).toBeInTheDocument();
   expect(
     screen.queryByText("Cannot reach the node of this session right now. Retrying…"),
   ).not.toBeInTheDocument();

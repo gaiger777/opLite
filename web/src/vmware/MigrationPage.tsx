@@ -22,6 +22,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatBytes, formatTime } from "@/lib/format";
+import { TaskErrorText } from "@/tasks/TaskErrorText";
 import {
   localized,
   type Migration,
@@ -350,13 +351,13 @@ export function MigrationPage() {
                     </TableCell>
                     <TableCell>
                       <ItemStateChip item={item} />
+                      {/* 잘라서 마우스로만 보이지 않게 2줄 + 펼침(계획 77-1 리뷰 I5) */}
                       {item.status.error && (
-                        <div
-                          className="max-w-xs truncate text-xs text-destructive"
-                          title={item.status.error}
-                        >
-                          {item.status.error}
-                        </div>
+                        <TaskErrorText
+                          text={item.status.error}
+                          subject={item.spec.target_name}
+                          className="mt-0.5 max-w-xs"
+                        />
                       )}
                     </TableCell>
                     <TableCell>{item.status.rounds ?? 0}</TableCell>

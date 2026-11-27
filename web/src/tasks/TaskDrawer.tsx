@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useSearchParams } from "react-router";
 
@@ -10,8 +10,9 @@ import type { Task } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { CopyButton } from "@/components/CopyButton";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
+import { serverSkew } from "@/fileRestore/fileRestore";
 import { formatTime, uuidTime } from "@/lib/format";
-import { setTaskOpener, TASK_PARAM } from "@/tasks/center";
+import { CENTER_BUTTON, setTaskOpener, TASK_PARAM } from "@/tasks/center";
 import { requesterName } from "@/tasks/taskLink";
 import { relatedLinks, taskTarget, TASK_LABELS } from "@/tasks/target";
 import { bytePercent, describeDetail, describeProgress, describeTask } from "@/tasks/tasks";
@@ -36,12 +37,15 @@ export function formatElapsed(ms: number, t: TFunction): string {
 function useNamesFor(task: Task) {
   const perms = usePermissions();
   const kind = task.spec.op.kind;
+  const op = task.spec.op;
   const labels = task.labels ?? {};
   const unnamed = !labels[TASK_LABELS.targetName];
+  // 묶음 이름이 필요할 때만: 이름 레이블이 없는 옛 Task, 묶음이 대상이 아닌 적용(이어진 대상 줄 — 리뷰 S9)
+  const needsSet = op.kind === "apply" && (unnamed || (!!op.set && op.set !== task.spec.target));
   useQuery({
     queryKey: ["apply-sets"],
     queryFn: () => call(api.GET("/apply-sets")),
-    enabled: kind === "apply" && perms.reads("apply-set"),
+    enabled: needsSet && perms.reads("apply-set"),
     staleTime: 60_000,
   });
   useQuery({
@@ -59,6 +63,24 @@ function useNamesFor(task: Task) {
       perms.reads("user"),
     staleTime: 60_000,
   });
+}
+
+/**
+ * 서버 시계와 이 브라우저 시계의 차이(ms, 서버 − 브라우저). 도는 Task의 걸린 시간은 서버 시각(`started_at`)에서 재므로,
+ * 그 Task를 한 번 읽은 응답의 `Date` 머리로 잰다(리뷰 S4). 끝난 Task(서버 시각끼리)에는 읽지 않는다.
+ */
+function useServerSkew(id: string, enabled: boolean): number {
+  const query = useQuery({
+    queryKey: ["task-clock", id],
+    queryFn: async () => {
+      const { response } = await api.GET("/tasks/{key}", { params: { path: { key: id } } });
+      return serverSkew(response.headers.get("date")) * 1000;
+    },
+    enabled,
+    staleTime: Infinity,
+    retry: false,
+  });
+  return query.data ?? 0;
 }
 
 /** 지금 시각(ms). `ticking`이면 1초마다 다시 그린다(도는 Task의 걸린 시간). */
@@ -101,9 +123,12 @@ export function TaskDetail({ task }: { task: Task }) {
   const { state, error, started_at: started, finished_at: finished } = task.status;
   const created = uuidTime(task.id);
   const time = (ms: number) => formatTime(new Date(ms), i18n.language);
-  const now = useNow(started !== undefined && finished === undefined);
-  // 옛 Task(시작 시각 없음)는 걸린 시간을 모른다(만든 시각부터 재면 기다린 시간이 섞인다).
-  const elapsed = started !== undefined ? formatElapsed((finished ?? now) - started, t) : null;
+  const ticking = started !== undefined && finished === undefined;
+  const now = useNow(ticking) + useServerSkew(task.id, ticking);
+  // 옛 Task(시작 시각 없음)는 걸린 시간을 모른다(만든 시각부터 재면 기다린 시간이 섞인다). 시작과 끝을 다른 노드가
+  // 적어 시계가 어긋나 음수면 보이지 않는다(리뷰 S4).
+  const took = started !== undefined ? (finished ?? now) - started : -1;
+  const elapsed = took >= 0 ? formatElapsed(took, t) : null;
   const p = task.status.progress;
   const pct = p && p.total_bytes > 0 ? bytePercent(p.done_bytes, p.total_bytes) : null;
   const kindName = task.labels?.[TASK_LABELS.targetKind];
@@ -171,7 +196,14 @@ export function TaskDetail({ task }: { task: Task }) {
         <Row label={t("tasks.drawer.requester")}>{requesterName(task, t, lookup.named)}</Row>
         <Row label={t("tasks.drawer.created")}>{formatTime(created, i18n.language)}</Row>
         <Row label={t("tasks.drawer.started")}>
-          {started !== undefined ? time(started) : t("tasks.drawer.notRecorded")}
+          {started !== undefined
+            ? time(started)
+            : state === "pending"
+              ? t("tasks.drawer.waiting")
+              : // 끝 시각만 있으면 시작하지 않고 끝났다(기다리다 정리 작업·SDN·Ceph가 끝냄 — 리뷰 I1). 둘 다 없으면 옛 노드.
+                finished !== undefined
+                ? t("tasks.drawer.notStarted")
+                : t("tasks.drawer.notRecorded")}
         </Row>
         <Row label={t("tasks.drawer.finished")}>
           {finished !== undefined
@@ -228,6 +260,18 @@ export function TaskDetail({ task }: { task: Task }) {
 export function TaskDrawer() {
   const [params, setParams] = useSearchParams();
   const id = params.get(TASK_PARAM);
+  // 서랍을 열기 전 마지막으로 포커스를 받은 것: 닫을 때 그리로 돌려준다(서랍에는 여는 단추가 따로 없다 — 리뷰 S2).
+  const lastFocus = useRef<Element | null>(null);
+  useEffect(() => {
+    if (id !== null) {
+      return;
+    }
+    const track = (e: FocusEvent) => {
+      lastFocus.current = e.target instanceof Element ? e.target : null;
+    };
+    document.addEventListener("focusin", track);
+    return () => document.removeEventListener("focusin", track);
+  }, [id]);
   useEffect(
     () =>
       setTaskOpener((next) =>
@@ -242,17 +286,29 @@ export function TaskDrawer() {
   if (id === null) {
     return null;
   }
-  // 안의 링크로 다른 화면에 가면 주소에서 `task`가 빠져 저절로 닫힌다.
+  // 안의 링크로 다른 화면에 가면 주소에서 `task`가 빠져 저절로 닫힌다. 닫기는 기록을 바꿔 쓴다 — "뒤로"가 서랍을
+  // 다시 열지 않게(리뷰 S1).
   const close = () =>
-    setParams((prev) => {
-      const p = new URLSearchParams(prev);
-      p.delete(TASK_PARAM);
-      return p;
-    });
-  return <OpenTaskDrawer id={id} onClose={close} />;
+    setParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        p.delete(TASK_PARAM);
+        return p;
+      },
+      { replace: true },
+    );
+  return <OpenTaskDrawer id={id} onClose={close} opener={lastFocus} />;
 }
 
-function OpenTaskDrawer({ id, onClose }: { id: string; onClose(): void }) {
+function OpenTaskDrawer({
+  id,
+  onClose,
+  opener,
+}: {
+  id: string;
+  onClose(): void;
+  opener: React.RefObject<Element | null>;
+}) {
   const { t } = useTranslation();
   const tasks = useList("task");
   const task = useMemo(() => tasks.data?.find((x) => x.id === id), [tasks.data, id]);
@@ -262,7 +318,19 @@ function OpenTaskDrawer({ id, onClose }: { id: string; onClose(): void }) {
     : t("tasks.drawer.title");
   return (
     <Sheet open onOpenChange={(open) => !open && onClose()}>
-      <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
+      <SheetContent
+        className="w-full overflow-y-auto sm:max-w-xl"
+        onCloseAutoFocus={(e) => {
+          // 연 곳(링크)이 남아 있으면 그리로, 센터 안의 링크·알림처럼 사라졌으면 알림 종으로
+          e.preventDefault();
+          const back = opener.current;
+          const target =
+            back instanceof HTMLElement && back.isConnected && back !== document.body
+              ? back
+              : document.querySelector<HTMLElement>(CENTER_BUTTON);
+          target?.focus();
+        }}
+      >
         <SheetTitle className="px-4 pt-4 pr-10 text-lg break-words">{title}</SheetTitle>
         <SheetDescription className="px-4">{t("tasks.drawer.description")}</SheetDescription>
         <div className="px-4 pb-4">

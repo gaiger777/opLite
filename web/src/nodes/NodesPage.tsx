@@ -28,6 +28,7 @@ import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { NodeSdnCell } from "@/sdn/chips";
 import { strayNodes, useSdn } from "@/sdn/sdn";
 import { PoolStatus } from "@/storage/PoolStatus";
+import { TaskErrorText } from "@/tasks/TaskErrorText";
 import { useTopologyUsage } from "@/numa/numa";
 import { replicasOn } from "@/vms/replication";
 
@@ -305,9 +306,15 @@ export function NodesPage() {
           )}
           {/* 이웃 노드가 이 노드의 BMC·명령으로 전원을 읽지 못했다. */}
           {node.status.fence_check?.error && (
-            <Badge variant="destructive" title={node.status.fence_check.error}>
-              {t("nodes.fenceUnreachable")}
-            </Badge>
+            <>
+              <Badge variant="destructive">{t("nodes.fenceUnreachable")}</Badge>
+              {/* 읽지 못한 까닭: 마우스로만 보이는 title 대신 글로(계획 77-1 리뷰 I5) */}
+              <TaskErrorText
+                text={node.status.fence_check.error}
+                subject={node.name}
+                className="mt-0.5"
+              />
+            </>
           )}
         </>
       ),

@@ -286,9 +286,12 @@ it("shows the manual steps of a failed rollback and retries the rollback", async
   const posted = setup([stuck]);
   open();
   const table = await screen.findByRole("table", { name: "wave1" });
-  expect(await within(table).findByRole("row", { name: /web01/ })).toHaveTextContent(
-    "Rollback failed: creating the VM",
-  );
+  const row = await within(table).findByRole("row", { name: /web01/ });
+  expect(row).toHaveTextContent("Rollback failed: creating the VM");
+  // 오류 글은 자르지 않고 글로 보인다(마우스를 올려야 보이는 title이 아니다 — 계획 77-1 리뷰 I5).
+  const error = within(row).getByText(/power on web01 in vCenter/);
+  expect(error).toBeVisible();
+  expect(error.closest("[title]")).toBeNull();
   await user.click(screen.getByRole("button", { name: "Open web01" }));
   const sheet = screen.getByRole("dialog", { name: "web01" });
   const alert = within(sheet).getByRole("alert");

@@ -153,7 +153,12 @@ it("shows loading instead of zeros, then errors", async () => {
       () =>
         new Promise<Response>((resolve) => {
           fail = () =>
-            resolve(HttpResponse.json({ code: "forbidden", message: "denied" }, { status: 403 }));
+            resolve(
+              HttpResponse.json(
+                { code: "forbidden", message: "permission denied" },
+                { status: 403 },
+              ),
+            );
         }),
     ),
     http.get(apiUrl("/vms"), () => new Promise<never>(() => {})),

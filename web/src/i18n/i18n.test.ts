@@ -1,10 +1,13 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { ApiError, NetworkError } from "@/api/client";
 import mapEn from "@/clusterMap/i18n/en.json";
 import mapKo from "@/clusterMap/i18n/ko.json";
 import dndEn from "@/dnd/i18n/en.json";
 import dndKo from "@/dnd/i18n/ko.json";
 import en from "@/i18n/en.json";
-import { errorMessage } from "@/i18n/errors";
+import { errorMessage, FIXED_MESSAGE } from "@/i18n/errors";
 import i18n from "@/i18n";
 import ko from "@/i18n/ko.json";
 import builderEn from "@/vmBuilder/i18n/en.json";
@@ -93,6 +96,54 @@ it("keeps common words only under common", () => {
   }
   expect(en.common).toMatchObject({ cancel: "Cancel", deleteNamed: "Delete {{name}}" });
   expect(ko.common).toMatchObject({ cancel: "취소", deleteNamed: "{{name}} 삭제" });
+});
+
+/** `dir` 아래의 `.rs` 파일(시험 파일·`tests` 디렉터리는 빼고) */
+function rustSources(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const path = join(dir, e.name);
+    if (e.isDirectory()) {
+      return e.name === "tests" || e.name === "target" ? [] : rustSources(path);
+    }
+    return e.name.endsWith(".rs") && e.name !== "tests.rs" ? [path] : [];
+  });
+}
+
+/**
+ * 계획 77-1 리뷰 S7: 설명을 덧붙이지 않는 code(`FIXED_MESSAGE`)는 서버의 설명이 늘 글자 그대로여야 한다. 서버 코드에서
+ * `"<code>", ` 바로 다음이 `format!`이나 변수(소문자 이름)면 이름·값이 든 설명이라 덧붙여야 한다 — 목록에서 뺀다.
+ */
+it("only skips the server detail for codes whose server message never changes", () => {
+  const root = join(import.meta.dirname, "../../../crates");
+  const dynamic: string[] = [];
+  const seen = new Set<string>();
+  for (const file of rustSources(root)) {
+    const text = readFileSync(file, "utf8");
+    for (const [, code = "", next] of text.matchAll(
+      /"([a-z_0-9]+)",\s*(format!|[a-z_][a-z_0-9.]*)/g,
+    )) {
+      seen.add(code);
+      if (FIXED_MESSAGE.has(code)) {
+        dynamic.push(`${file.slice(root.length + 1)}: ${code} ${next}`);
+      }
+    }
+    for (const [, code = ""] of text.matchAll(/"([a-z_0-9]+)",\s*"/g)) {
+      seen.add(code);
+    }
+  }
+  expect(dynamic).toEqual([]);
+  // 서버에 없는 code(지워졌거나 잘못 적음)도 없다.
+  expect([...FIXED_MESSAGE].filter((c) => !seen.has(c))).toEqual([]);
+  // `forbidden`은 구체 설명을 주기도 하므로 덧붙이고, 기본 글("permission denied")만 뺀다.
+  expect(
+    errorMessage(
+      i18n.t,
+      new ApiError(403, "forbidden", "cannot grant privileges you do not hold: vm.power"),
+    ),
+  ).toContain("Details: cannot grant privileges you do not hold: vm.power");
+  expect(errorMessage(i18n.t, new ApiError(403, "forbidden", "permission denied"))).not.toContain(
+    "Details",
+  );
 });
 
 it("translates API error codes and falls back to the server message", async () => {

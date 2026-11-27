@@ -121,10 +121,9 @@ it("shows how each node fences", async () => {
   // 펜싱이 꺼진 노드는 `ha`가 없다.
   const b = within(table).getByText("node-b").closest("tr")!;
   expect(within(b).getAllByRole("cell")[column]).toHaveTextContent("—");
-  expect(within(b).getByText("Power fence unreachable")).toHaveAttribute(
-    "title",
-    "ipmi: connection timed out",
-  );
+  // 읽지 못한 까닭은 title이 아니라 글로 보인다(계획 77-1 리뷰 I5).
+  expect(within(b).getByText("Power fence unreachable")).not.toHaveAttribute("title");
+  expect(within(b).getByText("ipmi: connection timed out")).toBeVisible();
 });
 
 it("shows what each node can hotplug", async () => {

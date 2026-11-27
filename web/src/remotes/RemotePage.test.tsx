@@ -76,7 +76,7 @@ it("shows the error of a refused action", async () => {
   mockRemote();
   server.use(
     http.post(apiUrl("/remotes/dr/api/vms/:id/actions/start"), () =>
-      HttpResponse.json({ code: "forbidden", message: "viewer" }, { status: 403 }),
+      HttpResponse.json({ code: "forbidden", message: "permission denied" }, { status: 403 }),
     ),
   );
   render();

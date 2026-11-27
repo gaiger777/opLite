@@ -141,5 +141,24 @@ it("lists what a task is tied to besides its target", () => {
   expect(relatedLinks(applied, lookup)).toEqual([
     { kind: "plan", name: "000000b2", href: "/history" },
   ]);
+  // 대상이 묶음이 아니면 묶음 줄을 따로 둔다. 대상 이름 레이블은 묶음의 이름이 아니므로 쓰지 않는다(리뷰 S3).
+  const other = {
+    ...op("apply", web.id, { plan: "019a0f3c-0000-7000-8073-0000000000b2", set }),
+    labels: { "target-name": "web", "target-kind": "vm" },
+  };
+  expect(relatedLinks(other, lookup)[0]).toEqual({
+    kind: "applySet",
+    name: "000000a1",
+    href: "/apply-sets",
+  });
+  const withSets: TargetLookup = {
+    ...lookup,
+    named: new Map([[set, { name: "p73", kind: "apply-set" }]]),
+  };
+  expect(relatedLinks(other, withSets)[0]).toEqual({
+    kind: "applySet",
+    name: "p73",
+    href: "/apply-sets/p73",
+  });
   expect(relatedLinks(op("vm-start", web.id), lookup)).toEqual([]);
 });

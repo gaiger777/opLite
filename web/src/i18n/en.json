@@ -473,6 +473,8 @@
     "warning": "Warning",
     "errorMore": "Show all",
     "errorLess": "Show less",
+    "errorMoreOf": "Show all: {{name}}",
+    "errorLessOf": "Show less: {{name}}",
     "drawer": {
       "title": "Task",
       "description": "What was done, by whom and when, and how it ended. Errors are shown exactly as the server recorded them.",
@@ -494,6 +496,8 @@
       "id": "Task id",
       "notRecorded": "Not recorded (older node version)",
       "notYet": "Not finished yet",
+      "notStarted": "Not started (ended while waiting)",
+      "waiting": "Not started yet (waiting)",
       "secs": "{{s}} s",
       "mins": "{{m}} min {{s}} s",
       "hours": "{{h}} h {{m}} min",
