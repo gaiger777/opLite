@@ -1,4 +1,4 @@
-import { Server, SlidersHorizontal } from "lucide-react";
+import { Keyboard, Server, SlidersHorizontal } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router";
@@ -42,6 +42,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { DndProvider } from "@/dnd/DndProvider";
@@ -675,7 +676,8 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
           controls
         )}
       </div>
-      {mode === "picture" && lod && (
+      {/* 가장 가까운 단계는 더 알릴 것이 없다("자세히." 홀로 한 줄이던 것, 77-6). */}
+      {mode === "picture" && lod && lod !== "detail" && (
         <p className="text-xs text-muted-foreground" role="status">
           {t(`clusterMap.lod.${lod}`)}
         </p>
@@ -735,8 +737,20 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
                 renderCard={renderCard}
                 drag={home ? undefined : (drag.drag ?? undefined)}
               />
-              <Legend layers={shown} ports={full?.rails != null} collapsed={home} />
-              <p id={keysId} className="text-xs text-muted-foreground">
+              {/* 조작 안내는 긴 문단 대신 "조작법" 팝오버(계획 77-6). 화면 읽기는 그대로 지도 설명으로 읽는다. */}
+              <div className="flex flex-wrap items-start gap-x-4 gap-y-1">
+                <Legend layers={shown} ports={full?.rails != null} collapsed={home} />
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button variant="ghost" size="xs" className="text-muted-foreground">
+                      <Keyboard aria-hidden />
+                      {t("clusterMap.keysButton")}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-80 text-xs">{t("clusterMap.keys")}</PopoverContent>
+                </Popover>
+              </div>
+              <p id={keysId} className="sr-only">
                 {t("clusterMap.keys")}
               </p>
             </DndProvider>

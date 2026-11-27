@@ -103,6 +103,7 @@
     "big": "Many nodes: show one group to read the map more easily.",
     "loadUnknownNote": "Load unknown: the leader's placement summary can't be read.",
     "keys": "Arrows move between nodes, ] enters a node's VMs and [ or Esc leaves; with the Network layer, p enters a node's ports and ↓ goes from a port to its rail. Enter opens, Shift+Enter opens the page. Drag to pan; Ctrl + wheel, pinch or + − 0 to zoom. Drag a running VM's tile onto a node, or press m on it, to migrate it.",
+    "keysButton": "Controls",
     "cluster": "Cluster",
     "noGroup": "No zone",
     "unplaced": "Not placed",

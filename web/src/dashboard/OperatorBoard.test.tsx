@@ -12,6 +12,10 @@ import { CAPACITY, LAN, PHYSICAL } from "@/test/physical";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
+// 접힌 "위젯 더 보기"(77-6)는 따로 본다. 다른 시험은 연 채로 표를 본다.
+beforeEach(() => localStorage.setItem(`opl.${ADMIN.user}.home.more`, "1"));
+afterEach(() => localStorage.removeItem(`opl.${ADMIN.user}.home.more`));
+
 // 지도(5단계 `clusterMap/InfraMap`)는 가짜: 받은 초점을 글로 보이고, 단추로 고른다.
 vi.mock("@/dashboard/HomeMap", () => ({
   HomeMap: ({
@@ -618,4 +622,30 @@ it("does not ask for the dashboard without cluster read", async () => {
   ).toBeInTheDocument();
   expect(screen.queryByRole("region", { name: "Infrastructure map" })).not.toBeInTheDocument();
   expect(asked).toEqual([]);
+});
+
+it("folds the allocation table and the other widgets under 'more widgets' at first (plan 77-6)", async () => {
+  localStorage.removeItem(`opl.${ADMIN.user}.home.more`);
+  dashboard();
+  const { container } = renderPage(<DashboardPage />);
+  const more = await screen.findByRole("button", { name: "Show more widgets" });
+  expect(more).toHaveAttribute("aria-expanded", "false");
+  // 접힌 것의 이름은 단추 옆에 적는다.
+  expect(screen.getByRole("region", { name: "More widgets" })).toHaveTextContent(
+    "Allocation and use by node",
+  );
+  expect(
+    screen.queryByRole("table", { name: "Allocation and use by node" }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "Recent tasks" })).not.toBeInTheDocument();
+  await expectNoAxeViolations(container);
+  await userEvent.click(more);
+  expect(
+    await screen.findByRole("table", { name: "Allocation and use by node" }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Hide widgets" })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+  expect(localStorage.getItem(`opl.${ADMIN.user}.home.more`)).toBe("1");
 });

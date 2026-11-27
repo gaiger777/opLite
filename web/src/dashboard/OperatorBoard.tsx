@@ -11,6 +11,7 @@ import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { CapacityTable } from "@/dashboard/CapacityTable";
 import { DetailPanel } from "@/dashboard/DetailPanel";
 import { HomeMap } from "@/dashboard/HomeMap";
+import { HomeMore } from "@/dashboard/HomeMore";
 import { LinkAlertsCard } from "@/dashboard/LinkAlertsCard";
 import { pickFault } from "@/dashboard/pick";
 import { focusOf, type MapSelection } from "@/dashboard/selection";
@@ -20,7 +21,14 @@ import { useList } from "@/api/live";
 import { useCapacity, usePhysicalTopology } from "@/physical/api";
 import { faultList } from "@/physical/chain";
 
-export default function OperatorBoard({ phone }: { phone: boolean }) {
+export default function OperatorBoard({
+  phone,
+  more,
+}: {
+  phone: boolean;
+  /** 넓은 화면에서 할당 표와 함께 "위젯 더 보기"에 접을 나머지 위젯과 그 이름(계획 77-6) */
+  more?: { names: string[]; content: React.ReactNode };
+}) {
   const { t } = useTranslation();
   const capacity = useCapacity();
   const physical = usePhysicalTopology();
@@ -127,12 +135,11 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
     waiting
   );
 
-  // 배지도 카드도 없으면 빈 줄을 남기지 않는다.
+  // 배지도 카드도 없으면 빈 줄을 남기지 않는다. "링크 경보 켜기" 권유는 넓은 화면은 "위젯 더 보기" 안, 휴대폰은 표 뒤다(77-6).
   const top = (
     <div className="flex flex-wrap items-center gap-(--gap) empty:hidden">
       {badge}
       {stale}
-      <LinkAlertsCard />
     </div>
   );
 
@@ -142,6 +149,7 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
         {top}
         {map}
         {table}
+        <LinkAlertsCard />
         <Sheet open={selection !== null} onOpenChange={(open) => !open && select(null)}>
           <SheetContent className="overflow-y-auto p-4">
             <SheetTitle className="sr-only">{t("physical.panel.title")}</SheetTitle>
@@ -155,10 +163,7 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
     <>
       {top}
       <div className="grid grid-cols-1 gap-(--gap) lg:grid-cols-[minmax(0,1fr)_24rem]">
-        <div className="flex min-w-0 flex-col gap-(--gap)">
-          {map}
-          {table}
-        </div>
+        <div className="flex min-w-0 flex-col gap-(--gap)">{map}</div>
         <aside
           aria-label={t("physical.panel.title")}
           className="flex flex-col gap-3 self-start rounded-lg border bg-card p-4 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto"
@@ -166,6 +171,12 @@ export default function OperatorBoard({ phone }: { phone: boolean }) {
           {panel}
         </aside>
       </div>
+      {/* 노드별 할당은 자세히 판(클러스터 합계)·지도 꼬리표와 겹치므로 접어 둔다(같은 정보 세 번 → 한 번, 진단 §2.1). */}
+      <HomeMore names={[t("physical.table.title"), ...(more?.names ?? [])]}>
+        <LinkAlertsCard />
+        {table}
+        {more?.content}
+      </HomeMore>
     </>
   );
 }

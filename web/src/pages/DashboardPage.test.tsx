@@ -13,7 +13,11 @@ import { apiUrl, server } from "@/test/server";
 const VIEWER = { ...ADMIN, role: "viewer" as const };
 const OPERATOR = { ...ADMIN, role: "operator" as const };
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  // 접힌 "위젯 더 보기"(77-6)를 연 채로 시험한다 — 접기는 OperatorBoard 시험이 본다.
+  localStorage.setItem(`opl.${ADMIN.user}.home.more`, "1");
+});
 
 const cluster = (leader: string | null, members: { id: string; name?: string | null }[] = []) =>
   http.get(apiUrl("/cluster"), () =>
@@ -326,6 +330,7 @@ it("says when there are no favorites and hides power buttons from viewers", asyn
   unmount();
 
   localStorage.clear();
+  localStorage.setItem(`opl.${ADMIN.user}.home.more`, "1");
   renderPage(<DashboardPage />);
   expect(
     await screen.findByText(/^No favorites yet\. Mark VMs, nodes and storage pools/),

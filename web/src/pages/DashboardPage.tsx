@@ -202,6 +202,7 @@ export function DashboardPage() {
   // 있어야 한다. 없으면(폴더 사용자) 숨기고 한 줄로 알린다.
   const clusterRead = usePermissions().has("cluster.read");
   const capacity = useCapacity(clusterRead);
+  const alerts = useAlerts();
   const legacy = isUpgrading(capacity.error);
   const grid2 = "grid grid-cols-1 gap-(--gap) lg:grid-cols-2";
   const hidden = !clusterRead && (
@@ -210,9 +211,33 @@ export function DashboardPage() {
   const upgrading = legacy && (
     <p className="text-sm text-muted-foreground">{t("dashboard.boardAfterUpgrade")}</p>
   );
+  // 울리는 경보가 있으면 경보 위젯을 접지 않고 지도 위에 둔다(홈 한 화면의 "주의할 것", 77-6).
+  const ringing = (alerts.data?.alerts.filter(isRinging).length ?? 0) > 0;
+  const more = {
+    names: [
+      ...(ringing ? [] : [t("alerts.active")]),
+      t("metrics.topVms"),
+      t("metrics.clusterLoad"),
+      t("dashboard.recentTasks"),
+      t("favorites.title"),
+    ],
+    content: (
+      <>
+        <div className={grid2}>
+          {!ringing && <ActiveAlertsWidget />}
+          <TopVmsWidget />
+        </div>
+        <ClusterChartsWidget />
+        <div className={grid2}>
+          <RecentTasksWidget />
+          <FavoritesWidget />
+        </div>
+      </>
+    ),
+  };
   const board = (
     <Suspense fallback={<p className="text-sm text-muted-foreground">{t("common.loading")}</p>}>
-      <OperatorBoard phone={phone} />
+      <OperatorBoard phone={phone} more={phone ? undefined : more} />
     </Suspense>
   );
   const operator = clusterRead && !legacy;
@@ -261,12 +286,8 @@ export function DashboardPage() {
             loading
           ) : operator ? (
             <>
+              {ringing && <ActiveAlertsWidget />}
               {board}
-              <div className={grid2}>
-                <ActiveAlertsWidget />
-                <TopVmsWidget />
-              </div>
-              <ClusterChartsWidget />
             </>
           ) : clusterRead ? (
             <>
@@ -285,7 +306,7 @@ export function DashboardPage() {
           ) : (
             <ActiveAlertsWidget />
           )}
-          {!pending && (
+          {!pending && !operator && (
             <div className={grid2}>
               <RecentTasksWidget />
               <FavoritesWidget />
