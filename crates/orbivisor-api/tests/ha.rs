@@ -331,7 +331,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
     let task = |id: Uuid| env.cluster.get::<TaskSpec>(id).unwrap().unwrap();
     for id in &tasks[..2] {
         assert_eq!(
-            task(*id).status,
+            finished(task(*id).status),
             TaskStatus {
                 state: TaskState::Failed,
                 error: Some("node failed failed; the VM was recovered by HA".into()),
@@ -346,7 +346,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
     // 기록 Task: 대상 VM, 받은 노드, 처음부터 Succeeded
     let mut records: Vec<(Uuid, Uuid, TaskOp, TaskStatus)> = recover_tasks(&env)
         .into_iter()
-        .map(|t| (t.spec.target, t.spec.node, t.spec.op, t.status))
+        .map(|t| (t.spec.target, t.spec.node, t.spec.op, finished(t.status)))
         .collect();
     records.sort_by_key(|r| (r.0 != a.id, r.0));
     let done = TaskStatus {
@@ -737,7 +737,7 @@ async fn fails_a_task_of_the_failed_node_created_before_the_spec_write() {
     assert_ne!(get(&env, a.id).spec.node, Some(failed));
     let task = *writer.created.get().unwrap();
     assert_eq!(
-        env.cluster.get::<TaskSpec>(task).unwrap().unwrap().status,
+        finished(env.cluster.get::<TaskSpec>(task).unwrap().unwrap().status),
         TaskStatus {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
@@ -942,7 +942,7 @@ async fn finishes_a_spec_write_settled_by_a_new_term() {
     assert_eq!(records[0].spec.target, a.id);
     assert_eq!(records[0].spec.node, spare);
     assert_eq!(
-        env.cluster.get::<TaskSpec>(task).unwrap().unwrap().status,
+        finished(env.cluster.get::<TaskSpec>(task).unwrap().unwrap().status),
         TaskStatus {
             state: TaskState::Failed,
             error: Some("node failed failed; the VM was recovered by HA".into()),
@@ -2682,6 +2682,15 @@ fn check_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
             (t.spec.target, t.spec.op, status)
         })
         .collect()
+}
+
+/// HA가 실패로 끝낸 Task의 status(끝 시각이 적혔는지 보고 비교에서 뺀다 — 계획 77)
+fn finished(status: TaskStatus) -> TaskStatus {
+    assert!(status.finished_at.is_some(), "{status:?}");
+    TaskStatus {
+        finished_at: None,
+        ..status
+    }
 }
 
 fn succeeded() -> TaskStatus {
