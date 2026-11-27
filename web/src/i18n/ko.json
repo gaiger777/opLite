@@ -129,7 +129,7 @@
     "cpu_flag_restricted": "클러스터 관리자만 켤 수 있는 CPU 플래그입니다: {{message}}",
     "invalid_cpu_flags": "CPU 플래그가 잘못되었습니다: {{message}}",
     "cpu_baseline_unsupported": "고정 CPU 모델을 켤 수 없는 노드가 있습니다: {{message}}",
-    "sdn_not_ready": "SDN(OVN)이 아직 설정되지 않았습니다. 네트워크 › SDN에서 설정하세요.",
+    "sdn_not_ready": "SDN(OVN)이 아직 설정되지 않았습니다. 네트워크 › SDN(가상 네트워크)에서 설정하세요.",
     "sdn_exists": "{{message}}",
     "sdn_limit": "SDN(OVN) 중앙 노드는 5개까지입니다.",
     "sdn_last_central": "마지막 OVN 중앙 노드는 뺄 수 없습니다.",
@@ -191,7 +191,6 @@
     "withDetail": "{{text}} 자세히: {{detail}}"
   },
   "nav": {
-    "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",
     "vms": "가상 머신",
     "imports": "가져오기",
     "volumes": "볼륨",
@@ -220,23 +219,14 @@
     "alerts": "경보",
     "notificationTargets": "알림 대상",
     "area": {
-      "home": "홈",
-      "vms": "가상 머신",
-      "infra": "인프라",
-      "protect": "보호",
-      "activity": "활동",
-      "settings": "설정"
+      "home": "홈"
     },
     "vmList": "VM",
-    "imagesIsos": "이미지·ISO",
     "replication": "원격 복제",
-    "placementTab": "배치",
     "general": "일반",
     "subscription": "구독",
     "new": "새로 만들기",
     "main": "주 메뉴",
-    "areaMenu": "{{area}} 메뉴",
-    "viewMenu": "{{tab}} 보기",
     "breadcrumb": "이동 경로",
     "skipToContent": "본문으로 건너뛰기",
     "openMenu": "메뉴 열기",
@@ -266,13 +256,66 @@
     "vmwareMigrationsKeywords": "vmware, vcenter, esxi, 이전, 마이그레이션, 따뜻한, 전환",
     "vmwareSourcesKeywords": "vmware, vcenter, esxi, 연결",
     "vmExportsKeywords": "내보내기, export, ova, ovf, vmdk",
-    "auditTab": "감사",
     "history": "설정 기록",
     "historyKeywords": "설정 기록, 이력, history, 바뀜, revision, 되돌리기, 드리프트, drift",
     "applySets": "선언 묶음",
     "applySetsKeywords": "선언 묶음, 적용 묶음, apply set, 선언형, 매니페스트, yaml, gitops, 드리프트, drift",
     "certificates": "인증서",
-    "certificatesKeywords": "인증서, certificate, ACME, Let's Encrypt, TLS, https"
+    "certificatesKeywords": "인증서, certificate, ACME, Let's Encrypt, TLS, https",
+    "group": {
+      "overview": "개요",
+      "vms": "가상 머신",
+      "images": "이미지·이전",
+      "storage": "스토리지",
+      "network": "네트워크",
+      "cluster": "클러스터·가용성",
+      "backup": "백업·복구",
+      "records": "기록",
+      "admin": "관리",
+      "account": "내 계정"
+    },
+    "item": {
+      "dashboard": "대시보드",
+      "map": "인프라 지도",
+      "alerts": "경보",
+      "vms": "모든 VM",
+      "createVm": "VM 만들기",
+      "images": "OS 이미지",
+      "isos": "ISO 파일",
+      "imports": "가져오기(OVA·ESXi)",
+      "vmware": "VMware 이전",
+      "volumes": "디스크(볼륨)",
+      "securityGroups": "방화벽(보안 그룹)",
+      "routing": "라우터·공인 IP",
+      "sdn": "SDN(가상 네트워크)",
+      "topology": "토폴로지 그림",
+      "cluster": "클러스터(멤버·인증서)",
+      "haGroups": "자동 복구(HA)",
+      "haChecks": "장애 감지(HA 검사)",
+      "placement": "배치 규칙·자동 균형",
+      "backupJobs": "백업 일정",
+      "remotes": "원격 클러스터·복제",
+      "dr": "DR(재해 복구)",
+      "tasks": "작업 기록",
+      "history": "변경 기록",
+      "applySets": "코드로 관리(YAML)",
+      "general": "일반·업데이트",
+      "users": "사용자·그룹",
+      "roles": "역할·권한",
+      "realms": "로그인 방식(인증 영역)",
+      "security": "보안·인증서",
+      "notifications": "알림 보낼 곳",
+      "tokens": "내 API 토큰",
+      "account": "내 2단계 인증"
+    },
+    "pageTabs": "{{item}} 화면",
+    "listView": "목록으로 보기",
+    "folderView": "폴더로 보기",
+    "viewAs": "보기 모양",
+    "search": "찾기·명령",
+    "badgeAlerts": "울리는 경보 {{n}}개",
+    "badgeFailedTasks": "24시간 안에 실패한 작업 {{n}}개",
+    "groupMenu": "{{group}} 메뉴"
   },
   "header": {
     "language": "언어",
@@ -2081,7 +2124,7 @@
       "tokenAgain": "URL이나 CA가 바뀌었으니 API 토큰을 다시 넣으세요."
     },
     "manage": "원격 클러스터 관리",
-    "manageHint": "이 클러스터가 보는 원격 클러스터를 더하고 고치고 지웁니다. 상태와 VM은 보호 › 원격 복제에 있습니다.",
+    "manageHint": "이 클러스터가 보는 원격 클러스터를 더하고 고치고 지웁니다. 상태와 VM은 원격 복제 탭에 있습니다.",
     "replicatingJobs": "원격 클러스터로 사본을 보내는 백업 작업",
     "noReplicatingJobs": "원격 클러스터로 사본을 보내는 백업 작업이 없습니다.",
     "job": "백업 작업",
@@ -3499,12 +3542,15 @@
     "favorite": "이 리소스 즐겨찾기",
     "center": "작업·알림 센터",
     "go": {
-      "home": "홈",
+      "overview": "개요",
       "vms": "가상 머신",
-      "infra": "인프라",
-      "protect": "보호",
-      "activity": "활동",
-      "settings": "설정"
+      "images": "이미지·이전",
+      "storage": "스토리지",
+      "network": "네트워크",
+      "cluster": "클러스터·가용성",
+      "backup": "백업·복구",
+      "records": "기록",
+      "admin": "관리"
     },
     "list": {
       "next": "다음 행",
@@ -3895,7 +3941,7 @@
     },
     "cluster": {
       "title": "CPU 기준",
-      "mode": "기준: {{mode}}. 설정 › 일반에서 바꿉니다.",
+      "mode": "기준: {{mode}}. 관리 › 일반·업데이트에서 바꿉니다.",
       "mask": "모든 VM에서 숨김: {{flags}}",
       "noBaseline": "기준이 없습니다. cluster 모델 VM은 host처럼 켭니다.",
       "since": "{{time}}부터",
@@ -4216,7 +4262,7 @@
     },
     "noChassis": "준비된 OVN chassis 노드가 없음",
     "kindNotReady": "SDN(OVN) — 설정 안 됨",
-    "notReadyHint": "SDN 네트워크를 만들려면 먼저 네트워크 › SDN에서 SDN(OVN)을 설정하세요.",
+    "notReadyHint": "SDN 네트워크를 만들려면 먼저 네트워크 › SDN(가상 네트워크)에서 SDN(OVN)을 설정하세요.",
     "statusUnknown": "SDN 상태를 읽지 못했습니다({{error}}). 네트워크를 만들 때 서버가 확인합니다.",
     "mtuHint": "1280~9000. 기본 1442: underlay 1500바이트에서 Geneve 머리 58바이트를 뺀 값입니다.",
     "wizard": {
@@ -4444,7 +4490,7 @@
   },
   "router": {
     "pageHint": "라우터는 SDN 네트워크끼리 잇고, 외부(공급자) 네트워크를 거쳐 SNAT와 유동 IP로 밖과 잇습니다.",
-    "sdnNotReady": "라우터와 유동 IP는 먼저 네트워크 › SDN에서 SDN(OVN)을 설정해야 합니다.",
+    "sdnNotReady": "라우터와 유동 IP는 먼저 네트워크 › SDN(가상 네트워크)에서 SDN(OVN)을 설정해야 합니다.",
     "empty": {
       "title": "라우터가 없습니다",
       "description": "SDN 네트워크를 잇고 밖으로 나가려면 라우터를 만드세요."
@@ -4604,7 +4650,7 @@
   },
   "lb": {
     "pageHint": "부하 분산기는 SDN 네트워크의 가상 주소(VIP) 하나를 VM 인터페이스나 주소 여럿으로 나눕니다(TCP·UDP). 건강 검사가 죽은 멤버를 빼고, 바깥 VIP로 물리 망에도 엽니다.",
-    "sdnNotReady": "부하 분산기는 먼저 네트워크 › SDN에서 SDN(OVN)을 설정해야 합니다.",
+    "sdnNotReady": "부하 분산기는 먼저 네트워크 › SDN(가상 네트워크)에서 SDN(OVN)을 설정해야 합니다.",
     "empty": {
       "title": "부하 분산기가 없습니다",
       "description": "라우터에 붙은 SDN 네트워크에 부하 분산기를 만드세요."

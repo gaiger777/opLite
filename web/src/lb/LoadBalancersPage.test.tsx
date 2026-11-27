@@ -130,7 +130,9 @@ it("shows the empty state before SDN is set up", async () => {
   const { container } = renderPage(<LoadBalancersPage />);
   expect(await screen.findByText("No load balancers")).toBeVisible();
   expect(
-    await screen.findByText("Load balancers need SDN (OVN) set up first, under Networks › SDN."),
+    await screen.findByText(
+      "Load balancers need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+    ),
   ).toBeVisible();
   expect(screen.getByRole("button", { name: "Create a load balancer" })).toBeDisabled();
   await expectNoAxeViolations(container);

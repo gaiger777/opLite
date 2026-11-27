@@ -56,7 +56,7 @@ export function RemotesPage() {
         description={t("remotes.pageHint")}
         actions={
           admin && (
-            <Link to="/settings/remotes" className="text-sm underline-offset-4 hover:underline">
+            <Link to="/remotes/-manage" className="text-sm underline-offset-4 hover:underline">
               {t("remotes.manage")}
             </Link>
           )

@@ -12,6 +12,7 @@ import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
+import { ViewToggle } from "@/layout/PageTabs";
 import { ResourceHeader } from "@/components/ResourceHeader";
 import { useConfigMenu } from "@/declarative/ConfigMenu";
 import { Button } from "@/components/ui/button";
@@ -306,6 +307,7 @@ export function FolderViewPage({ kind }: { kind: FolderKind }) {
         title={t(`nav.${kind}Folders`)}
         actions={
           <>
+            <ViewToggle />
             {canCreateFolder && (
               <Button variant="outline" onClick={() => setCreating(true)}>
                 <FolderPlus />

@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { Permissions } from "@/auth/permissions";
-import { AREAS, viewVisible } from "@/layout/nav";
+import { GROUPS, pageVisible } from "@/layout/nav";
 import { NodeDetailPage } from "@/nodes/NodeDetailPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NODE, readyChassis, sdnNode, sdnTask, sdnView } from "@/test/fixtures";
@@ -54,12 +54,12 @@ it("shows the SDN state in a node's header only once SDN is set up", async () =>
 });
 
 it("shows the SDN view to users who can read the cluster", () => {
-  const view = AREAS.flatMap((a) => a.tabs)
-    .flatMap((t) => t.views ?? [])
-    .find((v) => v.to === "/sdn")!;
-  expect(view.kind).toBe("sdn");
-  expect(viewVisible(view, Permissions.fromRole("viewer"))).toBe(true);
-  expect(viewVisible(view, Permissions.fromRole("none"))).toBe(false);
+  const page = GROUPS.flatMap((g) => g.items)
+    .flatMap((item) => item.pages)
+    .find((p) => p.to === "/sdn")!;
+  expect(page.kind).toBe("sdn");
+  expect(pageVisible(page, Permissions.fromRole("viewer"))).toBe(true);
+  expect(pageVisible(page, Permissions.fromRole("none"))).toBe(false);
 });
 
 it("marks a node holding leftover central databases", async () => {

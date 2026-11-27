@@ -1,4 +1,15 @@
-import { Lock, Menu, Monitor, Moon, ShieldOff, Sun, User, WifiOff } from "lucide-react";
+import {
+  KeyRound,
+  Lock,
+  Menu,
+  Monitor,
+  Moon,
+  ShieldCheck,
+  ShieldOff,
+  Sun,
+  User,
+  WifiOff,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Outlet, useLocation, useNavigate } from "react-router";
@@ -26,23 +37,23 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { type Language, setLanguage } from "@/i18n";
-import { AreaTabs, ViewSwitch } from "@/layout/AreaTabs";
 import { Breadcrumbs } from "@/layout/Breadcrumbs";
 import { ClusterSwitch, CreateMenu, SearchButton } from "@/layout/HeaderTools";
 import {
-  AREAS,
-  areaOf,
   crumbsOf,
+  GROUPS,
+  hitVisible,
   isFullWidth,
-  lastTab,
-  rememberTab,
-  tabVisible,
+  itemHome,
+  navOf,
+  visibleItems,
 } from "@/layout/nav";
+import { PageTabs } from "@/layout/PageTabs";
 import { NavProgress } from "@/layout/RouteError";
 import { NotificationBell } from "@/layout/NotificationBell";
 import { TaskDrawer } from "@/tasks/TaskDrawer";
 import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
-import { AreaLinks, Sidebar, useRail } from "@/layout/Sidebar";
+import { NavTree, Sidebar, useRail } from "@/layout/Sidebar";
 import { type Density, useDensity } from "@/lib/density";
 import { type ShortcutId, useShortcuts } from "@/lib/shortcuts";
 import { type Theme, useTheme } from "@/lib/theme";
@@ -50,22 +61,22 @@ import { CommandPalette } from "@/palette/CommandPalette";
 import { setCenterOpen } from "@/tasks/center";
 
 /**
- * 앱의 틀: 왼쪽 영역 사이드바(설계 §4), 머리줄(☰·이동 경로·검색·+ 만들기·클러스터 전환·종·실시간·사용자 메뉴), 본문 위
- * 영역 탭과 보기 전환, ⌘K 팔레트와 단축키(§5.2·§5.7). 경로가 바뀌면 그 영역의 마지막 탭을 기억하고 본문 제목으로
+ * 앱의 틀: 왼쪽 2단 사이드바(묶음 → 항목, 계획 77), 머리줄(☰·이동 경로·+ 만들기·클러스터 전환·종·실시간·사용자 메뉴),
+ * 본문 위 화면 안 탭(한 항목에 화면이 둘 이상일 때), ⌘K 팔레트와 단축키(§5.2·§5.7). 경로가 바뀌면 본문 제목으로
  * 포커스를 옮긴다.
  */
 export function AppLayout() {
   const { t } = useTranslation();
   const me = useNavUser();
   const navigate = useNavigate();
-  const { pathname, search } = useLocation();
+  const { pathname } = useLocation();
   const main = useRef<HTMLElement>(null);
   const [announce, setAnnounce] = useState("");
   const full = isFullWidth(pathname);
   // 숨긴 탭의 주소를 바로 열면(`/nodes` 등) 그 화면은 묻지 않는 목록을 끝없이 기다린다. 권한을 받은 뒤 안내로 바꾼다.
   const ready = usePermissionsReady();
-  const hit = areaOf(pathname);
-  const denied = ready && hit !== null && !tabVisible(hit.tab, me.gate);
+  const hit = navOf(pathname);
+  const denied = ready && hit !== null && !hitVisible(hit, me.gate);
   const { rail, toggle: toggleRail } = useRail();
   const [palette, setPalette] = useState(false);
   const [help, setHelp] = useState(false);
@@ -79,8 +90,17 @@ export function AppLayout() {
     }
     setPalette(!palette);
   };
+  // `g` 다음 키는 그 묶음의 보이는 첫 항목으로 간다.
   const goTo = Object.fromEntries(
-    AREAS.map((area) => [`go.${area.id}`, () => void navigate(lastTab(area, me))]),
+    GROUPS.filter((group) => !group.hidden).map((group) => [
+      `go.${group.id}`,
+      () => {
+        const first = visibleItems(group, me.gate)[0];
+        if (first) {
+          void navigate(itemHome(first, me.gate));
+        }
+      },
+    ]),
   ) as Partial<Record<ShortcutId, () => void>>;
   // 콘솔 화면에서는 키를 모두 게스트에 넘긴다.
   useShortcuts(
@@ -97,8 +117,6 @@ export function AppLayout() {
     !full,
   );
 
-  useEffect(() => rememberTab(me.user, pathname, search), [me.user, pathname, search]);
-
   // 첫 화면은 그대로 두고, 화면이 바뀔 때만 본문 제목(없으면 본문)으로 포커스를 옮기고 화면 이름을 읽어 준다.
   const shown = useRef(pathname);
   useEffect(() => {
@@ -112,7 +130,7 @@ export function AppLayout() {
       target.focus({ preventScroll: true });
     }
     setAnnounce(
-      crumbsOf(pathname, me, t)
+      crumbsOf(pathname, me.gate, t)
         .map((crumb) => crumb.label)
         .join(" › "),
     );
@@ -129,7 +147,7 @@ export function AppLayout() {
       >
         {t("nav.skipToContent")}
       </a>
-      <Sidebar rail={rail} onToggle={toggleRail} />
+      <Sidebar rail={rail} onToggle={toggleRail} onSearch={openPalette} />
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 items-center justify-between gap-2 border-b px-4">
           <div className="flex min-w-0 items-center gap-2">
@@ -137,7 +155,10 @@ export function AppLayout() {
             <Breadcrumbs />
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            <SearchButton onOpen={openPalette} />
+            {/* 768px 이상에서는 사이드바 맨 위에 있다. */}
+            <div className="md:hidden">
+              <SearchButton onOpen={openPalette} />
+            </div>
             <CreateMenu open={creating} onOpenChange={setCreating} />
             <ClusterSwitch />
             <NotificationBell />
@@ -152,12 +173,11 @@ export function AppLayout() {
           className="flex min-w-0 flex-1 flex-col gap-(--gap) p-4 outline-none md:p-6"
         >
           <OfflineBanner />
-          {!full && <AreaTabs />}
-          {!full && <ViewSwitch />}
+          {!full && <PageTabs />}
           <div className="min-w-0">
             {denied ? (
               <div className="flex flex-col gap-4">
-                <PageHeader title={t(hit.tab.key)} />
+                <PageHeader title={t(hit.item.key)} />
                 <EmptyState icon={ShieldOff} title={t("nav.noAccess")} />
               </div>
             ) : (
@@ -181,7 +201,7 @@ export function AppLayout() {
   );
 }
 
-/** 768px 아래: 사이드바 대신 머리줄의 ☰가 영역 링크 서랍을 연다. */
+/** 768px 아래: 사이드바 대신 머리줄의 ☰가 같은 2단 메뉴 서랍을 연다. */
 function MobileNav() {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -192,9 +212,9 @@ function MobileNav() {
           <Menu />
         </Button>
       </SheetTrigger>
-      <SheetContent side="left" className="w-64 gap-0 p-0" aria-describedby={undefined}>
+      <SheetContent side="left" className="w-72 gap-0 p-0" aria-describedby={undefined}>
         <SheetTitle className="flex h-14 items-center px-4 text-lg">Orbivisor</SheetTitle>
-        <AreaLinks onNavigate={() => setOpen(false)} />
+        <NavTree onNavigate={() => setOpen(false)} />
       </SheetContent>
     </Sheet>
   );
@@ -240,6 +260,7 @@ function UserMenu({ onHelp }: { onHelp(): void }) {
   const { t } = useTranslation();
   const { logout } = useAuth();
   const me = usePrincipal();
+  const navigate = useNavigate();
   const { density, setDensity } = useDensity();
   const [changing, setChanging] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -280,6 +301,15 @@ function UserMenu({ onHelp }: { onHelp(): void }) {
             {t("shortcuts.title")}
           </DropdownMenuItem>
           <DropdownMenuSeparator />
+          {/* 내 것(토큰·2단계 인증)은 관리 메뉴가 아니라 여기서 연다(계획 77). */}
+          <DropdownMenuItem onSelect={() => void navigate("/settings/tokens")}>
+            <KeyRound />
+            {t("nav.item.tokens")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void navigate("/settings/account")}>
+            <ShieldCheck />
+            {t("nav.item.account")}
+          </DropdownMenuItem>
           {/* 외부 사용자(이름에 `@<영역>`)의 비밀번호는 영역의 디렉터리가 맡는다. */}
           {!me.name.includes("@") && (
             <DropdownMenuItem onSelect={() => setChanging(true)}>

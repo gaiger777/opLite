@@ -10,8 +10,8 @@ import { RequireAuth } from "@/auth/RequireAuth";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppLayout } from "@/layout/AppLayout";
-import { AREAS, LEGACY_REDIRECTS } from "@/layout/nav";
-import { AreaRedirect, Redirect } from "@/layout/Redirect";
+import { LEGACY_REDIRECTS } from "@/layout/nav";
+import { Redirect } from "@/layout/Redirect";
 import { RouteError } from "@/layout/RouteError";
 import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
@@ -267,6 +267,11 @@ export const appRoutes: RouteObject[] = [
                 ),
               },
               { path: "remotes", lazy: page(() => import("@/remotes/RemotesPage"), "RemotesPage") },
+              // 원격 클러스터 주소·토큰 관리(예전 설정 › 원격 클러스터, admin): 백업·복구 › 원격 클러스터·복제의 화면 안 탭
+              {
+                path: "remotes/-manage",
+                lazy: page(() => import("@/remotes/RemotesManagePage"), "RemotesManagePage"),
+              },
               {
                 path: "remotes/:name",
                 lazy: page(() => import("@/remotes/RemotePage"), "RemotePage"),
@@ -310,10 +315,6 @@ export const appRoutes: RouteObject[] = [
                 lazy: page(() => import("@/accounts/TokensPage"), "TokensPage"),
               },
               {
-                path: "settings/remotes",
-                lazy: page(() => import("@/remotes/RemotesManagePage"), "RemotesManagePage"),
-              },
-              {
                 path: "settings/notifications",
                 lazy: page(
                   () => import("@/alerts/NotificationTargetsPage"),
@@ -324,13 +325,6 @@ export const appRoutes: RouteObject[] = [
                 path: "settings/subscription",
                 lazy: page(() => import("@/settings/SubscriptionPage"), "SubscriptionPage"),
               },
-              // 영역 주소는 기억한 탭으로 간다(`/`·`/vms`·`/settings`는 첫 탭 화면 자체다).
-              ...AREAS.filter((area) => !area.tabs.some((tab) => tab.to === area.to)).map(
-                (area) => ({
-                  path: area.to.slice(1),
-                  element: <AreaRedirect area={area.id} />,
-                }),
-              ),
               ...LEGACY_REDIRECTS.map(({ from, to }) => ({
                 path: from.slice(1),
                 element: <Redirect to={to} />,

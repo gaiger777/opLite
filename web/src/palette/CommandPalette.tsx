@@ -16,7 +16,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { FOLDER_PATHS } from "@/folders/folders";
 import { useFolderPaths } from "@/folders/useFolderPaths";
 import { createItems } from "@/layout/create";
-import { AREAS, type NavView, viewVisible, visibleTabs } from "@/layout/nav";
+import { GROUPS as NAV_GROUPS, visibleItems, visiblePages } from "@/layout/nav";
 import { useDensity } from "@/lib/density";
 import { alive, type ResourceRef, useRefs } from "@/lib/recent";
 import { keyLabel } from "@/lib/shortcuts";
@@ -452,20 +452,31 @@ function usePaletteItems(
 
   const navigation = useMemo(() => {
     const list: Omit<Item, "run">[] = [];
-    for (const area of AREAS) {
-      for (const tab of visibleTabs(area, perms)) {
-        // 읽을 수 없는 보기(예: 루트 cluster.read가 없는 사용자의 SDN)는 내지 않는다(리뷰 1 #6).
-        const leaves: NavView[] = tab.views?.filter((view) => viewVisible(view, perms)) ?? [
-          { to: tab.to, key: tab.key },
-        ];
-        for (const leaf of leaves) {
-          const label = area.id === "home" ? t(area.key) : `${t(area.key)} › ${t(leaf.key)}`;
-          const keywords = leaf.keywords
-            ? t(leaf.keywords)
-                .split(",")
-                .map((w) => w.trim())
-            : undefined;
-          list.push({ id: `nav:${leaf.to}`, group: "navigation", label, to: leaf.to, keywords });
+    // 사이드바 항목마다(`묶음 › 항목`), 화면 안 탭이 있으면 탭마다(`묶음 › 항목 › 탭`), 폴더 모양도. 읽을 수 없는 화면은
+    // 내지 않는다(리뷰 1 #6). 화면의 옛 이름(번역 키 `page.key`)과 묶음 이름도 찾는 낱말이다.
+    const words = (...keys: (string | undefined)[]) =>
+      keys
+        .filter((key): key is string => key !== undefined)
+        .flatMap((key) => t(key).split(","))
+        .map((w) => w.trim())
+        .filter(Boolean);
+    for (const group of NAV_GROUPS) {
+      for (const item of visibleItems(group, perms)) {
+        const base = `${t(group.key)} › ${t(item.key)}`;
+        const pages = visiblePages(item, perms);
+        for (const page of pages) {
+          const label = pages.length > 1 ? `${base} › ${t(page.key)}` : base;
+          const keywords = words(page.key, page.keywords);
+          list.push({ id: `nav:${page.to}`, group: "navigation", label, to: page.to, keywords });
+        }
+        if (item.folder) {
+          list.push({
+            id: `nav:${item.folder.to}`,
+            group: "navigation",
+            label: `${base} › ${t(item.folder.key)}`,
+            to: item.folder.to,
+            keywords: words(item.folder.key),
+          });
         }
       }
     }

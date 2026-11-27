@@ -9,7 +9,7 @@ import { createQueryClient } from "@/api/queryClient";
 import type { Principal } from "@/api/types";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { AREAS, LEGACY_REDIRECTS } from "@/layout/nav";
+import { LEGACY_REDIRECTS } from "@/layout/nav";
 import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
 import { NODE } from "@/test/fixtures";
@@ -137,8 +137,8 @@ it("shows a thin progress bar while a lazy page loads", async () => {
 it("offers a reload inside the shell when a page chunk is gone after a deploy", async () => {
   const user = userEvent.setup();
   renderApp("/settings");
-  const tabs = await screen.findByRole("navigation", { name: "Settings menu" });
-  await user.click(within(tabs).getByRole("link", { name: "Subscription" }));
+  await user.click(await screen.findByRole("button", { name: "Administration menu" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Subscription" }));
   expect(
     await screen.findByRole("heading", { level: 1, name: "A new version is available" }),
   ).toBeInTheDocument();
@@ -146,22 +146,6 @@ it("offers a reload inside the shell when a page chunk is gone after a deploy", 
   // 셸(사이드바)은 그대로다.
   expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
   expect(screen.queryByText(/Unexpected Application Error/)).not.toBeInTheDocument();
-});
-
-it("shows an empty area instead of redirecting to itself when no tab is visible", async () => {
-  const infra = AREAS.find((a) => a.id === "infra")!;
-  const tabs = infra.tabs;
-  infra.tabs = tabs.map((tab) => ({ ...tab, admin: true }));
-  try {
-    const router = renderApp("/infra", { ...ADMIN, role: "viewer" });
-    expect(
-      await screen.findByText("Nothing in this area is available to your role."),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("heading", { level: 1, name: "Infrastructure" })).toBeInTheDocument();
-    expect(where(router)).toBe("/infra");
-  } finally {
-    infra.tabs = tabs;
-  }
 });
 
 it.each(LEGACY_REDIRECTS)("moves $from to $to with its query and hash", async ({ from, to }) => {
@@ -178,13 +162,13 @@ it.each(OLD_NAV_PATHS)("still opens %s", async (path) => {
   expect(heading).not.toHaveTextContent("Page not found");
 });
 
-// VMware 이전·원본·내보내기(계획 72): 가져오기 탭의 보기가 늦게 받는 화면과 문구로 열린다.
+// VMware 이전·원본·내보내기(계획 72): 늦게 받는 화면과 문구로 열린다. 이전·원본은 VMware 이전 항목의 화면 안 탭 둘이다.
 it.each([
   ["/vmware-migrations", "VMware migrations"],
   ["/vmware-migrations/-new", "New VMware migration"],
   ["/vmware-sources", "VMware sources"],
   ["/vm-exports", "Exports"],
-])("opens %s as a view of the Imports tab", async (path, title) => {
+])("opens %s lazily", async (path, title) => {
   server.use(
     ...["/vmware-migrations", "/vmware-sources", "/vm-exports"].map((p) =>
       http.get(apiUrl(p), () => HttpResponse.json({ revision: 1, items: [] })),
@@ -194,24 +178,25 @@ it.each([
   expect(
     await screen.findByRole("heading", { level: 1, name: title }, { timeout: 3000 }),
   ).toBeInTheDocument();
-  // 상세(새 계획)에는 보기 전환이 없다 — 목록 보기에만
-  if (path.endsWith("-new")) {
+  // 상세(새 계획)와 내보내기에는 화면 안 탭이 없다
+  const tabs = screen.queryByRole("navigation", { name: "VMware migration pages" });
+  if (path.endsWith("-new") || path === "/vm-exports") {
+    expect(tabs).not.toBeInTheDocument();
     return;
   }
-  const views = screen.getByRole("navigation", { name: "Imports views" });
   expect(
-    within(views)
+    within(tabs!)
       .getAllByRole("link")
       .map((l) => l.textContent),
-  ).toEqual(["Imports", "VMware migrations", "VMware sources", "Exports"]);
+  ).toEqual(["VMware migrations", "VMware sources"]);
 });
 
-// 설정 기록·선언 묶음(계획 73)은 감사 탭의, 인증서는 보안 탭의 보기로 늦게 받는 화면과 문구로 열린다.
+// 설정 기록·선언 묶음(계획 73)은 기록 묶음의 항목, 인증서는 관리 › 보안·인증서의 화면 안 탭으로 늦게 받는 화면과 문구로 열린다.
 it.each([
-  ["/history", "Config history", "Audit views", ["Audit log", "Config history", "Apply sets"]],
-  ["/apply-sets", "Apply sets", "Audit views", ["Audit log", "Config history", "Apply sets"]],
-  ["/settings/certificates", "Certificates", "Security views", ["Security", "Certificates"]],
-] as const)("opens %s as a view", async (path, title, nav, views) => {
+  ["/history", "Config history", null],
+  ["/apply-sets", "Apply sets", null],
+  ["/settings/certificates", "Certificates", ["Security", "Certificates"]],
+] as const)("opens %s lazily", async (path, title, tabs) => {
   server.use(
     http.get(apiUrl("/history"), () => HttpResponse.json({ items: [] })),
     ...["/apply-sets", "/acme-accounts", "/acme-dns", "/certificates"].map((p) =>
@@ -222,76 +207,71 @@ it.each([
   expect(
     await screen.findByRole("heading", { level: 1, name: title }, { timeout: 3000 }),
   ).toBeInTheDocument();
+  const nav = screen.queryByRole("navigation", { name: / pages$/ });
+  if (!tabs) {
+    expect(nav).not.toBeInTheDocument();
+    return;
+  }
   expect(
-    within(screen.getByRole("navigation", { name: nav }))
+    within(nav!)
       .getAllByRole("link")
       .map((l) => l.textContent),
-  ).toEqual(views);
+  ).toEqual(tabs);
 });
 
-// DR(계획 76)은 데이터 보호 영역의 탭이고, 실행 화면도 그 탭에 속한다(사이드바 항목이 아니다).
-it("opens /dr-plans as a tab of the protection area", async () => {
+// DR(계획 76)은 백업·복구 › DR(재해 복구)이다.
+it("opens /dr-plans under Backup & recovery", async () => {
   server.use(http.get(apiUrl("/dr-plans"), () => HttpResponse.json({ revision: 1, items: [] })));
   renderApp("/dr-plans");
   expect(
     await screen.findByRole("heading", { level: 1, name: "DR" }, { timeout: 3000 }),
   ).toBeInTheDocument();
-  const tabs = screen.getByRole("navigation", { name: "Protection menu" });
-  expect(within(tabs).getByRole("link", { name: "DR" })).toHaveAttribute("aria-current", "page");
+  const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
+  expect(within(crumbs).getByText("Backup & recovery")).toBeInTheDocument();
+  expect(within(crumbs).getByText("DR (disaster recovery)")).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  expect(screen.getByRole("button", { name: "Backup & recovery menu" })).toHaveAttribute(
+    "data-current",
+  );
 });
 
-it.each([
-  ["/infra", "/nodes"],
-  ["/protect", "/backups"],
-  ["/activity", "/tasks"],
-])("opens the first tab of %s without a remembered tab", async (from, to) => {
-  const router = renderApp(from);
-  await vi.waitFor(() => expect(where(router)).toBe(to));
+it("merges remote clusters into one item with the manage tab for admins", async () => {
+  renderApp("/remotes/-manage");
+  expect(
+    await screen.findByRole("heading", { level: 1, name: "Remote clusters" }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  const tabs = screen.getByRole("navigation", { name: "Remote clusters & replication pages" });
+  expect(
+    within(tabs)
+      .getAllByRole("link")
+      .map((l) => [l.textContent, l.getAttribute("href")]),
+  ).toEqual([
+    ["Remote replication", "/remotes"],
+    ["Remote clusters", "/remotes/-manage"],
+  ]);
 });
 
-it("opens the remembered tab of an area address", async () => {
-  localStorage.setItem("opl.nav.last.infra", "/volumes?q=root");
-  localStorage.setItem("opl.nav.last.activity", "/audit");
-  const router = renderApp("/infra");
-  await vi.waitFor(() => expect(where(router)).toBe("/volumes?q=root"));
+it("goes to a group with g and a key, and focuses the new page", async () => {
+  const router = renderApp("/");
+  await screen.findByRole("heading", { level: 1, name: "Home" });
+  fireEvent.keyDown(document.body, { key: "g" });
+  fireEvent.keyDown(document.body, { key: "d" });
+  await vi.waitFor(() => expect(where(router)).toBe("/storage-pools"));
+  await vi.waitFor(() =>
+    expect(screen.getByRole("heading", { level: 1, name: "Storage pools" })).toHaveFocus(),
+  );
+  fireEvent.keyDown(document.body, { key: "g" });
+  fireEvent.keyDown(document.body, { key: "a" });
+  await vi.waitFor(() => expect(where(router)).toBe("/tasks"));
 });
 
-it("ignores a remembered view the user may not see", async () => {
-  localStorage.setItem("opl.nav.last.activity", "/audit");
-  // 감사 로그 보기는 admin만 — 감사 탭의 보이는 첫 보기(설정 기록, 계획 73)로 간다.
-  server.use(http.get(apiUrl("/history"), () => HttpResponse.json({ items: [] })));
-  const router = renderApp("/activity", { ...ADMIN, role: "viewer" });
-  await vi.waitFor(() => expect(where(router)).toBe("/history"));
-});
-
-it("returns to the last tab from the sidebar and moves focus to the new page", async () => {
+it("opens an item from a rail flyout", async () => {
   const user = userEvent.setup();
   const router = renderApp("/storage-pools");
-  const main = await screen.findByRole("navigation", { name: "Main" });
-  const tabs = await screen.findByRole("navigation", { name: "Infrastructure menu" });
-  expect(within(tabs).getByRole("link", { name: "Storage pools" })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
-  expect(within(main).getByRole("link", { name: "Infrastructure" })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
-
-  await user.click(within(tabs).getByRole("link", { name: "Volumes" }));
-  await vi.waitFor(() => expect(where(router)).toBe("/volumes"));
-  // 경로가 바뀌면 본문 제목으로 포커스가 간다.
-  await vi.waitFor(() =>
-    expect(screen.getByRole("heading", { level: 1, name: "Volumes" })).toHaveFocus(),
-  );
-
-  await user.click(within(main).getByRole("link", { name: "Home" }));
-  await vi.waitFor(() => expect(where(router)).toBe("/"));
-  expect(within(main).getByRole("link", { name: "Infrastructure" })).toHaveAttribute(
-    "href",
-    "/volumes",
-  );
-  await user.click(within(main).getByRole("link", { name: "Infrastructure" }));
+  await user.click(await screen.findByRole("button", { name: "Storage menu" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Disks (volumes)" }));
   await vi.waitFor(() => expect(where(router)).toBe("/volumes"));
 });
 
@@ -307,20 +287,14 @@ it("opens the VM builder as a lazy view of the create page with its strings", as
   expect(screen.getByRole("link", { name: "Builder" })).toHaveAttribute("aria-current", "page");
 });
 
-it("opens the cluster map as a lazy view of Infrastructure › Nodes and keeps [ inside the map", async () => {
+it("opens the cluster map lazily under Overview and keeps [ inside the map", async () => {
   const router = renderApp("/cluster/map");
   // 노드 하나(레이블 없음) — 그림이 노드 블록을 그린다
   server.use(http.get(apiUrl("/nodes"), () => HttpResponse.json({ revision: 1, items: [NODE] })));
   expect(
     await screen.findByRole("heading", { level: 1, name: "Map" }, { timeout: 3000 }),
   ).toBeInTheDocument();
-  const views = screen.getByRole("navigation", { name: "Nodes views" });
-  expect(
-    within(views)
-      .getAllByRole("link")
-      .map((a) => a.textContent),
-  ).toEqual(["Nodes", "Map", "Cluster"]);
-  expect(within(views).getByRole("link", { name: "Map" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("button", { name: "Overview menu" })).toHaveAttribute("data-current");
   const block = await screen.findByRole("button", { name: /^Node node-a, online/ });
   // 그림 밖의 `[`는 사이드바를 접는다
   expect(localStorage.getItem("opl.nav.rail")).toBeNull();

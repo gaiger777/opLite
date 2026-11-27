@@ -15,6 +15,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
+import { ViewToggle } from "@/layout/PageTabs";
 import { ListPending } from "@/components/ListPending";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
@@ -279,12 +280,15 @@ export function PoolsPage() {
         id="pools-title"
         title={t("nav.pools")}
         actions={
-          create && (
-            <Button onClick={() => setCreating(true)}>
-              <Plus />
-              {t("common.create")}
-            </Button>
-          )
+          <>
+            <ViewToggle />
+            {create && (
+              <Button onClick={() => setCreating(true)}>
+                <Plus />
+                {t("common.create")}
+              </Button>
+            )}
+          </>
         }
       />
       <DataTable

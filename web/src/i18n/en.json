@@ -129,7 +129,7 @@
     "cpu_flag_restricted": "Only a cluster administrator can turn on these CPU flags: {{message}}",
     "invalid_cpu_flags": "Invalid CPU flags: {{message}}",
     "cpu_baseline_unsupported": "Some nodes cannot run the pinned CPU model: {{message}}",
-    "sdn_not_ready": "SDN (OVN) is not set up yet. Set it up under Networks › SDN.",
+    "sdn_not_ready": "SDN (OVN) is not set up yet. Set it up under Networking › SDN (virtual networks).",
     "sdn_exists": "{{message}}",
     "sdn_limit": "SDN (OVN) can have at most 5 central nodes.",
     "sdn_last_central": "The last OVN central node cannot be removed.",
@@ -191,7 +191,6 @@
     "withDetail": "{{text}} Details: {{detail}}"
   },
   "nav": {
-    "noTabs": "Nothing in this area is available to your role.",
     "vms": "Virtual machines",
     "imports": "Imports",
     "volumes": "Volumes",
@@ -220,23 +219,14 @@
     "alerts": "Alerts",
     "notificationTargets": "Notification targets",
     "area": {
-      "home": "Home",
-      "vms": "Virtual machines",
-      "infra": "Infrastructure",
-      "protect": "Protection",
-      "activity": "Activity",
-      "settings": "Settings"
+      "home": "Home"
     },
     "vmList": "VMs",
-    "imagesIsos": "Images & ISOs",
     "replication": "Remote replication",
-    "placementTab": "Placement",
     "general": "General",
     "subscription": "Subscription",
     "new": "New",
     "main": "Main",
-    "areaMenu": "{{area}} menu",
-    "viewMenu": "{{tab}} views",
     "breadcrumb": "Breadcrumb",
     "skipToContent": "Skip to content",
     "openMenu": "Open menu",
@@ -266,13 +256,66 @@
     "vmwareMigrationsKeywords": "vmware, vcenter, esxi, migrate, warm, cutover, wave",
     "vmwareSourcesKeywords": "vmware, vcenter, esxi, connection",
     "vmExportsKeywords": "export, ova, ovf, vmdk",
-    "auditTab": "Audit",
     "history": "Config history",
     "historyKeywords": "history, config history, changes, revision, rollback, restore, drift",
     "applySets": "Apply sets",
     "applySetsKeywords": "apply set, declarative, manifest, yaml, gitops, drift",
     "certificates": "Certificates",
-    "certificatesKeywords": "certificate, ACME, Let's Encrypt, TLS, https"
+    "certificatesKeywords": "certificate, ACME, Let's Encrypt, TLS, https",
+    "group": {
+      "overview": "Overview",
+      "vms": "Virtual machines",
+      "images": "Images & migration",
+      "storage": "Storage",
+      "network": "Networking",
+      "cluster": "Cluster & availability",
+      "backup": "Backup & recovery",
+      "records": "Records",
+      "admin": "Administration",
+      "account": "My account"
+    },
+    "item": {
+      "dashboard": "Dashboard",
+      "map": "Infrastructure map",
+      "alerts": "Alerts",
+      "vms": "All VMs",
+      "createVm": "Create VM",
+      "images": "OS images",
+      "isos": "ISO files",
+      "imports": "Imports (OVA, ESXi)",
+      "vmware": "VMware migration",
+      "volumes": "Disks (volumes)",
+      "securityGroups": "Firewall (security groups)",
+      "routing": "Routers & public IPs",
+      "sdn": "SDN (virtual networks)",
+      "topology": "Topology diagram",
+      "cluster": "Cluster (members, certificates)",
+      "haGroups": "Automatic recovery (HA)",
+      "haChecks": "Failure detection (HA checks)",
+      "placement": "Placement rules & balancing",
+      "backupJobs": "Backup schedules",
+      "remotes": "Remote clusters & replication",
+      "dr": "DR (disaster recovery)",
+      "tasks": "Task history",
+      "history": "Change history",
+      "applySets": "Managed as code (YAML)",
+      "general": "General & updates",
+      "users": "Users & groups",
+      "roles": "Roles & permissions",
+      "realms": "Sign-in methods (realms)",
+      "security": "Security & certificates",
+      "notifications": "Where to send alerts",
+      "tokens": "My API tokens",
+      "account": "My two-step verification"
+    },
+    "pageTabs": "{{item}} pages",
+    "listView": "Show as a list",
+    "folderView": "Show by folder",
+    "viewAs": "Show as",
+    "search": "Find or run a command",
+    "badgeAlerts": "{{n}} alerts ringing",
+    "badgeFailedTasks": "{{n}} tasks failed in the last 24 hours",
+    "groupMenu": "{{group}} menu"
   },
   "header": {
     "language": "Language",
@@ -2081,7 +2124,7 @@
       "tokenAgain": "Enter the API token again: the URL or CA changed."
     },
     "manage": "Manage remote clusters",
-    "manageHint": "Add, change or remove the remote clusters this cluster can see. Their status and VMs are under Protection › Remote replication.",
+    "manageHint": "Add, change or remove the remote clusters this cluster can see. Their status and VMs are in the Remote replication tab.",
     "replicatingJobs": "Backup jobs that copy to remote clusters",
     "noReplicatingJobs": "No backup job copies to a remote cluster.",
     "job": "Backup job",
@@ -3499,12 +3542,15 @@
     "favorite": "Favorite this resource",
     "center": "Tasks and alerts",
     "go": {
-      "home": "Home",
+      "overview": "Overview",
       "vms": "Virtual machines",
-      "infra": "Infrastructure",
-      "protect": "Protection",
-      "activity": "Activity",
-      "settings": "Settings"
+      "images": "Images & migration",
+      "storage": "Storage",
+      "network": "Networking",
+      "cluster": "Cluster & availability",
+      "backup": "Backup & recovery",
+      "records": "Records",
+      "admin": "Administration"
     },
     "list": {
       "next": "Next row",
@@ -3895,7 +3941,7 @@
     },
     "cluster": {
       "title": "CPU baseline",
-      "mode": "Baseline: {{mode}}. Change it in Settings › General.",
+      "mode": "Baseline: {{mode}}. Change it in Administration › General & updates.",
       "mask": "Hidden from every VM: {{flags}}",
       "noBaseline": "No baseline. VMs with the cluster model run like host.",
       "since": "Since {{time}}",
@@ -4216,7 +4262,7 @@
     },
     "noChassis": "No node is a ready OVN chassis",
     "kindNotReady": "SDN (OVN) — not set up",
-    "notReadyHint": "SDN networks need SDN (OVN) set up first, under Networks › SDN.",
+    "notReadyHint": "SDN networks need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
     "statusUnknown": "Cannot read the SDN state ({{error}}); the server checks it when you create the network.",
     "mtuHint": "1280–9000. Defaults to 1442: a 1500-byte underlay minus the 58-byte Geneve header.",
     "wizard": {
@@ -4444,7 +4490,7 @@
   },
   "router": {
     "pageHint": "Routers connect SDN networks to each other and, through an external (provider) network, to the outside with SNAT and floating IPs.",
-    "sdnNotReady": "Routers and floating IPs need SDN (OVN) set up first, under Networks › SDN.",
+    "sdnNotReady": "Routers and floating IPs need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
     "empty": {
       "title": "No routers",
       "description": "Create a router to connect SDN networks and reach the outside."
@@ -4604,7 +4650,7 @@
   },
   "lb": {
     "pageHint": "A load balancer spreads one virtual address (VIP) on an SDN network over VM interfaces or addresses (TCP·UDP). Health checks take dead members out; an external VIP opens it to the physical network.",
-    "sdnNotReady": "Load balancers need SDN (OVN) set up first, under Networks › SDN.",
+    "sdnNotReady": "Load balancers need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
     "empty": {
       "title": "No load balancers",
       "description": "Create a load balancer on an SDN network that is attached to a router."

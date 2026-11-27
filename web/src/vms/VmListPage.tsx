@@ -12,6 +12,7 @@ import { usePermissions } from "@/auth/usePermissions";
 import { type Column, DataTable, type Filter, useIsPhone } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { PageHeader } from "@/components/PageHeader";
+import { ViewToggle } from "@/layout/PageTabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cpuPending } from "@/cpu/cpu";
@@ -239,14 +240,17 @@ export function VmListPage() {
         id="vms-title"
         title={t("nav.vms")}
         actions={
-          create && (
-            <Button asChild>
-              <Link to="/vms/-new">
-                <Plus />
-                {t("common.create")}
-              </Link>
-            </Button>
-          )
+          <>
+            <ViewToggle />
+            {create && (
+              <Button asChild>
+                <Link to="/vms/-new">
+                  <Plus />
+                  {t("common.create")}
+                </Link>
+              </Button>
+            )}
+          </>
         }
       />
       <FirstSteps />

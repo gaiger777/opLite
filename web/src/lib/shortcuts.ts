@@ -11,12 +11,15 @@ export type ShortcutId =
   | "create"
   | "favorite"
   | "center"
-  | "go.home"
+  | "go.overview"
   | "go.vms"
-  | "go.infra"
-  | "go.protect"
-  | "go.activity"
-  | "go.settings"
+  | "go.images"
+  | "go.storage"
+  | "go.network"
+  | "go.cluster"
+  | "go.backup"
+  | "go.records"
+  | "go.admin"
   | "list.next"
   | "list.prev"
   | "list.select"
@@ -46,12 +49,16 @@ export const SHORTCUTS: readonly Shortcut[] = [
   { id: "favorite", keys: ["f"], group: "general" },
   // Shift+N(키 이름은 대문자 N)
   { id: "center", keys: ["N"], group: "general" },
-  { id: "go.home", keys: ["g", "h"], group: "navigation" },
+  // 사이드바 묶음(계획 77). `g a`(예전 활동)는 작업이 있는 기록, `g s`(예전 설정)는 관리다.
+  { id: "go.overview", keys: ["g", "h"], group: "navigation" },
   { id: "go.vms", keys: ["g", "v"], group: "navigation" },
-  { id: "go.infra", keys: ["g", "i"], group: "navigation" },
-  { id: "go.protect", keys: ["g", "p"], group: "navigation" },
-  { id: "go.activity", keys: ["g", "a"], group: "navigation" },
-  { id: "go.settings", keys: ["g", "s"], group: "navigation" },
+  { id: "go.images", keys: ["g", "i"], group: "navigation" },
+  { id: "go.storage", keys: ["g", "d"], group: "navigation" },
+  { id: "go.network", keys: ["g", "n"], group: "navigation" },
+  { id: "go.cluster", keys: ["g", "c"], group: "navigation" },
+  { id: "go.backup", keys: ["g", "b"], group: "navigation" },
+  { id: "go.records", keys: ["g", "a"], group: "navigation" },
+  { id: "go.admin", keys: ["g", "s"], group: "navigation" },
   // 목록 키는 공통 표(`DataTable`)가 받는다. 여기서는 도움말에만 보인다.
   { id: "list.next", keys: ["j"], group: "list" },
   { id: "list.prev", keys: ["k"], group: "list" },
