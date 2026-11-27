@@ -483,7 +483,7 @@ orbivisorctl -o json audit --since 7d            # 응답 그대로(항목의 �
   on: node4`, `note: more entries match; narrow the range or raise --limit`을 쓴다(`-o json`이면 쓰지 않는다). 표의
   `TARGET`은 대상이 없으면 `detail`(로그인의 `username=…`, `audit.dropped`의 수)이다. 기간 `--since`(`1h` 등)와 `--until`은
   함께 줄 수 없다(`a relative --since cannot be combined with --until; give a time` — `--since`에 시각을 준다).
-- **웹.** 활동 › 감사 탭의 "감사 로그" 보기(admin에게만 보인다 — 같은 탭의 설정 기록·선언 묶음 보기는 [웹 화면](web-ui.md#설정-기록선언-묶음인증서-화면)): 시간 범위(지난 1시간·24시간·7일, 기본 24시간), 사용자·동작 입력(적용을
+- **웹.** 기록 › 감사 로그(admin에게만 보인다 — 같은 묶음의 변경 기록·코드로 관리(YAML)는 [웹 화면](web-ui.md#설정-기록선언-묶음인증서-화면)): 시간 범위(지난 1시간·24시간·7일, 기본 24시간), 사용자·동작 입력(적용을
   눌러야 거른다), 표(시각은 브라우저의 지역 시간, 대상이 없으면 `detail`, 4xx·5xx 상태는 경고 색), 읽지 못한 노드 경고,
   감사 로그를 끈 노드 안내와 잘림 안내, 행을 누르면 항목 JSON. 자동으로 다시 읽지 않는다(새로고침 버튼). 다시 읽기가
   실패하면 마지막 표를 두고 위에 오류를 보인다.

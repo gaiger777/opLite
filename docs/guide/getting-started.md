@@ -209,7 +209,7 @@ orbivisorctl cluster status                      # 버전이 섞여 있으면 �
 
 - **채널.** 설정은 클러스터에 하나뿐인 `Settings` 리소스(이름 `cluster`)다. `GET /api/v1/settings`는 로그인한 누구나,
   `PATCH /api/v1/settings`(`{"updates":{"channel":"testing"}}`, 다른 패치 API처럼 `If-Match`를 받는다)는 admin만
-  한다. 한 번도 바꾸지 않았으면 기본값(`stable`)이다. 웹은 설정 › 일반 탭(admin만 저장, 그 밖은 읽기만).
+  한다. 한 번도 바꾸지 않았으면 기본값(`stable`)이다. 웹은 관리 › 일반·업데이트 화면(admin만 저장, 그 밖은 읽기만).
 - **소스 파일.** 저장소 주소는 orbivisord 설정 `[updates] apt_url`이고, 비면 빌드할 때 넣은 `ORBIVISOR_APT_URL`이다. 둘 다 비면
   orbivisord는 소스 파일을 쓰지 않는다(관리자가 apt 소스를 직접 둔다). 주소가 있으면 orbivisord가 시작할 때와 채널이 바뀔 때
   `/etc/apt/sources.list.d/oplite.sources`를 쓴다:

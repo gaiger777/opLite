@@ -38,7 +38,7 @@ orbivisorctl settings set ha_start_concurrency=8  # 복구 때 대상 노드당 
 웹은 VM 만들기·편집의 "고가용성(HA)" 스위치(그 노드의 펜싱이 꺼져 있거나, 실행 중이고 HA가 꺼진 VM이면 이유와
 함께 켜기를 막는다)와 그 아래 "복구 우선순위"·"게스트가 멈추면 다시 켜기", VM 목록·상세의 HA 배지(상세 요약에 우선순위·게스트
 에이전트 감시), 노드 목록·클러스터 보기의 "펜싱" 열(노드 화면은 그 아래 "N초 뒤 복구"와 "전원 펜싱 닿지 않음" 배지),
-노드 메뉴의 "전원 끄기 펜싱…"(admin, 방법 더하기·빼기·순서, 저장, "시험", "펜싱 지우기"), 설정 › 일반의 "HA 용량", 작업 목록의
+노드 메뉴의 "전원 끄기 펜싱…"(admin, 방법 더하기·빼기·순서, 저장, "시험", "펜싱 지우기"), 관리 › 일반·업데이트의 "HA 용량", 작업 목록의
 "web HA 복구 (노드 node-a에서)"·"node-b 전원 끄기(펜싱)"다. API는 VM `spec.ha`(생성·`PUT /api/v1/vms/{key}`),
 Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …, "fence_after_secs": …}`, 펜싱이 꺼져 있으면
 없다)·`status.fence_check`, `GET|PUT|DELETE /api/v1/nodes/{key}/fence`·`POST /api/v1/nodes/{key}/fence-test`, 설정
@@ -255,7 +255,7 @@ control의 백분율 방식).
   (`stopped`·`ignored`에서), 켜진 HA VM의 메모리 늘리기, 꺼진 VM 시작 — 에서 사용 + 그 VM > 용량 − 예약이면 **409** `ha_capacity`(`details { capacity_mib, reserve_mib, used_mib, need_mib }`,
   웹은 "이 HA VM을 켜면 HA 복구용으로 비워 둔 메모리를 씁니다. …"). 마이그레이션은 합이 바뀌지 않아 보지 않고, HA 복구·
   되돌아가기도 보지 않는다. 이미 넘친 클러스터에서 도는 VM을 끄지는 않는다.
-- **설정.** `orbivisorctl settings set ha_reserve=none|nodes:N|percent:P`, 웹 설정 › 일반의 "HA 용량". 기본(`none`)은 저장하지 않고,
+- **설정.** `orbivisorctl settings set ha_reserve=none|nodes:N|percent:P`, 웹 관리 › 일반·업데이트의 "HA 용량". 기본(`none`)은 저장하지 않고,
   바꾸려면 모든 노드가 이 버전이어야 한다.
 
 **같은 노드 빠른 재시작과 게스트 감시.**
@@ -373,7 +373,7 @@ orbivisorctl settings set shutdown_policy=conditional|freeze|failover|migrate
 orbivisorctl node unfreeze node2                  # 돌아오지 않는 얼린 노드
 ```
 
-웹은 보호 › HA 그룹 탭과 보호 › 배치 › 배치 규칙 보기(목록·만들기·편집·삭제, 누구나 읽고 admin만 바꿈), VM 만들기·편집의 HA 절(상태·그룹·횟수),
+웹은 클러스터·가용성 › 자동 복구(HA) 탭과 클러스터·가용성 › 배치 규칙·자동 균형 › 배치 규칙 보기(목록·만들기·편집·삭제, 누구나 읽고 admin만 바꿈), VM 만들기·편집의 HA 절(상태·그룹·횟수),
 VM 상세 요약의 고가용성·HA 그룹·어긴 배치 규칙·HA 오류, 마이그레이션 대화상자의 "배치 규칙 무시"(admin), 노드 화면의
 "레이블" 열과 "레이블 편집"(연 사이 다른 곳에서 레이블이 바뀌었으면 저장하지 않고 다시 열라고 알림)·"얼림" 배지·"얼림 풀기", 설정의 "호스트 종료 때 HA VM"이다. API는 `/api/v1/ha-groups`,
 `/api/v1/placement-rules`(목록·조회·만들기 `POST`·통째로 바꾸기 `PUT`(If-Match)·`DELETE`, watch 종류 `ha-group`·`placement-rule`),
@@ -510,7 +510,7 @@ orbivisorctl node list                 # CHECKS 열: - · ok · degraded · fail
 orbivisorctl task list                 # 리더의 대응 "ha-check", 본딩 알림 "bond-degraded"
 ```
 
-웹은 보호 › HA 검사 탭(목록·만들기·편집·삭제, 누구나 읽고 admin만 바꿈 — 인터페이스는 모든 노드가 보고한
+웹은 클러스터·가용성 › 장애 감지(HA 검사) 탭(목록·만들기·편집·삭제, 누구나 읽고 admin만 바꿈 — 인터페이스는 모든 노드가 보고한
 이름에서 고르거나 직접 쓰고, 풀은 공유 풀에서 고르며, 노드별 대상 줄을 더한다), 노드 화면의 "상태 검사" 열(실패한 검사 수 배지,
 제목에 검사 이름과 오류, 누르면 대화상자)과 노드 메뉴의 "네트워크 인터페이스…"(종류·상태·링크·속도·소속·주소, 본딩은 모드와
 `degraded`·`down` 배지, 포트는 아래 줄이고 `up`이 아니면 빨간 글자와 상태 문구, 그 아래 이 노드의 검사 결과·시작 시각·오류),
@@ -663,7 +663,7 @@ orbivisorctl vm set db --pinned               # 균형 조정기가 옮기지 �
 orbivisorctl settings get                     # placement.mode 등(기본값이면 줄이 없다)
 ```
 
-웹은 보호 › 배치 › 최적 배치 보기(누구나 읽음 — 15초마다 다시 읽는다): 머리에 모드·정책·문턱·불균형·마지막/다음
+웹은 클러스터·가용성 › 배치 규칙·자동 균형 › 최적 배치 보기(누구나 읽음 — 15초마다 다시 읽는다): 머리에 모드·정책·문턱·불균형·마지막/다음
 실행·쉬는 이유, 노드 부하 표(CPU·메모리 사용률 막대, 1분·5분 CPU, 사용·할당·전체 메모리, VM 수, 요약 나이 — 요약이 없으면
 "요약 없음"), 추천 표(VM·원래 노드·옮길 노드·이유(균형이면 줄어드는 불균형, 규칙이면 어긴 규칙)·비용과 "적용" 단추 — VM을
 옮길 권한(operator 이상)이 있어야 보이고, 누르면 Task 알림, 추천이 바뀌었으면 "추천이 바뀌었습니다"), auto면 "시작한

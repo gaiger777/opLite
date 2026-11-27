@@ -459,10 +459,10 @@ pnpm -C web build && cargo test -p orbivisord --features web-it --test web   # E
 pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_shows_a_folder_user_only_their_folder   # 폴더 사용자만(QEMU 없이 돈다)
 ```
 
-브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 영역 탭으로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
+브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 2단 사이드바(`web/e2e/nav.ts`)로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
 일괄 막대로 강제 정지하고, VM 동작 메뉴(⋯)로 복제·편집·지우기를 하고, 노드 상세의 "CPU 모델" 칸(실제 탐침이 읽은 QEMU와
-다시 읽기 단추)과 설정 › 일반의 CPU 기준 칸을 보고, 꺼진 VM을 소켓 2·게스트 NUMA 노드 2로 고쳐 요약을 보며, 노드 상세의 "NUMA
-토폴로지"(Linux는 탐침 요약, macOS는 "알리지 않았습니다")를 보고, VM이 켜진 뒤 인프라 › 노드의 보기 "지도"(계획 70 — 노드 블록·VM 타일,
+다시 읽기 단추)과 관리 › 일반·업데이트의 CPU 기준 칸을 보고, 꺼진 VM을 소켓 2·게스트 NUMA 노드 2로 고쳐 요약을 보며, 노드 상세의 "NUMA
+토폴로지"(Linux는 탐침 요약, macOS는 "알리지 않았습니다")를 보고, VM이 켜진 뒤 개요 › 인프라 지도(계획 70 — 노드 블록·VM 타일,
 키보드 `]`·`Enter` 서랍·`Esc`·`[`, 실제 브라우저 가리키기 카드와 타일 누르기, 목록 보기, 동작 줄이기·어둠 테마, 390 × 844 폭의 "보기 설정"과
 가로 스크롤 없음, 기억한 보기)와 지도 `m`(계획 71 — 한 노드라 "Moving web: no node can take it. Escape cancels."와 `Esc` → "Cancelled.",
 초점은 노드)을 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
@@ -471,7 +471,7 @@ pnpm -C web build && cargo test -p orbivisord --features web-it --test web brows
 
 둘째 브라우저 E2E(`web/e2e/permissions.spec.ts`)는 `web.rs`의 `browser_shows_a_folder_user_only_their_folder`가 돌린다. Rust 쪽이
 `/teamA`·`/teamB`와 VM, 그룹 grant로 `/teamA` operator를 받은 `none` 사용자를 준비하고, 브라우저는 그 사용자로 VM 목록·폴더
-트리·팔레트에 `/teamA`만 보이는지, + 만들기가 폴더를 골라 두고 노드 칸 없이 VM을 만드는지, 설정 › 2단계 인증에서 인증 앱을 켠
+트리·팔레트에 `/teamA`만 보이는지, + 만들기가 폴더를 골라 두고 노드 칸 없이 VM을 만드는지, 사용자 메뉴 › 내 2단계 인증에서 인증 앱을 켠
 뒤 둘째 단계로 다시 로그인하는지 본다.
 
 셋째 브라우저 E2E(`web/e2e/builder.spec.ts`, 계획 71)는 `web.rs`의 `browser_builds_vms_with_the_builder`가 돌린다. Rust 쪽이 dir 풀
@@ -484,7 +484,7 @@ pnpm -C web build && cargo test -p orbivisord --features web-it --test web brows
 
 넷째 브라우저 E2E(`web/e2e/history.spec.ts`, 계획 73)는 `web.rs`의 `browser_restores_a_vm_from_its_config_history`가 돌린다(QEMU를 켜지
 않음). Rust 쪽이 꺼진 VM `hist`(메모리 256 MiB)를 CLI로 만들고, 브라우저는 웹 편집으로 메모리를 512로 바꾼 뒤 VM ⋯ "설정 기록…" 서랍에서
-줄 둘과 전·후 표를 보고 만든 줄로 되돌린다. 이어서 설정 › 보안 › 인증서 보기를 열어 빈 목록을 본다. 끝에 Rust가 메모리 256과 이력 맨 위 줄(`restored_from`)을 본다. 선언 묶음·설정 기록·인증서 보기의
+줄 둘과 전·후 표를 보고 만든 줄로 되돌린다. 이어서 관리 › 보안·인증서 › 인증서 보기를 열어 빈 목록을 본다. 끝에 Rust가 메모리 256과 이력 맨 위 줄(`restored_from`)을 본다. 선언 묶음·설정 기록·인증서 보기의
 390px 폭 가로 넘침 없음은 `builder.spec.ts`가 본다.
 
 **웹 CLI 미리 보기 교차 시험.** 빌더 모델 시험(`web/src/vmBuilder/model/cli.test.ts`)이 대표 상태 열둘의 CLI 명령(셸을 거치지 않는 인자 배열)·
