@@ -68,11 +68,11 @@ const PARAM_KINDS: Record<string, string> = {
 const CODE_LINKS: Record<string, { kind: string; href: string }> = {
   backup_store_unavailable: { kind: "backup-store", href: "/backup-stores" },
   backup_store_denied: { kind: "backup-store", href: "/backup-stores" },
+  backup_store_full: { kind: "backup-store", href: "/backup-stores" },
   backup_corrupt: { kind: "backup-store", href: "/backup-stores" },
   backup_key_mismatch: { kind: "backup-store", href: "/backup-stores" },
   ceph_no_quorum: { kind: "ceph", href: "/ceph" },
   sdn_not_ready: { kind: "sdn", href: "/sdn" },
-  storage_full: { kind: "storage-pool", href: "/storage-pools" },
   vmware_unreachable: { kind: "vmware-migration", href: "/vmware-migrations" },
   vmware_auth: { kind: "vmware-migration", href: "/vmware-migrations" },
 };

@@ -1,13 +1,18 @@
 // 실패한 Task의 "다시 하기"(설계 §5.4). Task에는 동작 파라미터가 없으므로 파라미터가 필요 없는 전원 동작과
 // "백업 작업 지금 실행"만 같은 API로 다시 보낸다.
+import type { TFunction } from "i18next";
+
 import type { Backup, BackupJob, Task, Vm } from "@/api/types";
 import { objectTarget, type Permissions } from "@/auth/permissions";
 import { availability, type VmAction } from "@/vms/actions";
 
-/** 다시 보낼 요청. `reason`이 있으면 지금은 할 수 없다(번역 키). */
+/**
+ * 다시 보낼 요청. `reason`이 있으면 지금은 할 수 없다(번역 키). `fixFirst`면 서버가 원인을 알고 다시 해도 같다고 했다 —
+ * 단추는 두되 "고친 뒤 다시 하기"로 보인다(계획 77-2 리뷰 I7).
+ */
 export type Retry =
-  | { kind: "vm"; vm: Vm; action: VmAction; reason?: string }
-  | { kind: "job"; job: BackupJob; reason?: string };
+  | { kind: "vm"; vm: Vm; action: VmAction; reason?: string; fixFirst?: boolean }
+  | { kind: "job"; job: BackupJob; reason?: string; fixFirst?: boolean };
 
 const POWER: Partial<Record<Task["spec"]["op"]["kind"], VmAction>> = {
   "vm-start": "start",
@@ -57,10 +62,8 @@ export function retryOf(task: Task, ctx: RetryContext): Retry | null {
   if (task.status.state !== "failed") {
     return null;
   }
-  // 서버가 원인을 알고 다시 해도 같다고 했으면(권한·설정을 먼저 고쳐야 함) 다시 하지 않는다(계획 77-2).
-  if (task.status.failure && !task.status.failure.retryable) {
-    return null;
-  }
+  // 서버가 원인을 알고 다시 해도 같다고 했으면(설정을 먼저 고쳐야 함) "고친 뒤 다시 하기"로(계획 77-2 리뷰 I7).
+  const fixFirst = task.status.failure ? !task.status.failure.retryable : undefined;
   // 그 뒤에 같은 대상에 다른 시도(성공한 시작, 일부러 한 정지 등)가 있으면 옛 실패를 다시 하지 않는다.
   const group = retryGroup(task);
   const newest = group && ctx.latest?.get(group);
@@ -75,7 +78,7 @@ export function retryOf(task: Task, ctx: RetryContext): Retry | null {
       return null;
     }
     const ok = availability(vm, action, ctx.tasks.get(vm.id) ?? []);
-    return { kind: "vm", vm, action, reason: ok.ok ? undefined : ok.reason };
+    return { kind: "vm", vm, action, reason: ok.ok ? undefined : ok.reason, fixFirst };
   }
   if (op.kind === "vm-backup") {
     const jobId = ctx.backup.get(op.backup)?.spec.job;
@@ -90,7 +93,15 @@ export function retryOf(task: Task, ctx: RetryContext): Retry | null {
         : !job.spec.enabled
           ? "center.jobDisabled"
           : undefined;
-    return { kind: "job", job, reason };
+    return { kind: "job", job, reason, fixFirst };
   }
   return null;
+}
+
+/** 다시 하기 단추 이름: 먼저 고칠 실패면 "고친 뒤 다시 하기", 백업은 "작업 다시 실행", 그 밖은 "다시 하기" */
+export function retryLabel(r: Retry, t: TFunction): string {
+  if (r.fixFirst) {
+    return t("center.retryAfterFix");
+  }
+  return r.kind === "job" ? t("center.runJobAgain") : t("center.retry");
 }

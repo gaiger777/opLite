@@ -10,14 +10,19 @@ import ko from "@/tasks/failures/i18n/ko.json";
 
 const crates = join(import.meta.dirname, "../../../../crates");
 
-/** 서버의 원인 코드 목록(`orbivisor-types/src/task_failure.rs`의 `codes!`) */
-function serverCodes(): string[] {
+/** 서버의 원인 코드와 서버가 다는 값 이름(`orbivisor-types/src/task_failure.rs`의 `codes!`) */
+function serverCodes(): Map<string, string[]> {
   const text = readFileSync(join(crates, "orbivisor-types/src/task_failure.rs"), "utf8");
-  const block = text.slice(
-    text.indexOf("codes! {"),
-    text.indexOf("\n}\n", text.indexOf("codes! {")),
+  const start = text.indexOf("codes! {");
+  const block = text.slice(start, text.indexOf("\n}\n", start));
+  // 줄바꿈·띄어쓰기가 달라도 읽는다. 항목 수(`= "`)와 읽은 수가 같아야 한다 — 다른 모양으로 쓴 줄이 조용히 빠지지 않게.
+  const entries = [
+    ...block.matchAll(/[A-Z_]+\s*=\s*"([a-z_]+)"\s*,\s*(?:true|false)\s*,\s*\[([^\]]*)\]\s*;/g),
+  ];
+  expect(entries.length, "codes! entries that could not be read").toBe(
+    block.match(/=\s*"/g)?.length ?? 0,
   );
-  return [...block.matchAll(/[A-Z_]+ = "([a-z_]+)", (?:true|false);/g)].map((m) => m[1]!);
+  return new Map(entries.map((m) => [m[1]!, [...m[2]!.matchAll(/"(\w+)"/g)].map((p) => p[1]!)]));
 }
 
 /** 서버의 경보 조건 종류(`AlertCondition`의 변형 이름을 snake_case로) */
@@ -33,7 +38,8 @@ function alertConditions(): string[] {
 const placeholders = (s: string) => [...s.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]).sort();
 
 it("has a ko and en entry for every server failure code, and nothing else", () => {
-  const codes = serverCodes();
+  const params = serverCodes();
+  const codes = [...params.keys()];
   expect(codes.length).toBeGreaterThanOrEqual(20);
   expect(Object.keys(en.taskErrors).sort()).toEqual([...codes].sort());
   expect(Object.keys(ko.taskErrors).sort()).toEqual([...codes].sort());
@@ -45,6 +51,13 @@ it("has a ko and en entry for every server failure code, and nothing else", () =
       expect(k[field].trim(), `${code}.${field}`).not.toBe("");
       // 두 언어가 같은 값을 쓴다.
       expect(placeholders(k[field]), `${code}.${field}`).toEqual(placeholders(e[field]));
+      // 서버가 다는 값만 쓴다(`need_bytes`는 사람 단위 `need`로도).
+      const known = params
+        .get(code)!
+        .flatMap((p) => (p.endsWith("_bytes") ? [p, p.slice(0, -"_bytes".length)] : [p]));
+      for (const name of placeholders(e[field])) {
+        expect(known, `${code}.${field} uses {{${name}}}`).toContain(name);
+      }
     }
   }
 });
@@ -108,4 +121,15 @@ it("links to the pages the failure values name", () => {
   expect(failureLinks({ code: "backup_store_denied", params: { store: "s3" } })).toEqual([
     { kind: "backup-store", href: "/backup-stores" },
   ]);
+  // 적용 단계 실패는 만들다 실패한(아직 없는) 항목의 화면을 가리키지 않는다(리뷰 I6).
+  expect(
+    failureLinks({
+      code: "apply_step_failed",
+      params: { step: "1/1", action: "create", kind: "BackupStore", name: "s3", cause: "x" },
+    }),
+  ).toEqual([]);
+  // 내려받기 공간은 풀이 아니라 그 노드의 업로드 디렉터리(리뷰 I3)
+  expect(
+    failureLinks({ code: "upload_dir_full", params: { node: "svc01", dir: "/var/lib/x/uploads" } }),
+  ).toEqual([{ kind: "node", name: "svc01", href: "/nodes/svc01" }]);
 });

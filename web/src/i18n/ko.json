@@ -3625,6 +3625,8 @@
     "retry": "다시 하기",
     "runJobAgain": "작업 다시 실행",
     "retryNamed": "다시 하기: {{label}}",
+    "retryAfterFix": "고친 뒤 다시 하기",
+    "retryAfterFixNamed": "고친 뒤 다시 하기: {{label}}",
     "jobRunning": "백업 일정이 도는 중입니다.",
     "jobDisabled": "백업 일정이 꺼져 있습니다.",
     "view": "보기"

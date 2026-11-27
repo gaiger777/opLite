@@ -3625,6 +3625,8 @@
     "retry": "Retry",
     "runJobAgain": "Run job again",
     "retryNamed": "Retry: {{label}}",
+    "retryAfterFix": "Retry after fixing",
+    "retryAfterFixNamed": "Retry after fixing: {{label}}",
     "jobRunning": "The backup schedule is running.",
     "jobDisabled": "The backup schedule is turned off.",
     "view": "View"

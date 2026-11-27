@@ -5,11 +5,12 @@ import type { Task } from "@/api/types";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { type FailureText, failureLinks } from "@/tasks/failures/failure";
+import { retryLabel } from "@/tasks/retry";
 import { useRetry } from "@/tasks/useRetry";
 
 /**
  * 실패한 Task의 "무엇이 잘못됐나 / 왜 / 이렇게 하세요"(계획 77-2, 진단 §3.4): 사전 문구, 관련 화면 링크(원인 값으로), 다시 할 수
- * 있는 Task면 "다시 하기". 원문은 부르는 쪽(상세 서랍)이 아래 "자세히(원문)"에 접어 둔다.
+ * 있는 Task면 "다시 하기"(서버가 먼저 고쳐야 한다고 했으면 "고친 뒤 다시 하기"). 원문은 부르는 쪽(상세 서랍)이 아래 "자세히(원문)"에 접어 둔다.
  */
 export function FailureExplain({ task, text }: { task: Task; text: FailureText }) {
   const { t } = useTranslation();
@@ -75,10 +76,15 @@ export function FailureExplain({ task, text }: { task: Task; text: FailureText }
             onClick={(e) => void retry(task, again, e.currentTarget)}
           >
             <ACTION_ICONS.retry />
-            {again.kind === "job" ? t("center.runJobAgain") : t("center.retry")}
+            {retryLabel(again, t)}
           </Button>
+          {/* 먼저 고칠 실패는 "이렇게 하세요"로, 잠깐의 문제일 수 있으면 바로 다시 해 보라고(리뷰 I7) */}
           <span className="text-xs text-muted-foreground">
-            {again.reason ? t(again.reason) : t("failureUi.retryHint")}
+            {again.reason
+              ? t(again.reason)
+              : again.fixFirst
+                ? t("failureUi.fixFirstHint")
+                : t("failureUi.retryHint")}
           </span>
         </div>
       )}

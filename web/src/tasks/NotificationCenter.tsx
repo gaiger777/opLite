@@ -19,6 +19,7 @@ import { useTaskHref } from "@/tasks/taskLink";
 import { alertHref } from "@/tasks/target";
 import { describeProgress, describeTask } from "@/tasks/tasks";
 import { newestFirst, TaskStateBadge, useTaskTarget } from "@/tasks/TasksPage";
+import { retryLabel } from "@/tasks/retry";
 import { useRetry } from "@/tasks/useRetry";
 
 /** 최근(끝난) Task를 몇 개 보일지 */
@@ -187,11 +188,15 @@ function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string })
                   variant="outline"
                   size="sm"
                   disabled={again.reason !== undefined || busy.has(task.id)}
-                  aria-label={t("center.retryNamed", { label })}
+                  aria-label={
+                    again.fixFirst
+                      ? t("center.retryAfterFixNamed", { label })
+                      : t("center.retryNamed", { label })
+                  }
                   onClick={(e) => void retry(task, again, e.currentTarget)}
                 >
                   <ACTION_ICONS.retry />
-                  {again.kind === "job" ? t("center.runJobAgain") : t("center.retry")}
+                  {retryLabel(again, t)}
                 </Button>
                 {again.reason && (
                   <span className="text-xs text-muted-foreground">{t(again.reason)}</span>

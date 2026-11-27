@@ -7,9 +7,10 @@
     "raw": "Details (raw message)",
     "code": "Error code",
     "step": "Failed step",
-    "retryHint": "Once the cause is fixed you can send the same request again.",
+    "retryHint": "This may have been a passing problem — try again now.",
     "runbook": "Cause and fix",
-    "runbookOf": "Cause and fix: {{name}}"
+    "runbookOf": "Cause and fix: {{name}}",
+    "fixFirstHint": "Fix the cause as described under \"What to do\", then try again."
   },
   "taskErrors": {
     "task_timeout": {
@@ -20,7 +21,7 @@
     "task_interrupted": {
       "title": "The node's Orbivisor service restarted during the task.",
       "cause": "orbivisord restarted while running the task (update, reboot or crash) and lost its work.",
-      "fix": "Check that the node is online again.\nRun the same task again."
+      "fix": "Check that the node is online again.\nFirst check what state the target (VM, volume, backup) was left in — a delete or restore may be half done.\nRun the same task again."
     },
     "node_offline": {
       "title": "Node {{node}} did not respond, so the task never started.",
@@ -28,34 +29,44 @@
       "fix": "Check {{node}}'s status and network on the Nodes page.\nTry again once the node is back."
     },
     "node_not_member": {
-      "title": "Node {{node}} is not in the cluster.",
-      "cause": "The node was removed from the cluster or is not a member.",
-      "fix": "Check the available nodes on the Nodes page and try again with another node."
+      "title": "Target node {{node}} is not a cluster member.",
+      "cause": "The chosen node was removed from the cluster or has not joined yet, so the VM cannot move there.",
+      "fix": "Check the available nodes on the Nodes page and move the VM to another node."
+    },
+    "node_removed": {
+      "title": "Node {{node}} was removed from the cluster, so the task was ended.",
+      "cause": "The node running the task was removed and will not come back; its unfinished tasks are ended as failed.",
+      "fix": "Check what state the target was left in.\nIf the task is still needed, run it again on another node."
     },
     "node_no_peers": {
       "title": "This node cannot reach other nodes.",
       "cause": "The node has no cluster link to other nodes (it runs alone).",
       "fix": "Check on the Cluster page that the node has joined the cluster."
     },
-    "storage_full": {
-      "title": "Out of disk space.",
-      "cause": "The file system ran out of space while writing.",
-      "fix": "Check free space on the Storage pools page.\nDelete unused volumes, snapshots or backups, or pick another pool, then try again."
-    },
     "pool_not_found": {
       "title": "Storage pool {{pool}} does not exist.",
       "cause": "The pool the task needed was deleted or has a different name.",
       "fix": "Check the pool name on the Storage pools page and try again with an existing pool."
     },
+    "pool_not_on_node": {
+      "title": "Storage pool {{pool}} is not set up for node {{node}}.",
+      "cause": "The pool is limited to a list of nodes, and {{node}} is not on it.",
+      "fix": "Check {{pool}}'s node list on the Storage pools page.\nAdd {{node}}, or pick another pool that node can use, then try again."
+    },
     "pool_not_ready": {
       "title": "Storage pool {{pool}} is not ready on node {{node}}.",
-      "cause": "The pool is not mounted on that node (for example NFS) or is not set up for it.",
-      "fix": "Check {{pool}}'s per-node state on the Storage pools page.\nFix the mount, then try again."
+      "cause": "The pool is not mounted on that node (for example NFS) or is not responding. The raw message has the reason.",
+      "fix": "Check {{pool}}'s per-node state on the Storage pools page.\nFix the mount or connection, then try again."
     },
     "pool_full": {
       "title": "Storage pool {{pool}} on node {{node}} is too full.",
       "cause": "The task needs {{need}} but only {{free}} is free.",
       "fix": "Free up space in {{pool}} (unused volumes, snapshots) or pick a pool with more room, then try again."
+    },
+    "pool_out_of_space": {
+      "title": "Storage pool {{pool}} on node {{node}} ran out of space while writing.",
+      "cause": "The pool's disk (file system) had no space left while the volume was being written.",
+      "fix": "Check {{pool}}'s free space on the Storage pools page.\nDelete unused volumes or snapshots, or pick a pool with more room, then try again."
     },
     "target_deleted": {
       "title": "The target was deleted during the task.",
@@ -74,8 +85,18 @@
     },
     "qemu_start_failed": {
       "title": "VM {{vm}} could not start.",
-      "cause": "The virtual machine program (QEMU) exited right after starting. The raw message below has QEMU's reason.",
+      "cause": "The virtual machine program (QEMU) exited with an error right after starting. The raw message below has QEMU's reason.",
       "fix": "Read QEMU's error in the raw message below (missing disk or ISO file, not enough memory, device settings …).\nFix the VM settings and start it again."
+    },
+    "vm_no_firewall": {
+      "title": "VM {{vm}} was not started — the node has no firewall.",
+      "cause": "A NIC of the VM has a security group, but this node has no firewall (nftables), so it was not started without the rules.",
+      "fix": "Install nftables on the node, then restart orbivisord there (it looks for the firewall at start).\nOr start the VM on another node that has a firewall."
+    },
+    "vm_firewall_failed": {
+      "title": "The firewall rules of VM {{vm}} could not be applied, so it was not started.",
+      "cause": "Putting the security group rules into the node's firewall (nftables) failed several times just before the start. The raw message has nft's reason.",
+      "fix": "Read the nft error in the raw message below.\nFix nftables on the node, then start the VM again."
     },
     "vm_not_running": {
       "title": "VM {{vm}} is not running.",
@@ -83,19 +104,29 @@
       "fix": "Start the VM and move it again, or change its node while it is off."
     },
     "migration_tls_missing": {
-      "title": "The move cannot be encrypted (TLS).",
-      "cause": "This node's QEMU was built without TLS support (no GnuTLS). Moving between nodes needs encryption.",
-      "fix": "Install a QEMU package with GnuTLS support on the node (the QEMU Orbivisor ships).\nRestart the VM, then move it again."
+      "title": "The QEMU on sending node {{node}} cannot encrypt the move (TLS).",
+      "cause": "The QEMU running the VM was built without TLS support (no GnuTLS). Moving between nodes needs encryption.",
+      "fix": "Install a QEMU package with GnuTLS support on node {{node}} (the QEMU Orbivisor ships).\nThe running VM still uses the old QEMU, so stop and start the VM, then move it again."
+    },
+    "migration_target_tls_missing": {
+      "title": "The QEMU on receiving node {{node}} cannot encrypt the move (TLS).",
+      "cause": "The receiving node's QEMU was built without TLS support (no GnuTLS). Moving between nodes needs encryption.",
+      "fix": "Install a QEMU package with GnuTLS support on node {{node}} (the QEMU Orbivisor ships).\nThen move the VM again (no need to restart it)."
     },
     "migration_target_refused": {
       "title": "Node {{node}} could not receive VM {{vm}}.",
-      "cause": "The receiving node refused during preparation (the raw message has the reason — disks, devices, QEMU version …).",
-      "fix": "Read the receiving node's reason in the raw message below.\nCheck node {{node}}, then try again or pick another node."
+      "cause": "The receiving node refused during preparation (the raw message has the reason — disks, devices, CPU, QEMU version …).",
+      "fix": "Read the receiving node's reason in the raw message below.\nFix it and try again, or pick another node."
     },
     "migration_no_port": {
-      "title": "The receiving node has no free migration port.",
-      "cause": "Other migrations use all ports or the port range is small.",
-      "fix": "Try again after the other moves finish.\nIf it keeps happening, widen the migration port range."
+      "title": "All migration ports on receiving node {{node}} are in use.",
+      "cause": "Other migrations or programs use every port in the receiving range ({{ports}}).",
+      "fix": "Try again after the other moves finish.\nIf it keeps happening, widen [migration] ports (default 60000-60099) in orbivisord's config on node {{node}}, and open that range in the firewall between nodes."
+    },
+    "migration_listen_failed": {
+      "title": "Receiving node {{node}} cannot listen for migrations on {{host}}.",
+      "cause": "The address the receiving QEMU listens on is not an address of that node (cluster link address settings), or it may not open ports there. The raw message has the reason.",
+      "fix": "Check that cluster_listen (the receiving address) in orbivisord's config on node {{node}} is one of its IPs, or 0.0.0.0 or ::.\nRestart orbivisord after fixing it, then move the VM again."
     },
     "migration_storage_not_shared": {
       "title": "VM {{vm}}'s disks could not be opened together with node {{node}}.",
@@ -107,25 +138,35 @@
       "cause": "Someone asked to stop the VM while it was moving; it was not started on the receiving node.",
       "fix": "Start the VM and move it again if needed."
     },
+    "backup_pool_full": {
+      "title": "Backup pool {{pool}} (node {{node}}) is out of space.",
+      "cause": "The pool's disk (file system) had no space left while the backup files were written to it.",
+      "fix": "Check {{pool}}'s free space on the Storage pools page.\nDelete old backups, keep fewer in the backup schedule, or pick another backup pool, then try again."
+    },
     "backup_store_unavailable": {
       "title": "Backup store {{store}} could not be reached.",
-      "cause": "The store (S3, NFS …) did not answer or the connection dropped.",
-      "fix": "Check {{store}}'s state and address on the Backup stores page.\nTry again once it is reachable."
+      "cause": "The S3 store did not answer (5xx or time-out) or the connection dropped, even after several retries.",
+      "fix": "Check {{store}}'s address (endpoint) and state on the Backup stores page.\nTry again once it is reachable."
     },
     "backup_store_denied": {
       "title": "Backup store {{store}} denied access.",
       "cause": "The credentials (access key) are wrong or the bucket policy blocks access.",
       "fix": "Check the keys and bucket permissions in the backup store settings."
     },
+    "backup_store_full": {
+      "title": "Backup store {{store}} has no disk space left.",
+      "cause": "The directory backup store's disk (file system) had no space left while writing.",
+      "fix": "Check {{store}}'s stored size on the Backup stores page.\nDelete old backups and run \"Clean up now\", or grow the store's disk, then try again."
+    },
     "backup_corrupt": {
       "title": "Data in backup store {{store}} is corrupt.",
-      "cause": "A chunk failed its check (disk damage or a file changed underneath).",
+      "cause": "Data read from the store (chunks, indexes …) failed its check (disk damage or a file changed underneath).",
       "fix": "Run a verify on the backup store to find the broken backups.\nRestore from another point in time or take a new backup."
     },
     "backup_key_mismatch": {
       "title": "The encryption key does not match backup store {{store}}.",
-      "cause": "The key set in this cluster differs from the key the store was created with.",
-      "fix": "Enter the encryption key the store was created with."
+      "cause": "The store's encryption and the key given do not match — the store is encrypted but no key or another key was given, or a key was given for an unencrypted store. The raw message says which.",
+      "fix": "Read the raw message below.\nIn the backup store settings, enter the key the store was created with, or remove the key if the store is not encrypted."
     },
     "restore_name_taken": {
       "title": "The VM name {{name}} is already used.",
@@ -139,18 +180,23 @@
     },
     "download_failed": {
       "title": "The file could not be downloaded.",
-      "cause": "{{url}} answered with an error or the node could not reach it.",
-      "fix": "Check the address and that the node can reach the internet (or that server).\nDownload again."
+      "cause": "{{url}} answered with an error (missing file, access …) or the node could not reach it.",
+      "fix": "Check the address and that the node can reach the internet (or that server).\nDownload again after fixing it."
+    },
+    "upload_dir_full": {
+      "title": "The upload directory on node {{node}} is too full.",
+      "cause": "Downloads are first saved in node {{node}}'s upload directory ({{dir}}) before going to the pool, and its disk (file system) has too little space left.",
+      "fix": "On node {{node}}, check the free space of the disk holding {{dir}} (uploads inside orbivisord's data directory).\nFree up space, then download again."
     },
     "image_unsupported": {
       "title": "Unsupported image format.",
-      "cause": "A non-ISO file was imported as ISO, or the image cannot stand alone (descriptor-only VMDK, qcow2 with a backing file).",
-      "fix": "Check the file format. Use a VMDK with its -flat data file, or a single merged qcow2 (qemu-img convert)."
+      "cause": "A non-ISO file was imported as ISO, or the image needs other files (descriptor VMDK, -flat or split VMDK, qcow2 with a backing or external data file).",
+      "fix": "Check the file format.\nUpload a single-file VMDK (monolithicSparse or streamOptimized — make one with qemu-img convert -O vmdk -o subformat=streamOptimized), or a single merged qcow2 (qemu-img convert -O qcow2)."
     },
     "apply_step_failed": {
       "title": "Apply step {{step}} ({{kind}} {{name}}) failed.",
-      "cause": "The server rejected that item: {{reason}}",
-      "fix": "Fix the YAML file as the reason says.\nApply again — only what is left is done."
+      "cause": "The server could not process that item: {{reason}}",
+      "fix": "Fix the YAML file, or whatever the item depends on (a store connection …), as the reason says.\nApply again — only what is left is done."
     },
     "apply_conflict": {
       "title": "{{kind}} {{name}} changed during the apply.",
@@ -165,7 +211,7 @@
     "vmware_unreachable": {
       "title": "vCenter/ESXi could not be reached.",
       "cause": "The address is wrong, a firewall or network blocks it, or it answered too slowly.",
-      "fix": "Check the address in the VMware connection settings and that the node reaches port 443.\nTry again."
+      "fix": "Check the address in the VMware connection settings and that the node reaches its port (443 by default).\nTry again."
     },
     "vmware_auth": {
       "title": "vCenter/ESXi rejected the login.",
@@ -178,13 +224,13 @@
       "fix": "Check that node {{node}} reaches its package repositories.\nFix the reason in the raw message and try again."
     },
     "ceph_no_quorum": {
-      "title": "The Ceph monitors did not reach quorum.",
-      "cause": "The new monitor on node {{node}} could not join the others (network, firewall or clock).",
+      "title": "The new Ceph monitor on node {{node}} did not join the quorum.",
+      "cause": "The new monitor did not connect to the others in time (network, firewall or clock).",
       "fix": "Check the monitors on the Ceph page.\nCheck ports 6789/3300 between nodes and the clock (NTP), then try again."
     },
     "sdn_not_ready": {
-      "title": "SDN (OVN) is not ready yet.",
-      "cause": "SDN setup has not finished or there is no OVN central.",
+      "title": "SDN is not ready yet.",
+      "cause": "SDN setup has not finished or there is no SDN central node (OVN central).",
       "fix": "Check the setup on the SDN page and try again when it is ready."
     },
     "ha_node_failed": {
@@ -263,12 +309,12 @@
       "fix": "See the drifted items on the apply set page; apply again or update the YAML."
     },
     "sdn_quorum_lost": {
-      "cause": "The SDN centrals (OVN) lost quorum.",
+      "cause": "The SDN central nodes (OVN central) lost their quorum.",
       "fix": "Find and bring back the down central nodes on the SDN page. Network changes are blocked meanwhile."
     },
     "sdn_central_down": {
-      "cause": "An SDN central (OVN) is down.",
-      "fix": "Check that node's OVN service and network."
+      "cause": "An SDN central node (OVN central) is down.",
+      "fix": "Check the SDN service (OVN) and network on that node."
     },
     "sdn_chassis_down": {
       "cause": "A node's SDN agent (ovn-controller) is down.",
@@ -283,7 +329,7 @@
       "fix": "Check the original node; external traffic continues."
     },
     "sdn_sync_failed": {
-      "cause": "SDN settings could not be synced to OVN.",
+      "cause": "SDN settings could not be synced to the network engine (OVN).",
       "fix": "See the last sync error on the SDN page."
     },
     "sdn_physnet_not_ready": {
