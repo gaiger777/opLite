@@ -224,3 +224,38 @@ export function crossPath(top: readonly Point[]): string {
   const [p3, p4] = shrink(b, d);
   return `M${p1}L${p2}M${p3}L${p4}`;
 }
+
+/** 화면의 글 상자(왼쪽 위 `x`·`y`, 너비·높이) */
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** 글 너비(재지 않고 셈한다 — 라틴 글자는 글자 크기의 0.6배, 한글처럼 넓은 글자는 1배, 바탕색 테두리 몫 4px) */
+export function textWidth(text: string, size: number): number {
+  let w = 0;
+  for (const ch of text) {
+    w += ch > "ɏ" ? size : size * 0.6;
+  }
+  return w + 4;
+}
+
+function overlaps(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
+ * 다른 글 상자(`avoid`)와 겹치지 않을 때까지 한 줄(`step`)씩 아래로 내린 만큼(0이면 그대로). `tries`번 내려도 겹치면
+ * 처음 자리(0) — 바닥 글(판·레일 이름)이 노드 이름·꼬리표와 포개지지 않게.
+ */
+export function clearShift(r: Rect, avoid: readonly Rect[], step = 12, tries = 6): number {
+  for (let i = 0; i <= tries; i++) {
+    const moved = { ...r, y: r.y + i * step };
+    if (!avoid.some((a) => overlaps(moved, a))) {
+      return i * step;
+    }
+  }
+  return 0;
+}

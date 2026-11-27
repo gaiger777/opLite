@@ -343,3 +343,32 @@ it("hits ports and rails under the pointer and lights the rail's nodes", () => {
     restore();
   }
 });
+
+it("draws every name and tag above all blocks, tiles and ports so no picture covers a label", () => {
+  const nodes = [
+    mapNode(1, "front", { labels: { zone: "z" }, spec: { maintenance: true } }),
+    mapNode(2, "back", { labels: { zone: "z" } }),
+  ];
+  const vms = Array.from({ length: 12 }, (_, i) =>
+    mapVm(i + 1, `vm-${i}`, nodes[i % 2]!.id, "running"),
+  );
+  const { svg } = draw(toModel({ nodes, vms }));
+  const shapes = [...svg.querySelectorAll("polygon, path")].filter(
+    // 밝힌 선·초점 테두리·화살표 끝은 그림 맨 위의 덧그림이다
+    (el) => !el.closest("marker, pattern") && el.getAttribute("fill") !== "none",
+  );
+  const last = shapes[shapes.length - 1]!;
+  for (const name of ["front", "back", "z"]) {
+    const text = [...svg.querySelectorAll("text")].find((t) => t.textContent?.startsWith(name))!;
+    expect(text, name).toBeDefined();
+    // 문서 차례가 그리는 차례: 글이 마지막 그림보다 뒤
+    expect(last.compareDocumentPosition(text) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // 글 층은 포인터를 받지 않는다(누르기·끌기는 밑의 블록·타일로)
+    expect(text.closest('g[pointer-events="none"]')).not.toBeNull();
+  }
+  // 노드 글은 노드 블록처럼 흐려지도록 그 노드 열쇠를 단다(열쇠로 찾으면 블록이 먼저)
+  const keyed = svg.querySelectorAll(`g[data-key="node:${nodes[0]!.id}"]`);
+  expect(keyed).toHaveLength(2);
+  expect(keyed[0]).toHaveAttribute("role", "button");
+  expect(keyed[1]!.textContent).toContain("front");
+});

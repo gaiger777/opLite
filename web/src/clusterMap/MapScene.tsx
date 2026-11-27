@@ -26,8 +26,11 @@ import {
   type Point,
   pointsAttr,
   prismFaces,
+  type Rect,
   round,
   shade,
+  textWidth,
+  clearShift,
   topCenter,
   useIsoViewport,
   type ViewBox,
@@ -330,19 +333,10 @@ const TAG_TONE: Record<Exclude<MarkTag, "alerts" | "fault">, TagTone> = {
   fence: "danger",
 };
 
-/** 판 하나: 면 셋 + 이름 글(스토리지 레이어에 공유 풀이 있으면 앞 가장자리 띠 + 글) */
-const Slab = memo(function Slab({
-  slab,
-  name,
-  shared,
-}: {
-  slab: SlabItem;
-  name: string;
-  shared: string | null;
-}) {
+/** 판 하나: 면 셋(스토리지 레이어에 공유 풀이 있으면 앞 가장자리 띠). 이름 글은 글 층에 따로 — 노드·VM 타일이 가리지 않게. */
+const Slab = memo(function Slab({ slab, shared }: { slab: SlabItem; shared: boolean }) {
   const b = slab.box;
   const color = slab.kind === "unplaced" ? TRAY_COLOR : SLAB_COLOR;
-  const front = iso(b.x, b.y + b.d, 0);
   return (
     <>
       {(["left", "right", "top"] as const).map((face) => (
@@ -354,29 +348,13 @@ const Slab = memo(function Slab({
           strokeWidth={0.6}
         />
       ))}
-      <Text at={{ x: front.x + 6, y: front.y + 18 }} text={name} strong anchor="start" />
-      {shared !== null && (
-        <>
-          <polygon
-            points={pointsAttr(
-              boxFace(
-                { x: b.x + 12, y: b.y + b.d - 26, z: b.z, w: b.w - 24, d: 12, h: b.h },
-                "top",
-              ),
-            )}
-            style={{ fill: "color-mix(in oklab, var(--chart-2) 45%, var(--card))" }}
-          />
-          <Text
-            at={{
-              x: iso(b.x + 16, b.y + b.d - 14, b.z + b.h).x + 4,
-              y: iso(b.x + 16, b.y + b.d - 14, b.z + b.h).y - 4,
-            }}
-            text={shared}
-            size={10}
-            muted
-            anchor="start"
-          />
-        </>
+      {shared && (
+        <polygon
+          points={pointsAttr(
+            boxFace({ x: b.x + 12, y: b.y + b.d - 26, z: b.z, w: b.w - 24, d: 12, h: b.h }, "top"),
+          )}
+          style={{ fill: "color-mix(in oklab, var(--chart-2) 45%, var(--card))" }}
+        />
       )}
     </>
   );
@@ -436,7 +414,8 @@ function Tags({ at, tags }: { at: Point; tags: { key: string; text: string; tone
 /**
  * 노드 블록의 그림(`memo` — 가리키기·초점·끌기에 다시 그리지 않는다). 원소 수는 `nodeElements`와 같다: 이름 글, 요약이면 면
  * 셋, 아니면 윗면 + 채움 면 둘(`IsoGauge` 꼴의 다각형 둘씩), 자세히면 부하 글, 꼬리표마다 알약·글, 줄무늬·과다 할당 띠,
- * 레이어(받침·빗금·눈금·업링크 띠·펜싱 없음 둘레).
+ * 레이어(받침·빗금·눈금·업링크 띠·펜싱 없음 둘레). 이름·부하 글·꼬리표는 여기가 아니라 글 층에 그린다(`nodeLabel` — 뒤에
+ * 그리는 VM 타일·앞 줄 블록이 이름을 가리지 않게).
  */
 const NodeShape = memo(function NodeShape({
   item,
@@ -452,7 +431,6 @@ const NodeShape = memo(function NodeShape({
   layersKey: string;
   defs: string;
 }) {
-  const { t } = useTranslation();
   const layers = useMemo(() => new Set(layersKey.split(",") as MapLayer[]), [layersKey]);
   if (item.kind === "unplaced") {
     return null;
@@ -474,23 +452,6 @@ const NodeShape = memo(function NodeShape({
     ? "var(--danger)"
     : "color-mix(in oklab, var(--muted-foreground) 70%, black)";
   const strokeWidth = offline ? 2 : 0.8;
-  const front = iso(b.x + b.w, b.y + b.d, b.z);
-  const tagItems = marks.tags.map((tag) => ({
-    key: tag,
-    text: tagLabel(t, tag, info),
-    tone:
-      tag === "alerts"
-        ? SEVERITY_TONE[info?.severity ?? "warning"]
-        : tag === "fault"
-          ? info?.net?.severity === "down"
-            ? "danger"
-            : "warning"
-          : TAG_TONE[tag],
-  }));
-  // 이름·부하 글·꼬리표는 블록의 왼쪽(앞) 면 위에 — 블록 아래 바닥에 두면 앞 줄 블록의 이름과 헷갈린다. 증인은 기둥 아래.
-  const face = item.kind === "witness" ? front : iso(b.x + b.w / 2, b.y + b.d, b.z + b.h);
-  const textY = face.y + (item.kind === "witness" ? 16 : 13);
-  const tagsY = textY + (lod === "detail" ? 16 : 4);
 
   if (item.kind === "witness") {
     const f = prismFaces(b.x + b.w / 2, b.y + b.d / 2, b.z, (b.w / 2) * Math.SQRT2, b.h, 4);
@@ -513,8 +474,6 @@ const NodeShape = memo(function NodeShape({
           stroke={stroke}
           strokeWidth={strokeWidth}
         />
-        <Text at={{ x: face.x, y: textY }} text={item.name} size={10} muted />
-        <Tags at={{ x: face.x, y: tagsY }} tags={tagItems} />
       </>
     );
   }
@@ -612,23 +571,47 @@ const NodeShape = memo(function NodeShape({
           style={{ fill: UPLINK_COLOR[item.layers.uplink] }}
         />
       )}
-      <Text at={{ x: face.x, y: textY }} text={item.name} strong />
-      {lod === "detail" && (
-        <Text
-          at={{ x: face.x, y: textY + 13 }}
-          text={
-            load
-              ? t("clusterMap.loadShort", { cpu: Math.round(load.cpu), mem: Math.round(load.mem) })
-              : t("clusterMap.label.loadUnknown")
-          }
-          size={10}
-          muted
-        />
-      )}
-      <Tags at={{ x: face.x, y: tagsY }} tags={tagItems} />
     </>
   );
 });
+
+/**
+ * 노드 글의 자리와 내용: 이름·부하 글·꼬리표는 블록의 왼쪽(앞) 면 위에 — 블록 아래 바닥에 두면 앞 줄 블록의 이름과
+ * 헷갈린다. 증인은 기둥 아래. 부하 글은 자세히 단계에만(`null`이면 없음).
+ */
+function nodeLabel(
+  item: NodeItem,
+  info: MapNode | undefined,
+  lod: Lod,
+  layers: ReadonlySet<MapLayer>,
+  t: Translate,
+) {
+  const b = item.box;
+  const witness = item.kind === "witness";
+  const face = witness ? iso(b.x + b.w, b.y + b.d, b.z) : iso(b.x + b.w / 2, b.y + b.d, b.z + b.h);
+  const textY = face.y + (witness ? 16 : 13);
+  const tagsY = textY + (lod === "detail" ? 16 : 4);
+  const tags = nodeMarks(item, layers, lod).tags.map((tag) => ({
+    key: tag,
+    text: tagLabel(t, tag, info),
+    tone:
+      tag === "alerts"
+        ? SEVERITY_TONE[info?.severity ?? "warning"]
+        : tag === "fault"
+          ? info?.net?.severity === "down"
+            ? "danger"
+            : "warning"
+          : TAG_TONE[tag],
+  }));
+  const l = info?.load ?? null;
+  const load =
+    witness || lod !== "detail"
+      ? null
+      : l
+        ? t("clusterMap.loadShort", { cpu: Math.round(l.cpu), mem: Math.round(l.mem) })
+        : t("clusterMap.label.loadUnknown");
+  return { x: face.x, textY, tagsY, tags, load };
+}
 
 /** 옆면 하나를 채움(아래)과 나머지(위) 두 다각형으로 */
 function Gauge({
@@ -1319,23 +1302,81 @@ export function MapScene(props: MapSceneProps) {
     return scene.byKey.get(lit)?.box ?? null;
   })();
 
-  // 장면이 바뀔 때만(가리키기·끌기에는 그대로)
+  // 공유 풀 띠의 글(스토리지 레이어에 공유 풀이 있을 때)
+  const sharedText =
+    layers.includes("storage") && scene.shared.length > 0
+      ? t("clusterMap.shared", { names: scene.shared.join(", ") })
+      : null;
+  // 글 층의 노드 글(이름·부하 글·꼬리표)과 바닥 글(판·레일 이름)이 피해 갈 상자: 노드 글 하나씩, VM 칸마다(글이 있든 없든
+  // 이름 앞 8자 너비). 장면·단계·레이어가 바뀔 때만 — 가리키기·끌기에는 그대로.
+  const nodeText = useMemo(() => {
+    const on = new Set(layers);
+    const avoid: Rect[] = [];
+    const els: ReactNode[] = [];
+    for (const n of scene.nodes) {
+      for (const cell of lod === "summary" ? [] : (n.grid?.cells ?? [])) {
+        const c = topCenter(cell.box);
+        avoid.push({ x: c.x - 19, y: c.y - 5, w: 38, h: 9 });
+      }
+      if (n.kind === "unplaced") {
+        continue;
+      }
+      const l = nodeLabel(n, nodes.get(n.key), lod, on, t);
+      const w = Math.max(
+        textWidth(n.name, 11),
+        l.load ? textWidth(l.load, 10) : 0,
+        l.tags.reduce((a, tag) => a + pillWidth(tag.text) + 4, 0),
+      );
+      avoid.push({ x: l.x - w / 2, y: l.textY - 11, w, h: l.tagsY - l.textY + 26 });
+      els.push(
+        // 블록과 같은 열쇠(`data-key`) — 밝히기·끌기·문제만의 흐리기 `<style>`이 글에도 맞는다. 글 층은 블록 뒤라 열쇠로
+        // 찾는 `querySelector`는 늘 블록을 먼저 찾는다.
+        <g key={n.key} data-key={n.key} data-problem={problem(n) ? "" : undefined}>
+          <Text
+            at={{ x: l.x, y: l.textY }}
+            text={n.name}
+            {...(n.kind === "witness" ? { size: 10, muted: true } : { strong: true })}
+          />
+          {l.load !== null && (
+            <Text at={{ x: l.x, y: l.textY + 13 }} text={l.load} size={10} muted />
+          )}
+          <Tags at={{ x: l.x, y: l.tagsY }} tags={l.tags} />
+        </g>,
+      );
+    }
+    // 판 이름(노드 글·칸을 피해 한 줄씩 내림)과 공유 풀 띠의 글
+    for (const s of scene.slabs) {
+      const b = s.box;
+      const f = iso(b.x, b.y + b.d, 0);
+      const name = props.slabName(s);
+      const dy = clearShift({ x: f.x + 6, y: f.y + 7, w: textWidth(name, 11), h: 14 }, avoid);
+      const at = iso(b.x + 16, b.y + b.d - 14, b.z + b.h);
+      els.unshift(
+        <Fragment key={s.key}>
+          <Text at={{ x: f.x + 6, y: f.y + 18 + dy }} text={name} strong anchor="start" />
+          {sharedText !== null && s.kind !== "unplaced" && (
+            <Text
+              at={{ x: at.x + 4, y: at.y - 4 }}
+              text={sharedText}
+              size={10}
+              muted
+              anchor="start"
+            />
+          )}
+        </Fragment>,
+      );
+    }
+    return { avoid, els };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scene, nodes, lod, layersKey, t, sharedText]);
+  const avoid = nodeText.avoid;
+  // 장면이 바뀔 때만(가리키기·끌기에는 그대로). 판 그림은 바닥, 판 이름은 글 층(`nodeText`).
   const floor = useMemo(
     () =>
       scene.slabs.map((s) => (
-        <Slab
-          key={s.key}
-          slab={s}
-          name={props.slabName(s)}
-          shared={
-            layers.includes("storage") && scene.shared.length > 0 && s.kind !== "unplaced"
-              ? t("clusterMap.shared", { names: scene.shared.join(", ") })
-              : null
-          }
-        />
+        <Slab key={s.key} slab={s} shared={sharedText !== null && s.kind !== "unplaced"} />
       )),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scene, layersKey, t],
+    [scene, sharedText],
   );
   const bandPieces = useMemo(
     () =>
@@ -1523,7 +1564,7 @@ export function MapScene(props: MapSceneProps) {
           {floor}
           {netOn && (
             <Suspense fallback={null}>
-              <NetLayer scene={scene} lod={lod} defs={defs} railName={railName} />
+              <NetLayer scene={scene} lod={lod} defs={defs} railName={railName} part="shape" />
             </Suspense>
           )}
           {litWires !== null && (
@@ -1569,6 +1610,22 @@ export function MapScene(props: MapSceneProps) {
               {bandPieces.get(band.band)}
             </Fragment>
           ))}
+        </g>
+        {/* 글 층: 판 이름·레일 이름·노드 이름·부하 글·꼬리표를 모든 그림(블록·타일·포트) 뒤에 그려 그림이 글을 가리지 않는다 */}
+        <g aria-hidden pointerEvents="none">
+          {netOn && (
+            <Suspense fallback={null}>
+              <NetLayer
+                scene={scene}
+                lod={lod}
+                defs={defs}
+                railName={railName}
+                part="label"
+                avoid={avoid}
+              />
+            </Suspense>
+          )}
+          {nodeText.els}
         </g>
         <g>{linkEls}</g>
         {here && (

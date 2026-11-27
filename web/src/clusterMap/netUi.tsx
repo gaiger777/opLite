@@ -4,7 +4,15 @@
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
 
-import { iso, type Point, round, shade } from "@/components/iso/iso";
+import {
+  clearShift,
+  iso,
+  type Point,
+  type Rect,
+  round,
+  shade,
+  textWidth,
+} from "@/components/iso/iso";
 import { StatusChip } from "@/components/StatusChip";
 import type { MapScene, PortItem } from "@/clusterMap/layout";
 import type { Lod } from "@/clusterMap/lod";
@@ -115,35 +123,36 @@ const NetShape = memo(function NetShape({ piece, defs }: { piece: NetPiece; defs
 
 /**
  * 네트워크 층 그림(원소 수는 `netElements`와 같다): 경로 조각마다 하나, 레일마다 이름 글, 판마다 "+n 레일", 포트 줄을 그린
- * 노드마다 "+n". 장면·단계가 바뀔 때만 다시 그린다.
+ * 노드마다 "+n". 장면·단계가 바뀔 때만 다시 그린다. `part`가 `"shape"`면 경로만(바닥 높이), `"label"`이면 글만(지도의 글
+ * 층 — 노드 블록이 레일 이름을 가리지 않게).
  */
 export const NetLayer = memo(function NetLayer({
   scene,
   lod,
   defs,
   railName: name,
+  part,
+  avoid = [],
 }: {
   scene: MapScene;
   lod: Lod;
   defs: string;
   railName?(rail: { carrier: string; kind: string; networks: number }): string;
+  part: "shape" | "label";
+  /** 레일 이름이 피할 노드 글 상자(겹치면 한 줄씩 내린다) */
+  avoid?: readonly Rect[];
 }) {
   const { t } = useTranslation();
+  if (part === "shape") {
+    return netPaths(scene, lod).map((p) => <NetShape key={p.key} piece={p} defs={defs} />);
+  }
   return (
     <>
-      {netPaths(scene, lod).map((p) => (
-        <NetShape key={p.key} piece={p} defs={defs} />
-      ))}
       {[...scene.rails.values()].map((r) => {
         const a = iso(r.box.x + 4, r.box.y, r.box.z);
-        return (
-          <Text
-            key={r.key}
-            at={{ x: a.x + 2, y: a.y - 5 }}
-            text={name ? name(r) : r.carrier}
-            size={10}
-          />
-        );
+        const text = name ? name(r) : r.carrier;
+        const dy = clearShift({ x: a.x + 2, y: a.y - 15, w: textWidth(text, 10), h: 13 }, avoid);
+        return <Text key={r.key} at={{ x: a.x + 2, y: a.y - 5 + dy }} text={text} size={10} />;
       })}
       {scene.slabs
         .filter((s) => s.railMore > 0)

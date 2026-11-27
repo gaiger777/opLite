@@ -4,6 +4,7 @@ import {
   boxesPath,
   boxFaces,
   byDepth,
+  clearShift,
   COS30,
   depthOf,
   facesPath,
@@ -14,6 +15,7 @@ import {
   prismFaces,
   screenToWorld,
   shade,
+  textWidth,
 } from "@/components/iso/iso";
 import { rng } from "@/test/clusterMap";
 import { fitBox, zoomAt } from "@/components/iso/viewport";
@@ -134,4 +136,27 @@ it("splits a side face into a gauge fill and the rest", () => {
   expect(gaugeFaces(box, "right", 2).fill).toEqual(boxFace(box, "right"));
   expect(gaugeFaces(box, "right", Number.NaN).rest).toEqual(boxFace(box, "right"));
   expect(gaugeFaces(box, "right", -1).rest).toEqual(boxFace(box, "right"));
+});
+
+it("estimates wide (Hangul) glyphs wider than Latin ones", () => {
+  expect(textWidth("ab", 10)).toBe(16);
+  expect(textWidth("가나", 10)).toBe(24);
+});
+
+it("moves a floor label down a line at a time until it clears the node labels", () => {
+  const label = { x: 0, y: 0, w: 100, h: 14 };
+  expect(clearShift(label, [])).toBe(0);
+  // 노드 이름이 같은 줄에 있으면 비켜날 때까지 아래로(한 줄 12px — 14px 높이라 두 줄)
+  expect(clearShift(label, [{ x: 50, y: 0, w: 40, h: 14 }])).toBe(24);
+  // 꼬리표 줄까지 겹치면 더 아래로
+  expect(
+    clearShift(label, [
+      { x: 50, y: 0, w: 40, h: 14 },
+      { x: 40, y: 14, w: 60, h: 15 },
+    ]),
+  ).toBe(36);
+  // 옆으로 비켜 있으면 그대로
+  expect(clearShift(label, [{ x: 120, y: 0, w: 40, h: 14 }])).toBe(0);
+  // 끝내 자리가 없으면 처음 자리
+  expect(clearShift(label, [{ x: 0, y: -100, w: 100, h: 1000 }])).toBe(0);
 });

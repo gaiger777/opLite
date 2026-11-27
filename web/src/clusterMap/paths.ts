@@ -289,8 +289,8 @@ export function nodeElements(node: NodeItem, lod: Lod, marks: NodeMarks): number
   if (node.kind === "unplaced") {
     return 1;
   }
-  // <g> + 이름 글 + 꼬리표마다 알약·글
-  let n = 2 + marks.tags.length * 2;
+  // <g> + 글 층의 <g> + 이름 글 + 꼬리표마다 알약·글
+  let n = 3 + marks.tags.length * 2;
   if (node.kind === "witness") {
     // 네모 기둥: 보이는 옆면 둘 + 윗면
     return n + 3;
@@ -316,9 +316,9 @@ export function nodeElements(node: NodeItem, lod: Lod, marks: NodeMarks): number
 
 /**
  * 그림 틀의 원소: `<svg>`, `<style>` 둘(밝히기·움직임), `<defs>`, 무늬 셋(부하 모름 빗금·준비 안 됨 빨간 빗금·유지보수
- * 줄무늬 — `<pattern>` + 바탕 + 선), 화살표 끝(`<marker>` + 경로), 층 `<g>` 셋(바닥·띠·화살표), 초점 테두리 경로 하나.
+ * 줄무늬 — `<pattern>` + 바탕 + 선), 화살표 끝(`<marker>` + 경로), 층 `<g>` 넷(바닥·띠·글·화살표), 초점 테두리 경로 하나.
  */
-export const FRAME_ELEMENTS = 1 + 2 + 1 + 3 * 3 + 2 + 3 + 1;
+export const FRAME_ELEMENTS = 1 + 2 + 1 + 3 * 3 + 2 + 4 + 1;
 
 /**
  * 칸에 글을 적는가: 윗면이 보이는 칸만(위 층이 덮으면 아니다) — 자세히는 모든 칸(이름 앞 8자·"+N"), 타일 단계는 "+N" 칸만.

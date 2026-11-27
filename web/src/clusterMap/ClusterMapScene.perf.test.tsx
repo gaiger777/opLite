@@ -1,7 +1,9 @@
 // 큰 클러스터의 예산(계획 70 §9.2): 100 노드 × 50 VM(5000 VM, 판 10개)의 배치 + 경로 시간과 단계마다 SVG 원소 수.
 // 원소 수는 그리기 없이 장면으로 센다(`elementCount`) — 화면(스테이지 2)이 같은 셈을 따르고 그린 DOM으로도 잰다.
-// 지도 칸(`InfraMap` 조각) 크기 예산은 gzip 24 KiB(24,576바이트, 계획 75 §4.2)이고 `vite build` 출력으로 잰다(이 시험 밖 — 2026-11-26
-// 리뷰 1에서 24,290바이트).
+// 지도 칸(`InfraMap` 조각) 크기 예산은 gzip 25 KiB(25,600바이트)이고 `vite build` 출력으로 잰다(이 시험 밖). 계획 75 §4.2의
+// 24 KiB(24,576바이트 — 2026-11-26 리뷰 1에서 24.43 kB)를 2026-11-27 화면 버그 고침에서 올렸다: 노드·판·레일 이름과 꼬리표를
+// 모든 그림 뒤의 글 층에 따로 그리고(블록·VM 타일이 글을 가렸다) 바닥 글이 노드 글을 비켜 가게 해 24.78 kB — 글 층만 해도
+// 24.65 kB로 옛 예산을 넘는다.
 import { layoutCluster } from "@/clusterMap/layout";
 import { toModel } from "@/clusterMap/model";
 import { netPaths } from "@/clusterMap/netPaths";
