@@ -10,6 +10,7 @@ import type { Node } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -237,6 +238,8 @@ function NodeSdnDialog({ node, onClose }: { node: Node; onClose(): void }) {
               id={`physnet-${i}-name`}
               label={t("sdn.physnet.nameN", { n: i + 1 })}
               error={errors[`physnets.${i}.name`]}
+              help={t("help.sdn.physnetName")}
+              info="networks.physnet"
             >
               {(a11y) => (
                 <Input
@@ -252,6 +255,7 @@ function NodeSdnDialog({ node, onClose }: { node: Node; onClose(): void }) {
               id={`physnet-${i}-bridge`}
               label={t("sdn.physnet.bridgeN", { n: i + 1 })}
               error={errors[`physnets.${i}.bridge`]}
+              help={t("help.sdn.physnetBridge")}
             >
               {(a11y) => (
                 <Input
@@ -306,13 +310,19 @@ function NodeSdnDialog({ node, onClose }: { node: Node; onClose(): void }) {
           onCheckedChange={(on) => setValues({ ...values, gateway: on === true })}
         />
         <Label htmlFor="node-sdn-gateway">{t("sdn.physnet.gateway")}</Label>
+        <InfoButton
+          topic="sdn.gateway"
+          label={t("sdn.physnet.gateway")}
+          line={t("help.sdn.gateway")}
+        />
       </div>
       {values.gateway && (
         <Field
           id="node-sdn-priority"
           label={t("sdn.physnet.priority")}
           error={errors.priority}
-          hint={t("sdn.physnet.priorityHint")}
+          help={t("sdn.physnet.priorityHint")}
+          info="sdn.gateway"
         >
           {(a11y) => (
             <Input

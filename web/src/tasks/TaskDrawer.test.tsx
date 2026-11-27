@@ -249,7 +249,7 @@ it("keeps the error in the phone cards", async () => {
   })) as typeof window.matchMedia;
   try {
     page();
-    const list = await screen.findByRole("list", { name: "Tasks" });
+    const list = await screen.findByRole("list", { name: "Task history" });
     const card = (await within(list).findByRole("link", { name: "Back up web" })).closest("li")!;
     expect(card).toHaveTextContent("Back up web");
     expect(card).toHaveTextContent(LONG);

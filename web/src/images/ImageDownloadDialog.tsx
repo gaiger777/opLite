@@ -6,6 +6,7 @@ import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -149,7 +150,12 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
           </p>
         ) : null}
         {!pools.isSuccess && <ListPending error={pools.error} />}
-        <Field id="image-pool" label={t("volumes.pool")} error={errors.pool}>
+        <Field
+          id="image-pool"
+          label={t("volumes.pool")}
+          error={errors.pool}
+          help={t("help.images.pool")}
+        >
           {(a11y) => (
             <NativeSelect
               id="image-pool"
@@ -167,7 +173,12 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
             </NativeSelect>
           )}
         </Field>
-        <Field id="image-name" label={t("images.volumeName")} error={errors.name}>
+        <Field
+          id="image-name"
+          label={t("images.volumeName")}
+          error={errors.name}
+          help={t("help.images.volumeName")}
+        >
           {(a11y) => (
             <Input
               id="image-name"
@@ -179,18 +190,36 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
           )}
         </Field>
         {canTemplate && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-start gap-2">
             <Checkbox
               id="image-template"
               checked={template}
               onCheckedChange={(v) => setTemplate(v === true)}
+              aria-describedby="image-template-hint"
             />
-            <Label htmlFor="image-template">{t("images.makeTemplate")}</Label>
+            <div className="flex flex-col gap-0.5">
+              <div className="flex items-center gap-1">
+                <Label htmlFor="image-template">{t("images.makeTemplate")}</Label>
+                <InfoButton
+                  topic="images.makeTemplate"
+                  label={t("images.makeTemplate")}
+                  line={t("help.images.makeTemplate")}
+                />
+              </div>
+              <p id="image-template-hint" className="text-xs text-muted-foreground">
+                {t("help.images.makeTemplate")}
+              </p>
+            </div>
           </div>
         )}
         {template && (
           <>
-            <Field id="image-tmpl-name" label={t("images.templateName")} error={errors.tmplName}>
+            <Field
+              id="image-tmpl-name"
+              label={t("images.templateName")}
+              error={errors.tmplName}
+              help={t("help.images.templateName")}
+            >
               {(a11y) => (
                 <Input
                   id="image-tmpl-name"
@@ -200,7 +229,12 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
                 />
               )}
             </Field>
-            <Field id="image-network" label={t("vms.network")} error={errors.network}>
+            <Field
+              id="image-network"
+              label={t("vms.network")}
+              error={errors.network}
+              help={t("help.images.network")}
+            >
               {(a11y) => (
                 <NativeSelect
                   id="image-network"
@@ -218,8 +252,13 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
                 </NativeSelect>
               )}
             </Field>
-            <div className="grid grid-cols-3 gap-4">
-              <Field id="image-cpus" label={t("vms.vcpus")} error={errors.cpus}>
+            <div className="grid grid-cols-2 gap-4">
+              <Field
+                id="image-cpus"
+                label={t("vms.vcpus")}
+                error={errors.cpus}
+                help={t("help.images.cpus")}
+              >
                 {(a11y) => (
                   <Input
                     id="image-cpus"
@@ -230,7 +269,12 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
                   />
                 )}
               </Field>
-              <Field id="image-memory" label={t("templates.memoryMib")} error={errors.memory}>
+              <Field
+                id="image-memory"
+                label={t("templates.memoryMib")}
+                error={errors.memory}
+                help={t("help.images.memory")}
+              >
                 {(a11y) => (
                   <Input
                     id="image-memory"
@@ -241,23 +285,29 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
                   />
                 )}
               </Field>
-              <Field id="image-size" label={t("images.diskSize")} error={errors.size}>
-                {(a11y) => (
-                  <Input
-                    id="image-size"
-                    inputMode="decimal"
-                    value={sizeGib}
-                    onChange={(e) => setSizeGib(e.target.value)}
-                    {...a11y}
-                  />
-                )}
-              </Field>
             </div>
+            <Field
+              id="image-size"
+              label={t("images.diskSize")}
+              error={errors.size}
+              help={t("help.images.size")}
+              info="images.diskSize"
+            >
+              {(a11y) => (
+                <Input
+                  id="image-size"
+                  inputMode="decimal"
+                  value={sizeGib}
+                  onChange={(e) => setSizeGib(e.target.value)}
+                  {...a11y}
+                />
+              )}
+            </Field>
             <Field
               id="image-user"
               label={t("vmForm.ciUser")}
               error={errors["ci.user"]}
-              hint={t("vmForm.ciUserHint")}
+              help={t("vmForm.ciUserHint")}
             >
               {(a11y) => (
                 <Input
@@ -273,7 +323,7 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
               id="image-password"
               label={t("vmForm.ciPassword")}
               error={errors["ci.password"]}
-              hint={t("vmForm.ciPasswordHint")}
+              help={t("vmForm.ciPasswordHint")}
             >
               {(a11y) => (
                 <Input
@@ -291,7 +341,7 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
               label={t("vmForm.ciKeys")}
               error={errors["ci.sshKeys"]}
               errorValues={validateKeys(sshKeys)?.values}
-              hint={t("vmForm.ciKeysHint")}
+              help={t("vmForm.ciKeysHint")}
             >
               {(a11y) => (
                 <textarea

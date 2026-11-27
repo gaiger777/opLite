@@ -10,12 +10,12 @@
     "rollbackFailedAt": "Rollback failed: {{step}}",
     "sources": {
       "title": "Saved vCenter and ESXi connections. Their passwords stay in the cluster and are never shown again.",
-      "empty": "No VMware sources",
-      "emptyHint": "Add a vCenter or ESXi connection to browse its inventory and plan a migration."
+      "empty": "No vCenter or ESXi connected",
+      "heading": "Connected vCenter & ESXi"
     },
     "source": {
-      "add": "Add source",
-      "addTitle": "Add a VMware source",
+      "add": "Connect vCenter or ESXi",
+      "addTitle": "Connect a vCenter or ESXi",
       "editTitle": "Change {{name}}",
       "editNamed": "Change {{name}}",
       "checkNamed": "Check {{name}} again",
@@ -26,12 +26,12 @@
       "user": "User",
       "password": "Password",
       "passwordKeep": "Leave empty to keep the saved password (only if host, port and user stay the same).",
-      "datacenter": "Datacenter hint",
-      "datacenterHint": "Optional. ESXi hosts use ha-datacenter.",
+      "datacenter": "Datacenter (optional)",
+      "datacenterHint": "If vCenter has several datacenters, write the one to use. ESXi hosts use ha-datacenter; you can leave it empty.",
       "vddk": "Read disks with VDDK",
       "vddkHint": "Needed for vSAN and vVols. The operator installs nbdkit and VDDK on the nodes.",
       "libdir": "VDDK library directory",
-      "libdirHint": "Empty uses the node setting [vmware] vddk_libdir.",
+      "libdirHint": "The directory on the nodes where VDDK is unpacked. Empty uses the node setting [vmware] vddk_libdir.",
       "connect": "Connect",
       "trust": "Trust and connect",
       "untrusted": "{{host}} presented a certificate this cluster has not seen. Compare the fingerprint with the one in vCenter before you trust it.",
@@ -44,7 +44,10 @@
       "transportFolder": "Datastore files",
       "transportVddk": "VDDK",
       "checkedAt": "Checked",
-      "kind": { "vcenter": "vCenter", "esxi": "ESXi" },
+      "kind": {
+        "vcenter": "vCenter",
+        "esxi": "ESXi"
+      },
       "state": {
         "ok": "Connected",
         "error": "Failed",
@@ -68,10 +71,8 @@
       }
     },
     "migrations": {
-      "title": "Move many VMware VMs with one set of rules. Warm migrations copy running VMs and keep syncing changed blocks until cutover.",
       "new": "New migration",
-      "empty": "No VMware migrations",
-      "emptyHint": "Add a VMware source, then pick VMs from its inventory."
+      "empty": "No VMware migrations"
     },
     "phase": {
       "draft": "Draft",
@@ -112,10 +113,24 @@
       "powered-off": "Off",
       "suspended": "Suspended"
     },
-    "tools": { "running": "Running", "notRunning": "Not running", "other": "Not installed" },
-    "shutdown": { "guest": "Shut down the guest", "power-off": "Power off" },
-    "level": { "ok": "OK", "warn": "Warning", "blocked": "Blocked" },
-    "problemLevel": { "error": "Blocked", "warn": "Warning" },
+    "tools": {
+      "running": "Running",
+      "notRunning": "Not running",
+      "other": "Not installed"
+    },
+    "shutdown": {
+      "guest": "Shut down the guest",
+      "power-off": "Power off"
+    },
+    "level": {
+      "ok": "OK",
+      "warn": "Warning",
+      "blocked": "Blocked"
+    },
+    "problemLevel": {
+      "error": "Blocked",
+      "warn": "Warning"
+    },
     "migration": {
       "source": "Source",
       "mode": "Mode",
@@ -231,7 +246,7 @@
     },
     "wizard": {
       "title": "New VMware migration",
-      "hint": "Pick a source, choose VMs, map networks and datastores once, check every VM, then start.",
+      "hint": "Go in order: ① connection and mode ② choose VMs ③ map networks and storage ④ limits and cutover ⑤ check each VM. It stays a draft until you start it.",
       "steps": "Steps",
       "step": {
         "source": "Source",
@@ -322,24 +337,24 @@
     },
     "policy": {
       "maxParallel": "VMs at a time",
-      "maxParallelHint": "Syncs and cutovers running together in this migration (1–64).",
+      "maxParallelHint": "VMs copied or cut over at the same time in this migration (1–64). More is faster but loads the source and network more.",
       "maxPerHost": "Per ESXi host",
-      "maxPerHostHint": "1–64",
+      "maxPerHostHint": "VMs read at once from one ESXi host (1–64). Fewer means less load on the source host.",
       "maxPerNode": "Per Orbivisor node",
-      "maxPerNodeHint": "1–64",
+      "maxPerNodeHint": "VMs one Orbivisor node receives at once (1–64).",
       "bandwidth": "Bandwidth (MiB/s)",
-      "bandwidthHint": "Empty means no limit.",
+      "bandwidthHint": "The most bandwidth copying may use. Set it to protect the network during business hours. Empty means no limit.",
       "interval": "Sync every (minutes)",
-      "intervalHint": "5–1440",
+      "intervalHint": "How often changed blocks are copied again (5–1440 minutes). Shorter means less to copy at cutover.",
       "stopAfter": "Stop syncing after (days)",
-      "stopAfterHint": "Our snapshot does not stay on the source for long. 0 never stops.",
+      "stopAfterHint": "Syncing stops if there is no cutover after this long, so our snapshot does not stay on the source. 0 never stops.",
       "shutdownTimeout": "Guest shutdown timeout (s)",
-      "shutdownTimeoutHint": "30–3600",
+      "shutdownTimeoutHint": "The longest wait when shutting the guest down through VMware Tools (30–3600 s).",
       "maxFinalDelta": "Largest final delta (GiB)",
-      "maxFinalDeltaHint": "Cutover stops before the source is touched if the last delta is larger. Empty means no limit.",
+      "maxFinalDeltaHint": "If the last changes are larger, cutover stops before the source is touched. Empty means no limit.",
       "shutdown": "Source shutdown",
       "cutoverAt": "Scheduled cutover",
-      "cutoverAtHint": "Empty means you cut over by hand.",
+      "cutoverAtHint": "Cut over automatically at this time. Empty means you cut over by hand once ready.",
       "protectSource": "Protect the source",
       "protectSourceHint": "Source NICs are set to stay disconnected at power-on and a note is added."
     },
@@ -379,6 +394,28 @@
       "preflight_blocked": "The source VM cannot be cut over now:",
       "name_taken": "That name is already in use: {{message}}",
       "confirm_mismatch": "Type the current name of the Orbivisor VM to revert it."
+    },
+    "help": {
+      "sourcesIntro": "To move VMs from VMware, first connect vCenter or ESXi here. VMware migration can then list its VMs for you to pick.",
+      "sourcesEmpty": "Save a vCenter or ESXi address and account once, and VMware migration can pick and move its VMs.",
+      "migrationsIntro": "Move many VMware VMs as one plan. A warm migration copies VMs while they run and powers them off only briefly at cutover.",
+      "migrationsEmpty": "Pick VMs from a connected vCenter or ESXi and map networks and storage once to move many together.",
+      "name": "The name of this connection (e.g. vcenter-seoul). Lowercase letters, digits and hyphens (not at the start or end); it cannot be changed later.",
+      "port": "The HTTPS port, usually 443.",
+      "user": "The VMware user to log in as (e.g. administrator@vsphere.local). It needs permission to read VMs, create and remove snapshots, change settings (CBT on and off, NIC connection, notes), shut down guests and power VMs off and on.",
+      "password": "That user's password. It stays in the cluster and is never shown again.",
+      "planName": "The name of this migration (e.g. wave-1). Lowercase letters, digits and hyphens (not at the start or end).",
+      "source": "The vCenter or ESXi connection to read VMs from. If there is none, add one under Connected vCenter & ESXi first.",
+      "defaultPool": "The pool for disks on datastores set to 'Default pool' above. A shared pool lets VMs move between nodes easily.",
+      "folderKind": "Put the moved VMs together in one folder, or rebuild VMware's folder tree.",
+      "folder": "The Orbivisor folder for the moved VMs (or the VMware folder tree). They inherit its permissions.",
+      "node": "The node the new VMs are created on. Automatic picks a node with room.",
+      "driverIso": "A virtio driver ISO to put in Windows VMs, for switching to the fast virtual devices after the move.",
+      "devices": "Choose disk and network card types automatically by guest OS, or the same for every VM.",
+      "diskBus": "This applies to every VM moved. virtio-blk: the fast virtual device — only if every VM has the driver (install it on Windows first, or it does not boot). SATA: a compatible device Windows sees without drivers.",
+      "nicModel": "This applies to every VM moved. virtio: the fast virtual device — only if every VM has the driver (install it on Windows first). e1000e: a compatible device that works without drivers.",
+      "shutdown": "How the source is turned off at cutover. Guest shutdown (recommended) lets the OS shut itself down; power off cuts it at once.",
+      "startAfter": "When on, the new VM starts as soon as cutover finishes. Off leaves it stopped so you can check it first."
     }
   }
 }

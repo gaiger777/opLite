@@ -74,6 +74,7 @@ export function DisksSection({
                   id={`disk-${i}-volume`}
                   label={t("vms.volume")}
                   error={errors[`disks.${i}.volume`]}
+                  info="vmForm.diskVolume"
                 >
                   {(a11y) => (
                     <NativeSelect
@@ -105,6 +106,7 @@ export function DisksSection({
                     id={`disk-${i}-volume`}
                     label={t("vmForm.newVolume")}
                     error={errors[`disks.${i}.volume`]}
+                    info="vmForm.newVolume"
                   >
                     {(a11y) => (
                       <Input
@@ -119,6 +121,7 @@ export function DisksSection({
                     id={`disk-${i}-pool`}
                     label={t("vmForm.pool")}
                     error={errors[`disks.${i}.pool`]}
+                    info="vmForm.diskPool"
                   >
                     {(a11y) => (
                       <NativeSelect
@@ -141,6 +144,7 @@ export function DisksSection({
                     id={`disk-${i}-size`}
                     label={t("vmForm.sizeGib")}
                     error={errors[`disks.${i}.size`]}
+                    info="vmForm.diskSize"
                   >
                     {(a11y) => (
                       <Input
@@ -155,7 +159,7 @@ export function DisksSection({
                   </Field>
                 </>
               )}
-              <Field id={`disk-${i}-bus`} label={t("vms.bus")}>
+              <Field id={`disk-${i}-bus`} label={t("vms.bus")} info="vmForm.diskBus">
                 <NativeSelect
                   id={`disk-${i}-bus`}
                   className="w-full"
@@ -163,10 +167,12 @@ export function DisksSection({
                   value={disk.bus}
                   onChange={(e) => setDisk(i, { bus: e.target.value as DiskRow["bus"] })}
                 >
-                  <NativeSelectOption value="virtio-blk">virtio-blk</NativeSelectOption>
+                  <NativeSelectOption value="virtio-blk">
+                    {t("vmForm.busVirtio")}
+                  </NativeSelectOption>
                   {/* 실행 중에는 virtio-blk만 붙인다(서버의 409). */}
                   <NativeSelectOption value="sata" disabled={live && !fixed}>
-                    sata
+                    {t("vmForm.busSata")}
                   </NativeSelectOption>
                 </NativeSelect>
               </Field>

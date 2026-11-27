@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { useSettings } from "@/api/live";
 import { CopyButton } from "@/components/CopyButton";
+import { InfoButton } from "@/components/InfoButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { patchSettings, settingsError } from "@/settings/save";
@@ -63,9 +64,16 @@ export function PrometheusSection({ write }: { write: boolean }) {
 
   return (
     <section aria-labelledby="settings-prometheus" className="flex flex-col gap-4">
-      <h2 id="settings-prometheus" ref={heading} tabIndex={-1} className="font-medium">
-        {t("settings.prometheus.title")}
-      </h2>
+      <div className="flex items-center gap-1">
+        <h2 id="settings-prometheus" ref={heading} tabIndex={-1} className="font-medium">
+          {t("settings.prometheus.title")}
+        </h2>
+        <InfoButton
+          topic="settings.prometheus"
+          label={t("settings.prometheus.title")}
+          line={t("settings.prometheus.intro")}
+        />
+      </div>
       <p className="text-sm text-muted-foreground">{t("settings.prometheus.intro")}</p>
       {error && (
         <p role="alert" className="text-sm text-destructive">

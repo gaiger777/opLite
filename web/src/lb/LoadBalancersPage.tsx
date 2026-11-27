@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Scale, Trash2, X } from "lucide-react";
+import { Pencil, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -14,6 +14,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { StatusChip, type StatusTone } from "@/components/StatusChip";
@@ -151,7 +152,8 @@ export function LoadBalancersPage() {
       <PageHeader
         id="lbs-title"
         title={t("nav.loadBalancers")}
-        description={t("lb.pageHint")}
+        help="lb"
+        intro={t("help.lb.intro")}
         actions={items.length > 0 && createButton}
       />
       {blocked && (
@@ -163,7 +165,8 @@ export function LoadBalancersPage() {
         <ListPending error={lbs.error} />
       ) : items.length === 0 ? (
         <EmptyState
-          icon={Scale}
+          diagram="sdn"
+          help="lb.page"
           title={t("lb.empty.title")}
           description={t("lb.empty.description")}
           action={createButton}
@@ -605,7 +608,7 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
     >
       <div className="-mx-1 flex max-h-[65svh] flex-col gap-4 overflow-y-auto px-1">
         {!lb && (
-          <Field id="lb-name" label={t("common.name")} error={errors.name}>
+          <Field id="lb-name" label={t("common.name")} error={errors.name} help={t("help.lb.name")}>
             {(a11y) => (
               <Input
                 id="lb-name"
@@ -618,7 +621,11 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           </Field>
         )}
         {!lb && <FolderSelect id="lb-folder" state={folder} />}
-        <Field id="lb-description" label={t("lb.descriptionOptional")}>
+        <Field
+          id="lb-description"
+          label={t("lb.descriptionOptional")}
+          help={t("help.lb.description")}
+        >
           {(a11y) => (
             <Input
               id="lb-description"
@@ -633,7 +640,8 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           id="lb-network"
           label={t("lb.vipNetwork")}
           error={errors.network}
-          hint={t("lb.vipNetworkHint")}
+          help={t("lb.vipNetworkHint")}
+          info="lb.vip"
         >
           {(a11y) => (
             <NativeSelect
@@ -661,7 +669,13 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
             </NativeSelect>
           )}
         </Field>
-        <Field id="lb-vip" label={t("lb.vipOptional")} error={errors.vip} hint={t("lb.vipHint")}>
+        <Field
+          id="lb-vip"
+          label={t("lb.vipOptional")}
+          error={errors.vip}
+          help={t("lb.vipHint")}
+          info="lb.vip"
+        >
           {(a11y) => (
             <Input
               id="lb-vip"
@@ -695,7 +709,8 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
               id="lb-external-ip"
               label={t("lb.externalIpOptional")}
               error={errors.externalIp}
-              hint={t("lb.externalIpHint")}
+              help={t("lb.externalIpHint")}
+              info="fip.page"
             >
               {(a11y) => (
                 <Input
@@ -713,7 +728,8 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           id="lb-affinity"
           label={t("lb.affinityOptional")}
           error={errors.affinity}
-          hint={t("lb.affinityHint")}
+          help={t("lb.affinityHint")}
+          info="lb.affinity"
         >
           {(a11y) => (
             <Input
@@ -726,7 +742,14 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           )}
         </Field>
         <fieldset className="flex flex-col gap-3">
-          <legend className="mb-1 text-sm font-medium">{t("lb.listeners")}</legend>
+          <legend className="mb-1 flex items-center gap-1 text-sm font-medium">
+            {t("lb.listeners")}
+            <InfoButton
+              topic="lb.listeners"
+              label={t("lb.listeners")}
+              line={t("help.lb.listeners")}
+            />
+          </legend>
           {errors.listeners && <p className="text-xs text-destructive">{t(errors.listeners)}</p>}
           {rows.map((row, i) => (
             <ListenerEditor
@@ -792,17 +815,25 @@ function ListenerEditor({
       className="flex flex-col gap-3 rounded-md border p-3"
     >
       <div className="grid grid-cols-[auto_1fr_auto] items-end gap-2">
-        <Field id={`lb-l${i}-protocol`} label={t("lb.protocol")}>
-          <NativeSelect
-            id={`lb-l${i}-protocol`}
-            value={row.protocol}
-            onChange={(e) => onChange({ protocol: e.target.value as ListenerRow["protocol"] })}
-          >
-            <NativeSelectOption value="tcp">TCP</NativeSelectOption>
-            <NativeSelectOption value="udp">UDP</NativeSelectOption>
-          </NativeSelect>
+        <Field id={`lb-l${i}-protocol`} label={t("lb.protocol")} help={t("help.lb.protocol")}>
+          {(a11y) => (
+            <NativeSelect
+              id={`lb-l${i}-protocol`}
+              value={row.protocol}
+              onChange={(e) => onChange({ protocol: e.target.value as ListenerRow["protocol"] })}
+              {...a11y}
+            >
+              <NativeSelectOption value="tcp">TCP</NativeSelectOption>
+              <NativeSelectOption value="udp">UDP</NativeSelectOption>
+            </NativeSelect>
+          )}
         </Field>
-        <Field id={`lb-l${i}-port`} label={t("lb.vipPort")} error={errors[`l${i}.port`]}>
+        <Field
+          id={`lb-l${i}-port`}
+          label={t("lb.vipPort")}
+          error={errors[`l${i}.port`]}
+          help={t("help.lb.vipPort")}
+        >
           {(a11y) => (
             <Input
               id={`lb-l${i}-port`}
@@ -831,18 +862,19 @@ function ListenerEditor({
           onCheckedChange={(on) => onChange({ health: on === true })}
         />
         <Label htmlFor={`lb-l${i}-health`}>{t("lb.healthOn")}</Label>
+        <InfoButton topic="lb.health" label={t("lb.healthOn")} line={t("help.lb.health")} />
       </div>
       {row.health && (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           {(
             [
-              ["interval", "lb.interval"],
-              ["timeout", "lb.timeout"],
-              ["rise", "lb.rise"],
-              ["fall", "lb.fall"],
+              ["interval", "lb.interval", "help.lb.interval"],
+              ["timeout", "lb.timeout", "help.lb.timeout"],
+              ["rise", "lb.rise", "help.lb.rise"],
+              ["fall", "lb.fall", "help.lb.fall"],
             ] as const
-          ).map(([key, label]) => (
-            <Field key={key} id={`lb-l${i}-${key}`} label={t(label)}>
+          ).map(([key, label, help]) => (
+            <Field key={key} id={`lb-l${i}-${key}`} label={t(label)} help={t(help)}>
               {(a11y) => (
                 <Input
                   id={`lb-l${i}-${key}`}
@@ -876,6 +908,7 @@ function ListenerEditor({
                 id={`lb-l${i}-m${j}-ip`}
                 label={t("lb.address")}
                 error={errors[`l${i}.m${j}.ip`]}
+                help={t("help.lb.memberIp")}
               >
                 {(a11y) => (
                   <Input
@@ -891,6 +924,7 @@ function ListenerEditor({
               id={`lb-l${i}-m${j}-port`}
               label={t("lb.port")}
               error={errors[`l${i}.m${j}.port`]}
+              help={t("help.lb.memberPort")}
             >
               {(a11y) => (
                 <Input
@@ -917,7 +951,7 @@ function ListenerEditor({
           <Field
             id={`lb-l${i}-pick`}
             label={t("lb.addNicMember")}
-            hint={usable ? undefined : t("lb.noUsableNic")}
+            help={t(usable ? "help.lb.pickNic" : "lb.noUsableNic")}
           >
             {(a11y) => (
               <NativeSelect

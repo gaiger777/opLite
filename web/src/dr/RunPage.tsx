@@ -127,6 +127,7 @@ function RunView({ run }: { run: DrRun }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="dr-run-title"
+        help="drRun"
         title={t("dr.run.title", { kind: t(`dr.kind.${run.spec.kind}`), plan: run.spec.plan_name })}
         description={
           <span className="flex flex-wrap items-center gap-2">

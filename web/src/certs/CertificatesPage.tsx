@@ -159,7 +159,8 @@ export function CertificatesPage() {
       <PageHeader
         id="certs-title"
         title={t("nav.certificates")}
-        description={t("certs.pageHint")}
+        help="certs"
+        intro={t("certs.intro")}
       />
       {/* 노드 HTTPS 인증서를 서명하는 클러스터 CA는 클러스터 화면에 있다(두 화면이 서로 가리킨다). */}
       {perms.reads("node") && (
@@ -195,6 +196,16 @@ export function CertificatesPage() {
             description={t(
               accountList.length === 0 ? "certs.needAccount" : "certs.emptyCertificatesHint",
             )}
+            help="certs.page"
+            action={
+              write &&
+              accountList.length > 0 && (
+                <Button onClick={() => setCreating("certificate")}>
+                  <Plus />
+                  {t("certs.cert.open")}
+                </Button>
+              )
+            }
           />
         ) : (
           <div className="overflow-x-auto">
@@ -283,7 +294,20 @@ export function CertificatesPage() {
         {accounts.data === undefined ? (
           <ListPending error={accounts.error} />
         ) : accountList.length === 0 ? (
-          <EmptyState icon={KeyRound} title={t("certs.emptyAccounts")} />
+          <EmptyState
+            icon={KeyRound}
+            title={t("certs.emptyAccounts")}
+            description={t("certs.emptyAccountsHint")}
+            help="certs.directory"
+            action={
+              write && (
+                <Button onClick={() => setCreating("account")}>
+                  <Plus />
+                  {t("certs.account.open")}
+                </Button>
+              )
+            }
+          />
         ) : (
           <div className="overflow-x-auto">
             <Table aria-labelledby="certs-accounts">
@@ -357,7 +381,19 @@ export function CertificatesPage() {
         {dns.data === undefined ? (
           <ListPending error={dns.error} />
         ) : dnsList.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("certs.emptyDns")}</p>
+          <EmptyState
+            title={t("certs.emptyDns")}
+            description={t("certs.emptyDnsHint")}
+            help="certs.challenge"
+            action={
+              write && (
+                <Button variant="outline" onClick={() => setCreating("dns")}>
+                  <Plus />
+                  {t("certs.dns.open")}
+                </Button>
+              )
+            }
+          />
         ) : (
           <div className="overflow-x-auto">
             <Table aria-labelledby="certs-dns">

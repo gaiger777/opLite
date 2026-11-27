@@ -56,12 +56,14 @@ it("shows the store, verify badge, new data and base of store backups", async ()
   expect(cell("web-1", "Target")).toHaveTextContent(/^bk$/);
   expect(cell("web-1", "Verified")).toHaveTextContent(/^—$/);
   expect(cell("web-s2", "Target")).toHaveTextContent("stbackup store");
-  expect(cell("web-s2", "Verified")).toHaveTextContent("2 bad chunks");
+  expect(cell("web-s2", "Verified")).toHaveTextContent("2 bad pieces");
   expect(cell("web-s1", "Verified")).toHaveTextContent("Verified");
   expect(cell("web-s3", "Verified")).toHaveTextContent("Not verified");
-  expect(cell("web-s2", "Size")).toHaveTextContent("New data 300 MiBLogical 16 GiB");
+  expect(cell("web-s2", "Size")).toHaveTextContent("New 300 MiBdisk 16 GiB");
+  // 짧은 셀 글의 뜻은 title로 남긴다(계획 77-4 리뷰 — 표 가로 넘침).
+  expect(within(cell("web-s2", "Size")).getByTitle(/newly wrote to the store/)).toBeInTheDocument();
   expect(cell("web-s2", "Type")).toHaveTextContent(
-    "ChunkedBase: web-s1Read in full: a chunk of the base backup failed verification",
+    "DedupBase: web-s1Read in full: a chunk of the base backup failed verification",
   );
   expect(within(cell("web-s2", "Type")).getByRole("link", { name: "web-s1" })).toHaveAttribute(
     "href",
@@ -257,7 +259,7 @@ it("makes a job that backs up to a store and copies to another store", async () 
   );
   renderPage(<BackupJobsPage />);
   await user.click(await screen.findByRole("button", { name: "Create" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  const dialog = await screen.findByRole("dialog", { name: "Create backup schedule" });
   await user.type(within(dialog).getByLabelText("Name"), "tiered");
   await user.type(within(dialog).getByLabelText("Time (UTC)"), "03:00");
   // 풀 작업에는 복사본이 없다.
@@ -328,7 +330,7 @@ it("defaults a new job to the first store when the stores arrive after the dialo
   );
   renderPage(<BackupJobsPage />);
   await user.click(await screen.findByRole("button", { name: "Create" }));
-  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  const dialog = await screen.findByRole("dialog", { name: "Create backup schedule" });
   release();
   expect(await within(dialog).findByLabelText("Target")).toHaveValue("store:st");
   await user.type(within(dialog).getByLabelText("Name"), "late");

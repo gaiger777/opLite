@@ -66,6 +66,6 @@ it("translates fixed pause reasons and keeps the others as the server wrote them
 
 it("explains each recommendation", () => {
   const [balance, rule] = PLACEMENT.recommendations;
-  expect(moveReasonText(t, balance!)).toBe("Imbalance −8.5%");
+  expect(moveReasonText(t, balance!)).toBe("Load difference −8.5%");
   expect(moveReasonText(t, rule!)).toBe("Breaks only-b");
 });

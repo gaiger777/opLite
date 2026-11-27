@@ -81,7 +81,7 @@ export function ExportDialog({ vm, onClose }: { vm: Vm; onClose(): void }) {
         id="export-pool"
         label={t("vmExports.dialog.pool")}
         error={errors.pool}
-        hint={t("vmExports.dialog.poolHint")}
+        help={t("vmExports.dialog.poolHint")}
       >
         {(a11y) => (
           <NativeSelect
@@ -105,7 +105,7 @@ export function ExportDialog({ vm, onClose }: { vm: Vm; onClose(): void }) {
       <Field
         id="export-name"
         label={t("vmExports.dialog.name")}
-        hint={t("vmExports.dialog.nameHint")}
+        help={t("vmExports.dialog.nameHint")}
       >
         {(a11y) => (
           <Input
@@ -119,7 +119,7 @@ export function ExportDialog({ vm, onClose }: { vm: Vm; onClose(): void }) {
       <Field
         id="export-guest-os"
         label={t("vmExports.dialog.guestOs")}
-        hint={t("vmExports.dialog.guestOsHint")}
+        help={t("vmExports.dialog.guestOsHint")}
       >
         {(a11y) => (
           <Input
@@ -135,7 +135,8 @@ export function ExportDialog({ vm, onClose }: { vm: Vm; onClose(): void }) {
         id="export-hw-version"
         label={t("vmExports.dialog.hwVersion")}
         error={errors.hwVersion}
-        hint={t("vmExports.dialog.hwVersionHint")}
+        help={t("vmExports.dialog.hwVersionHint")}
+        info="vmExports.hwVersion"
       >
         {(a11y) => (
           <Input

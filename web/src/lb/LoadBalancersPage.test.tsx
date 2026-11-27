@@ -131,10 +131,11 @@ it("shows the empty state before SDN is set up", async () => {
   expect(await screen.findByText("No load balancers")).toBeVisible();
   expect(
     await screen.findByText(
-      "Load balancers need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+      "Load balancers need SDN set up first, under Networking › SDN (virtual networks).",
     ),
   ).toBeVisible();
   expect(screen.getByRole("button", { name: "Create a load balancer" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
   await expectNoAxeViolations(container);
 });
 

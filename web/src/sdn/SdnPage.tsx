@@ -1,4 +1,3 @@
-import { Network } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -26,7 +25,7 @@ export function SdnPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title={t("nav.sdn")} description={t("sdn.pageHint")} />
+      <PageHeader title={t("nav.sdn")} help="sdn" intro={t("help.sdn.intro")} />
       {sdn.data === undefined ? (
         <ListPending error={sdn.error} />
       ) : inWizard || (unset && opened && admin) ? (
@@ -37,7 +36,8 @@ export function SdnPage() {
         />
       ) : unset ? (
         <EmptyState
-          icon={Network}
+          diagram="sdn"
+          help="sdn.page"
           title={t("sdn.empty.title")}
           description={t(admin ? "sdn.empty.admin" : "sdn.none")}
           action={admin && <Button onClick={() => setOpened(true)}>{t("sdn.empty.start")}</Button>}

@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { components } from "@/api/schema";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,7 +19,8 @@ import { flagProblem, splitFlag, toFlag, useCpuFlags } from "@/cpu/cpu";
 export function CpuFlagsInput({
   id,
   label,
-  hint,
+  help,
+  info,
   flags,
   onChange,
   arches,
@@ -27,7 +29,9 @@ export function CpuFlagsInput({
 }: {
   id: string;
   label: string;
-  hint?: string;
+  help?: string;
+  /** 도움말 패널 주제(`helpInfo.<info>`) */
+  info?: string;
   flags: string[];
   onChange(flags: string[]): void;
   /** 이름을 찾을 아키텍처(숨김 목록은 모든 아키텍처). 비면 서버가 노드들의 아키텍처로 고른다. */
@@ -88,7 +92,14 @@ export function CpuFlagsInput({
 
   return (
     <div className="flex flex-col gap-1.5 sm:col-span-2">
-      <Label htmlFor={id}>{label}</Label>
+      {info ? (
+        <div className="flex items-center gap-1">
+          <Label htmlFor={id}>{label}</Label>
+          <InfoButton topic={info} label={label} line={help} />
+        </div>
+      ) : (
+        <Label htmlFor={id}>{label}</Label>
+      )}
       {flags.length > 0 && (
         <ul aria-label={label} className="flex flex-wrap gap-1.5">
           {flags.map((flag, i) => {
@@ -154,7 +165,7 @@ export function CpuFlagsInput({
           autoComplete="off"
           placeholder="avx512vbmi"
           aria-invalid={problem ? true : undefined}
-          aria-describedby={problem ? errorId : hint || limited ? hintId : undefined}
+          aria-describedby={problem ? errorId : help || limited ? hintId : undefined}
           onChange={(e) => {
             setText(e.target.value);
             setProblem(null);
@@ -197,9 +208,9 @@ export function CpuFlagsInput({
           {t(problem.key, { name: problem.name })}
         </p>
       ) : (
-        (hint || limited) && (
+        (help || limited) && (
           <div id={hintId} className="flex flex-col gap-1 text-xs text-muted-foreground">
-            {hint && <p>{hint}</p>}
+            {help && <p>{help}</p>}
             {limited && <p>{t("cpu.flags.allowedOnly", { flags: allowed.join(", ") })}</p>}
           </div>
         )

@@ -7,6 +7,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
@@ -62,7 +63,7 @@ export function ImagesPage() {
   if (!readable) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.images")} />
+        <PageHeader title={t("nav.item.images")} help="images" intro={t("help.images.intro")} />
         <p className="text-sm text-muted-foreground">{t("images.needsRead")}</p>
       </div>
     );
@@ -72,7 +73,9 @@ export function ImagesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="images-title"
-        title={t("nav.images")}
+        title={t("nav.item.images")}
+        help="images"
+        intro={t("help.images.intro")}
         actions={
           admin && (
             <Button variant="outline" onClick={() => setAdding(true)}>
@@ -82,7 +85,6 @@ export function ImagesPage() {
           )
         }
       />
-      <p className="text-sm text-muted-foreground">{t("images.note")}</p>
       <div role="group" aria-label={t("images.arch")} className="flex flex-wrap gap-2">
         {[null, ...ARCHES].map((a) => (
           <Button
@@ -96,80 +98,99 @@ export function ImagesPage() {
           </Button>
         ))}
       </div>
-      <Table aria-labelledby="images-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("images.image")}</TableHead>
-            <TableHead>{t("images.arch")}</TableHead>
-            <TableHead>{t("vms.firmware")}</TableHead>
-            <TableHead>{t("images.checksum")}</TableHead>
-            <TableHead>{t("images.source")}</TableHead>
-            <TableHead>{t("images.volumes")}</TableHead>
-            {(write || admin) && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
+      {catalog.isSuccess && items.length === 0 && arch === null ? (
+        <EmptyState
+          icon={Download}
+          title={t("images.empty")}
+          description={t("help.images.empty")}
+          help="images.page"
+          action={
+            admin && (
+              <Button onClick={() => setAdding(true)}>
+                <Plus />
+                {t("images.add")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="images-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("images.image")}</TableHead>
+              <TableHead>{t("images.arch")}</TableHead>
+              <TableHead>{t("vms.firmware")}</TableHead>
+              <TableHead>{t("images.checksum")}</TableHead>
+              <TableHead>{t("images.source")}</TableHead>
+              <TableHead>{t("images.volumes")}</TableHead>
+              {(write || admin) && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {items.length === 0 && (
+              <TableMessage colSpan={columns} query={catalog} empty={t("images.empty")} />
             )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {items.length === 0 && (
-            <TableMessage colSpan={columns} query={catalog} empty={t("images.empty")} />
-          )}
-          {items.map((entry) => {
-            const active = activeDownloads(entry, tasks.data ?? []);
-            const label = `${entry.title} (${entry.arch})`;
-            return (
-              <TableRow key={`${entry.id}/${entry.arch}`}>
-                <TableCell>
-                  <span className="font-medium">{entry.title}</span>
-                  <span className="block font-mono text-xs text-muted-foreground">{entry.id}</span>
-                </TableCell>
-                <TableCell>{entry.arch}</TableCell>
-                <TableCell>{entry.firmware.toUpperCase()}</TableCell>
-                <TableCell>{t(`images.checksums.${entry.checksum.kind}`)}</TableCell>
-                <TableCell>
-                  <Badge variant={entry.source === "builtin" ? "outline" : "secondary"}>
-                    {t(`images.sources.${entry.source}`)}
-                  </Badge>
-                </TableCell>
-                <TableCell>
-                  {entry.volumes.length > 0 ? entry.volumes.join(", ") : "—"}
-                  {active.map((task) => (
-                    <span key={task.id} className="block text-xs text-muted-foreground">
-                      {describeProgress(task, t) ?? t("images.queued")}
+            {items.map((entry) => {
+              const active = activeDownloads(entry, tasks.data ?? []);
+              const label = `${entry.title} (${entry.arch})`;
+              return (
+                <TableRow key={`${entry.id}/${entry.arch}`}>
+                  <TableCell>
+                    <span className="font-medium">{entry.title}</span>
+                    <span className="block font-mono text-xs text-muted-foreground">
+                      {entry.id}
                     </span>
-                  ))}
-                </TableCell>
-                {(write || admin) && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    {write && (
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("images.downloadNamed", { name: label })}
-                        onClick={() => setDownloading(entry)}
-                      >
-                        <Download />
-                      </Button>
-                    )}
-                    {admin && entry.source === "custom" && (
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("common.deleteNamed", { name: label })}
-                        onClick={() => setRemoving(entry)}
-                      >
-                        <Trash2 />
-                      </Button>
-                    )}
                   </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                  <TableCell>{entry.arch}</TableCell>
+                  <TableCell>{entry.firmware.toUpperCase()}</TableCell>
+                  <TableCell>{t(`images.checksums.${entry.checksum.kind}`)}</TableCell>
+                  <TableCell>
+                    <Badge variant={entry.source === "builtin" ? "outline" : "secondary"}>
+                      {t(`images.sources.${entry.source}`)}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>
+                    {entry.volumes.length > 0 ? entry.volumes.join(", ") : "—"}
+                    {active.map((task) => (
+                      <span key={task.id} className="block text-xs text-muted-foreground">
+                        {describeProgress(task, t) ?? t("images.queued")}
+                      </span>
+                    ))}
+                  </TableCell>
+                  {(write || admin) && (
+                    <TableCell className="text-right whitespace-nowrap">
+                      {write && (
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t("images.downloadNamed", { name: label })}
+                          onClick={() => setDownloading(entry)}
+                        >
+                          <Download />
+                        </Button>
+                      )}
+                      {admin && entry.source === "custom" && (
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t("common.deleteNamed", { name: label })}
+                          onClick={() => setRemoving(entry)}
+                        >
+                          <Trash2 />
+                        </Button>
+                      )}
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {downloading && (
         <ImageDownloadDialog entry={downloading} onClose={() => setDownloading(null)} />
       )}

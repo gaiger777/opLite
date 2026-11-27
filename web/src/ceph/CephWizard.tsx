@@ -126,26 +126,30 @@ function NetworkStep({ onCreated }: { onCreated(task: string): void }) {
         </p>
       )}
       <fieldset disabled={busy} className="flex min-w-0 flex-col gap-4">
-        <Field id="ceph-init-node" label={t("ceph.wizard.initNode")}>
-          <NativeSelect
-            id="ceph-init-node"
-            value={chosen?.id ?? ""}
-            onChange={(e) => {
-              setNode(e.target.value);
-              setPublicNetwork(null);
-            }}
-          >
-            {choices.map((n) => (
-              <NativeSelectOption key={n.id} value={n.id} disabled={!n.status.online}>
-                {n.status.online ? n.name : t("ceph.offlineNode", { name: n.name })}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field id="ceph-init-node" label={t("ceph.wizard.initNode")} help={t("help.ceph.initNode")}>
+          {(a11y) => (
+            <NativeSelect
+              id="ceph-init-node"
+              value={chosen?.id ?? ""}
+              onChange={(e) => {
+                setNode(e.target.value);
+                setPublicNetwork(null);
+              }}
+              {...a11y}
+            >
+              {choices.map((n) => (
+                <NativeSelectOption key={n.id} value={n.id} disabled={!n.status.online}>
+                  {n.status.online ? n.name : t("ceph.offlineNode", { name: n.name })}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
         <Field
           id="ceph-public-network"
           label={t("ceph.publicNetwork")}
-          hint={t("ceph.wizard.publicHint")}
+          help={t("ceph.wizard.publicHint")}
+          info="ceph.networks"
         >
           {(a11y) => (
             <Input
@@ -160,7 +164,8 @@ function NetworkStep({ onCreated }: { onCreated(task: string): void }) {
         <Field
           id="ceph-cluster-network"
           label={t("ceph.clusterNetwork")}
-          hint={t("ceph.wizard.clusterHint")}
+          help={t("ceph.wizard.clusterHint")}
+          info="ceph.networks"
         >
           {(a11y) => (
             <Input

@@ -95,7 +95,12 @@ export function DownloadDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="download-url" label={t("downloads.url")} error={errors.url}>
+      <Field
+        id="download-url"
+        label={t("downloads.url")}
+        error={errors.url}
+        help={t("help.downloads.url")}
+      >
         {(a11y) => (
           <Input
             id="download-url"
@@ -111,7 +116,12 @@ export function DownloadDialog({
           />
         )}
       </Field>
-      <Field id="download-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="download-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.downloads.name")}
+      >
         {(a11y) => (
           <Input
             id="download-name"
@@ -129,7 +139,11 @@ export function DownloadDialog({
         id="download-pool"
         label={t("volumes.pool")}
         error={errors.pool}
-        hint={usable.length === 0 && pools.isSuccess && iso ? t("uploads.noIsoPool") : undefined}
+        help={
+          usable.length === 0 && pools.isSuccess && iso
+            ? t("uploads.noIsoPool")
+            : t("help.downloads.pool")
+        }
       >
         {(a11y) => (
           <NativeSelect
@@ -152,7 +166,7 @@ export function DownloadDialog({
         id="download-sha256"
         label={t("downloads.sha256")}
         error={errors.sha256}
-        hint={t("downloads.sha256Hint")}
+        help={t("downloads.sha256Hint")}
       >
         {(a11y) => (
           <Input
@@ -166,31 +180,46 @@ export function DownloadDialog({
       </Field>
       {!iso && (
         <div className="grid grid-cols-2 gap-4">
-          <Field id="download-source" label={t("uploads.sourceFormat")}>
-            <NativeSelect
-              id="download-source"
-              className="w-full"
-              value={sourceFormat}
-              onChange={(e) => setSourceFormat(e.target.value as typeof sourceFormat)}
-            >
-              <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
-              <NativeSelectOption value="raw">raw</NativeSelectOption>
-              <NativeSelectOption value="vmdk">vmdk</NativeSelectOption>
-            </NativeSelect>
+          <Field
+            id="download-source"
+            label={t("uploads.sourceFormat")}
+            help={t("help.downloads.sourceFormat")}
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="download-source"
+                className="w-full"
+                value={sourceFormat}
+                onChange={(e) => setSourceFormat(e.target.value as typeof sourceFormat)}
+                {...a11y}
+              >
+                <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
+                <NativeSelectOption value="raw">raw</NativeSelectOption>
+                <NativeSelectOption value="vmdk">vmdk</NativeSelectOption>
+              </NativeSelect>
+            )}
           </Field>
-          <Field id="download-format" label={t("volumes.format")}>
-            <NativeSelect
-              id="download-format"
-              className="w-full"
-              value={format}
-              onChange={(e) => setFormat(e.target.value as typeof format)}
-            >
-              {formats.map((f) => (
-                <NativeSelectOption key={f} value={f}>
-                  {f}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+          <Field
+            id="download-format"
+            label={t("volumes.format")}
+            help={t("help.volumes.format")}
+            info="volumes.format"
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="download-format"
+                className="w-full"
+                value={format}
+                onChange={(e) => setFormat(e.target.value as typeof format)}
+                {...a11y}
+              >
+                {formats.map((f) => (
+                  <NativeSelectOption key={f} value={f}>
+                    {f}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
         </div>
       )}

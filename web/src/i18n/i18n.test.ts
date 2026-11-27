@@ -26,6 +26,8 @@ import physicalEn from "@/physical/i18n/en.json";
 import physicalKo from "@/physical/i18n/ko.json";
 import drEn from "@/dr/i18n/en.json";
 import drKo from "@/dr/i18n/ko.json";
+import helpEn from "@/help/i18n/en.json";
+import helpKo from "@/help/i18n/ko.json";
 
 function keys(value: unknown, prefix = ""): string[] {
   if (typeof value !== "object" || value === null) {
@@ -63,6 +65,8 @@ it("has the same keys in every language", () => {
     [physicalEn, physicalKo, "physical"],
     // DR(계획 76 — `dr/strings.ts`)
     [drEn, drKo, "dr"],
+    // 도움말 패널·그림(계획 77-4 — `help/strings.ts`)
+    [helpEn, helpKo, "helpInfo"],
   ] as const) {
     expect(keys(two).sort()).toEqual(keys(one).sort());
     expect(Object.keys(one)).toEqual([top]);
@@ -184,7 +188,7 @@ it("translates API error codes and falls back to the server message", async () =
     'The backup is not ready. Only finished backups can be restored or copied. Details: backup "b" is not ready',
   );
   expect(errorMessage(t, new ApiError(409, "job_disabled", 'backup job "n" is disabled'))).toBe(
-    'The backup job is off. Turn on "Run on schedule" first. Details: backup job "n" is disabled',
+    'The backup schedule is off. Turn on "Run on schedule" first. Details: backup job "n" is disabled',
   );
   expect(errorMessage(t, new ApiError(400, "invalid_ova", "the OVA has no .ovf file"))).toBe(
     "The file is not a usable OVA: the OVA has no .ovf file",
@@ -329,4 +333,14 @@ it("translates the declarative and history error codes in both languages", async
     expect(i18n.getFixedT("en")(`errors.${code}`)).not.toBe(`errors.${code}`);
     expect(i18n.getFixedT("ko")(`errors.${code}`)).not.toBe(`errors.${code}`);
   }
+});
+
+// 첫 화면 묶음은 고른 언어 하나만 받는다(계획 77-4 리뷰): 두 언어 문구를 정적으로 들이지 않는다.
+it("loads the main strings per language, not both up front", async () => {
+  const source = readFileSync(join(import.meta.dirname, "index.ts"), "utf8");
+  expect(source).not.toMatch(/^import .* from "@\/i18n\/(ko|en)\.json";$/m);
+  expect(source).toMatch(/import\("@\/i18n\/ko\.json"\)/);
+  const { loadLanguage } = await import("@/i18n");
+  await loadLanguage("ko");
+  expect(i18n.exists("nav.vms", { lng: "ko" })).toBe(true);
 });

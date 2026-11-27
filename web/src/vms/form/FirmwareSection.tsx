@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 
 import type { Node } from "@/api/types";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -14,20 +15,23 @@ type Reason = { key: string; values?: Record<string, string> } | null;
 function Toggle({
   id,
   label,
-  hint,
+  help,
   checked,
   disabled,
   reason,
   error,
+  info,
   onChange,
 }: {
   id: string;
   label: string;
-  hint: string;
+  help: string;
   checked: boolean;
   disabled: boolean;
   reason: Reason;
   error?: string;
+  /** 도움말 패널 주제(`helpInfo.<info>`) */
+  info?: string;
   onChange: (checked: boolean) => void;
 }) {
   const { t } = useTranslation();
@@ -43,9 +47,10 @@ function Toggle({
           onCheckedChange={onChange}
         />
         <Label htmlFor={id}>{label}</Label>
+        {info && <InfoButton topic={info} label={label} line={help} />}
       </div>
       <p id={`${id}-hint`} className="text-xs text-muted-foreground">
-        {hint}
+        {help}
       </p>
       {reason && (
         // 켠 채로 쓸 수 없으면 오류처럼 알린다.
@@ -105,7 +110,8 @@ export function SecuritySection({
         <Toggle
           id="vm-tpm"
           label={t("vmForm.tpm")}
-          hint={t("vmForm.tpmHint")}
+          help={t("vmForm.tpmHint")}
+          info="vmForm.tpm"
           checked={values.tpm}
           disabled={tpmReason !== null && !values.tpm}
           reason={tpmReason}
@@ -115,7 +121,8 @@ export function SecuritySection({
         <Toggle
           id="vm-secure-boot"
           label={t("vmForm.secureBoot")}
-          hint={t("vmForm.secureBootHint")}
+          help={t("vmForm.secureBootHint")}
+          info="vmForm.secureBoot"
           checked={values.secureBoot}
           disabled={sbLocked !== null || (sbReason !== null && !values.secureBoot)}
           reason={sbReason}
@@ -151,7 +158,8 @@ export function GuestAgentSection({
           <Toggle
             id="vm-guest-agent"
             label={t("vmForm.guestAgentOn")}
-            hint={t(live ? "vmForm.guestAgentLive" : "vmForm.guestAgentHint")}
+            help={t(live ? "vmForm.guestAgentLive" : "vmForm.guestAgentHint")}
+            info="vmForm.guestAgent"
             checked={values.guestAgent}
             disabled={false}
             reason={null}
@@ -164,29 +172,36 @@ export function GuestAgentSection({
               <Toggle
                 id="vm-agent-freeze"
                 label={t("vmForm.agentFreeze")}
-                hint={t("vmForm.agentFreezeHint")}
+                help={t("vmForm.agentFreezeHint")}
                 checked={values.agentFreeze}
                 disabled={false}
                 reason={null}
                 onChange={(agentFreeze) => onChange({ agentFreeze })}
               />
             </div>
-            <Field id="vm-agent-shutdown" label={t("vmForm.agentShutdown")}>
-              <NativeSelect
-                id="vm-agent-shutdown"
-                className="w-full"
-                value={values.agentShutdown}
-                onChange={(e) =>
-                  onChange({ agentShutdown: e.target.value as VmFormValues["agentShutdown"] })
-                }
-              >
-                <NativeSelectOption value="agent">
-                  {t("vmForm.agentShutdownAgent")}
-                </NativeSelectOption>
-                <NativeSelectOption value="acpi">
-                  {t("vmForm.agentShutdownAcpi")}
-                </NativeSelectOption>
-              </NativeSelect>
+            <Field
+              id="vm-agent-shutdown"
+              label={t("vmForm.agentShutdown")}
+              help={t("help.vmForm.agentShutdown")}
+            >
+              {(a11y) => (
+                <NativeSelect
+                  {...a11y}
+                  id="vm-agent-shutdown"
+                  className="w-full"
+                  value={values.agentShutdown}
+                  onChange={(e) =>
+                    onChange({ agentShutdown: e.target.value as VmFormValues["agentShutdown"] })
+                  }
+                >
+                  <NativeSelectOption value="agent">
+                    {t("vmForm.agentShutdownAgent")}
+                  </NativeSelectOption>
+                  <NativeSelectOption value="acpi">
+                    {t("vmForm.agentShutdownAcpi")}
+                  </NativeSelectOption>
+                </NativeSelect>
+              )}
             </Field>
           </>
         )}

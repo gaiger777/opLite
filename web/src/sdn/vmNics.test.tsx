@@ -63,7 +63,7 @@ it("gives an SDN interface addresses and keeps its security groups", async () =>
   expect(ips).toHaveAttribute("placeholder", "Automatic");
   await user.type(ips, "10.10.0.5, 10.10.0.6");
   // cloud-init의 그 NIC 주소는 IPAM이 정한다.
-  await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
+  await user.click(screen.getByLabelText("Set up the guest on first boot (cloud-init)"));
   expect(
     screen.getByText("NIC 1 is on an SDN network: its addresses come from the subnet (IPAM)."),
   ).toBeVisible();

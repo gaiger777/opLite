@@ -277,7 +277,7 @@ it("shows taken names on the name field and explains MAC conflicts", async () =>
   // 서버 메시지는 번역 키가 아니라 정해진 문장에 끼운다.
   expect(await screen.findByText('Name in use: volume "web01-disk0" already exists')).toBeVisible();
   expect(screen.getByLabelText("New VM name")).toHaveAccessibleDescription(
-    'Name in use: volume "web01-disk0" already exists',
+    expect.stringContaining('Name in use: volume "web01-disk0" already exists'),
   );
   // 실패하면 다시 보낼 수 있다.
   expect(screen.getByRole("button", { name: "Import" })).toBeEnabled();

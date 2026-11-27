@@ -42,14 +42,14 @@
     "no_capacity": "The target node cannot take this VM: {{message}}",
     "task_failed": "Task error: {{message}}",
     "internal": "The server failed: {{message}}",
-    "ha_unsupported": "The node has fencing off and cannot run HA VMs.",
+    "ha_unsupported": "The node has node fencing (forced cut-off) turned off and cannot run HA VMs.",
     "firewall_unsupported": "The node has no firewall (nftables) and cannot run VMs with security groups.",
     "security_group_in_use": "A VM interface uses this security group. Remove it from the VM first.",
     "backup_busy": "A task on this backup (backing up, restoring, copying or deleting) is in progress. Try again when it has finished.",
     "backup_not_ready": "The backup is not ready. Only finished backups can be restored or copied.",
     "backup_in_use": "This backup is still needed: {{message}}",
-    "job_running": "The backup job is already running. Wait for the run to finish.",
-    "job_disabled": "The backup job is off. Turn on \"Run on schedule\" first.",
+    "job_running": "The backup schedule is already running. Wait for the run to finish.",
+    "job_disabled": "The backup schedule is off. Turn on \"Run on schedule\" first.",
     "invalid_ova": "The file is not a usable OVA: {{message}}",
     "import_busy": "The import is running, or another task on it has not finished.",
     "import_done": "The VM has already been imported.",
@@ -89,7 +89,7 @@
     "ceph_busy": "Another Ceph task is running. Wait for it to finish: {{message}}",
     "ceph_limit": "{{message}}",
     "ceph_unreachable": "Could not read the Ceph status: {{message}}",
-    "disk_in_use": "The disk cannot hold an OSD: {{message}}",
+    "disk_in_use": "The disk cannot be used as a Ceph disk (OSD): {{message}}",
     "disk_not_empty": "The disk is not empty. Choose to erase it first: {{message}}",
     "cdrom_local": "An ISO from a node-local pool is in a CD-ROM drive: {{message}}",
     "restart_required": "The VM must be restarted first: {{message}}",
@@ -322,7 +322,8 @@
       "protect": "Protection, protect",
       "activity": "Activity",
       "settings": "Settings"
-    }
+    },
+    "floatingIpsKeywords": "floating ip, public ip, external ip, external address, fip, elastic ip"
   },
   "header": {
     "language": "Language",
@@ -693,10 +694,10 @@
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}} cores ({{model}})",
     "firmware": "Firmware",
-    "machine": "Machine type",
+    "machine": "Virtual motherboard (advanced)",
     "restart": "Restart policy",
-    "power": "Desired power",
-    "pid": "QEMU PID",
+    "power": "Power to keep",
+    "pid": "Process ID (QEMU PID)",
     "created": "Created",
     "lastError": "Last error",
     "restartPolicy": {
@@ -704,8 +705,8 @@
       "on-failure": "On failure"
     },
     "powerState": {
-      "running": "Running",
-      "stopped": "Stopped"
+      "running": "Keep on",
+      "stopped": "Keep off"
     },
     "disks": "Disks",
     "volume": "Volume",
@@ -728,7 +729,7 @@
     },
     "haCounts": "Restarts {{restart}}, moves {{relocate}}",
     "haGroup": "HA group",
-    "ruleViolations": "Broken placement rules",
+    "ruleViolations": "Placement rules not met",
     "haError": "HA error",
     "haPolicy": "High availability",
     "haCapacityDetail": "It needs {{need}}, but only {{free}} of {{capacity}} is left outside the {{reserve}} reserve.",
@@ -739,9 +740,9 @@
     "pinnedOn": "Excluded (pinned)",
     "restartNeeded": "Restart needed",
     "withMax": "{{value}} (max {{max}})",
-    "hotplug": "Hotplug",
-    "hotplugPorts": "{{used}}/{{ports}} hotplug ports used",
-    "hotplugOff": "Not available (started without it)",
+    "hotplug": "Add while running",
+    "hotplugPorts": "{{free}} more devices can be added while running ({{used}}/{{ports}} used)",
+    "hotplugOff": "None (restart the VM to add devices)",
     "hotAdded": "Added while running",
     "pendingTitle": "Applies at the next power cycle",
     "pendingNote": "These changes could not be applied while the VM runs. Rebooting inside the guest does not apply them; power cycle the VM (Reboot, or Stop and Start).",
@@ -759,11 +760,11 @@
       "memory_mib": "Memory (MiB)",
       "max_memory_mib": "Maximum memory (MiB)",
       "firmware": "Firmware",
-      "machine": "Machine type",
+      "machine": "Virtual motherboard",
       "cdrom": "CD-ROM drive {{n}}",
       "cdromBoot": "Boot order of CD-ROM drive {{n}}",
       "cdroms": "CD-ROM drives",
-      "cloud_init": "cloud-init",
+      "cloud_init": "First-boot setup",
       "tpm": "TPM 2.0",
       "secure_boot": "Secure Boot",
       "guest_agent": "Guest agent",
@@ -795,7 +796,7 @@
       "lastRecovery": "Last recovery at {{time}}: {{from}} failed; restarted on {{node}} from the replica taken at {{synced}} (writes after that were lost)."
     },
     "cdroms": "CD/DVD",
-    "cloudInit": "cloud-init",
+    "cloudInit": "First-boot setup",
     "bootNone": "No boot device",
     "ciUser": "user {{user}}",
     "ciDefaultUser": "default user",
@@ -947,7 +948,9 @@
       "start": "Start {{name}}",
       "stop": "Stop {{name}}"
     },
-    "addresses": "Addresses"
+    "addresses": "Addresses",
+    "createFirst": "Create your first VM",
+    "fromTemplate": "Quick start from a template"
   },
   "snapshots": {
     "created": "Created",
@@ -1031,22 +1034,22 @@
   "backups": {
     "vm": "VM",
     "pool": "Backup pool",
-    "job": "Job",
-    "jobDeleted": "Deleted job",
+    "job": "Schedule",
+    "jobDeleted": "Deleted schedule",
     "created": "Created",
     "size": "Size",
     "type": "Type",
     "kind": {
       "full": "Full",
       "incremental": "Incremental",
-      "store": "Chunked"
+      "store": "Dedup"
     },
     "parent": "Parent:",
     "fullReason": "Why full: {{reason}}",
     "chainSize": "Chain {{size}}",
     "origin": "From {{cluster}}",
     "originHint": "Copy of backup {{backup}} on cluster {{cluster}}",
-    "originJobHint": "Copy of backup {{backup}} (job {{job}}) on cluster {{cluster}}",
+    "originJobHint": "Copy of backup {{backup}} (backup schedule {{job}}) on cluster {{cluster}}",
     "replicas": "Remote copies",
     "replicaState": {
       "copying": "Copying",
@@ -1059,7 +1062,7 @@
     "replicate": "Copy to remote",
     "replicateNamed": "Copy {{name}} to a remote cluster",
     "replicateDescription": "Sends the backup files to a backup pool of a remote cluster. The copy there is an ordinary backup that can be restored on that cluster. An incremental backup is sent with the earlier backups of its chain that the remote cluster does not have yet, starting from the full backup. Deleting this backup deletes the copy too.",
-    "replicateStoreDescription": "Sends the store backup to a backup store of a remote cluster. Only the chunks that store does not have yet cross the network. The copy there is an ordinary store backup that can be restored on that cluster. Deleting this backup deletes the copy too.",
+    "replicateStoreDescription": "Sends the store backup to a backup store of a remote cluster. Only the pieces that store does not have yet cross the network. The copy there is an ordinary store backup that can be restored on that cluster. Deleting this backup deletes the copy too.",
     "replicateSubmit": "Copy",
     "replicateErrors": {
       "backup_busy": "This backup is being deleted, or it or a backup of its chain is being copied to this remote: {{message}}"
@@ -1120,7 +1123,7 @@
       "securityGroup": "Choose a security group."
     },
     "target": "Target",
-    "targetHint": "A backup pool keeps a qcow2 file per disk. A store keeps each changed chunk once.",
+    "targetHint": "A backup pool keeps one whole file per disk. A backup store keeps each identical piece only once, saving space.",
     "storeTarget": "backup store",
     "poolsGroup": "Backup pools",
     "storesGroup": "Backup stores",
@@ -1129,14 +1132,14 @@
     "verified": "Verified",
     "verify": {
       "ok": "Verified",
-      "failed_one": "{{count}} bad chunk",
-      "failed_other": "{{count}} bad chunks",
+      "failed_one": "{{count}} bad piece",
+      "failed_other": "{{count}} bad pieces",
       "never": "Not verified",
       "at": "Verified {{at}}",
       "neverHint": "Not verified yet"
     },
-    "newData": "New data {{size}}",
-    "logical": "Logical {{size}}",
+    "newData": "New {{size}}",
+    "logical": "disk {{size}}",
     "base": "Base:",
     "fullRead": "Read in full: {{reason}}",
     "verifyNamed": "Verify {{name}} now",
@@ -1146,7 +1149,7 @@
     "convertDescription": "Copies this backup (with its chain) into a backup store as a new backup. The original stays in the backup pool until you delete it.",
     "copy": "Copy to store",
     "copyNamed": "Copy {{name}} to another backup store",
-    "copyDescription": "Copies the backup into another store, sending only the chunks that store does not have. The copy is a separate backup with its own retention.",
+    "copyDescription": "Copies the backup into another store, sending only the pieces that store does not have. The copy is a separate backup with its own retention.",
     "incrementalStoreHint": "Reads only the blocks changed since the last backup of this VM in the store. Every backup still has a complete index, so any backup can be restored or deleted on its own.",
     "browse": "Browse files",
     "browseNamed": "Browse files of {{name}}",
@@ -1158,11 +1161,12 @@
     "securityGroupMap": "Security groups",
     "securityGroupMapHint": "These security groups of the backed-up VM are not on this cluster. Choose one of this cluster for each.",
     "securityGroupFor": "Security group for {{name}}",
-    "chooseSecurityGroup": "Choose a security group"
+    "chooseSecurityGroup": "Choose a security group",
+    "newDataTitle": "What this backup newly wrote to the store (pieces no other backup shares) and the VM disk size"
   },
   "backupJobs": {
-    "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
-    "empty": "No backup jobs.",
+    "pageHint": "Back up the chosen VMs at a set time and delete this schedule's backups the retention rules do not keep. Times are in UTC. The cluster leader runs the schedules, at most 2 backups per node at a time.",
+    "empty": "No backup schedules.",
     "vms": "VMs",
     "schedule": "Schedule (UTC)",
     "keep": "Keep",
@@ -1197,8 +1201,8 @@
     "runNamed": "Run {{name}} now",
     "runRequested": "{{name}} starts at the scheduler's next check.",
     "editNamed": "Edit {{name}}",
-    "deleteNamed": "Delete backup job {{name}}",
-    "createTitle": "Create backup job",
+    "deleteNamed": "Delete backup schedule {{name}}",
+    "createTitle": "Create backup schedule",
     "createDescription": "Backs up the chosen VMs to a backup pool on the chosen days and deletes the backups the retention rules no longer keep.",
     "editTitle": "Edit {{name}}",
     "editDescription": "Changes apply from the next run. A run in progress finishes.",
@@ -1211,15 +1215,15 @@
     "names": "VM names",
     "namesHint": "Separate names with commas.",
     "labels": "Labels",
-    "labelsHint": "KEY=VALUE pairs separated by commas. A VM must have all of them.",
+    "labelsHint": "KEY=VALUE pairs separated by commas (such as tier=prod). Only VMs with all of them are backed up.",
     "at": "Time (UTC)",
-    "atHint": "HH:MM in UTC, such as 03:00.",
+    "atHint": "HH:MM in UTC, such as 03:00. Pick a quiet time.",
     "days": "Days",
     "daysHint": "Leave every day unchecked to run every day.",
     "retention": "Retention",
-    "retentionHint": "Keeps the newest backups (Last), then the newest backup of each day, ISO week and month, counted per VM. Leave all at 0 to keep every backup. Failed backups are deleted after a later success.",
+    "retentionHint": "For example Last 3, Daily 7, Weekly 4 keeps the 3 newest backups + one a day for the last 7 days + one a week for the last 4 weeks, and deletes the rest. All 0 keeps everything.",
     "fullEvery": "Incremental backups between full backups",
-    "fullEveryHint": "With 0, every backup is full. With n, backups are incremental where possible and the backup after n incremental ones is full. For example, daily with 6 makes one full and six incremental backups a week.",
+    "fullEveryHint": "With 6, it repeats 'one full + six of only the changes'. Larger is faster and smaller, but a restore reads more pieces. 0 is always full.",
     "fullEveryShort_one": "Incremental, full after {{count}} incremental backup",
     "fullEveryShort_other": "Incremental, full after {{count}} incremental backups",
     "keepLabel": {
@@ -1232,15 +1236,15 @@
     "replicate": "Remote copy",
     "replicateLabel": "Copy to a remote cluster",
     "noReplicate": "Do not copy",
-    "replicateHint": "Each backup the job makes is copied to this backup pool of the remote cluster. Failed copies are tried again at the next run.",
-    "replicateStoreHint": "Each backup the job makes is copied to this backup store of the remote cluster. Failed copies are tried again at the next run.",
-    "created": "Backup job {{name}} created.",
-    "saved": "Backup job {{name}} saved.",
-    "deleted": "Backup job {{name}} deleted.",
-    "deleteTitle": "Delete backup job {{name}}?",
-    "deleteDescription": "The job stops running. The backups it made are kept.",
+    "replicateHint": "Each backup this schedule makes is copied to this backup pool of the remote cluster. Failed copies are tried again at the next run.",
+    "replicateStoreHint": "Each backup this schedule makes is copied to this backup store of the remote cluster. Failed copies are tried again at the next run.",
+    "created": "Backup schedule {{name}} created.",
+    "saved": "Backup schedule {{name}} saved.",
+    "deleted": "Backup schedule {{name}} deleted.",
+    "deleteTitle": "Delete backup schedule {{name}}?",
+    "deleteDescription": "The schedule stops running. The backups it made are kept.",
     "errors": {
-      "exists": "A backup job with this name already exists.",
+      "exists": "A backup schedule with this name already exists.",
       "names": "Enter at least one VM name.",
       "labels": "Enter at least one KEY=VALUE label.",
       "at": "Enter a time from 00:00 to 23:59.",
@@ -1252,13 +1256,12 @@
     "copiesTo": "copies to {{store}}",
     "copyTo": "Copy to another store",
     "copyStore": "Copy store",
-    "copyHint": "Each backup of the job is copied there once it is ready, such as from a fast local store to S3.",
+    "copyHint": "Each backup of this schedule is also copied there once it is ready, such as from a fast local store to S3.",
     "noCopy": "Do not copy",
     "copyKeepLabel": "{{unit}} (copies)",
     "copyKeepHint": "Retention of the copies in the copy store. Leave all empty to use the job's retention."
   },
   "imports": {
-    "pageHint": "Bring VMware VMs into Orbivisor from OVA files or straight from ESXi or vCenter. Review the settings proposed from the source VM, then run the import to create a stopped VM.",
     "empty": "No imports.",
     "upload": "Upload OVA",
     "uploadTitle": "Upload an OVA",
@@ -1332,7 +1335,7 @@
     },
     "esxi": "Import from ESXi",
     "esxiTitle": "Import from ESXi",
-    "esxiDescription": "The connection is made from the node you are connected to ({{node}}), and the import runs there. The password stays only in that node's memory: if orbivisord restarts there, create the import again.",
+    "esxiDescription": "The node you are connected to ({{node}}) connects to VMware and runs the import. The password stays only in that node's memory, so if that node restarts, create the import again.",
     "host": "Host",
     "port": "Port",
     "user": "User",
@@ -1357,7 +1360,7 @@
   },
   "migrate": {
     "title": "Migrate {{name}}",
-    "description": "The running VM moves to another node without stopping. Disks on node-local pools are copied to the target node. Both nodes need the same QEMU version and CPU.",
+    "description": "Moves the VM to another node without turning it off (live migration). Disks on shared pools stay put and only memory moves; disks on node-local pools are copied over.",
     "node": "Target node",
     "noTarget": "No other online node with the VM's architecture is available.",
     "needsClusterRead": "Choosing a node needs permission to read the cluster (cluster.read on the root).",
@@ -1395,7 +1398,7 @@
       "ready": "Ready"
     },
     "createTitle": "Create an empty volume",
-    "createDescription": "A new disk image in a storage pool. A qcow2 volume takes space only as it is written.",
+    "createDescription": "Creates an empty disk in a storage pool. Attach it to a VM in the VM's settings.",
     "deleteTitle": "Delete volume {{name}}?",
     "deleteDescription": "The disk image and all data on it are deleted.",
     "resize": "Resize",
@@ -1419,7 +1422,7 @@
       "vmRunning": "Stop the VM using it first."
     },
     "showIsos": "Show ISO images",
-    "base": "Base",
+    "base": "Clone source (template)",
     "flatten": "Flatten",
     "flattenNamed": "Flatten {{name}}",
     "flattenTitle": "Flatten volume {{name}}?",
@@ -1563,20 +1566,20 @@
       "provider": "External (provider)"
     },
     "kindHint": {
-      "bridge": "A Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
-      "vxlan": "orbivisord creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789.",
-      "sdn": "An OVN logical switch over Geneve tunnels between the chassis nodes, with subnets, IP addresses that Orbivisor assigns and built-in DHCP. Connect it to a router to reach other networks and the outside.",
-      "provider": "An SDN network on a physical network (physnet) of the nodes, flat or with a VLAN tag. VMs can attach to it directly, and routers and floating IPs use it as their outside. Administrators only."
+      "bridge": "Plugs VMs straight into a bridge the node already has (such as vmbr0). Simplest; VMs only start on nodes with that bridge.",
+      "vxlan": "Joins all nodes with a tunnel so they share one network: a VM sees the same network on any node. Orbivisor creates the bridge on each node.",
+      "sdn": "A virtual switch spanning the nodes, with address ranges (subnets) and automatic addresses (DHCP). Attach it to a router to reach the outside.",
+      "provider": "An SDN network on the nodes' real physical network (untagged or a VLAN). Router outsides and floating IPs (external addresses) come from it. Administrators only."
     },
     "bridge": "Bridge",
     "vlanVni": "VLAN/VNI",
     "vni": "VNI",
-    "vniHint": "1–16777215, not used by another network.",
+    "vniHint": "The number that tells VXLAN networks apart (1–16777215). Pick one no other network uses.",
     "mtu": "MTU",
     "mtuOptional": "MTU (optional)",
-    "mtuHint": "1280–9000. Defaults to 1450: a 1500-byte underlay minus the 50-byte VXLAN header.",
+    "mtuHint": "The largest packet sent at once. Empty means 1450 (1500 minus 50 bytes of tunnel header); usually leave it.",
     "vlanOptional": "VLAN tag (optional)",
-    "vlanHint": "1–4094. The bridge must be VLAN-aware (vlan_filtering 1).",
+    "vlanHint": "A number that splits one switch into separate networks (1–4094). Empty means untagged. The switch port must be a trunk and the bridge must have VLAN awareness (vlan_filtering) on.",
     "nodes": "Nodes with the bridge",
     "vms": "VMs",
     "empty": "No networks.",
@@ -1584,10 +1587,10 @@
     "noNode": "No node has this bridge",
     "noVlanFiltering": "VLAN filtering is off on {{nodes}}",
     "createTitle": "Create a network",
-    "createDescription": "Points VM interfaces at a Linux bridge on the nodes or at a VXLAN network that spans the nodes.",
+    "createDescription": "Creates a network for VM network cards. If this is your first, 'bridge' is the simplest.",
     "created": "Created network {{name}}.",
     "deleteTitle": "Delete network {{name}}?",
-    "deleteDescription": "Bridges you created on the nodes are not changed. For a VXLAN network, orbivisord removes its bridge and VXLAN device from the nodes.",
+    "deleteDescription": "Bridges you created on the nodes are left alone. For a VXLAN network, Orbivisor removes its bridge and tunnel device from the nodes.",
     "deleted": "Deleted network {{name}}.",
     "inUse": "Remove the VM interfaces first.",
     "errors": {
@@ -1600,28 +1603,27 @@
     }
   },
   "securityGroups": {
-    "note": "Firewall rules for VM interfaces. Nodes with nftables apply them right away, also to running VMs.",
     "rules": "Rules",
     "description": "Description",
     "descriptionOptional": "Description (optional)",
     "vms": "VMs",
-    "empty": "No security groups.",
+    "empty": "No security groups (firewall rule bundles).",
     "inUse": "Remove it from the VM interfaces first.",
     "createTitle": "Create a security group",
-    "createDescription": "Creates an empty group. Add its rules on the next page.",
+    "createDescription": "Creates an empty group. You write its rules on the next screen.",
     "created": "Created security group {{name}}.",
     "deleteTitle": "Delete security group {{name}}?",
     "deleteDescription": "No VM interface uses it, so no traffic changes.",
     "deleted": "Deleted security group {{name}}.",
     "notFound": "Security group {{name}} not found",
     "saved": "Saved security group {{name}}.",
-    "order": "Rules are checked from the top, and the first match decides. An interface with groups drops incoming traffic that no rule accepts and sends outgoing traffic that no rule drops. With several groups, the first group's rules come first.",
+    "order": "Rules are checked from the top and the first match decides. With no match, incoming traffic is dropped and outgoing traffic is sent. With several groups, the first group's rules come first.",
     "always": "Always allowed: replies to allowed traffic, ARP, IPv6 neighbor discovery and DHCP replies. A VM can only send from its own MAC address.",
     "direction": "Direction",
     "action": "Action",
     "protocol": "Protocol",
     "ports": "Ports",
-    "remote": "Remote CIDR",
+    "remote": "Remote address (CIDR)",
     "directionN": "Direction of rule {{n}}",
     "actionN": "Action of rule {{n}}",
     "protocolN": "Protocol of rule {{n}}",
@@ -1638,7 +1640,7 @@
     "moveDown": "Move rule {{n}} down",
     "removeRule": "Remove rule {{n}}",
     "addRule": "Add a rule",
-    "noRules": "No rules: incoming traffic is dropped and outgoing traffic is sent.",
+    "noRules": "No rules",
     "errors": {
       "description": "Use at most 200 characters.",
       "ports": "Use a port like 22 or a range like 8000-8080 (1–65535).",
@@ -1647,12 +1649,11 @@
       "icmpv6Remote": "ICMPv6 rules take only IPv6 addresses."
     },
     "nics": "Interfaces",
-    "nicCounts": "{{simple}} simple · {{sdn}} SDN",
-    "sdnNote": "The same groups apply to SDN interfaces through OVN ACLs, with the same order and defaults. Differences: on SDN interfaces, taking away an allow rule also cuts connections already open, and port security blocks spoofed source addresses."
+    "nicCounts": "{{simple}} simple · {{sdn}} SDN"
   },
   "nodes": {
     "address": "API address",
-    "underlay": "Underlay address",
+    "underlay": "Node-to-node address",
     "hypervisor": "Hypervisor",
     "arch": "Architecture",
     "cpus": "CPUs",
@@ -1661,7 +1662,6 @@
     "pools": "Storage pools",
     "vms": "VMs",
     "thisNode": "(this node)",
-    "joinNote": "To add a node, issue a join token on the Cluster page and run orbivisorctl cluster join on the new node.",
     "maintenanceNote": "No new VMs are placed on a node in maintenance. VMs already running there keep running.",
     "startMaintenance": "Enter maintenance",
     "endMaintenance": "End maintenance",
@@ -1695,7 +1695,7 @@
       "thisNode": "You are connected through this node.",
       "online": "The node is online. Run orbivisorctl cluster leave on it."
     },
-    "fencing": "Fencing",
+    "fencing": "Forced reboot on failure",
     "fencingMode": {
       "watchdog": "Watchdog",
       "process": "Process"
@@ -1732,8 +1732,8 @@
     "labels": "Labels",
     "labelsMenu": "Edit labels",
     "labelsTitle": "Labels of {{name}}",
-    "labelsDescription": "Placement rules choose nodes by label (node_tag), such as zone=rack-a. The zone label follows [node] zone in the node's configuration.",
-    "labelsHint": "KEY=VALUE pairs separated by commas. Leave empty to remove all.",
+    "labelsDescription": "Placement rules choose nodes by these labels, such as zone=rack-a. The zone label follows [node] zone in the node's configuration file.",
+    "labelsHint": "name=value pairs separated by commas (for example zone=rack-a, ssd=yes). Leave empty to remove all labels.",
     "labelsSaved": "Labels of {{name}} saved.",
     "errors": {
       "labels": "Use KEY=VALUE pairs separated by commas.",
@@ -1750,19 +1750,19 @@
         "node_online": "The node is online again; it clears the mark itself."
       }
     },
-    "recoverAfter": "Recovers after {{secs}} s",
-    "fenceUnreachable": "Power fence unreachable",
+    "recoverAfter": "Restarts on another node after {{secs}} s",
+    "fenceUnreachable": "Power-off device unreachable",
     "fence": {
-      "menu": "Power-off fencing…",
-      "title": "Power-off fencing of {{name}}",
-      "description": "When the node stops renewing its lease, the leader powers it off with these methods, in order, and recovers its HA VMs without waiting for the watchdog. If every method fails, it waits as before.",
-      "none": "No methods. The leader waits for the watchdog before recovering.",
+      "menu": "Force-isolate failed node…",
+      "title": "Force-isolate {{name}} when it fails (power off)",
+      "description": "When the node stops sending its heartbeat, the leader powers it off with these methods in order and starts its HA VMs on other nodes right away. If every method fails, it waits until the node stops itself (watchdog).",
+      "none": "No methods. When the node dies, the leader waits until it stops itself (watchdog, about 22 seconds by default — about 62 with the safe profile) before recovering.",
       "add": "Add a method",
       "note": "The leader powers nodes off, and neighbour nodes (regular checks), the testing node and the leader read the power, so every node must reach the BMC. IPMI needs ipmitool on every node. Commands get ORBIVISOR_NODE_NAME, ORBIVISOR_NODE_ID and ORBIVISOR_NODE_ADDRESS.",
-      "remove": "Remove fencing",
+      "remove": "Remove force-isolation",
       "test": "Test",
-      "saved": "Saved the power-off fencing of {{name}}.",
-      "removed": "Removed the power-off fencing of {{name}}.",
+      "saved": "Saved the failed-node force-isolation of {{name}}.",
+      "removed": "Removed the failed-node force-isolation of {{name}}.",
       "method": "Method {{n}}",
       "kind": "Method {{n}}",
       "kinds": {
@@ -1782,13 +1782,13 @@
       "lanplus": "IPMI 2.0 (lanplus)",
       "url": "BMC URL",
       "systemId": "System ID",
-      "systemIdHint": "Empty: the only system of the BMC.",
+      "systemIdHint": "The server ID inside the management card. Leave empty when it has only one.",
       "caPem": "BMC CA certificate (PEM)",
       "insecure": "Do not verify the BMC certificate",
       "off": "Power-off command",
-      "offHint": "Runs with /bin/sh -c on the leader. A non-zero exit fails.",
+      "offHint": "Runs with /bin/sh -c on the leader to power the node off. A non-zero exit fails.",
       "status": "Status command",
-      "statusHint": "Prints off or on on its first line. Runs on neighbour nodes, the testing node and the leader.",
+      "statusHint": "Prints off when the power is off and on when it is on, on its first line. Runs on neighbour nodes, the testing node and the leader.",
       "checkedBy": "Read by {{name}}. The power was not changed.",
       "testResult": "Test result",
       "kindColumn": "Method",
@@ -1861,7 +1861,7 @@
       "noChecks": "The node reports no health checks.",
       "since": "Since"
     },
-    "hotplug": "Hotplug: vCPU {{cpu}}, memory {{memory}}",
+    "hotplug": "Add while running: vCPU {{cpu}}, memory {{memory}}",
     "yes": "yes",
     "no": "no",
     "replicas": "Replicas",
@@ -1889,7 +1889,7 @@
     "passwordChanged": "Your password was changed. Sign in with the new password.",
     "newPassword": "New password",
     "confirmPassword": "Confirm the new password",
-    "passwordHint": "At least 8 characters.",
+    "passwordHint": "At least 8 characters. Use one you do not use anywhere else.",
     "errors": {
       "password": "Use at least 8 characters.",
       "mismatch": "The passwords do not match.",
@@ -1902,7 +1902,7 @@
     "realm": "Realm",
     "you": "(you)",
     "empty": "No users.",
-    "roleHint": "Operators change VMs and volumes. Viewers only read. Neither can see accounts.",
+    "roleHint": "Administrator: changes everything, including users and settings. Operator: changes VMs and volumes. Viewer: only looks. Operators and viewers cannot see user accounts.",
     "createTitle": "Create a user",
     "created": "Created user {{name}}.",
     "changeRole": "Change role",
@@ -1930,7 +1930,6 @@
     "reset2faDone": "Two-step verification of {{name}} was reset."
   },
   "realms": {
-    "pageHint": "Users of a realm sign in with their directory (LDAP) or identity provider (OIDC) account as <name>@<realm>. Their role comes from their groups at each sign-in.",
     "adminOnly": "Only administrators can manage realms.",
     "empty": "No realms. Only local users can sign in.",
     "display": "Display name",
@@ -1941,21 +1940,21 @@
       "oidc": "OIDC"
     },
     "url": "URL",
-    "urlHint": "ldap:// always uses StartTLS. ldaps:// uses TLS from the start.",
+    "urlHint": "The directory server address. ldap:// encrypts after connecting (StartTLS); ldaps:// encrypts from the start (for example ldaps://dc1.example.com).",
     "baseDn": "Base DN",
     "bindDn": "Bind DN",
-    "bindDnHint": "Service account used to find users. Leave empty to search anonymously.",
+    "bindDnHint": "The service account used to look users up (for example cn=orbivisor,ou=svc,dc=example,dc=com). Leave empty to look up anonymously.",
     "bindPassword": "Bind password",
     "bindPasswordSaved": "A password is saved. Leave this empty to keep it.",
     "clearBindPassword": "Clear the saved password",
     "userFilter": "User filter",
-    "userFilterHint": "{username} is replaced with the escaped sign-in name.",
+    "userFilterHint": "How to find a user by sign-in name. {username} becomes the name typed (for example (sAMAccountName={username})).",
     "groupAttr": "Group attribute",
     "caPem": "CA certificate (PEM)",
-    "caPemHint": "Trust only this CA for the directory's certificate. Leave empty to use the system roots.",
+    "caPemHint": "Only for a directory server signed by a private CA: paste that CA. Leave empty to use the CAs the system trusts.",
     "timeout": "Timeout (seconds)",
     "groups": "Group to role mapping",
-    "groupsHint": "Group DNs match without regard to case. A user in several groups gets the highest role.",
+    "groupsHint": "The role for each directory group. Group DNs ignore letter case; a member of several groups gets the highest role.",
     "groupN": "Group {{n}}",
     "groupRoleN": "Role of group {{n}}",
     "removeGroupN": "Remove group {{n}}",
@@ -2012,31 +2011,30 @@
     },
     "createOidcTitle": "Create an OIDC realm",
     "issuer": "Issuer",
-    "issuerHint": "https:// URL exactly as the identity provider reports it, including any trailing slash.",
+    "issuerHint": "The IdP address. Enter the issuer from the IdP's settings exactly, including any trailing / (for example https://sso.example.com/realms/corp).",
     "clientId": "Client ID",
     "clientSecret": "Client secret",
     "clientSecretHint": "Leave empty for a public client (PKCE only).",
     "clientSecretSaved": "A secret is saved. Leave this empty to keep it.",
     "clearClientSecret": "Clear the saved secret (public client)",
     "scopes": "Scopes",
-    "scopesHint": "Separated by spaces. openid is required.",
+    "scopesHint": "What to ask the IdP for at sign-in. Separate with spaces; openid is required (for example openid profile email).",
     "usernameClaim": "Username claim",
     "groupsClaim": "Groups claim",
-    "groupsClaimHint": "Claim with the user's groups as a list of strings.",
+    "groupsClaimHint": "The token field with the user's groups (usually groups). Roles per group are matched against these values.",
     "redirectUri": "Redirect URI",
     "redirectUriHint": "Register this address with the identity provider. Each node address you sign in through needs its own. Behind a reverse proxy, register the address the proxy passes as the Host.",
     "copyRedirectUri": "Copy the redirect URI",
-    "oidcCaPemHint": "Trust only this CA for the identity provider's certificate. Leave empty to use the system roots.",
-    "oidcGroupsHint": "Group values from the groups claim match without regard to case. A user in several groups gets the highest role.",
+    "oidcCaPemHint": "Only for an IdP signed by a private CA: paste that CA. Leave empty to use the CAs the system trusts.",
+    "oidcGroupsHint": "The role for each group name. Letter case is ignored; a member of several groups gets the highest role.",
     "oidcTestDescription": "Checks the identity provider's discovery document and signing keys. No one signs in."
   },
   "tokens": {
     "owner": "Owner",
     "created": "Created",
     "empty": "No API tokens.",
-    "note": "Scripts and tools use API tokens. A token has the role of its owner. orbivisorctl login makes one for the CLI.",
     "createTitle": "Create an API token",
-    "createDescription": "The token acts as you, with your role.",
+    "createDescription": "The token makes requests for me, with my role. It is shown only once, so copy it right away.",
     "secretTitle": "Token {{name}} was created",
     "secretDescription": "Copy the token now. It cannot be shown again.",
     "secret": "Token",
@@ -2049,18 +2047,18 @@
   "cluster": {
     "title": "Cluster {{name}}",
     "ca": "Certificate authority",
-    "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches. Browsers show the SHA-256 fingerprint in uppercase hex, in pairs separated by colons or spaces; compare it with the hex after sha256: (letter case does not matter).",
+    "caNote": "Every node's HTTPS certificate is signed by this CA. To stop the browser warning, download the CA and import it into your browser.",
     "acmeHint": "To get or renew public certificates (ACME, Let's Encrypt) for the web UI, go to",
     "copyFingerprint": "Copy the CA fingerprint",
     "downloadCa": "Download the CA",
     "members": "Members",
-    "membersNote": "Voters keep the cluster state. A learner is a standby or joining node with the full Raft log. An observer follows a voter outside Raft, so it adds no work to the leader. A witness votes but runs no VMs.",
+    "membersNote": "The cluster runs only while a majority of voters is alive. With 2 nodes, losing 1 stops the cluster. Use 3 or more nodes, or add a vote-only node (witness — a small node that only votes).",
     "refreshFailed": "Could not refresh the cluster. {{error}}",
     "role": "Role",
     "leader": "Leader",
     "voter": "Voter",
-    "learner": "Learner",
-    "observer": "Observer",
+    "learner": "Joining",
+    "observer": "Read-only member",
     "clusterAddress": "Cluster address",
     "issue": "Issue a join token",
     "issueTitle": "Issue a join token",
@@ -2089,7 +2087,9 @@
       "joined_one": "A node joined the cluster: {{names}}.",
       "joined_other": "Nodes joined the cluster: {{names}}.",
       "waiting": "Waiting for the new node to join…"
-    }
+    },
+    "caCheck": "How to check the fingerprint",
+    "caCheckNote": "Browsers show the SHA-256 fingerprint in uppercase hex, in pairs separated by colons or spaces. Compare it with the hex after sha256: below (letter case does not matter)."
   },
   "remotes": {
     "needsRead": "{{label}}: choosing a remote cluster needs permission to read the cluster (cluster.read on the root).",
@@ -2102,12 +2102,12 @@
     "editNamed": "Edit {{name}}",
     "refreshNamed": "Refresh {{name}}",
     "url": "URL",
-    "urlHint": "https://host[:port] of a node of the remote cluster.",
+    "urlHint": "The address of one node of the remote cluster, such as https://10.0.0.5:8006. Then press 'Get CA'.",
     "getCa": "Get the CA",
     "fingerprint": "CA fingerprint",
     "confirmFingerprint": "This matches the CA fingerprint on the Cluster page of the remote cluster.",
     "token": "API token",
-    "tokenHint": "Create it on the API tokens page of the remote cluster. Its user's role there limits what this cluster can do.",
+    "tokenHint": "Create it on the API tokens page of the remote cluster and paste it here. This cluster can do there only what that token's user may do.",
     "tokenSaved": "A token is saved. Leave this empty to keep it.",
     "cluster": "Cluster",
     "version": "Version",
@@ -2136,9 +2136,9 @@
       "tokenAgain": "Enter the API token again: the URL or CA changed."
     },
     "manageHint": "Add, change or remove the remote clusters this cluster can see. Their status and VMs are in the Remote replication tab.",
-    "replicatingJobs": "Backup jobs that copy to remote clusters",
-    "noReplicatingJobs": "No backup job copies to a remote cluster.",
-    "job": "Backup job",
+    "replicatingJobs": "Backup schedules that copy to remote clusters",
+    "noReplicatingJobs": "No backup schedule copies to a remote cluster.",
+    "job": "Backup schedule",
     "target": "Remote / pool"
   },
   "vmForm": {
@@ -2161,7 +2161,7 @@
     "addExisting": "Attach a volume",
     "addNew": "New empty volume",
     "nicN": "Network interface {{n}}",
-    "userNetwork": "user (NAT)",
+    "userNetwork": "Built-in NAT (user, outbound only)",
     "macAuto": "Automatic",
     "removeNic": "Remove interface {{n}}",
     "addNic": "Add an interface",
@@ -2203,7 +2203,7 @@
       "replicationOwnNode": "The VM's own node cannot hold its replica.",
       "replicationMinutes": "Enter whole minutes from 1 to 1440.",
       "cdromCount": "Up to 4 CD-ROM drives.",
-      "sataPorts": "q35 has 6 SATA ports for SATA disks, CD-ROM drives and the cloud-init drive together.",
+      "sataPorts": "The virtual motherboard (q35) has 6 SATA ports shared by SATA disks, CD-ROMs and the first-boot setup drive.",
       "bootOverflow": "The boot order leaves no room for the CD-ROM drives after it.",
       "ciHostname": "Use a host name or FQDN: letters, digits and - in labels of up to 63 characters.",
       "ciRoot": "Use SSH keys with the default user instead of root.",
@@ -2232,7 +2232,7 @@
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
-    "scheduleNote": "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools.",
+    "scheduleNote": "Takes snapshots automatically and keeps only the newest scheduled ones (manual snapshots stay). All disks must be qcow2 files or all on one pool type (LVM-thin, ZFS, Ceph RBD).",
     "scheduleEvery": "Take snapshots",
     "scheduleOff": "Off",
     "scheduleKeep": "Snapshots to keep",
@@ -2241,15 +2241,15 @@
     "scheduleMixed": "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools, Ceph RBD pools) are mixed, so scheduled snapshots will fail.",
     "scheduleSharedLvm": "{{volume}} is in a shared LVM pool, so scheduled snapshots will fail.",
     "ha": "High availability (HA)",
-    "haHint": "Runs only on nodes with fencing on. If its node loses the cluster majority, the node stops the VM.",
-    "haNodeOff": "{{node}} has fencing off and cannot run HA VMs.",
-    "haNoNode": "No node has fencing on, so HA VMs cannot run.",
+    "haHint": "If the node fails, the VM is restarted on another node automatically. Works only on nodes with failed-node isolation (fencing) on.",
+    "haNodeOff": "{{node}} has failed-node isolation (fencing) off, so it can't run HA VMs.",
+    "haNoNode": "No node has failed-node isolation (fencing) on, so HA VMs can't run.",
     "haRunning": "Turn on HA while the VM is stopped.",
     "haState": "HA state",
     "haStateHint": {
       "started": "If its node fails, HA starts the VM on another node.",
       "stopped": "If its node fails, HA moves the VM to another node but leaves it off.",
-      "ignored": "HA leaves the VM alone for now: no fencing, recovery or counting. The settings are kept."
+      "ignored": "HA leaves this VM alone for now: no isolation, recovery or counting. The settings are kept."
     },
     "haGroup": "HA group",
     "haGroupHint": "Recovers on the group's nodes, higher priority first.",
@@ -2261,22 +2261,22 @@
     "haPriority": "Recovery priority",
     "haPriorityHint": "From 0 to 100. When a node fails, HA restarts VMs with higher priority first.",
     "guestWatch": "Restart when the guest hangs",
-    "guestWatchHint": "Pings the QEMU guest agent (qemu-guest-agent must run in the guest). Once it has answered, no answer for the time below force-restarts the VM. After a guest reboot it waits until the agent answers again. Can be turned on or off only while the VM is stopped.",
+    "guestWatchHint": "Asks the guest agent (qemu-guest-agent) whether the guest is alive and force-restarts the VM if it doesn't answer for the time below. Can be turned on or off only while the VM is stopped.",
     "guestWatchSecs": "Seconds without an answer",
-    "guestWatchSecsHint": "From 30 to 3600.",
+    "guestWatchSecsHint": "30–3600 seconds. Shorter recovers faster but may restart a guest that is only briefly busy.",
     "pinned": "Not moved by the balancer",
-    "pinnedHint": "The balancer never moves this VM. HA recovery, node draining and migrations you start still move it.",
+    "pinnedHint": "Automatic load balancing (the balancer) won't move this VM. HA recovery, node evacuation and manual moves still work.",
     "maxVcpus": "Maximum vCPUs",
-    "maxVcpusHint": "Leave empty for none. While running, vCPU cores can grow up to this on x86_64 nodes. Takes effect from the next start.",
+    "maxVcpusHint": "(Advanced) Reserves room to add vCPUs up to this number while the VM runs. Empty means none. Applies from the next start.",
     "maxMemory": "Maximum memory (MiB)",
-    "maxMemoryHint": "Leave empty for none. While running, memory can grow up to this on Linux nodes with virtio-mem. Takes effect from the next start.",
+    "maxMemoryHint": "(Advanced) Lets you grow memory up to this size while the VM runs (Linux guests). Empty means none. Applies from the next start.",
     "liveHint": "vCPU cores and memory within the maximums apply right away where the node supports it. Other CPU, memory, firmware and machine changes apply at the next restart.",
     "runningNoteLive": "The VM is running and its node cannot change. Hardware changes are applied while it runs where possible; the rest are listed on its page and apply at the next restart.",
-    "restartForHotplug": "The VM was started without hotplug support. Restart it once to add or remove disks and interfaces while it runs.",
-    "disksLive": "While the VM runs, volumes can be attached at the end (virtio-blk only, 8 devices at most) and disks attached while it runs can be removed from the end. Disks it started with cannot change.",
+    "restartForHotplug": "This VM was started without room for adding devices. Restart it once to attach or detach disks and interfaces while running.",
+    "disksLive": "While running you can add disks at the end (virtio-blk only, up to 8) and remove disks added while running, from the end. Disks present at start can't change.",
     "nicsLive": "While the VM runs, interfaces can be added at the end (8 devices at most) and interfaces added while it runs can be removed from the end. The network, model and MAC address of a running interface cannot change; its security groups can.",
     "replication": "Replication",
-    "replicationNote": "Only disks on node-local pools are replicated · Cannot be used together with snapshots. Copies the disks to each target node on a schedule; HA restarts the VM there from the latest copy if its node fails.",
+    "replicationNote": "Copies disks on node-local pools to other nodes on a schedule. If the VM's node fails, HA starts it there from the latest copy. Can't be combined with snapshots.",
     "replicationN": "Replication target {{n}}",
     "replicationChoose": "Choose a node",
     "replicationMinutes": "Every (minutes)",
@@ -2305,9 +2305,9 @@
     "bootOffList": "Not booted",
     "bootOn": "Boot",
     "bootOnNamed": "Boot from {{name}}",
-    "cloudInit": "cloud-init",
-    "ciEnabled": "Configure the guest with cloud-init",
-    "ciNote": "Orbivisor attaches a NoCloud seed drive (label cidata). Cloud images and cloudbase-init read it at first boot.",
+    "cloudInit": "First-boot setup",
+    "ciEnabled": "Set up the guest on first boot (cloud-init)",
+    "ciNote": "On first boot, puts the host name, user, SSH keys and addresses into the guest. Cloud images (Ubuntu, Rocky…) and cloudbase-init on Windows read it.",
     "ciRunning": "Changes apply at the next start of the VM (restart). A reboot inside the guest still sees the old settings.",
     "ciHostname": "Host name",
     "ciHostnameHint": "Empty uses the VM name ({{name}}). A FQDN also sets the domain.",
@@ -2338,13 +2338,13 @@
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "Runs together with the generated user-data, for packages and runcmd.",
     "ciUserDataWarning": "The user-data replaces the generated user-data; user, password and SSH keys are not used.",
-    "windows11Hint": "Filled in for Windows 11: q35, UEFI with Secure Boot, TPM 2.0, guest agent, 2 cores, 4096 MiB, SATA disks and e1000e interfaces, because the Windows installer has no VirtIO drivers. After installing the VirtIO drivers in Windows, switch the disks to virtio-blk and the interfaces to virtio for better speed.",
+    "windows11Hint": "Filled in for Windows 11: UEFI, Secure Boot, TPM 2.0, guest agent, 2 cores, 4096 MiB, a SATA disk and the compatible network device (e1000e) — the Windows installer has no drivers for the fast VirtIO devices. After installing the VirtIO drivers, switch to virtio for speed.",
     "security": "Security",
     "securityLive": "TPM changes apply at the next restart. Secure Boot can only change while the VM is stopped.",
     "tpm": "TPM 2.0",
-    "tpmHint": "A virtual TPM (swtpm). Its state stays on the node the VM runs on and follows the VM. Windows 11 needs it.",
+    "tpmHint": "Virtual TPM chip (swtpm), needed by Windows 11 and BitLocker. Its state follows the VM between nodes.",
     "secureBoot": "Secure Boot",
-    "secureBootHint": "UEFI firmware with Microsoft's keys enrolled. Only signed boot loaders start.",
+    "secureBootHint": "UEFI feature (with Microsoft keys) that boots only signed boot loaders. Recommended for Windows 11; unsigned OSes won't boot.",
     "needsUefi": "Needs UEFI firmware.",
     "tpmNodeOff": "Node {{node}} cannot run a TPM (swtpm is missing or the node is too old).",
     "tpmNoNode": "No node can run a TPM. Install swtpm on the nodes and restart orbivisor.",
@@ -2371,7 +2371,7 @@
       "boot": "Boot order",
       "security": "Security",
       "agent": "Guest agent",
-      "cloudInit": "cloud-init",
+      "cloudInit": "First-boot setup",
       "schedule": "Snapshots",
       "replication": "Replication",
       "review": "Review"
@@ -2388,9 +2388,9 @@
       "blank": "Blank VM",
       "blankHint": "Default values; set everything yourself.",
       "linux": "Linux server",
-      "linuxHint": "2 cores, 2048 MiB, guest agent and cloud-init on.",
+      "linuxHint": "2 cores, 2048 MiB, guest agent and first-boot setup on.",
       "windows": "Windows 11",
-      "windowsHint": "UEFI with Secure Boot, TPM 2.0, SATA disks and e1000e interfaces.",
+      "windowsHint": "UEFI with Secure Boot, TPM 2.0, SATA disk, compatible network device (e1000e).",
       "template": "From a template",
       "templateHint": "Deploy a copy of a template.",
       "noTemplates": "There are no templates yet. Convert a VM on the Templates page.",
@@ -2422,7 +2422,11 @@
       "dscpShort": "DSCP {{dscp}}",
       "noTc": "Node {{node}} can't rate-limit simple-network interfaces (no tc). Saving or starting the VM there is refused; remove the rate limit or pick another node.",
       "noTcAnywhere": "No node can rate-limit simple-network interfaces (no tc). Remove the rate limit or use an SDN network."
-    }
+    },
+    "nicModelVirtio": "virtio — fast virtual device (recommended)",
+    "nicModelE1000e": "e1000e — compatible device (before Windows drivers)",
+    "busVirtio": "virtio-blk — fast virtual device (recommended)",
+    "busSata": "SATA — compatible (before Windows drivers)"
   },
   "console": {
     "connecting": "Connecting…",
@@ -2446,7 +2450,7 @@
     "nodeOnline": "Online",
     "nodeOffline": "Offline",
     "maintenance": "Maintenance",
-    "witness": "Witness",
+    "witness": "Vote-only node",
     "recentTasks": "Recent tasks",
     "allTasks": "All tasks",
     "noLeader": "No leader",
@@ -2471,7 +2475,7 @@
   "settings": {
     "updates": "Updates",
     "channel": "Update channel",
-    "channelHint": "Every node gets Orbivisor packages from this channel. Testing gets new versions before stable.",
+    "channelHint": "Where every node gets Orbivisor updates. Default is stable — testing gets new versions first but they are less proven.",
     "channels": {
       "stable": "Stable",
       "testing": "Testing",
@@ -2482,7 +2486,7 @@
     "errors": {
       "busy": "Another settings change is in progress. Try again."
     },
-    "enterpriseHint": "Enterprise needs an active subscription.",
+    "enterpriseHint": "Enterprise needs an active subscription key.",
     "subscription": {
       "title": "Subscription",
       "states": {
@@ -2502,7 +2506,7 @@
       "nodes": "Nodes",
       "expires": "Expires",
       "key": "Subscription key",
-      "keyHint": "Paste the key you received. It starts with opl1.",
+      "keyHint": "Paste the key you received after purchase (it starts with opl1.). It unlocks the enterprise update channel.",
       "apply": "Apply key",
       "applied": "Subscription key applied.",
       "remove": "Remove key",
@@ -2511,14 +2515,14 @@
       "removed": "Subscription key removed."
     },
     "telemetry": {
-      "title": "Telemetry",
-      "intro": "When on, the leader sends a usage report once a day: counts and versions only, without names, addresses or keys.",
+      "title": "Usage reports (telemetry)",
+      "intro": "When on, the leader sends node and VM counts and versions once a day — no names, addresses or keys. Off by default.",
       "on": "On",
       "off": "Off",
-      "endpoint": "Endpoint",
-      "buildDefault": "Not set (the build's default endpoint is used if it has one)",
-      "endpointHint": "An https:// address. Leave it empty to use the build default.",
-      "saveEndpoint": "Save endpoint",
+      "endpoint": "Report address",
+      "buildDefault": "Not set (the build's default address is used if it has one)",
+      "endpointHint": "The https:// address that receives the report. Usually leave it empty to use the default.",
+      "saveEndpoint": "Save address",
       "id": "Report ID",
       "lastSent": "Last sent",
       "never": "Never",
@@ -2538,15 +2542,15 @@
       "policy": "Policy",
       "policies": {
         "conditional": "Conditional (default)",
-        "freeze": "Freeze",
-        "failover": "Fail over",
-        "migrate": "Migrate"
+        "freeze": "Pause (start again on the same node)",
+        "failover": "Start on another node",
+        "migrate": "Move to other nodes first"
       },
       "hint": {
-        "conditional": "Freeze on reboot, fail over on power off.",
-        "freeze": "Turn the node's HA VMs off and start them on the same node when it comes back. HA does not move them meanwhile.",
-        "failover": "Turn the node's HA VMs off; HA starts them on other nodes after the usual recovery wait.",
-        "migrate": "Live-migrate the node's VMs away first (node drain, up to 10 minutes), then fail over the remaining HA VMs."
+        "conditional": "On reboot, pause (start again on the same node when it returns); on power off, start on another node. Recommended.",
+        "freeze": "Turns the node's HA VMs off and starts them again on the same node when it returns. HA does not move them meanwhile.",
+        "failover": "Turns the node's HA VMs off; after a short wait HA starts them on other nodes.",
+        "migrate": "First moves the VMs to other nodes while running (up to 10 minutes), then starts the remaining HA VMs elsewhere. Slowest, but the VMs do not stop."
       },
       "note": "Applies only when the host reboots or powers off. Stopping or upgrading orbivisord leaves the VMs running.",
       "save": "Save policy"
@@ -2554,18 +2558,18 @@
     "ha": {
       "title": "HA capacity",
       "reserve": "Capacity reserved for HA recovery",
-      "reserveHint": "Memory of HA-capable nodes kept free for recovery. Starting an HA VM that would use it is refused. All running VMs count; migrations are not checked.",
+      "reserveHint": "Keeps enough memory free to take the VMs of a node that dies. 'One node's worth' is recommended. Starting an HA VM that would use this room is refused.",
       "reserveKind": {
         "none": "None",
-        "nodes": "Largest nodes",
+        "nodes": "Number of nodes",
         "percent": "Percent of memory"
       },
       "amount": {
         "nodes": "Nodes (1–8)",
         "percent": "Percent (1–90)"
       },
-      "concurrency": "Concurrent starts per target node",
-      "concurrencyHint": "How many HA VMs the leader starts at once on one node during recovery (1–32, default 4).",
+      "concurrency": "VMs started at once per node during recovery",
+      "concurrencyHint": "How many VMs one node starts at once during recovery (more is faster but causes a load spike). 1–32, default 4.",
       "save": "Save HA capacity",
       "errors": {
         "nodes": "From 1 to 8.",
@@ -2575,14 +2579,14 @@
     },
     "prometheus": {
       "title": "Prometheus",
-      "intro": "Each node can serve its metrics in the Prometheus text format. Scrape every node: each one exports only its own node, VMs and pools, plus the cluster values.",
+      "intro": "Lets Prometheus (a metrics server) collect CPU, memory and disk metrics from every node. Add every node's address as a target — each node exports only its own.",
       "on": "On",
       "off": "Off",
-      "url": "Scrape URL (this node)",
-      "copyUrl": "Copy scrape URL",
-      "auth": "Prometheus signs in with an API token of a viewer or higher. Trust the cluster CA for HTTPS.",
-      "example": "Example scrape configuration",
-      "copyExample": "Copy example scrape configuration",
+      "url": "Metrics URL (this node)",
+      "copyUrl": "Copy metrics URL",
+      "auth": "Prometheus signs in with an API token of a viewer or higher. Make it trust the cluster CA so HTTPS has no warning.",
+      "example": "Example Prometheus configuration (scrape_configs)",
+      "copyExample": "Copy example Prometheus configuration",
       "enable": "Turn on Prometheus endpoint",
       "disable": "Turn off Prometheus endpoint",
       "enabled": "The Prometheus endpoint is on.",
@@ -2618,7 +2622,7 @@
     }
   },
   "haGroups": {
-    "pageHint": "HA VMs in a group are placed and recovered on the group's nodes, higher priority first. When a higher-priority node comes back, a running VM moves back to it by live migration unless the group has No failback.",
+    "pageHint": "Decides on which nodes, and in what order, a failed node's VMs are started again. The node with the larger number is used first, and VMs move back when it returns.",
     "empty": "No HA groups.",
     "nodes": "Nodes and priority",
     "options": "Options",
@@ -2637,11 +2641,11 @@
     "saved": "HA group {{name}} saved.",
     "created": "HA group {{name}} created.",
     "priorityOf": "Priority of {{node}}",
-    "nodesHint": "Priority from 0 to 1000; higher goes first. Empty means 0.",
+    "nodesHint": "Pick the nodes that may take the VMs and give each an order number (0–1000, larger goes first). For example node1=2, node2=1 makes node1 first and node2 second.",
     "restrictedLabel": "Only on the group's nodes",
-    "restrictedHint": "Never place the VMs outside the group. If no group node can take a VM, HA leaves it off and shows why.",
+    "restrictedHint": "VMs never move outside the chosen nodes. If they are all down, the VM waits stopped and shows why.",
     "nofailbackLabel": "No failback",
-    "nofailbackHint": "Do not move VMs back when a higher-priority node comes back.",
+    "nofailbackHint": "When the first-choice node returns, VMs stay where they are instead of moving back (avoids the short extra move).",
     "errors": {
       "exists": "An HA group with this name already exists.",
       "nodes": "Choose at least one node.",
@@ -2649,16 +2653,16 @@
     }
   },
   "haChecks": {
-    "pageHint": "Every node checks these links, ping targets and storage pool paths every 5 seconds and sends the results with its lease. When a check fails on a node for longer than the grace time, the leader reacts as set below. If a check fails on most of the nodes reporting it, the leader treats it as a shared failure and only warns. Only HA VMs are moved.",
+    "pageHint": "Every node checks these links, ping targets and storage pool paths every 5 seconds and sends the results with its heartbeat. When a check fails on a node for longer than the wait time, the reaction set below runs. If many nodes fail together, it is treated as a shared failure and only warns.",
     "autoNote": "Each node also checks its cluster links by itself (cluster-link-1, cluster-link-2 …). Those checks only warn and are shown with the node.",
     "empty": "No HA checks.",
-    "role": "Role",
+    "role": "What it checks",
     "target": "Target",
     "targetKind": "Check",
     "onFail": "On failure",
-    "grace": "Grace",
-    "graceLabel": "Grace (seconds)",
-    "graceHint": "How long the check must fail before the leader reacts: 10 to 600 seconds (at least two check rounds). Empty means 10.",
+    "grace": "Wait time",
+    "graceLabel": "Wait time (seconds)",
+    "graceHint": "The check must keep failing this long before anything happens. Default 10 (10–600). Longer ignores short blips but recovers later.",
     "seconds": "{{n}} s",
     "overrides": "Node overrides",
     "overridesHint": "A different target on some nodes, such as another interface name. Other nodes use the target above.",
@@ -2667,8 +2671,8 @@
     "addOverride": "Add node override",
     "removeOverride": "Remove the override for {{node}}",
     "ofNode": "{{field}} on {{node}}",
-    "roleDefault": "(role default)",
-    "defaultAction": "Role default: {{action}}",
+    "roleDefault": "(default)",
+    "defaultAction": "Default: {{action}}",
     "enabled": "On",
     "disabled": "Off",
     "enabledLabel": "Check on all nodes",
@@ -2679,14 +2683,14 @@
     "pool": "Storage pool",
     "choosePool": "Choose a shared pool",
     "roles": {
-      "management": "Management",
-      "storage": "Storage",
+      "management": "Management network",
+      "storage": "Shared storage connection",
       "vm": "VM network"
     },
     "roleHint": {
-      "management": "The node's management network. Failing it only warns unless you choose power-off fencing.",
-      "storage": "The path to shared storage. VMs with disks on it are affected; by default they are restarted on another node, since a VM with stuck disk I/O cannot be live migrated.",
-      "vm": "A network VMs use. VMs with NICs on the bridges behind the interface are affected; by default they are live migrated."
+      "management": "The network used to manage the node. VMs can keep running without it, so by default it only warns.",
+      "storage": "Whether the node reaches the shared storage holding VM disks. If not, VMs using those disks are started again on another node.",
+      "vm": "A network VMs use. If it fails, VMs on it are moved to another node while running (live migration)."
     },
     "kinds": {
       "link": "Link",
@@ -2723,19 +2727,19 @@
       "duplicate": "An address is given twice.",
       "need": "Need is a whole number from 1 to the number of addresses.",
       "pool": "Choose a shared storage pool.",
-      "poolRole": "Pool checks need the storage role.",
-      "action": "This role does not allow that reaction.",
-      "grace": "Grace is a whole number of seconds from 10 to 600.",
+      "poolRole": "Pool checks are only for 'Shared storage connection'.",
+      "action": "This reaction is not allowed for what it checks.",
+      "grace": "The wait time is a whole number of seconds from 10 to 600.",
       "overrideNode": "Choose the node for this override."
     }
   },
   "placementRules": {
-    "pageHint": "Rules for where VMs run, for all VMs. Hard rules must hold: creating, starting or migrating a VM that would break one is refused. Soft rules are kept when possible. The leader shows broken rules on each VM. VMs already placed are not moved when you add a rule.",
+    "pageHint": "Rules for which nodes VMs run on. Creating, starting or moving a VM that would break a 'hard' rule is refused; 'if possible' rules are kept when possible. Adding a rule does not move VMs already placed.",
     "empty": "No placement rules.",
     "kind": "Rule",
     "vms": "VMs",
     "nodes": "Nodes",
-    "weight": "Weight",
+    "weight": "Importance",
     "state": {
       "enabled": "On",
       "disabled": "Off"
@@ -2748,7 +2752,7 @@
     "deleted": "Placement rule {{name}} deleted.",
     "createTitle": "Create placement rule",
     "editTitle": "Edit {{name}}",
-    "dialogDescription": "Hard rules that contradict each other are refused. Node labels (such as zone=rack-a) can choose nodes.",
+    "dialogDescription": "Conflicting 'hard' rules are refused. Nodes can also be picked by node label (such as zone=rack-a).",
     "saved": "Placement rule {{name}} saved.",
     "created": "Placement rule {{name}} created.",
     "kinds": {
@@ -2777,11 +2781,11 @@
     "vmNames": "VM names",
     "vmNamesHint": "Separate names with commas. VMs you create later may be named here.",
     "vmTag": "VM label",
-    "vmTagHint": "KEY=VALUE, such as app=web. Every VM with this label.",
+    "vmTagHint": "KEY=VALUE (such as app=web). Applies to every VM with this label.",
     "nodeBy": "Choose nodes",
     "nodeTag": "Node label",
-    "nodeTagHint": "KEY=VALUE, such as zone=rack-a. Set node labels on the Nodes page.",
-    "weightHint": "From 1 to 100. Empty means 50. A higher weight matters more.",
+    "nodeTagHint": "KEY=VALUE (such as disk=ssd). Node labels are set on the Nodes page.",
+    "weightHint": "1 to 100, 50 if empty. When 'if possible' rules clash, the larger number wins.",
     "haMayViolate": "HA recovery may break this rule",
     "haMayViolateHint": "If HA can recover a VM only by breaking the rule, it starts the VM anyway and shows the broken rule. Otherwise the VM stays off.",
     "enabled": "On (an off rule is ignored)",
@@ -2796,11 +2800,11 @@
     }
   },
   "placement": {
-    "pageHint": "Every node sends a load summary (CPU over 1 and 5 minutes, memory) with its lease every 5 seconds. Starting VMs, HA recovery and node draining choose the node with the best score. Every 5 minutes the balancer looks at how uneven the nodes are and recommends, or makes, live migrations.",
+    "pageHint": "Every node sends its load (1- and 5-minute CPU, memory) with its heartbeat every 5 seconds. VM start, HA recovery and node evacuation pick the node with the best score. Every 5 minutes the balancer looks at the load difference between nodes and suggests or makes live migrations.",
     "mode": "Mode",
     "policy": "Policy",
-    "threshold": "Threshold",
-    "imbalance": "Imbalance",
+    "threshold": "Move threshold",
+    "imbalance": "Load difference between nodes",
     "imbalanceValue": "{{total}} (CPU {{cpu}}, memory {{mem}})",
     "lastRun": "Last run",
     "nextRun": "Next run",
@@ -2821,13 +2825,13 @@
     },
     "policyHint": {
       "balance": "Spread load evenly across nodes.",
-      "pack": "Fill busy nodes first, keeping others free. The balancer only fixes broken hard rules."
+      "pack": "Fills busy nodes first and keeps others empty (to save power or for maintenance). The balancer only fixes broken 'hard' rules."
     },
-    "thresholdHint": "From 1 to 50 percent. The balancer starts moving VMs when the imbalance (the mean of the CPU and memory spread across nodes) is above this and goes on until it is below 0.8 times this. A node whose CPU or memory use is more than twice this above the average is relieved even when the imbalance is lower.",
+    "thresholdHint": "Suggest moves when the load difference between nodes is above this (1–50%). Default 15%. Smaller moves more often; larger waits for a bigger difference.",
     "pausedReasons": {
       "off": "The mode is off.",
       "pack": "The policy is pack, so the balancer does not move VMs for balance.",
-      "fewNodes": "Fewer than two nodes have a recent load summary."
+      "fewNodes": "Fewer than two nodes have a recent load report."
     },
     "nodes": "Node load",
     "cpu": "CPU",
@@ -2837,14 +2841,14 @@
     "memUsed": "Used",
     "memAllocated": "Allocated",
     "vms": "VMs",
-    "age": "Summary age",
+    "age": "Since last report",
     "ageSecs": "{{n}} s",
-    "noSummary": "No summary",
-    "noSummaryHint": "No recent load summary: the score uses the other nodes' mean CPU and allocated memory.",
+    "noSummary": "No report",
+    "noSummaryHint": "No recent load report. The score uses the other nodes' average CPU and allocated memory.",
     "noNodes": "No nodes.",
     "recommendations": "Recommendations",
     "applied": "Moves started",
-    "empty": "No recommendations.",
+    "empty": "No VMs to move right now.",
     "vm": "VM",
     "from": "From",
     "to": "To",
@@ -2854,7 +2858,7 @@
       "balance": "Balance",
       "rule": "Rule"
     },
-    "reasonBalance": "Imbalance −{{gain}}",
+    "reasonBalance": "Load difference −{{gain}}",
     "reasonRule": "Breaks {{rules}}",
     "apply": "Apply",
     "applyNamed": "Apply: move {{vm}} to {{node}}",
@@ -2868,7 +2872,6 @@
     }
   },
   "ceph": {
-    "pageHint": "A Ceph cluster that Orbivisor installs and runs on the cluster nodes: monitors, managers and OSDs on whole disks, with RBD pools registered as storage pools. To use an existing Ceph cluster, create a Ceph RBD storage pool instead.",
     "none": "No Ceph cluster is set up. An administrator can set one up here.",
     "noNodes": "No node can take this.",
     "offlineNode": "{{name}} (offline)",
@@ -2928,9 +2931,9 @@
       "addDescription": "The node installs the Ceph packages and runs a standby manager that takes over when the active one stops."
     },
     "osd": {
-      "add": "Add OSD",
-      "addTitle": "Add a Ceph OSD",
-      "addDescription": "The node installs the Ceph packages and makes an OSD (BlueStore on LVM) on the whole disk.",
+      "add": "Add Ceph disk (OSD)",
+      "addTitle": "Add a Ceph disk (OSD)",
+      "addDescription": "The chosen disk becomes Ceph storage (an OSD) as a whole. The node installs the Ceph packages, and what is on the disk is erased.",
       "wipeAndAdd": "Erase and add OSD",
       "typeDevice": "Type {{device}} to erase all data on it",
       "wipeWarning": "The disk is not empty: {{reasons}}. Everything on it is erased."
@@ -2943,7 +2946,7 @@
       "cephPoolHint": "Leave empty to use the storage pool name.",
       "storagePool": "Storage pool",
       "size": "Copies (size)",
-      "sizeHint": "{{hosts}} hosts have OSDs that are up. Each copy is kept on a different host.",
+      "sizeHint": "{{hosts}} nodes have Ceph disks up. Each copy is kept on a different node.",
       "sizeOne": "Size 1 keeps a single copy: data is lost when that disk fails.",
       "sizeTwo": "Size 2 can lose data when one copy is down; 3 is recommended.",
       "singleConfirm": "I understand that there is no redundancy",
@@ -2974,14 +2977,14 @@
         "network": "Node and network",
         "progress": "Create",
         "mons": "Monitors",
-        "osds": "OSDs",
+        "osds": "Ceph disks (OSDs)",
         "pool": "Pool",
         "clients": "Client packages"
       },
       "networkHint": "The first monitor and manager run on this node. Nodes need the same Ceph release, synchronised clocks (NTP) and open ports 3300, 6789 and 6800-7300/tcp.",
       "initNode": "First node",
       "publicHint": "The network of monitors and clients (CIDR). Filled in from the node's address; leave empty to let the server choose it the same way.",
-      "clusterHint": "Optional separate network for OSD replication (CIDR).",
+      "clusterHint": "Optional separate network (CIDR) for Ceph disks to copy data to each other. Empty uses the network above.",
       "create": "Set up Ceph",
       "stages": "Setup steps",
       "failed": "Setting up Ceph failed: {{error}}",
@@ -2991,14 +2994,14 @@
       "haveMons": "Monitors now: {{n}} ({{names}})",
       "haveOsds": "Nodes with OSDs: {{names}}",
       "haveHosts": "Hosts with OSDs up: {{n}}",
-      "monsHint": "Add monitors on two more nodes (three are recommended), one at a time. You can skip this.",
-      "osdsHint": "Add OSDs on whole disks of the nodes. Disks that are not empty must be erased; disks in use cannot be chosen.",
+      "monsHint": "Add a monitor on two more nodes, one each. With three monitors (a majority of 2), Ceph keeps running when one node is down. You can skip this.",
+      "osdsHint": "Add each node's empty disks as whole Ceph disks (OSDs). Disks with data must be erased; disks in use cannot be chosen.",
       "poolHint": "Create a Ceph pool and register it as a storage pool. Add OSDs first.",
       "clientsHint": "Optionally install the Ceph client packages on nodes without Ceph daemons so that their VMs can use the pools."
     },
     "empty": {
       "title": "No Ceph cluster",
-      "admin": "Set up a Ceph cluster that Orbivisor installs and runs on the cluster nodes, step by step.",
+      "admin": "Step by step, join the empty disks of three nodes into one storage every node uses. Orbivisor installs and runs Ceph on the nodes.",
       "start": "Start the Ceph setup"
     }
   },
@@ -3018,7 +3021,6 @@
   },
   "isos": {
     "upload": "Upload ISO",
-    "note": "ISO images are kept in directory and NFS pools and can be in the CD-ROM drives of many VMs at once. An ISO in a node-local pool keeps its VMs on that node.",
     "usedBy": "Used by",
     "empty": "No ISO images.",
     "progressFor": "Download of {{name}}",
@@ -3029,7 +3031,6 @@
     "deleteDescription": "The image file is deleted. Snapshots whose VM had it in a drive keep it from being deleted."
   },
   "templates": {
-    "note": "A template is a VM that cannot be started. Deploying makes its disks linked clones (thin copies sharing the base) in the same pool, or full copies where the pool cannot hold linked clones.",
     "empty": "No templates. Choose \"Convert to template\" in a stopped VM's menu or download one from the image library.",
     "disks": "Disks",
     "clones": "Linked clones",
@@ -3077,7 +3078,7 @@
     "nics": "NIC networks",
     "nicNetwork": "nic{{n}} network",
     "keepNetwork": "Keep ({{network}})",
-    "ciNote": "With cloud-init on, only the fields you fill change the template's settings. For several VMs leave the host name empty (the VM name is used).",
+    "ciNote": "With first-boot setup on, only the fields you fill in override the template. When deploying several, leave the host name empty (each VM's name is used).",
     "start": "Start after deploying",
     "reason": {
       "notStopped": "Only a stopped VM can become a template.",
@@ -3099,25 +3100,27 @@
       "hostname": "Several VMs cannot share one host name. Leave it empty to use the VM names.",
       "staticIp": "Several VMs cannot share one static address."
     },
-    "nicIps": "Interface {{n}} IP addresses"
+    "nicIps": "Interface {{n}} IP addresses",
+    "emptyTitle": "No templates yet",
+    "fromImage": "Get one from the image library",
+    "fromVm": "Turn a VM into a template"
   },
   "images": {
     "needsRead": "The image catalog needs permission to read the system (system.read on the root). Ask an administrator.",
-    "note": "Well-known cloud images. The downloading node checks each image against the publisher's checksum file and can make a template from the disk right away.",
     "add": "Add entry",
     "arch": "Architecture",
     "allArches": "All",
     "image": "Image",
-    "checksum": "Checksum",
+    "checksum": "File check",
     "checksums": {
       "sha256": "SHA-256",
       "sha512": "SHA-512",
-      "sums": "Checksum file"
+      "sums": "Publisher's checksum file"
     },
-    "source": "Source",
+    "source": "Provided by",
     "sources": {
-      "builtin": "Built-in",
-      "custom": "Custom"
+      "builtin": "Built in",
+      "custom": "Your admin"
     },
     "volumes": "Downloaded volumes",
     "empty": "No catalog entries.",
@@ -3136,7 +3139,7 @@
     "addTitle": "Add a catalog entry",
     "addDescription": "An image entry for this cluster only. Use the same id for each architecture; built-in ids cannot be used.",
     "id": "id",
-    "idHint": "Lowercase letters, digits, ., _ and -, up to 63 (e.g. myos-1.0).",
+    "idHint": "Lowercase letters, digits, . and -, up to 57; start and end with a letter or digit (e.g. myos-1.0).",
     "title": "Title",
     "os": "Distribution",
     "version": "Version",
@@ -3195,7 +3198,7 @@
     "time": "Time",
     "summary": "{{title}}, last {{range}}: {{values}}",
     "summaryField": "{{field}} average {{avg}}, max {{max}}, min {{min}}",
-    "witness": "Witness nodes keep no metrics history.",
+    "witness": "Vote-only nodes (witnesses) keep no metrics history.",
     "clusterLoad": "Cluster load",
     "nodeUnreachable": "{{node}} (did not answer)",
     "nodeUnsupported": "{{node}} (older version)",
@@ -3350,24 +3353,24 @@
       "unitHint": "Units: CPU and other % values in percent, memory in MiB, disk and network in bytes per second.",
       "percent": "Used above (%)",
       "ops": "Task kinds",
-      "opsHint": "For example vm-start, vm-migrate. Leave empty for every task.",
+      "opsHint": "Notify only when tasks of these kinds fail (for example vm-start, vm-migrate). Leave empty for every task.",
       "role": "Ports to watch",
       "roles": {
-        "uplink": "Uplink and underlay ports only",
-        "any": "Every LAN port"
+        "uplink": "Uplink and node-to-node ports only",
+        "any": "All LAN ports"
       },
       "ports": "Port names",
-      "portsHint": "A pattern with * and ? (for example eno*). Leave empty for every port.",
+      "portsHint": "Port names to watch. * and ? work (for example eno*). Leave empty for every port.",
       "forSecs": "For (seconds)",
-      "forSecsHint": "The condition must hold this long before it notifies (0 to 86400).",
+      "forSecsHint": "The condition must last this long before notifying. 60–300 s filters out short spikes (0–86400).",
       "noTargets": "There are no notification targets. Create one first.",
       "repeatSecs": "Repeat every (seconds)",
-      "repeatSecsHint": "Notify again while the alert lasts. 0 sends once; otherwise 60 to 604800.",
+      "repeatSecsHint": "While the alert stays, notify again at this interval. 0 notifies once; otherwise 60–604800 s.",
       "sendResolved": "Notify when resolved",
       "nodes": "Only nodes",
       "vms": "Only VMs",
       "plans": "Only recovery plans",
-      "namesHint": "Names separated by commas. Leave empty for all.",
+      "namesHint": "Watch only these names (separated by commas). Leave empty for all.",
       "enabled": "Rule is on",
       "errors": {
         "name": "Use 1-63 lowercase letters, digits and '-', not starting or ending with '-'.",
@@ -3384,7 +3387,6 @@
     },
     "targets": {
       "adminOnly": "Only administrators can manage notification targets.",
-      "pageHint": "Alert rules send to these targets by name. Passwords, tokens, header values and webhook URL paths are never shown again.",
       "testSent": "Test notification sent to {{name}}.",
       "testFailed": "Test notification to {{name}} failed: {{error}}",
       "kind": "Kind",
@@ -3422,16 +3424,16 @@
         "none": "None"
       },
       "user": "User",
-      "userHint": "Leave empty to send without signing in.",
+      "userHint": "The SMTP sign-in user. Leave empty to send without signing in.",
       "password": "Password",
       "secretSaved": "A value is saved. Leave empty to keep it.",
       "clearPassword": "Remove the saved password",
       "from": "From",
       "to": "To",
-      "toHint": "Up to 20 addresses separated by commas.",
+      "toHint": "Who gets the notification. Up to 20 addresses, separated by commas.",
       "url": "URL",
       "urlSaved": "The path and query are hidden. Leave the URL as it is to keep it.",
-      "urlHint": "http:// or https:// address that receives a POST.",
+      "urlHint": "The http:// or https:// address that receives the notification by POST. For Slack or Teams, the webhook URL made in that app.",
       "format": "Format",
       "token": "Token",
       "clearToken": "Remove the saved token",
@@ -3442,7 +3444,7 @@
       "removeHeader": "Remove header {{n}}",
       "addHeader": "Add header",
       "caPem": "CA certificate (PEM)",
-      "caPemHint": "Only trust this CA. Leave empty to use the system CAs.",
+      "caPemHint": "Only for a server with a private certificate: paste its CA. Leave empty to use the CAs the system trusts.",
       "enabled": "Send notifications",
       "errors": {
         "name": "Use 1-63 lowercase letters, digits and '-', not starting or ending with '-'.",
@@ -3485,7 +3487,7 @@
     "import": "VM import",
     "pool": "Storage pool",
     "network": "Network",
-    "backup-job": "Backup job",
+    "backup-job": "Backup schedule",
     "iso": "ISO upload"
   },
   "palette": {
@@ -3504,7 +3506,7 @@
       "volumes": "Volumes",
       "networks": "Networks",
       "securityGroups": "Security groups",
-      "backupJobs": "Backup jobs",
+      "backupJobs": "Backup schedules",
       "haGroups": "HA groups",
       "folders": "Folders",
       "navigation": "Go to",
@@ -3596,7 +3598,8 @@
     "columns": "Columns",
     "open": "Open",
     "addresses": "Addresses",
-    "viewDeleted": "View {{name}} deleted."
+    "viewDeleted": "View {{name}} deleted.",
+    "noMatch": "Nothing matches the search or filter."
   },
   "impact": {
     "vmsAssigned": "VMs assigned to it: {{count}}",
@@ -3607,7 +3610,7 @@
     "volumes": "Volumes in it: {{count}}",
     "backups": "Backups in it: {{count}}",
     "routersUsing": "Routers using it: {{count}}",
-    "fipsUsing": "Floating IPs on it: {{count}}"
+    "fipsUsing": "Floating IPs on this network: {{count}}"
   },
   "center": {
     "title": "Tasks and alerts",
@@ -3622,8 +3625,8 @@
     "retry": "Retry",
     "runJobAgain": "Run job again",
     "retryNamed": "Retry: {{label}}",
-    "jobRunning": "The backup job is running.",
-    "jobDisabled": "The backup job is turned off.",
+    "jobRunning": "The backup schedule is running.",
+    "jobDisabled": "The backup schedule is turned off.",
     "view": "View"
   },
   "capacity": {
@@ -3720,7 +3723,7 @@
     "noQuota": "This folder has no quota of its own.",
     "quotaSaved": "Saved the quota of {{name}}.",
     "badLimit": "Enter a number of 0 or more.",
-    "noLimitHint": "Empty: no limit",
+    "noLimitHint": "The most this folder can use. Leave empty for no limit.",
     "memoryGib": "Memory (GiB)",
     "diskGib": "Disk (GiB)",
     "dim": {
@@ -3741,7 +3744,7 @@
     "boundBy": "Limited by {{path}}",
     "badCount": "Enter a whole number of 0 or more.",
     "hiddenLimits": "Folders above this one that you cannot see may also have quotas. If one of them blocks a change, the error says so.",
-    "networkQuotaDescription": "Limits for this folder and everything below it. Floating IPs are usually the scarce public addresses.",
+    "networkQuotaDescription": "Limits for this folder and everything below it. Floating IPs (external addresses) are usually scarce, so a limit is recommended.",
     "backupGib": "Backups (GiB)"
   },
   "permissions": {
@@ -3766,10 +3769,10 @@
     "added": "Added a permission on {{name}}.",
     "principalKind": "Give to",
     "choose": "Choose…",
-    "typedHint": "Paste the user or group id (from the people who already have access, or from an administrator).",
+    "typedHint": "Enter a user or group id. Pick one from the list below or get it from an administrator.",
     "badPrincipal": "Enter a user or group id.",
-    "propagate": "Also apply to subfolders and what they contain",
-    "propagateShort": "Subfolders",
+    "propagate": "Apply inside the folder and its subfolders",
+    "propagateShort": "Inside",
     "remove": "Remove",
     "removeNamed": "Remove the permission of {{name}}",
     "removeTitle": "Remove the permission of {{name}}?",
@@ -3777,15 +3780,13 @@
     "removed": "Removed the permission.",
     "rootTarget": "Whole cluster",
     "openNamed": "Permissions of {{name}}",
-    "pageHint": "Every permission in the cluster. A permission gives a user or group a role on the whole cluster, a folder (and what is under it) or one object. Permissions add up; there is no deny.",
     "escalation": "You do not hold every permission this needs: {{message}}",
     "noGrantableRole": "No role is within the permissions you hold here.",
     "removeSelf": "This grant gives you access. After removing it you may lose access here, including this tab, and you cannot add it back yourself. Type the name to confirm.",
     "globalHidden": "Users with a cluster-wide role also have access. Only administrators see who they are."
   },
   "roleEditor": {
-    "pageHint": "Built-in roles match the global roles. Custom roles are lists of privileges to use in permissions.",
-    "privileges": "Privileges",
+    "privileges": "What it can do (privileges)",
     "description": "Description",
     "builtin": "built-in",
     "empty": "No roles.",
@@ -3801,7 +3802,6 @@
     "deleted": "Deleted role {{name}}."
   },
   "groupEditor": {
-    "pageHint": "Groups collect users for permissions. Members are local or directory users; a linked directory group adds its members when they sign in.",
     "members": "Members",
     "external": "Directory groups",
     "externalHint": "Users of that realm who belong to the directory group (LDAP DN or OIDC group value) are members.",
@@ -3823,7 +3823,6 @@
     "inUse": "Permissions use this group. Remove them first: {{message}}"
   },
   "twoFactor": {
-    "pageHint": "A second step after your password: an authenticator app code, a passkey or a recovery code.",
     "required": "Required for you",
     "unavailable": "Two-step verification is not available until every node is upgraded.",
     "app": "Authenticator app",
@@ -3863,11 +3862,10 @@
     "enrollRequired": "Your administrator requires two-step verification. Set it up to finish signing in.",
     "orPasskey": "Or use a passkey:",
     "backToLogin": "Back to sign-in",
-    "policyHint": "Require two-step verification for users with these global roles or from these realms. OIDC realms are not listed: the identity provider handles it.",
-    "policyRoles": "Global roles",
-    "policyRealms": "Realms",
+    "policyRoles": "Require for users with these global roles",
+    "policyRealms": "Require for users in these sign-in realms",
     "rpId": "Passkey domain (RP ID)",
-    "rpIdHint": "Optional. Empty: the host name the browser uses."
+    "rpIdHint": "The domain passkeys are bound to (for example opl.example.com). Usually leave it empty to use the host name in the browser's address bar."
   },
   "cpu": {
     "none": "none",
@@ -3903,7 +3901,7 @@
     },
     "flags": {
       "label": "CPU flags",
-      "hint": "Type a flag and press Enter to hide it from the guest (for example avx512vbmi). Click a flag to switch between hidden (−) and on (+).",
+      "hint": "(Advanced) CPU features to hide from or add for the guest. Type a name and press Enter to hide it (e.g. avx512vbmi); click −/+ on a chip to switch. Usually left empty.",
       "liveHint": "CPU model and flag changes apply at the next power cycle (Reboot, or Stop and Start). A reboot inside the guest does not apply them.",
       "hide": "Hide",
       "show": "Turn on",
@@ -3925,7 +3923,7 @@
     },
     "pending": {
       "badge": "CPU change pending",
-      "filter": "CPU change",
+      "filter": "Restart needed (CPU changed)",
       "view": "CPU change pending",
       "required": "Power cycle required: the CPU or its placement changes when the VM is powered off and on by Orbivisor. A reboot inside the guest or a live migration does not apply it.",
       "now": "Power cycle now"
@@ -4001,7 +3999,7 @@
       "label": "CPU policy",
       "shared": "Shared",
       "dedicated": "Dedicated",
-      "hint": "Dedicated gives each vCPU slot (up to the maximum vCPUs) its own physical CPU from the node's dedicated CPUs."
+      "hint": "Shared (default) shares node CPUs with other VMs. Dedicated gives each vCPU its own physical CPU for steady latency."
     },
     "threads": {
       "label": "SMT threads",
@@ -4018,14 +4016,14 @@
       "label": "Emulator threads",
       "shared": "On shared CPUs",
       "isolate": "Own dedicated CPU",
-      "hint": "QEMU's own threads run on the node's shared CPUs, or on one more dedicated CPU."
+      "hint": "Where QEMU's own work for this VM runs. Usually leave it on shared."
     },
     "nodes": {
       "label": "Guest NUMA nodes",
       "off": "None",
       "auto": "Automatic",
       "list": "Per node…",
-      "hint": "Automatic splits the VM only when it is larger than a host NUMA node.",
+      "hint": "Auto (recommended) splits the VM only when it is bigger than one NUMA node of the host.",
       "oneSocket": "With one socket the guest has one NUMA node. Add sockets to split it.",
       "implicitAuto": "Dedicated CPUs and hugepages always use automatic NUMA."
     },
@@ -4034,7 +4032,7 @@
       "default": "Default",
       "strict": "Strict",
       "preferred": "Preferred",
-      "hint": "Bind each guest node's memory to its host NUMA node. Dedicated and hugepages VMs are strict by default."
+      "hint": "Whether guest memory is tied to the matching host NUMA node. Usually leave the default."
     },
     "hugepages": {
       "label": "Hugepages",
@@ -4042,8 +4040,8 @@
       "2M": "2 MiB",
       "1G": "1 GiB",
       "any": "Any (largest first)",
-      "hint": "Back guest memory with the node's reserved hugepages.",
-      "anyHotplug": "With memory hotplug, Any uses 2 MiB pages (memory is hot-added in 2 MiB blocks)."
+      "hint": "Backs guest memory with large pages the node set aside (hugepages). Memory-heavy VMs such as databases get a bit faster.",
+      "anyHotplug": "For a VM whose memory can grow while running, Any uses 2 MiB pages (memory is added in 2 MiB blocks)."
     },
     "list": {
       "title": "Guest NUMA nodes",
@@ -4052,7 +4050,7 @@
       "memory": "Node {{n}} memory (MiB)",
       "add": "Add node",
       "remove": "Remove node {{n}}",
-      "hotplugHint": "These set how the boot memory is split. With memory hotplug, memory above their sum is spread evenly over the nodes (also while the VM runs), so growing the memory does not need a new list."
+      "hotplugHint": "How memory is split at start. For a VM whose memory can grow while running, added memory is spread evenly, so you don't need to edit the list."
     },
     "errors": {
       "count": "Choose a node count that divides the number of sockets (1–8).",
@@ -4062,7 +4060,7 @@
       "listCpusSum": "The vCPU slots must add up to the maximum vCPUs.",
       "listMemorySum": "The node memory must add up to the VM's memory.",
       "requireOdd": "Sibling pairs need an even number of vCPU slots per socket.",
-      "hugepagesHotplug": "1 GiB hugepages cannot be used with memory hotplug.",
+      "hugepagesHotplug": "1 GiB hugepages can't be combined with growing memory while running.",
       "listMemoryOver": "The node memory must not add up to more than the VM's memory.",
       "listMemoryUnit": "The memory above the node list must be a multiple of 2 MiB."
     },
@@ -4089,7 +4087,7 @@
       "guestNode": "Guest node",
       "hostNode": "Host node",
       "pcpu": "Host CPU",
-      "pinningNote": "Slots above the running vCPU count keep their CPU for hotplug."
+      "pinningNote": "Slots beyond the current vCPU count also hold CPUs, for adding vCPUs while running."
     },
     "node": {
       "title": "NUMA topology",
@@ -4171,17 +4169,16 @@
     }
   },
   "sdn": {
-    "pageHint": "OVN that Orbivisor installs and runs: central nodes (NB and SB databases, northd) and a chassis (ovn-controller) on every Linux node. SDN networks are logical switches with subnets, IP addresses and DHCP.",
     "empty": {
       "title": "SDN is not set up",
-      "admin": "Set up OVN on the cluster nodes step by step. Nothing is installed until you start.",
+      "admin": "Pick a few nodes and set it up step by step. Nothing is installed until you press Install.",
       "start": "Start the SDN setup"
     },
-    "none": "SDN (OVN) is not set up. An administrator can set it up here.",
+    "none": "SDN is not set up yet. An administrator can set it up here.",
     "blocked": {
-      "witness": "witness",
+      "witness": "vote-only node",
       "macos": "macOS node",
-      "underlay": "no underlay address",
+      "underlay": "no address between nodes",
       "maintenance": "in maintenance",
       "offline": "offline"
     },
@@ -4205,15 +4202,15 @@
     },
     "subnets": {
       "title": "Subnets",
-      "none": "No subnets: interfaces get no addresses.",
+      "none": "No subnets: VMs get no address on this network.",
       "n": "Subnet {{n}}",
       "cidr": "CIDR",
       "gateway": "Gateway",
-      "gatewayHint": "Optional. Defaults to the first host address; always reserved.",
+      "gatewayHint": "Optional. The address VMs go through to leave the network. Defaults to the first address (such as 10.10.0.1), which is never given to a VM.",
       "dns": "DNS servers",
-      "dnsHint": "Optional, up to 4.",
+      "dnsHint": "Optional. Name server (DNS) addresses told to VMs, up to 4, separated by commas.",
       "pools": "Allocation ranges",
-      "poolsHint": "Optional. Defaults to the whole subnet.",
+      "poolsHint": "Optional. The addresses handed out to VMs automatically. Defaults to the whole subnet.",
       "description": "Description",
       "dhcp": "DHCP",
       "noDhcp6": "IPv6: no DHCP switch here; choose an IPv6 mode for RA or DHCPv6.",
@@ -4229,10 +4226,10 @@
       "conflict": "Someone changed the subnets meanwhile (now: {{subnets}}). Your rows are kept; check them and save again.",
       "noneShort": "none",
       "floating": "Floating IP ranges",
-      "floatingHint": "Optional. Router outside addresses and floating IPs come from here; without it they share the allocation ranges.",
+      "floatingHint": "Optional. Router outside addresses and floating IPs (external addresses) come from here; without it they share the allocation ranges.",
       "floatingFromPools": "from the allocation ranges",
       "ipv6Mode": "IPv6 mode",
-      "ipv6ModeHint": "Router advertisements go out only when the network is a router interface. SLAAC modes need a /64 and give EUI-64 addresses."
+      "ipv6ModeHint": "How VMs get an IPv6 address. If unsure, SLAAC (needs a /64). Works only on networks attached to a router."
     },
     "sheet": {
       "title": "Network {{name}}",
@@ -4271,24 +4268,24 @@
       "lbVip": "Load balancer {{name}} (VIP)",
       "lbMonitor": "Load balancer {{name}} (health checks)"
     },
-    "noChassis": "No node is a ready OVN chassis",
+    "noChassis": "No node is ready for SDN",
     "kindNotReady": "SDN (OVN) — not set up",
     "notReadyHint": "SDN networks need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
     "statusUnknown": "Cannot read the SDN state ({{error}}); the server checks it when you create the network.",
-    "mtuHint": "1280–9000. Defaults to 1442: a 1500-byte underlay minus the 58-byte Geneve header.",
+    "mtuHint": "Empty means 1442 (1500 minus 58 bytes of tunnel header); usually leave it. Raise it if the physical network takes large (jumbo) frames.",
     "wizard": {
       "title": "Set up SDN (OVN)",
       "steps": {
         "centrals": "Central nodes",
         "progress": "Installation",
-        "chassis": "Chassis"
+        "chassis": "Node connectors"
       },
-      "centralsHint": "Central nodes run the OVN NB and SB databases (Raft) and northd. Choose 1, 3 or 5; the first is set up first and the others join it one at a time. Three voting members are chosen for you. Packages are installed with apt.",
+      "centralsHint": "Choose 1, 3 or 5 central nodes that store and hand out the SDN settings (with 3, one can fail and SDN keeps working). The first is set up first and the others join one at a time. Packages are installed with apt.",
       "centralNodes": "Central nodes",
       "voter": "voting member",
       "initNode": "set up first",
       "address": "Central address of the first node (optional)",
-      "addressHint": "The address the databases listen on. Defaults to the node's address; it must be the node's address or one of its cluster link addresses (not loopback or link-local).",
+      "addressHint": "Optional. The address other nodes use to reach this central node. Defaults to the node's address; it must be the node's address or one of its cluster link addresses.",
       "start": "Install",
       "stages": "Setup steps",
       "moreCentrals": "More central nodes",
@@ -4305,7 +4302,7 @@
       "failed": "The setup failed: {{error}}",
       "addFailed": "Adding {{node}} failed: {{error}}",
       "next": "Next",
-      "chassisHint": "Every node that runs VMs on SDN networks must be a ready chassis. Central nodes already are. New nodes that join later are not installed by themselves.",
+      "chassisHint": "Every node that runs VMs on SDN networks needs the connector program (chassis). Central nodes already have it. Nodes that join later do not get it by themselves.",
       "finish": "Finish",
       "installed": "The first central is installed."
     },
@@ -4321,8 +4318,8 @@
       "title": "Last sync",
       "never": "Not synced yet",
       "at": "{{at}}",
-      "caughtUp": "All chassis applied it.",
-      "behind": "Chassis applied {{hv}} of {{nb}}."
+      "caughtUp": "Every node has applied the latest settings.",
+      "behind": "Nodes applied {{hv}} of {{nb}} (settings version)."
     },
     "tasks": "Tasks",
     "running_one": "{{count}} SDN task running",
@@ -4332,7 +4329,7 @@
     "centrals": {
       "title": "Central nodes",
       "add": "Add a central",
-      "hint": "A fixed set you choose (1, 3 or 5). Changing it copies the databases; one change runs at a time.",
+      "hint": "The nodes that store the SDN settings (1, 3 or 5). Changing them copies the data, so one change runs at a time.",
       "address": "Address",
       "nb": "NB",
       "sb": "SB",
@@ -4342,18 +4339,18 @@
       "standby": "standby",
       "removeNamed": "Remove central {{name}}",
       "removeTitle": "Remove the OVN central on {{name}}?",
-      "removeDescription": "An online node leaves the NB and SB databases and stops them; its database files are renamed, not deleted, and it stays a chassis. An offline node is kicked out of the databases by another central instead (its own files are left as they are).",
+      "removeDescription": "An online node leaves the settings databases and stops its central role (its files are renamed, not deleted); it stays a node connector (chassis). An offline node is removed from the databases by another central node instead.",
       "remove": "Remove",
       "addTitle": "Add an OVN central",
-      "addDescription": "Installs the OVN central packages on the node with apt and joins it to the NB and SB databases."
+      "addDescription": "Installs the SDN central packages on the node with apt and joins it to the settings databases."
     },
     "noNodes": "No other node can become a central.",
     "chassis": {
-      "title": "Chassis",
+      "title": "Node connectors (chassis)",
       "installAll": "Install on all nodes",
       "install": "Install",
       "installNamed": "Install the chassis on {{name}}",
-      "encap": "Geneve address",
+      "encap": "Tunnel address (Geneve)",
       "versions": "Versions",
       "versionText": "OVN {{ovn}}, OVS {{ovs}}",
       "missing": "Not installed",
@@ -4378,7 +4375,7 @@
     "serverChecks": "The server checks that SDN (OVN) is set up when you create the network.",
     "strays": {
       "title": "Leftover central databases",
-      "hint": "These nodes may still be members of the OVN database cluster although they are not central nodes, which narrows its failure margin. Remove them.",
+      "hint": "These nodes are not central nodes but may still be members of the settings database, which lowers how many failures it can survive. Remove them.",
       "held": "{{name}} holds OVN central databases but is not a central.",
       "gone": "{{name}} was removed from the cluster but may still be an OVN database member.",
       "chip": "leftover central DB",
@@ -4398,19 +4395,19 @@
       "title": "SDN physical networks",
       "edit": "Edit",
       "editTitle": "SDN settings of {{name}}",
-      "editDescription": "Link physical networks (physnets) to Linux bridges you made on this node, and make the node a gateway candidate for routers.",
+      "editDescription": "Give physical network names to this node's Linux bridges, and choose whether this node can host routers' outside door (gateway).",
       "rows": "Physical networks",
       "name": "Physical network",
       "nameN": "Physical network {{n}}",
       "bridge": "Bridge",
       "bridgeN": "Bridge {{n}}",
-      "bridgeHint": "The bridge must exist on the node. The SDN agent links it to OVS with a veth pair and does not change the bridge.",
+      "bridgeHint": "The bridge must already exist on the node. Orbivisor only plugs into it and does not change its settings.",
       "add": "Add a physical network",
       "remove": "Remove physical network {{n}}",
       "none": "No physical networks.",
       "gateway": "Gateway candidate for routers",
       "priority": "Gateway priority",
-      "priorityHint": "1–1000. Higher goes first; routers spread across candidates with the same priority.",
+      "priorityHint": "1–1000. Higher takes over first; routers spread evenly across nodes with the same value.",
       "gatewayOn": "Gateway candidate, priority {{priority}}.",
       "gatewayOff": "Not a gateway candidate.",
       "gatewayPending": "(the SDN agent has not applied it yet)",
@@ -4420,10 +4417,10 @@
       "removing": "removing",
       "saved": "Saved the SDN settings of {{name}}.",
       "noNode": "No node has physnet {{physnet}} ready",
-      "pickHint": "The name nodes link to a bridge under Cluster & availability › Nodes › a node's SDN physical networks.",
+      "pickHint": "The physical network name tied to a bridge on a node's page (Cluster & availability › Nodes › a node's SDN physical networks).",
       "noneHint": "No node has a physical network yet. Add one on a node's page first (Cluster & availability › Nodes › a node's SDN physical networks).",
-      "vlanHint": "Optional, 1–4094. Without it the network is flat (untagged).",
-      "mtuHint": "1280–9000. Defaults to 1500 (the physical network).",
+      "vlanHint": "Optional, 1–4094. Empty plugs straight into the physical network untagged (flat).",
+      "mtuHint": "1280–9000. Empty means 1500 (same as the physical network). Raise it if the physical switches take jumbo frames.",
       "errors": {
         "name": "Use a lowercase letter, then up to 30 lowercase letters, digits or -.",
         "duplicate": "This physical network is listed twice.",
@@ -4500,15 +4497,14 @@
     }
   },
   "router": {
-    "pageHint": "Routers connect SDN networks to each other and, through an external (provider) network, to the outside with SNAT and floating IPs.",
-    "sdnNotReady": "Routers and floating IPs need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+    "sdnNotReady": "Routers and floating IPs need SDN set up first, under Networking › SDN (virtual networks).",
     "empty": {
       "title": "No routers",
-      "description": "Create a router to connect SDN networks and reach the outside."
+      "description": "Create a router to join SDN private networks or let private VMs reach the internet."
     },
     "create": "Create a router",
     "createTitle": "Create a router",
-    "createDescription": "Pick the SDN networks to connect and, optionally, an external network for the way out.",
+    "createDescription": "Pick the SDN networks to join and, optionally, an external network to reach the outside.",
     "created": "Created router {{name}}.",
     "saved": "Saved router {{name}}.",
     "deleted": "Deleted router {{name}}.",
@@ -4519,15 +4515,15 @@
     "sheetTitle": "Router {{name}}",
     "descriptionOptional": "Description (optional)",
     "external": "External network",
-    "externalHint": "A provider network. Without one, the router only connects its SDN networks to each other.",
+    "externalHint": "The network the router uses to reach the outside (external network). None joins SDN private networks only.",
     "externalIps": "Outside addresses",
-    "externalChangeHint": "Keeping the same network keeps the outside addresses. Floating IPs routed through this router must be detached before you change or clear it.",
+    "externalChangeHint": "Keeping the same network keeps the outside addresses. Floating IPs going through this router must be detached before you change or clear it.",
     "editExternal": "Change",
     "noExternal": "None",
     "noExternalHint": "No external network: the router only connects its SDN networks.",
     "snat": "SNAT",
-    "snatLabel": "Translate inside IPv4 addresses to the outside address (SNAT)",
-    "snatOffHint": "Without SNAT the physical router needs routes to the inside subnets via the router's outside address.",
+    "snatLabel": "Let private VMs reach the internet through the outside address (SNAT)",
+    "snatOffHint": "With SNAT off, VMs' private addresses go out as they are: the outside router then needs its own route back to the private networks.",
     "on": "on",
     "off": "off",
     "interfaces": "Interfaces",
@@ -4548,7 +4544,7 @@
     "gateways": "Gateway nodes",
     "firstGatewayHint": "Top-ranked. The active one is in the router.",
     "nodeHidden": "(node name hidden)",
-    "gatewaysHint": "OVN moves the router's outside port to the next node when the active one fails (BFD). Open SNAT connections are cut then.",
+    "gatewaysHint": "When the active node fails, the next node takes over the router's outside door. Open SNAT connections are cut then.",
     "node": "Node",
     "nodePriority": "Node priority",
     "haPriority": "Rank",
@@ -4573,10 +4569,9 @@
     "gatewayErrorAsk": "No gateway node has the physical network of {{network}} ready, so the router's outside port stays off (no SNAT or floating IPs). Ask an administrator to give a gateway node that physical network."
   },
   "fip": {
-    "pageHint": "Public addresses from an external network, mapped one to one to a VM interface. They are distributed (leave from the VM's node) when that node has the physical network, otherwise the gateway node handles them.",
     "empty": {
       "title": "No floating IPs",
-      "description": "Create a floating IP from an external network and attach it to a routed VM interface."
+      "description": "Create a floating IP from an external network and attach it to a VM interface that reaches the outside through a router."
     },
     "create": "Create a floating IP",
     "createTitle": "Create a floating IP",
@@ -4585,11 +4580,11 @@
     "deleted": "Deleted floating IP {{name}}.",
     "deleteTitle": "Delete floating IP {{name}}?",
     "deleteDescription": "The address goes back to the external network.",
-    "deleteAttached": "It is attached: its NAT goes away and the address goes back to the external network.",
+    "deleteAttached": "It is attached to a VM: the way in from outside goes away and the address goes back to the external network.",
     "attach": "Attach",
     "attachNamed": "Attach {{name}}",
     "attachTitle": "Attach {{name}}",
-    "attachDescription": "Interfaces on SDN networks routed to {{network}} can take it.",
+    "attachDescription": "Interfaces on SDN networks attached to a router that goes out to {{network}} can take it.",
     "attached": "Attached {{name}} to {{vm}}.",
     "detach": "Detach",
     "detachNamed": "Detach {{name}}",
@@ -4598,9 +4593,9 @@
     "detached": "Detached {{name}}.",
     "address": "Address",
     "addressOptional": "Address (optional)",
-    "addressHint": "Leave empty to take the next free one.",
+    "addressHint": "Leave empty to take the next free one. Fill it in only when you need a specific address.",
     "nameOptional": "Name (optional)",
-    "nameHint": "Defaults to the address with dashes (203-0-113-120).",
+    "nameHint": "Optional. Defaults to the address with dashes (203-0-113-120).",
     "network": "External network",
     "noProvider": "No external network you can use",
     "target": "Attached to",
@@ -4608,12 +4603,12 @@
     "hiddenVm": "a VM you cannot see",
     "nic": "Interface",
     "attachOptional": "Attach to (optional)",
-    "nicHint": "Only interfaces on a network that is an interface of a router with this external network, and that have an IPv4 address.",
+    "nicHint": "Only VM interfaces with an IPv4 address, on a network attached to a router that goes out to this external network.",
     "noAttach": "Do not attach",
     "pickNic": "Choose an interface",
     "nicLabel": "{{vm}} #{{n}} ({{network}})",
     "blockedNic": "{{nic}} — {{reason}}",
-    "noRoutableNic": "No interface is routed to this external network yet: connect its network to a router whose external network is this one.",
+    "noRoutableNic": "No interface goes out to this external network yet: attach the VM's network to a router whose external network is this one.",
     "column": "Floating IP",
     "onNic": "Floating IP {{address}}",
     "state": {
@@ -4660,16 +4655,15 @@
     }
   },
   "lb": {
-    "pageHint": "A load balancer spreads one virtual address (VIP) on an SDN network over VM interfaces or addresses (TCP·UDP). Health checks take dead members out; an external VIP opens it to the physical network.",
-    "sdnNotReady": "Load balancers need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+    "sdnNotReady": "Load balancers need SDN set up first, under Networking › SDN (virtual networks).",
     "empty": {
       "title": "No load balancers",
-      "description": "Create a load balancer on an SDN network that is attached to a router."
+      "description": "To put several web servers behind one address, create a load balancer on an SDN network attached to a router."
     },
     "create": "Create a load balancer",
     "createTitle": "Create a load balancer",
     "editTitle": "Edit load balancer {{name}}",
-    "createDescription": "The VIP and the health check addresses come from the subnet pools.",
+    "createDescription": "The VIP and the health check addresses come from the network's allocation ranges.",
     "created": "Created load balancer {{name}} with VIP {{vip}}.",
     "saved": "Saved load balancer {{name}}.",
     "deleted": "Deleted load balancer {{name}}.",
@@ -4714,16 +4708,16 @@
     "noMembersReject": "No members: connections are refused.",
     "descriptionOptional": "Description (optional)",
     "vipNetwork": "VIP network",
-    "vipNetworkHint": "An SDN network with an IPv4 subnet that is an interface of a router.",
+    "vipNetworkHint": "The SDN network for the VIP. It needs an IPv4 subnet and must be attached to a router.",
     "noVipNetwork": "No SDN network attached to a router",
     "vipOptional": "VIP (optional)",
-    "vipHint": "Empty: the next free address of the subnet pool.",
+    "vipHint": "The address clients connect to. Empty takes the next free address of the allocation ranges.",
     "externalOn": "External VIP on {{network}} (the router's external network)",
     "externalNone": "External VIP (the router of this network has no external network)",
     "externalIpOptional": "External VIP address (optional)",
-    "externalIpHint": "Empty: the next free floating IP. It counts toward the folder's floating IP quota.",
+    "externalIpHint": "The floating IP (external address) to reach it from outside. Empty takes the next free floating IP; it counts toward the folder's floating IP quota.",
     "affinityOptional": "Source affinity in seconds (optional)",
-    "affinityHint": "The same client goes to the same member for this long (1 to 65535).",
+    "affinityHint": "Sends the same client to the same member for this many seconds (to keep login sessions, for example). Empty spreads every connection.",
     "addListener": "Add a listener",
     "listenerN": "Listener {{n}}",
     "removeListener": "Remove listener {{n}}",
@@ -4766,7 +4760,6 @@
     "externalHidden": "External VIP (the router's external network isn't visible to you)"
   },
   "topology": {
-    "hint": "Networks, routers, gateways, floating IPs, VMs and load balancers in one picture. Physical networks at the back, routers above their SDN networks, simple networks on the side.",
     "mode": "View",
     "picture": "Picture",
     "list": "List",
@@ -4798,7 +4791,7 @@
     },
     "empty": {
       "title": "No networks",
-      "description": "Create a network to see it here.",
+      "description": "Create a network and this page draws how it connects to VMs and routers.",
       "create": "Create a network"
     },
     "moreTitle_one": "{{count}} more VM on {{network}}",
@@ -4887,7 +4880,7 @@
       "parallel": "Use 1 to 8."
     },
     "planHint": "Nothing has changed yet. Fix an address, leave a VM out or change the mode, then plan again. Blocked VMs are skipped.",
-    "instanceIdBanner": "Some VMs use cloud-init: their instance-id changes, so on the next boot the guest runs its per-instance setup again (for example new SSH host keys).",
+    "instanceIdBanner": "Some VMs use first-boot setup (cloud-init): their instance-id changes, so on next start the guest repeats its first-boot steps (SSH host keys and the like).",
     "replan": "Plan again",
     "planTable": "Migration plan",
     "include": "Move",
@@ -5061,11 +5054,11 @@
     }
   },
   "backupStores": {
-    "pageHint": "Deduplicated chunk stores for backups, in a backup pool or an S3-compatible bucket, optionally encrypted on the nodes. Back up to a store from the Backups tab of a VM or from a backup job.",
+    "pageHint": "Backup stores that keep each identical piece once, in a backup pool or an S3-compatible bucket, optionally encrypted on the nodes. Back up to a store from the Backups tab of a VM or from a backup schedule.",
     "create": "Create a backup store",
     "empty": {
       "title": "No backup stores",
-      "description": "A backup store keeps each changed 4 MiB chunk once, verifies it on a schedule and can encrypt it before it leaves the node. Old backups in backup pools keep working."
+      "description": "A backup store cuts VM disks into 4 MiB pieces, keeps each identical piece once, verifies them on a schedule and can encrypt them before they leave the node."
     },
     "backend": "Backend",
     "backendKind": {
@@ -5077,8 +5070,8 @@
     "plain": "Not encrypted",
     "snapshots": "Snapshots",
     "stored": "Stored",
-    "dedup": "Dedup",
-    "lastGc": "Last GC",
+    "dedup": "Space saved",
+    "lastGc": "Last cleanup",
     "lastVerify": "Last verify",
     "openNamed": "Open {{name}}",
     "readOnlyBadge": "Read-only",
@@ -5090,21 +5083,21 @@
     },
     "never": "Never",
     "verifyOk": "Verified",
-    "verifyFailed_one": "{{count}} bad chunk",
-    "verifyFailed_other": "{{count}} bad chunks",
-    "gcRunning": "GC: {{phase}}",
+    "verifyFailed_one": "{{count}} bad piece",
+    "verifyFailed_other": "{{count}} bad pieces",
+    "gcRunning": "Cleanup: {{phase}}",
     "gcPhase": {
-      "mark": "marking",
+      "mark": "finding used pieces",
       "wait": "waiting for backups",
-      "sweep": "sweeping"
+      "sweep": "removing unused pieces"
     },
-    "gcRemoved_one": "Removed {{count}} chunk ({{size}})",
-    "gcRemoved_other": "Removed {{count}} chunks ({{size}})",
+    "gcRemoved_one": "Removed {{count}} piece ({{size}})",
+    "gcRemoved_other": "Removed {{count}} pieces ({{size}})",
     "deleteTitle": "Delete backup store {{name}}?",
     "deleteDescription": "Only the store resource is removed. The data in the bucket or directory stays; remove it by hand. A store that still has backups cannot be deleted.",
     "deleted": "Backup store {{name}} deleted.",
     "createTitle": "Create a backup store",
-    "createDescription": "Choose where the chunks go, whether they are encrypted, and when garbage collection and verification run.",
+    "createDescription": "Choose where the pieces go, whether they are encrypted, and when space cleanup and verification run.",
     "steps": "Steps",
     "step": {
       "backend": "Backend",
@@ -5130,7 +5123,7 @@
     "caPem": "CA certificate (optional)",
     "caHint": "PEM of the CA that signed the endpoint certificate. Leave empty to trust the system roots.",
     "readOnly": "Attach read-only",
-    "readOnlyHint": "Opens a store another cluster owns, to restore from it (disaster recovery). Backups, deletes and GC are blocked; Scan adds its backups here.",
+    "readOnlyHint": "Opens a store another cluster owns, to restore from it (disaster recovery). Backups, deletes and cleanup are blocked; Scan adds its backups here.",
     "storeId": "Store ID",
     "storeIdHint": "The directory name under store/ in the pool, written by the cluster that made the store.",
     "encrypt": {
@@ -5140,8 +5133,8 @@
       "escrow": "Unlock with the escrow passphrase"
     },
     "encryptHint": {
-      "none": "Chunks are only compressed. Whoever can read the store can read the backups.",
-      "generate": "Chunks, VM settings and firmware state are encrypted with AES-256-GCM on the node. You get a recovery key once, right after creating the store.",
+      "none": "Pieces are only compressed. Whoever can read the store can read the backups.",
+      "generate": "Pieces, VM settings and firmware state are encrypted with AES-256-GCM on the node. You get a recovery key once, right after creating the store.",
       "recovery": "Opens or creates a store with an existing key, such as a copy of another store.",
       "escrow": "Opens a store whose key was wrapped with a passphrase inside the store."
     },
@@ -5150,9 +5143,9 @@
     "unlockHint": "The passphrase given when the key was escrowed.",
     "escrowPassphrase": "Escrow passphrase (optional)",
     "escrowHint": "Also wraps the key with this passphrase inside the store, so the store can be opened without this cluster. At least 8 characters. The passphrase is not saved.",
-    "scheduleHint": "Times are UTC. GC removes chunks no backup uses any more; verification re-reads chunks and checks them.",
-    "gcAt": "GC time (UTC)",
-    "gcDays": "GC days",
+    "scheduleHint": "Times are UTC. Space cleanup removes pieces no backup uses any more; verification re-reads pieces and checks them.",
+    "gcAt": "Cleanup time (UTC)",
+    "gcDays": "Cleanup days",
     "verifyScheduled": "Verify on a schedule",
     "verifyAt": "Verify time (UTC)",
     "verifyDays": "Verify days",
@@ -5160,8 +5153,8 @@
     "reverifyHint": "Backups verified longer ago than this are verified again.",
     "verifyMode": "Verify mode",
     "mode": {
-      "full": "Full (read every chunk)",
-      "metadata": "Metadata (check chunks exist)"
+      "full": "Full (read all of the backup's pieces)",
+      "metadata": "Metadata (check pieces exist)"
     },
     "verifyNew": "Verify each new backup right after it is made",
     "errors": {
@@ -5212,22 +5205,22 @@
     "owner": "Owner cluster",
     "usage": "Usage",
     "usageLine": "{{snapshots}} snapshots, {{stored}} stored for {{logical}} of disks ({{ratio}})",
-    "notCounted": "Not counted yet (GC counts it).",
-    "badChunks": "Bad chunks",
-    "gcNow": "Run GC now",
+    "notCounted": "Not counted yet (cleanup counts it).",
+    "badChunks": "Bad pieces",
+    "gcNow": "Clean up now",
     "verifyNow": "Verify now",
     "check": "Check connection",
     "editSettings": "Settings",
     "scan": "Scan",
     "takeOver": "Take over",
     "schedules": "Schedules and results",
-    "gc": "GC",
+    "gc": "Space cleanup",
     "verify": "Verification",
     "nextAt": "Next: {{at}}",
     "verifyPolicy": "Verify again after {{days}} days, {{mode}}",
     "verifyNewShort": "· new backups too",
     "noVerify": "No scheduled verification",
-    "verifyCounts": "{{snapshots}} backups, {{chunks}} chunks",
+    "verifyCounts": "{{snapshots}} backups, {{chunks}} pieces",
     "reach": "Reachable from nodes",
     "checkOk": "This node read the store and the key matches.",
     "checkFailed": "Check failed: {{error}}",
@@ -5412,5 +5405,441 @@
       "volume_not_found": "This volume is no longer in the session. Open the backup again.",
       "file_restore_too_large": "The selection is too large: {{message}}"
     }
+  },
+  "help": {
+    "open": "Help: {{name}}",
+    "title": "Help",
+    "aboutPage": "About this page",
+    "closeIntro": "Hide the introduction (the ⓘ next to the title shows it again)",
+    "more": "Learn more",
+    "pools": {
+      "intro": "Where VM disks (volumes) and backups are kept. A 'local' pool is separate on each node; a 'shared' pool is used by all nodes. VMs on shared pools move between nodes quickly and HA can restart them anywhere (on local pools, only where a replica exists).",
+      "empty": "To create VMs you need a pool for their disks. The simplest is a folder (directory) on each node.",
+      "name": "The name screens and VM settings use for this pool. Lowercase letters, digits and - only (not at the start or end); it cannot be changed later.",
+      "vg": "An LVM volume group that already exists on the nodes (check with `vgs`).",
+      "thinpool": "The LVM area that only takes the space VMs actually write. In `lvs`, its attributes start with 'twi'.",
+      "sharedVg": "The shared volume group on a LUN every node sees (check with `vgs`).",
+      "dataset": "A ZFS dataset that already exists on the nodes (e.g. tank/opl, see `zfs list`). VM disks become zvols under it.",
+      "cephPool": "An RBD pool that already exists in Ceph. With Orbivisor-managed Ceph, use a pool made on the Ceph page.",
+      "namespace": "Separates names when several clusters share one Ceph pool. Usually left empty."
+    },
+    "cluster": {
+      "intro": "The nodes in this cluster and their roles. To add a server, issue a join token to get a join command, then run it on the new server.",
+      "ttl": "Run the join command on the new node within this time. Default 1 hour — shorter is safer when you join right away."
+    },
+    "nodes": {
+      "intro": "The servers (nodes) in the cluster. Open a row for its metrics, CPU and VMs; use the ⋯ menu for maintenance (move VMs off), labels and removal. To add a node, issue a join token on the Cluster page.",
+      "fence": {
+        "address": "The address of the node's remote management card (BMC, iDRAC, iLO), such as 10.0.0.101 — the card's IP, not the node OS.",
+        "port": "The IPMI port. Usually 623.",
+        "user": "The management card user. It must be allowed to power the server on and off.",
+        "password": "The management card user's password. It is not shown again after saving.",
+        "url": "The Redfish address of the management card, such as https://10.0.0.101",
+        "caPem": "The CA (PEM) that signed the management card's certificate. Empty accepts only certificates the system trusts."
+      }
+    },
+    "networks": {
+      "intro": "Networks are what VM network cards plug into. A 'bridge' network on a node's existing bridge is the simplest (administrators only); with several nodes, pick 'VXLAN' or 'SDN' so a VM sees the same network on any node.",
+      "empty": "VMs can already reach the outside through the user network (NAT). Create a network so VMs can talk to each other or to your LAN.",
+      "name": "The name you pick in a VM's network card settings. 1 to 63 lowercase letters, digits or - (not at the start or end).",
+      "bridge": "A Linux bridge already set up on the nodes, such as vmbr0. VMs on this network only start on nodes that have it."
+    },
+    "backups": {
+      "intro": "Backups of every VM, including VMs that were deleted. Make one now from the VM's Backups tab, or let a backup schedule make them automatically.",
+      "empty": "Press 'Back up now' on a VM's Backups tab, or create a backup schedule to back up automatically at a set time.",
+      "vmEmpty": "This VM has no backups yet. Back it up now or add it to a backup schedule.",
+      "pool": "The storage pool that holds the backup files. A pool on another disk or a NAS keeps backups even if the node's disk fails.",
+      "restoreName": "The name of the new VM made from the backup. Use another name while the original VM still exists.",
+      "restorePool": "Where the new VM's disks go. A shared pool allows HA and fast migration.",
+      "restoreNetwork": "The network of this cluster to use instead of the one the backed-up VM was on.",
+      "restoreSecurityGroup": "The security group to use instead of one this cluster does not have. Its rules apply to the new VM.",
+      "convertStore": "The backup store to copy this backup into. The original backup stays. A store keeps each identical piece only once, saving space.",
+      "copyStore": "Another backup store to hold a copy, such as S3 in addition to a fast local store.",
+      "replicateRemote": "Another Orbivisor cluster that receives the copy, so you can restore there if this site is lost.",
+      "remotePool": "The backup pool on the remote cluster that holds the copy.",
+      "remoteStore": "The backup store on the remote cluster that holds the copy. Only pieces it does not have are sent."
+    },
+    "backupJobs": {
+      "intro": "Backs up the chosen VMs automatically on the chosen days and time, and deletes this schedule's backups that the retention rules (last n, daily, weekly, monthly) do not keep. Times are UTC; each node runs at most 2 backups at once.",
+      "empty": "Create a backup schedule to back up VMs automatically at a set time, such as every night, and delete old ones.",
+      "name": "The name of this schedule in lists, such as nightly-prod. It cannot be changed later.",
+      "target": "Which VMs this schedule backs up. Choosing by label also picks up VMs that get the same label later."
+    },
+    "settings": {
+      "intro": "Settings that apply to the whole cluster at once: where updates come from, what happens on host shutdown and HA, the VM CPU baseline, usage reports and metrics export. Only administrators can change them.",
+      "haAmount": {
+        "nodes": "How many nodes may die at once. That much memory, starting with the largest nodes, is kept free. Usually 1.",
+        "percent": "The share of all HA node memory kept free. For example with 4 nodes, 25% is one node's worth."
+      }
+    },
+    "subscription": {
+      "intro": "A subscription key unlocks the enterprise update channel and support. Every feature works without one."
+    },
+    "sdn": {
+      "intro": "Builds virtual switches and routers across the nodes, so a VM keeps the same private network on any node. (Similar to VMware NSX.)",
+      "chassis": "A connector program that runs on each node where SDN VMs start. SDN VMs only start on nodes marked ready.",
+      "moveNode": "The node that takes over the first setup. Pick one that is online and can install the SDN packages.",
+      "centralNode": "A node that shares the job of storing and handing out the SDN settings. Add them one at a time to reach 1, 3 or 5.",
+      "cidr": "The address range of this network, such as 10.10.0.0/24 (gateway 10.10.0.1, VMs .2–.254). It cannot change once saved.",
+      "gatewaySaved": "The gateway of a saved subnet cannot change. To change it, remove the subnet and add it again.",
+      "subnetDescription": "Optional. A note on what this address range is for (up to 200 characters).",
+      "dhcp": "On: VMs get the address Orbivisor assigned automatically when they start. Off: the VM must still use that address (shown on the VM page) — traffic from other addresses is blocked (cloud-init sets it for you).",
+      "physnetName": "The name SDN uses for this physical network, such as ext. You pick it when creating an external network.",
+      "physnetBridge": "The Linux bridge on this node that reaches that physical network, such as vmbr1. It may differ per node.",
+      "gateway": "On: this node can host a router's external gateway. Turn it on only on nodes that reach the outside network."
+    },
+    "backupStores": {
+      "intro": "A backup store keeps identical content only once. Backups are cut into pieces and each identical piece is stored once; cleanup removes pieces no backup uses to give the space back.",
+      "name": "The name screens and backup schedules use for this store. Lowercase letters, digits and - only (not at the start or end).",
+      "backend": "Where the pieces are actually kept: a backup pool (a folder or NFS on the nodes) or an S3-compatible bucket (AWS S3, MinIO and so on).",
+      "region": "The region of the bucket, such as us-east-1. Without regions (like MinIO), us-east-1 usually works.",
+      "bucket": "The S3 bucket that holds the pieces. Create it first.",
+      "accessKeyId": "The access key ID of an S3 user that can read, write, list and delete objects in the bucket (without delete, cleanup fails and space keeps growing).",
+      "verifyMode": "Full re-reads every piece the checked backups use, to find damage (slow). Metadata only checks those pieces exist (fast).",
+      "gcAt": "When the space cleanup starts (UTC, HH:MM). Pick a time with few backups running, such as 05:00.",
+      "escrowPassphrase": "The passphrase that wraps the key (8+ characters). With the store and this passphrase you can open the backups even without this cluster.",
+      "passphraseAgain": "Type the same passphrase again to catch typos."
+    },
+    "images": {
+      "intro": "Cloud images of well-known Linux distributions. Download (⬇) puts one in a pool as a disk and can also make a template you can stamp VMs from right away.",
+      "empty": "There are no images to download. An administrator can add in-house images to the list.",
+      "pool": "The storage pool for the downloaded disk. For a template used on several nodes, a shared pool (NFS, Ceph) is best.",
+      "volumeName": "The name of the downloaded disk (volume). Empty uses the suggested name shown in grey.",
+      "makeTemplate": "When on, a stopped template VM is made from the disk after the download. VMs can be cloned from a template in seconds.",
+      "templateName": "The name of the template VM. You pick it by this name in Templates and when creating VMs.",
+      "network": "The network the template's network card joins. Cloned VMs start on it too.",
+      "cpus": "Number of virtual CPUs. 2 by default; clones can change it.",
+      "memory": "Memory size. 2048 MiB (2 GiB) by default.",
+      "size": "Cannot be smaller than the image. It can grow later but never shrink. Empty keeps the image size.",
+      "add": {
+        "title": "The name shown in the list (e.g. Corp Ubuntu 24.04).",
+        "os": "The distribution name (e.g. ubuntu), used to filter the list.",
+        "version": "The distribution version (e.g. 24.04).",
+        "url": "The http or https address the nodes download the image from. The nodes must be able to reach it.",
+        "arch": "The CPU type of the image. It must match the nodes for the VM to start.",
+        "firmware": "How the image boots. Modern cloud images mostly use UEFI, older ones BIOS.",
+        "format": "The format of the downloaded file. Cloud images are usually qcow2.",
+        "checksumKind": "How to check that the downloaded file is not broken or tampered with. Pick the checksum file when the publisher has one.",
+        "sumsUrl": "The address of the publisher's checksum file (e.g. …/SHA256SUMS). The node finds the image's hash in it.",
+        "digest": "The image hash (hex) the publisher announced. The download fails if the file does not match.",
+        "defaultUser": "The login user built into the image (e.g. ubuntu). Used as the default when making a template.",
+        "minSize": "The size of the image's disk. Template disks cannot be made smaller than this."
+      }
+    },
+    "isos": {
+      "intro": "ISO files for installing operating systems. Upload one or download it from a URL, then put it in a VM's CD-ROM to install.",
+      "empty": "You need an ISO file to install an OS. Upload one from your computer or download it straight from the publisher's URL."
+    },
+    "downloads": {
+      "url": "The http or https address of the file. A node that uses the pool must reach it directly.",
+      "name": "The name for the downloaded file. Filled in from the URL's file name.",
+      "pool": "The storage pool for the file. A shared pool is best when VMs on several nodes will use it.",
+      "sourceFormat": "The format of the file being downloaded. VMware disks are vmdk.",
+      "format": "The format kept in the pool. qcow2 takes only what is written and supports snapshots; raw is a little faster."
+    },
+    "uploads": {
+      "file": "The file on your computer. It goes to the node you are connected to.",
+      "name": "The name for the uploaded file. Filled in from the file name.",
+      "pool": "The storage pool for the file. Only pools usable on the node you are connected to are listed.",
+      "sourceFormat": "The format of the file. VMware disks are vmdk; cloud images are usually qcow2."
+    },
+    "imports": {
+      "intro": "Bring VMs from VMware into Orbivisor, from an OVA file or straight from ESXi or vCenter. Review the proposed settings and run it to get a stopped VM.",
+      "empty": "To bring a VMware VM over, upload an OVA file or connect to ESXi.",
+      "ovaFile": "An .ova file exported from VMware. It goes to the node you are connected to.",
+      "ovaName": "The name of this import. Filled in from the file name.",
+      "vmName": "The name of the VM to create. It must not clash with another VM.",
+      "sockets": "Number of virtual CPU sockets. Keeping the source value is safest.",
+      "cores": "Cores per socket. Sockets × cores is the VM's vCPU count.",
+      "memory": "The VM's memory (MiB), taken from the source VM.",
+      "firmware": "How the source VM booted. Changing it may stop the VM from booting; keep the source value.",
+      "diskBus": "How disks are attached. Keep the suggestion made for the source OS: virtio-blk is fast but the guest needs its driver (most Linux has it); SATA works without drivers (suggested for Windows). A Windows guest without the driver does not boot on virtio-blk.",
+      "nicModel": "The network card type. Keep the suggestion: virtio is fast but needs a guest driver (most Linux has it); e1000e works without drivers (suggested for Windows).",
+      "network": "Choose which Orbivisor network the card on this source network joins.",
+      "esxiHost": "The name or IP address of the ESXi host or vCenter.",
+      "esxiPort": "The HTTPS port, usually 443.",
+      "esxiUser": "The VMware user to log in as (e.g. root, administrator@vsphere.local).",
+      "esxiPassword": "That user's password. It is kept only in the memory of the node running the import, never stored.",
+      "esxiName": "The name of this import. Filled in from the chosen VM's name."
+    },
+    "volumes": {
+      "intro": "The VM disks (volumes). Create an empty disk, upload or download an image as a disk, grow disks or delete them.",
+      "empty": "There are no disks yet. Creating a VM creates its disk, and you can also create an empty disk here.",
+      "name": "The name of the disk. VM settings attach it by this name.",
+      "pool": "The storage pool for the disk. On a shared pool the VM moves to other nodes quickly.",
+      "size": "The disk size the VM sees. A qcow2 disk only takes what is written. It can only grow later.",
+      "format": "qcow2: takes only what is written, supports snapshots (recommended). raw: one plain file, a little faster, but no snapshots on directory and NFS pools.",
+      "newSize": "Only a larger size works. Grow the partition inside the guest afterwards."
+    },
+    "ceph": {
+      "intro": "Orbivisor sets up Ceph itself: spare disks on 3 or more nodes become one storage that every node uses. To use an existing Ceph, create a Ceph RBD pool under Storage pools.",
+      "initNode": "The node for the first monitor and manager. Any node works; the others are added in the next steps.",
+      "monNode": "The node for the new monitor. Three monitors (an odd number) on different nodes keep Ceph running when one node is down.",
+      "mgrNode": "The node for a standby manager. It takes over when the active manager's node goes down.",
+      "osdNode": "The node that gives a disk to Ceph. Choose one of its empty disks below.",
+      "poolName": "The name this pool goes by in Storage pools and VM disks.",
+      "size": "How many copies of the data are kept. 3 is recommended; copies are always on different nodes."
+    },
+    "routers": {
+      "intro": "A router joins SDN private networks to each other and, through an external network, lets private VMs reach the internet (SNAT). To let the outside reach a VM, attach a floating IP (external address).",
+      "name": "The name of this router. 1 to 63 lowercase letters, digits or - (not at the start or end).",
+      "description": "Optional. A note on what this router joins (up to 200 characters).",
+      "snat": "On: private VMs share the router's one outside address to reach the internet. Usually leave it on.",
+      "addInterface": "An SDN network to attach to this router. Its VMs then go through the router to other networks and the outside.",
+      "destination": "The address range to send along this route, such as 10.20.0.0/16.",
+      "nexthop": "The address of the next device toward that destination. It must be on a network the router is attached to, such as 10.10.0.254."
+    },
+    "remotes": {
+      "intro": "Orbivisor clusters at other sites, and the backup schedules that send copies there. If this whole site is lost, you can restore on the remote cluster.",
+      "empty": "Register an Orbivisor cluster at another site to send backup copies there. If this cluster is the standby site, register the main site and use a DR plan to bring its VMs back up here.",
+      "name": "The name this cluster uses for the remote cluster, such as dr-site. It cannot be changed later."
+    },
+    "fip": {
+      "intro": "A floating IP (external address) ties one address of an external network to one private VM, so the outside can reach that VM directly (for example, to publish a web server). A private-range address on the external network works too.",
+      "network": "The external network to take the address from: a free one from its floating IP ranges."
+    },
+    "alerts": {
+      "intro": "When something goes wrong — CPU stays high, a node goes down — an alert fires and a notification goes where you chose (email, Slack and more). Rules decide what to watch; notification targets decide where to send.",
+      "empty": "No alerts are firing now. When a problem matches a rule, it shows up here.",
+      "historyEmpty": "Use Test on a notification target to check that notifications really arrive."
+    },
+    "alertRules": {
+      "empty": "A rule watches a condition such as \"node CPU above 90% for 5 minutes\" and sends a notification.",
+      "name": "The name of this rule (for example node-cpu-high). Lowercase letters, digits and - (not at the start or end); it cannot change later.",
+      "condition": "What to watch. States (a value over a threshold, or something that lasts, such as a node being down — can have a duration) or events (something that happens once, such as a task failing or an HA recovery — no duration).",
+      "metric": "The value to watch.",
+      "op": "Above or below the threshold.",
+      "value": "The value that triggers the alert.",
+      "percent": "Notify when the pool is this full. 80–90 is usual.",
+      "role": "Which ports to watch for a lost link. Default: uplink, underlay and service ports with addresses, plus bridges an administrator took down.",
+      "severity": "How serious the alert is. Critical: fix now; warning: will become a problem; info: good to know.",
+      "sendResolved": "Also sends one notification when the problem clears."
+    },
+    "notificationTargets": {
+      "intro": "Where alert notifications go (email, Slack, Teams, a webhook and more). After creating one, press Test to check it arrives, then choose its name in an alert rule.",
+      "empty": "Alerts reach email or chat only through a notification target. Create one place to receive them.",
+      "kind": "How to send. Email (SMTP) or webhook (Slack, Teams, ntfy, Gotify or your own server).",
+      "name": "The name alert rules choose (for example ops-mail). Lowercase letters, digits and - (not at the start or end); it cannot change later.",
+      "host": "The SMTP server that sends the mail (for example smtp.example.com).",
+      "port": "The SMTP port. Usually 587 for STARTTLS and 465 for TLS.",
+      "tls": "How the connection to the server is encrypted. Follow your server's instructions — usually STARTTLS.",
+      "password": "The SMTP sign-in password. It is not shown again after saving.",
+      "from": "The sender address of the mail (for example orbivisor@example.com).",
+      "format": "The message shape the receiver expects. For Slack or Teams, use the incoming webhook URL from that app.",
+      "token": "The ntfy or Gotify access token. It is not shown again after saving.",
+      "headers": "Add only when the receiving server needs an auth header (such as Authorization). Values are not shown again after saving."
+    },
+    "securityGroups": {
+      "intro": "Security groups are bundles of firewall rules. Put one on a VM network card and incoming traffic is accepted only when a rule allows it, while outgoing traffic is sent unless a rule drops it. Running VMs pick it up right away.",
+      "empty": "To open only SSH (22) and web (443) on a VM and block the rest, create a rule bundle and put it on the VM's network card.",
+      "rulesEmpty": "Cards with this group now drop all new incoming connections and send all outgoing traffic. Add rules for what to let in.",
+      "name": "The name you pick in a VM's network card settings, such as web or ssh. 1 to 63 lowercase letters, digits or - (not at the start or end).",
+      "description": "Optional. A note on what this group opens (up to 200 characters)."
+    },
+    "fileRestore": {
+      "vm": "The running VM to write the files back into. Its guest agent must be on; usually the original VM."
+    },
+    "vms": {
+      "intro": "Every virtual machine (VM) in the cluster. Click a name for its state, console, snapshots and backups; use Create at the top right for a new VM.",
+      "empty": "Create a VM from scratch, or copy a ready-made template in seconds.",
+      "cpu": "Virtual CPU layout (sockets × cores) and CPU model. The host model passes the node's CPU through — fastest, but hard to move live to a node with a different CPU.",
+      "vcpus": "Number of virtual CPUs. If a maximum is shown, you can add vCPUs up to it while the VM runs.",
+      "memory": "Memory given to the VM. If a maximum is shown, you can grow it up to that while the VM runs.",
+      "hotplug": "Free slots for adding disks or network devices without turning the VM off. Only virtio disks can be added while it runs. If none, restart the VM once first.",
+      "bootOrder": "Devices the VM tries in turn when it starts. After installing the OS, the disk should come first.",
+      "cloudInit": "Settings put into the guest automatically on first boot — host name, user, SSH keys, addresses (cloud-init).",
+      "template": "This VM is a template: it can't be started, you deploy new VMs from it. The number counts linked clones built on it.",
+      "linkedClone": "This VM's disk stores only its changes on top of a template disk (linked clone), so the base disk can't be deleted.",
+      "firmware": "Firmware that boots the VM: UEFI (default for modern OSes) or BIOS (older OSes).",
+      "machine": "(Advanced) Virtual motherboard type: q35 on x86 nodes, virt on ARM nodes.",
+      "restart": "Whether Orbivisor restarts the VM when it stops with an error.",
+      "power": "Whether Orbivisor keeps this VM on or off. After a node reboots, it brings the VM back to this state.",
+      "lastError": "The last error while starting or running the VM. Fix the cause, then start it again.",
+      "haPolicy": "Whether the VM is restarted automatically on another node if its node fails (HA). The line below is how many restarts and moves are allowed within 10 minutes.",
+      "haGroup": "Set of nodes HA picks from when restarting this VM. Without one, any node is used.",
+      "haPriority": "Order when many VMs recover at once (0–100, higher first).",
+      "guestWatch": "For VMs with automatic recovery (HA) on: if the guest OS hangs and the guest agent doesn't answer for this long, the VM is force-restarted.",
+      "pinned": "Automatic load balancing won't move this VM. HA recovery and node evacuation still do.",
+      "ruleViolations": "Placement rules (keep together / keep apart) this VM doesn't meet right now — usually because resources forced it onto another node.",
+      "haError": "Why HA couldn't restart or move this VM. It clears when you fix the cause and start the VM again.",
+      "guest": {
+        "settings": "Guest agent settings: whether file systems are frozen for snapshots and backups, and how the VM is shut down.",
+        "addresses": "Network addresses of the guest. Shown only when the guest agent runs.",
+        "user": "Account inside the guest whose password to change (e.g. root, Administrator).",
+        "newPassword": "The guest agent changes it right away. Orbivisor does not store the password.",
+        "passwordAgain": "Type the same password again to catch typos."
+      },
+      "security": {
+        "tpm": "Virtual TPM chip, needed by Windows 11 and BitLocker. Its state (keys) is stored on the node shown.",
+        "secureBoot": "UEFI feature that only boots signed boot loaders. Recommended for Windows 11.",
+        "uefiVars": "Where UEFI settings such as boot entries are kept. If booting gets stuck, clear them with Reset firmware."
+      }
+    },
+    "vmForm": {
+      "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or - (not at the start or end). It can't be changed later.",
+      "cores": "Number of virtual CPUs. Start with 2 and add more if the VM is slow.",
+      "memory": "Memory for the VM in MiB (1024 = 1 GiB). 2048 is a good start for Linux servers, 4096 or more for Windows.",
+      "firmware": "Firmware that boots the VM. UEFI (default, recommended) for modern OSes; BIOS for old OSes or BIOS-only images.",
+      "machine": "(Advanced) Virtual motherboard type. Auto picks the right one for the node — usually leave it.",
+      "node": "Node the VM runs on. Auto picks a node with enough free resources.",
+      "restart": "Whether to restart the VM when it stops with an error. Pick 'On failure' for servers that should stay up.",
+      "folder": "Folder for the VM. It inherits the folder's permissions and quotas.",
+      "agentShutdown": "How Shut down works: a clean shutdown through the agent, falling back to the power-button signal (ACPI).",
+      "scheduleKeep": "How many scheduled snapshots to keep. Beyond that the oldest are deleted."
+    },
+    "cpu": {
+      "pinnedFlags": "CPU features to add to or hide from the chosen model. Usually left empty."
+    },
+    "migrate": {
+      "node": "Node to move the VM to. It pauses very briefly at the end. Disabled nodes can't run this VM's CPU.",
+      "pool": "Pool on the target node for the copied node-local disks. By default, the pool with the same name."
+    },
+    "clone": {
+      "name": "Name of the new VM: 1–63 lowercase letters, digits or - (not at the start or end).",
+      "source": "What to copy. The current state works only for a stopped VM; pick a snapshot to copy a running VM as of that point.",
+      "pool": "Pool for the new disks. By default, the same pool as the source disks."
+    },
+    "snapshots": {
+      "name": "A name to recognise the snapshot by (e.g. before-upgrade).",
+      "description": "Note what it was taken before, to find it later (optional)."
+    },
+    "templates": {
+      "intro": "A template is a VM master copy that can't be started. Deploying it creates a VM with the same setup in seconds; disks are linked clones that store only their changes.",
+      "empty": "Download an OS image from the image library as a template, or choose Convert to template from a stopped VM's menu."
+    },
+    "deploy": {
+      "count": "How many VMs to create (1–100). For several, put {n} in the name.",
+      "first": "First number for {n}. E.g. 1 gives web-1, web-2…",
+      "pool": "Pool for the new disks. Keep the default (the template's pool) for fast linked clones.",
+      "cpus": "Empty keeps the template's value.",
+      "memory": "Empty keeps the template's value (MiB, 1024 = 1 GiB).",
+      "diskSize": "Empty keeps the template's size. It can't be smaller than the template; you can grow it later but never shrink it.",
+      "nic": "Network for this interface. Leave it to keep the template's network."
+    },
+    "migration": {
+      "target": "SDN network to move the VM interfaces to. It needs the same subnet as the source so addresses stay.",
+      "name": "Name of the new SDN network.",
+      "parallel": "How many VMs to move at once. Higher is faster, but a problem then hits several VMs together. Start small.",
+      "bridgeNode": "Node that hosts the bridge joining both networks during the move. Traffic between the two sides passes through it."
+    },
+    "haGroups": {
+      "empty": "HA works without groups. Create one when you want to set the order of nodes a VM goes to, such as 'databases on node1 first, then node2'. To keep VMs on those nodes only, turn on the group's 'Restricted'.",
+      "name": "The group name chosen in a VM's HA settings, such as db-nodes."
+    },
+    "lb": {
+      "intro": "A load balancer spreads connections arriving at one address (VIP) over several VMs. Health checks take dead VMs out, so the service keeps running when one VM stops.",
+      "name": "The name of this load balancer. 1 to 63 lowercase letters, digits or - (not at the start or end).",
+      "description": "Optional. A note on what it serves (up to 200 characters).",
+      "listeners": "A listener = 'spread connections to this VIP port over these members', such as TCP 443 → 3 web VMs.",
+      "protocol": "Usually TCP for web and databases, UDP for DNS or games.",
+      "vipPort": "The VIP port clients connect to, such as 443.",
+      "health": "On: members are probed regularly and get no traffic while they do not answer. Recommended.",
+      "interval": "Seconds between checks. Default 5.",
+      "timeout": "A check fails if there is no answer within this many seconds.",
+      "rise": "Back in after this many passes.",
+      "fall": "Out after this many fails.",
+      "memberIp": "The member's IPv4 address, on an SDN network attached to the router. Devices other than VMs work too, but members given by address are not health-checked.",
+      "memberPort": "The port the member actually listens on.",
+      "pickNic": "Adds a VM network card on this router's networks as a member. It follows the VM if its address changes."
+    },
+    "haChecks": {
+      "intro": "Every node checks its network and shared storage connections every 5 seconds. When a check fails on a node for longer than the wait time (10 seconds by default), only the HA VMs that check affects get its action (warn, move, or start elsewhere; management checks only warn by default). When most nodes fail together, it is treated as a shared fault and only warns.",
+      "empty": "Add HA checks so that, on a node that lost its switch or storage connection, the HA VMs the check affects are moved or restarted elsewhere (management checks only warn by default). A node that dies completely is handled by HA without any checks.",
+      "name": "The name of this check in lists, such as storage-nas or uplink-bond0.",
+      "onFail": "What to do when the check fails for longer than the wait time. Empty uses the default for what it checks."
+    },
+    "topology": {
+      "intro": "See in one picture how networks, routers, floating IPs (external addresses), VMs and load balancers connect. Click an item to open it.",
+      "folder": "Draws only this folder's networks. Narrow it down when the picture is large."
+    },
+    "users": {
+      "intro": "Users who can sign in to this cluster (local users, and directory users who have signed in at least once). The global role sets what they can do across the cluster; extra rights per folder or VM are set on the Permissions page.",
+      "empty": "Create users so people other than the administrator can sign in as operators or viewers.",
+      "name": "The name used to sign in (for example kim). It cannot change later."
+    },
+    "tokens": {
+      "intro": "Keys that scripts and tools such as Terraform or Prometheus use instead of a password. A token has all of its creator's rights (global role plus folder and VM permissions), narrowed to its scope if you set one. Deleting it stops whatever uses it at once.",
+      "empty": "Create an API token so scripts and other tools can manage this cluster. It is shown only once, when created.",
+      "name": "A name that says where the token is used (for example terraform, prometheus)."
+    },
+    "account": {
+      "intro": "Set up two-factor sign-in: one more check after your password. Use a code from an authenticator app on your phone or a passkey (fingerprint, security key), and save the recovery codes in case you lose both."
+    },
+    "security": {
+      "intro": "Choose who must use two-factor sign-in. Users with a chosen role, or in a chosen sign-in realm, must set it up at their next sign-in."
+    },
+    "twoFactor": {
+      "code": "Enter the 6-digit number your authenticator app shows. It changes every 30 seconds.",
+      "passkeyName": "A name to recognise this passkey (for example work laptop, YubiKey).",
+      "proofCode": "Enter the 6-digit code from your authenticator app, or one of your saved recovery codes.",
+      "proofPassword": "Without a code, confirm it is you with your sign-in password."
+    },
+    "accounts": {
+      "current": "The password you use now, to confirm it is you.",
+      "confirm": "Type the same password again to catch typos."
+    },
+    "placementRules": {
+      "intro": "Rules for which nodes VMs run on. For example: the two web VMs on different nodes (so one survives a node failure), databases only on SSD nodes.",
+      "empty": "For example 'the two web VMs on different nodes' or 'databases only on SSD nodes'. Without rules, VMs go where the placement policy puts them (by default 'balance' — the least loaded node).",
+      "name": "The name of this rule in lists, such as web-spread or db-on-ssd.",
+      "vmBy": "Name the VMs the rule applies to, or pick them by label. With a label, VMs that get the same label later follow too.",
+      "nodeBy": "Pick nodes one by one or by node label (such as disk=ssd). Node labels are set on the Nodes page."
+    },
+    "placement": {
+      "intro": "A VM's start node is picked by HA group priority, then 'if possible' rule penalties, then load (the least loaded node with the 'balance' policy, the fullest with 'pack'). Every 5 minutes the balancer looks at the load difference between nodes and, above the move threshold, suggests or makes VM moves."
+    },
+    "realms": {
+      "intro": "Lets people sign in with company accounts (Active Directory, LDAP) or a sign-in service (OIDC — Keycloak, Azure AD, Google and others). Users become <name>@<realm>, and their role is set from their groups at every sign-in.",
+      "empty": "Without a realm, only the local users made here can sign in. Create one to let people sign in with company accounts.",
+      "kind": "LDAP: an in-house directory such as Active Directory or OpenLDAP. OIDC: a sign-in service such as Keycloak, Azure AD or Google (the browser goes there to sign in).",
+      "name": "The name after the user name (for example corp → kim@corp). local is reserved, and it cannot change later.",
+      "clientId": "The client ID you get when you register this cluster as an app in the IdP.",
+      "usernameClaim": "The token field used as the sign-in name. Usually preferred_username or email.",
+      "baseDn": "Where in the directory to start looking for users (for example dc=example,dc=com).",
+      "bindPassword": "The password of the service account above. It is not shown again after saving.",
+      "groupAttr": "The user attribute that lists their groups. Usually memberOf.",
+      "timeout": "If the directory or IdP does not answer in this time, the sign-in fails. 1–30 s.",
+      "defaultRole": "The role for users who match no group. None means they cannot sign in (recommended).",
+      "testUser": "The sign-in name of a directory user to test with (without the realm).",
+      "testPassword": "That user's password. Used only for the test, never saved.",
+      "create": "Create a sign-in realm"
+    },
+    "permissions": {
+      "intro": "One table of who (users, groups) can do what (role) where (the whole cluster, a folder, one VM). Permissions only add up; nothing denies.",
+      "empty": "Add permissions to give users and groups work per folder or VM, beyond their global role.",
+      "target": "Where the permission applies. Choose a folder and turn on 'Apply inside the folder and its subfolders' to also cover the VMs, networks and storage in it.",
+      "principalKind": "Give it to one person, or to a group of people. With many people, groups are easier.",
+      "principal": "The user or group that gets the permission.",
+      "role": "The set of things they can do there. You can only give roles within your own rights here.",
+      "propagate": "On: the permission reaches everything in the folder (VMs, networks, storage) and its subfolders. Off: it applies to the folder itself only (renaming it and so on), not even to the VMs directly in it."
+    },
+    "roles": {
+      "intro": "A role is a set of things someone can do (a privilege list). Besides the built-in roles (administrator, operator, viewer), make roles such as \"backups only\" and give them on the Permissions page.",
+      "empty": "Create a role to hand out just the work needed, such as \"takes snapshots only\".",
+      "name": "The name you pick on the Permissions page (for example backup-operator). admin, operator, viewer and none are reserved.",
+      "description": "A short note on what the role is for. It shows in the list."
+    },
+    "groups": {
+      "intro": "A group is a set of people you give permissions to at once. Add local users directly, or link a company directory group (LDAP, OIDC) so its members join when they sign in.",
+      "empty": "Create a group to give permissions once to the group instead of to each person.",
+      "name": "The name you pick on the Permissions page (for example dev-team). It cannot change later.",
+      "description": "A short note on who is in the group. It shows in the list."
+    },
+    "audit": {
+      "intro": "A record, kept on every node, of who did what, when and from where (IP). Requests that change something — sign-ins, creating and deleting VMs, changing settings — plus console opens and file-restore downloads are kept; requests that only read are not. Open a row to see all of it.",
+      "empty": "Widen the time range, or clear the user and action filters."
+    },
+    "tasks": {
+      "intro": "Work that takes time, such as starting, moving or backing up VMs. See what is running, what finished, and why something failed.",
+      "empty": "When you start, move or back up a VM, its progress and result collect here."
+    },
+    "folders": {
+      "intro": "Group VMs, networks and storage into folders. Permissions given on a folder with 'Apply inside' pass down to what is inside, and VM folders can have quotas that cap the resources they use. Drag and drop to move things.",
+      "empty": "This folder is empty. Drag rows here or use Move to folder to put things in.",
+      "name": "The folder name (for example prod, team-a). Up to 64 characters, without '/'.",
+      "folder": "The folder the new item goes in. It gets the folder permissions given with 'Apply inside' and, for VM folders, counts toward the quota.",
+      "destination": "Where to move them. Moved items follow the permissions given on the new folder with 'Apply inside' and, for VM folders, its quota."
+    },
+    "aboutPageOf": "About {{name}}"
   }
 }

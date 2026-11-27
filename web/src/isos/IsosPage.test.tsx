@@ -38,7 +38,7 @@ it("lists ISO images with their pool, node and VMs", async () => {
     ],
   });
   renderPage(<IsosPage />);
-  const table = await screen.findByRole("table", { name: "ISO images" });
+  const table = await screen.findByRole("table", { name: "ISO files" });
   // 디스크 볼륨은 보이지 않는다.
   await within(table).findByText("alpine");
   expect(within(table).queryByText("root")).not.toBeInTheDocument();
@@ -149,4 +149,15 @@ it("uploads an ISO as raw with the iso content", async () => {
     "/volumes/import?name=alpine-virt&pool=nas&format=raw&source_format=raw&content=iso",
   );
   await waitFor(() => expect(checked?.get("content")).toBe("iso"));
+});
+
+it("explains an empty ISO library with upload and download buttons and more help", async () => {
+  mockLists({ node: [NODE], volume: [volume("disk0", "local")] });
+  renderPage(<IsosPage />);
+  expect(await screen.findByText("No ISO images.")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  const [, upload] = screen.getAllByRole("button", { name: "Upload ISO" });
+  await userEvent.click(upload!);
+  expect(await screen.findByRole("dialog", { name: "Upload an ISO image" })).toBeInTheDocument();
 });

@@ -20,7 +20,7 @@ export interface NavPage {
 
 /**
  * 사이드바의 2단 항목. `pages`의 첫 보이는 화면이 항목 링크이고, 화면이 둘 이상이면 그 목록 화면 위에 화면 안 탭으로
- * 보인다(라우터 | 공인 IP). `folder`는 같은 목록의 폴더 모양(목록 오른쪽 위 아이콘 토글)이고 첫 화면과 같은 권한을 본다.
+ * 보인다(라우터 | 유동 IP). `folder`는 같은 목록의 폴더 모양(목록 오른쪽 위 아이콘 토글)이고 첫 화면과 같은 권한을 본다.
  * `match`는 이 항목에 속하는 다른 경로 접두사(DR 실행 화면)다. 상세 경로(`/vms/web`)는 그 접두사의 항목에 속한다.
  */
 export interface NavItem {
@@ -150,7 +150,7 @@ export const GROUPS: NavGroup[] = [
         key: "nav.item.routing",
         pages: [
           { to: "/routers", key: "nav.routers" },
-          { to: "/floating-ips", key: "nav.floatingIps" },
+          { to: "/floating-ips", key: "nav.floatingIps", keywords: "nav.floatingIpsKeywords" },
         ],
       },
       one("lb", "nav.loadBalancers", { to: "/load-balancers" }),

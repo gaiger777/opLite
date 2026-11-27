@@ -5,6 +5,7 @@ import { useList } from "@/api/live";
 import type { Node } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -141,7 +142,12 @@ export function GeneralSection({
           <p className="text-sm text-muted-foreground sm:col-span-2">{t("vmForm.liveHint")}</p>
         )}
         {creating && (
-          <Field id="vm-name" label={t("common.name")} error={errors.name}>
+          <Field
+            id="vm-name"
+            label={t("common.name")}
+            error={errors.name}
+            help={t("help.vmForm.name")}
+          >
             {(a11y) => (
               <Input
                 id="vm-name"
@@ -156,13 +162,13 @@ export function GeneralSection({
           id="vm-cores"
           label={values.sockets > 1 ? t("vmForm.coresPerSocket") : t("vmForm.cores")}
           error={errors.cores}
-          hint={
+          help={
             values.sockets > 1 && /^\d+$/.test(values.cores)
               ? t("vmForm.totalVcpus", {
                   sockets: values.sockets,
                   count: values.sockets * Number(values.cores),
                 })
-              : undefined
+              : t("help.vmForm.cores")
           }
         >
           {(a11y) => (
@@ -177,7 +183,12 @@ export function GeneralSection({
             />
           )}
         </Field>
-        <Field id="vm-memory" label={t("vmForm.memory")} error={errors.memory}>
+        <Field
+          id="vm-memory"
+          label={t("vmForm.memory")}
+          error={errors.memory}
+          help={t("help.vmForm.memory")}
+        >
           {(a11y) => (
             <Input
               id="vm-memory"
@@ -194,7 +205,8 @@ export function GeneralSection({
           id="vm-max-vcpus"
           label={t("vmForm.maxVcpus")}
           error={errors.maxVcpus}
-          hint={t("vmForm.maxVcpusHint")}
+          help={t("vmForm.maxVcpusHint")}
+          info="vmForm.maxVcpus"
         >
           {(a11y) => (
             <Input
@@ -212,7 +224,8 @@ export function GeneralSection({
           id="vm-max-memory"
           label={t("vmForm.maxMemory")}
           error={errors.maxMemory}
-          hint={t("vmForm.maxMemoryHint")}
+          help={t("vmForm.maxMemoryHint")}
+          info="vmForm.maxMemory"
         >
           {(a11y) => (
             <Input
@@ -244,39 +257,56 @@ export function GeneralSection({
             {t("cpu.model.archReset")}
           </p>
         )}
-        <Field id="vm-firmware" label={t("vms.firmware")}>
-          <NativeSelect
-            id="vm-firmware"
-            className="w-full"
-            value={values.firmware}
-            onChange={(e) => onChange({ firmware: e.target.value as VmFormValues["firmware"] })}
-          >
-            <NativeSelectOption value="uefi">UEFI</NativeSelectOption>
-            <NativeSelectOption value="bios">BIOS</NativeSelectOption>
-          </NativeSelect>
+        <Field
+          id="vm-firmware"
+          label={t("vms.firmware")}
+          help={t("help.vmForm.firmware")}
+          info="vmForm.firmware"
+        >
+          {(a11y) => (
+            <NativeSelect
+              {...a11y}
+              id="vm-firmware"
+              className="w-full"
+              value={values.firmware}
+              onChange={(e) => onChange({ firmware: e.target.value as VmFormValues["firmware"] })}
+            >
+              <NativeSelectOption value="uefi">UEFI</NativeSelectOption>
+              <NativeSelectOption value="bios">BIOS</NativeSelectOption>
+            </NativeSelect>
+          )}
         </Field>
-        <Field id="vm-machine" label={t("vms.machine")}>
-          <NativeSelect
-            id="vm-machine"
-            className="w-full"
-            value={values.machine}
-            onChange={(e) => {
-              onMachineChosen();
-              onChange(withMachine({ machine: e.target.value as VmFormValues["machine"] }));
-            }}
-          >
-            {/* 노드를 모르면(폴더 사용자) 서버가 클러스터 아키텍처로 고른다. */}
-            {(nodes === undefined || values.machine === "") && (
-              <NativeSelectOption value="">{t("vmForm.machineAuto")}</NativeSelectOption>
-            )}
-            <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
-            <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
-          </NativeSelect>
+        <Field
+          id="vm-machine"
+          label={t("vms.machine")}
+          help={t("help.vmForm.machine")}
+          info="vmForm.machine"
+        >
+          {(a11y) => (
+            <NativeSelect
+              {...a11y}
+              id="vm-machine"
+              className="w-full"
+              value={values.machine}
+              onChange={(e) => {
+                onMachineChosen();
+                onChange(withMachine({ machine: e.target.value as VmFormValues["machine"] }));
+              }}
+            >
+              {/* 노드를 모르면(폴더 사용자) 서버가 클러스터 아키텍처로 고른다. */}
+              {(nodes === undefined || values.machine === "") && (
+                <NativeSelectOption value="">{t("vmForm.machineAuto")}</NativeSelectOption>
+              )}
+              <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
+              <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
+            </NativeSelect>
+          )}
         </Field>
         <CpuFlagsInput
           id="vm-cpu-flags"
           label={t("cpu.flags.label")}
-          hint={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
+          help={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
+          info="cpu.flags"
           flags={values.cpuFlags}
           arches={[archOf(values.machine)]}
           signed
@@ -304,45 +334,51 @@ export function GeneralSection({
         )}
         {/* 노드 목록을 읽을 수 없으면(폴더 사용자) 자동 배치다. */}
         {nodes !== undefined && (
-          <Field id="vm-node" label={t("common.node")}>
-            <NativeSelect
-              id="vm-node"
-              className="w-full"
-              disabled={locked}
-              value={values.node}
-              onChange={(e) => {
-                const node = e.target.value;
-                onChange(
-                  autoMachine
-                    ? withMachine({ node, machine: defaultMachine(nodes ?? [], node) })
-                    : { node },
-                );
-              }}
-            >
-              <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
-              {/* 위트니스는 VM을 돌리지 않는다. */}
-              {nodes
-                ?.filter((n) => !n.spec.witness)
-                .map((n) => (
-                  <NativeSelectOption key={n.id} value={n.id}>
-                    {n.name}
-                  </NativeSelectOption>
-                ))}
-            </NativeSelect>
+          <Field id="vm-node" label={t("common.node")} help={t("help.vmForm.node")}>
+            {(a11y) => (
+              <NativeSelect
+                {...a11y}
+                id="vm-node"
+                className="w-full"
+                disabled={locked}
+                value={values.node}
+                onChange={(e) => {
+                  const node = e.target.value;
+                  onChange(
+                    autoMachine
+                      ? withMachine({ node, machine: defaultMachine(nodes ?? [], node) })
+                      : { node },
+                  );
+                }}
+              >
+                <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
+                {/* 위트니스는 VM을 돌리지 않는다. */}
+                {nodes
+                  ?.filter((n) => !n.spec.witness)
+                  .map((n) => (
+                    <NativeSelectOption key={n.id} value={n.id}>
+                      {n.name}
+                    </NativeSelectOption>
+                  ))}
+              </NativeSelect>
+            )}
           </Field>
         )}
-        <Field id="vm-restart" label={t("vms.restart")}>
-          <NativeSelect
-            id="vm-restart"
-            className="w-full"
-            value={values.restart}
-            onChange={(e) => onChange({ restart: e.target.value as VmFormValues["restart"] })}
-          >
-            <NativeSelectOption value="never">{t("vms.restartPolicy.never")}</NativeSelectOption>
-            <NativeSelectOption value="on-failure">
-              {t("vms.restartPolicy.on-failure")}
-            </NativeSelectOption>
-          </NativeSelect>
+        <Field id="vm-restart" label={t("vms.restart")} help={t("help.vmForm.restart")}>
+          {(a11y) => (
+            <NativeSelect
+              {...a11y}
+              id="vm-restart"
+              className="w-full"
+              value={values.restart}
+              onChange={(e) => onChange({ restart: e.target.value as VmFormValues["restart"] })}
+            >
+              <NativeSelectOption value="never">{t("vms.restartPolicy.never")}</NativeSelectOption>
+              <NativeSelectOption value="on-failure">
+                {t("vms.restartPolicy.on-failure")}
+              </NativeSelectOption>
+            </NativeSelect>
+          )}
         </Field>
         <div className="flex flex-col gap-1.5 sm:col-span-2">
           <div className="flex items-center gap-2">
@@ -354,6 +390,11 @@ export function GeneralSection({
               onCheckedChange={(pinned) => onChange({ pinned })}
             />
             <Label htmlFor="vm-pinned">{t("vmForm.pinned")}</Label>
+            <InfoButton
+              topic="vmForm.pinned"
+              label={t("vmForm.pinned")}
+              line={t("vmForm.pinnedHint")}
+            />
           </div>
           <p id="vm-pinned-hint" className="text-xs text-muted-foreground">
             {t("vmForm.pinnedHint")}
@@ -370,6 +411,7 @@ export function GeneralSection({
               onCheckedChange={(ha) => onChange({ ha })}
             />
             <Label htmlFor="vm-ha">{t("vmForm.ha")}</Label>
+            <InfoButton topic="vmForm.ha" label={t("vmForm.ha")} line={t("vmForm.haHint")} />
           </div>
           <p id="vm-ha-hint" className="text-xs text-muted-foreground">
             {t("vmForm.haHint")}
@@ -392,7 +434,8 @@ export function GeneralSection({
             <Field
               id="vm-ha-state"
               label={t("vmForm.haState")}
-              hint={t(`vmForm.haStateHint.${values.haState}`)}
+              help={t(`vmForm.haStateHint.${values.haState}`)}
+              info="vmForm.haState"
             >
               {(a11y) => (
                 <NativeSelect
@@ -415,7 +458,7 @@ export function GeneralSection({
                 </NativeSelect>
               )}
             </Field>
-            <Field id="vm-ha-group" label={t("vmForm.haGroup")} hint={t("vmForm.haGroupHint")}>
+            <Field id="vm-ha-group" label={t("vmForm.haGroup")} help={t("vmForm.haGroupHint")}>
               {(a11y) => (
                 <NativeSelect
                   id="vm-ha-group"
@@ -437,7 +480,7 @@ export function GeneralSection({
               id="vm-max-restart"
               label={t("vmForm.maxRestart")}
               error={errors.maxRestart}
-              hint={t("vmForm.maxRestartHint")}
+              help={t("vmForm.maxRestartHint")}
             >
               {(a11y) => (
                 <Input
@@ -455,7 +498,7 @@ export function GeneralSection({
               id="vm-max-relocate"
               label={t("vmForm.maxRelocate")}
               error={errors.maxRelocate}
-              hint={t("vmForm.maxRelocateHint")}
+              help={t("vmForm.maxRelocateHint")}
             >
               {(a11y) => (
                 <Input
@@ -473,7 +516,8 @@ export function GeneralSection({
               id="vm-ha-priority"
               label={t("vmForm.haPriority")}
               error={errors.haPriority}
-              hint={t("vmForm.haPriorityHint")}
+              help={t("vmForm.haPriorityHint")}
+              info="vmForm.haPriority"
             >
               {(a11y) => (
                 <Input
@@ -496,6 +540,11 @@ export function GeneralSection({
                   onCheckedChange={(guestWatch) => onChange({ guestWatch })}
                 />
                 <Label htmlFor="vm-guest-watch">{t("vmForm.guestWatch")}</Label>
+                <InfoButton
+                  topic="vmForm.guestWatch"
+                  label={t("vmForm.guestWatch")}
+                  line={t("vmForm.guestWatchHint")}
+                />
               </div>
               <p id="vm-guest-watch-hint" className="text-xs text-muted-foreground">
                 {t("vmForm.guestWatchHint")}
@@ -506,7 +555,7 @@ export function GeneralSection({
                 id="vm-guest-watch-secs"
                 label={t("vmForm.guestWatchSecs")}
                 error={errors.guestWatchSecs}
-                hint={t("vmForm.guestWatchSecsHint")}
+                help={t("vmForm.guestWatchSecsHint")}
               >
                 {(a11y) => (
                   <Input
@@ -547,22 +596,25 @@ function FolderField({ value, onChange }: { value: string; onChange(folder: stri
     .map((f) => ({ id: f.id, path: folderPath(tree, f.id) }))
     .sort((a, b) => a.path.localeCompare(b.path));
   return (
-    <Field id="vm-folder" label={t("folders.folder")}>
-      <NativeSelect
-        id="vm-folder"
-        className="w-full"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      >
-        {(perms.has("vm.create") || value === "") && (
-          <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>
-        )}
-        {allowed.map((f) => (
-          <NativeSelectOption key={f.id} value={f.id}>
-            {f.path}
-          </NativeSelectOption>
-        ))}
-      </NativeSelect>
+    <Field id="vm-folder" label={t("folders.folder")} help={t("help.vmForm.folder")}>
+      {(a11y) => (
+        <NativeSelect
+          {...a11y}
+          id="vm-folder"
+          className="w-full"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        >
+          {(perms.has("vm.create") || value === "") && (
+            <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>
+          )}
+          {allowed.map((f) => (
+            <NativeSelectOption key={f.id} value={f.id}>
+              {f.path}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      )}
     </Field>
   );
 }

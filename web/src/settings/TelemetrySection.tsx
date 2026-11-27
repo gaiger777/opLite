@@ -8,6 +8,7 @@ import { useSettings } from "@/api/live";
 import type { TelemetryReport } from "@/api/types";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -66,9 +67,16 @@ export function TelemetrySection({ write }: { write: boolean }) {
 
   return (
     <section aria-labelledby="settings-telemetry" className="flex flex-col gap-4">
-      <h2 id="settings-telemetry" ref={heading} tabIndex={-1} className="font-medium">
-        {t("settings.telemetry.title")}
-      </h2>
+      <div className="flex items-center gap-1">
+        <h2 id="settings-telemetry" ref={heading} tabIndex={-1} className="font-medium">
+          {t("settings.telemetry.title")}
+        </h2>
+        <InfoButton
+          topic="settings.telemetry"
+          label={t("settings.telemetry.title")}
+          line={t("settings.telemetry.intro")}
+        />
+      </div>
       <p className="text-sm text-muted-foreground">{t("settings.telemetry.intro")}</p>
       {error && (
         <p role="alert" className="text-sm text-destructive">
@@ -105,7 +113,7 @@ export function TelemetrySection({ write }: { write: boolean }) {
             <Field
               id="settings-telemetry-endpoint"
               label={t("settings.telemetry.endpoint")}
-              hint={t("settings.telemetry.endpointHint")}
+              help={t("settings.telemetry.endpointHint")}
             >
               {(a11y) => (
                 <Input

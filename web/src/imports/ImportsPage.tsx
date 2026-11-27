@@ -1,4 +1,4 @@
-import { Server, Upload } from "lucide-react";
+import { PackageOpen, Server, Upload } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate } from "react-router";
@@ -8,6 +8,7 @@ import type { components } from "@/api/schema";
 import type { VmImport } from "@/api/types";
 import { useOptionalPrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
@@ -97,7 +98,8 @@ export function ImportsPage() {
       <PageHeader
         id="imports-title"
         title={t("nav.imports")}
-        description={t("imports.pageHint")}
+        help="imports"
+        intro={t("help.imports.intro")}
         actions={
           write && (
             <div className="flex flex-wrap gap-2">
@@ -113,46 +115,69 @@ export function ImportsPage() {
           )
         }
       />
-      <Table aria-labelledby="imports-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("common.node")}</TableHead>
-            <TableHead>{t("imports.sourceVm")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>{t("imports.vm")}</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(imports.data ?? []).length === 0 && (
-            <TableMessage colSpan={5} query={imports} empty={t("imports.empty")} />
-          )}
-          {(imports.data ?? []).map((imp) => (
-            <TableRow key={imp.id}>
-              <TableCell className="font-medium">
-                <Link
-                  to={`/imports/${encodeURIComponent(imp.name)}`}
-                  className="underline-offset-4 hover:underline"
-                >
-                  {imp.name}
-                </Link>
-              </TableCell>
-              <TableCell>{nodeName(imp.spec.node)}</TableCell>
-              <TableCell>
-                {imp.status.source_vm?.name ?? "—"}
-                <div className="text-xs text-muted-foreground">{sourceText(imp)}</div>
-              </TableCell>
-              <TableCell>
-                <ImportPhaseBadge phase={imp.status.phase} />
-                <ImportError imp={imp} />
-              </TableCell>
-              <TableCell>
-                <ImportedVm imp={imp} />
-              </TableCell>
+      {imports.isSuccess && imports.data.length === 0 ? (
+        <EmptyState
+          icon={PackageOpen}
+          title={t("imports.empty")}
+          description={t("help.imports.empty")}
+          help="imports.page"
+          action={
+            write && (
+              <div className="flex flex-wrap justify-center gap-2">
+                <Button variant="outline" onClick={() => setEsxi(true)}>
+                  <Server />
+                  {t("imports.esxi")}
+                </Button>
+                <Button onClick={() => setUploading(true)}>
+                  <Upload />
+                  {t("imports.upload")}
+                </Button>
+              </div>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="imports-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("common.node")}</TableHead>
+              <TableHead>{t("imports.sourceVm")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
+              <TableHead>{t("imports.vm")}</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {(imports.data ?? []).length === 0 && (
+              <TableMessage colSpan={5} query={imports} empty={t("imports.empty")} />
+            )}
+            {(imports.data ?? []).map((imp) => (
+              <TableRow key={imp.id}>
+                <TableCell className="font-medium">
+                  <Link
+                    to={`/imports/${encodeURIComponent(imp.name)}`}
+                    className="underline-offset-4 hover:underline"
+                  >
+                    {imp.name}
+                  </Link>
+                </TableCell>
+                <TableCell>{nodeName(imp.spec.node)}</TableCell>
+                <TableCell>
+                  {imp.status.source_vm?.name ?? "—"}
+                  <div className="text-xs text-muted-foreground">{sourceText(imp)}</div>
+                </TableCell>
+                <TableCell>
+                  <ImportPhaseBadge phase={imp.status.phase} />
+                  <ImportError imp={imp} />
+                </TableCell>
+                <TableCell>
+                  <ImportedVm imp={imp} />
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {uploading && <OvaUploadDialog onClose={() => setUploading(false)} />}
       {esxi && <EsxiImportDialog onClose={() => setEsxi(false)} />}
     </div>
@@ -212,7 +237,7 @@ function OvaUploadDialog({ onClose }: { onClose(): void }) {
         id="ova-file"
         label={t("imports.file")}
         error={errors.file}
-        hint={file ? formatBytes(file.size) : undefined}
+        help={file ? formatBytes(file.size) : t("help.imports.ovaFile")}
       >
         {(a11y) => (
           <Input
@@ -224,7 +249,12 @@ function OvaUploadDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
-      <Field id="ova-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="ova-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.imports.ovaName")}
+      >
         {(a11y) => (
           <Input id="ova-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}

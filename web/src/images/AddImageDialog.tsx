@@ -94,7 +94,7 @@ export function AddImageDialog({ onClose }: { onClose(): void }) {
     set: (v: string) => void,
     extra: { hint?: string; mono?: boolean; type?: string } = {},
   ) => (
-    <Field id={`catalog-${field}`} label={label} error={errors[field]} hint={extra.hint}>
+    <Field id={`catalog-${field}`} label={label} error={errors[field]} help={extra.hint}>
       {(a11y) => (
         <Input
           id={`catalog-${field}`}
@@ -119,28 +119,41 @@ export function AddImageDialog({ onClose }: { onClose(): void }) {
     >
       <div className="-mx-1 flex max-h-[65svh] flex-col gap-4 overflow-y-auto px-1">
         {text("id", t("images.id"), id, setId, { hint: t("images.idHint"), mono: true })}
-        {text("title", t("images.title"), title, setTitle)}
+        {text("title", t("images.title"), title, setTitle, { hint: t("help.images.add.title") })}
         <div className="grid grid-cols-2 gap-4">
-          {text("os", t("images.os"), os, setOs)}
-          {text("version", t("images.version"), version, setVersion)}
+          {text("os", t("images.os"), os, setOs, { hint: t("help.images.add.os") })}
+          {text("version", t("images.version"), version, setVersion, {
+            hint: t("help.images.add.version"),
+          })}
         </div>
-        {text("url", t("downloads.url"), url, setUrl, { type: "url" })}
-        <div className="grid grid-cols-3 gap-4">
-          <Field id="catalog-arch" label={t("images.arch")}>
-            <NativeSelect
-              id="catalog-arch"
-              className="w-full"
-              value={arch}
-              onChange={(e) => setArch(e.target.value as Arch)}
-            >
-              {ARCHES.map((a) => (
-                <NativeSelectOption key={a} value={a}>
-                  {a}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+        {text("url", t("downloads.url"), url, setUrl, {
+          type: "url",
+          hint: t("help.images.add.url"),
+        })}
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field id="catalog-arch" label={t("images.arch")} help={t("help.images.add.arch")}>
+            {(a11y) => (
+              <NativeSelect
+                id="catalog-arch"
+                className="w-full"
+                value={arch}
+                onChange={(e) => setArch(e.target.value as Arch)}
+                {...a11y}
+              >
+                {ARCHES.map((a) => (
+                  <NativeSelectOption key={a} value={a}>
+                    {a}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
-          <Field id="catalog-firmware" label={t("vms.firmware")} error={errors.firmware}>
+          <Field
+            id="catalog-firmware"
+            label={t("vms.firmware")}
+            error={errors.firmware}
+            help={t("help.images.add.firmware")}
+          >
             {(a11y) => (
               <NativeSelect
                 id="catalog-firmware"
@@ -154,40 +167,62 @@ export function AddImageDialog({ onClose }: { onClose(): void }) {
               </NativeSelect>
             )}
           </Field>
-          <Field id="catalog-format" label={t("uploads.sourceFormat")}>
-            <NativeSelect
-              id="catalog-format"
-              className="w-full"
-              value={sourceFormat}
-              onChange={(e) => setSourceFormat(e.target.value as typeof sourceFormat)}
-            >
-              <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
-              <NativeSelectOption value="raw">raw</NativeSelectOption>
-            </NativeSelect>
+          <Field
+            id="catalog-format"
+            label={t("uploads.sourceFormat")}
+            help={t("help.images.add.format")}
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="catalog-format"
+                className="w-full"
+                value={sourceFormat}
+                onChange={(e) => setSourceFormat(e.target.value as typeof sourceFormat)}
+                {...a11y}
+              >
+                <NativeSelectOption value="qcow2">qcow2</NativeSelectOption>
+                <NativeSelectOption value="raw">raw</NativeSelectOption>
+              </NativeSelect>
+            )}
           </Field>
         </div>
-        <Field id="catalog-kind" label={t("images.checksum")}>
-          <NativeSelect
-            id="catalog-kind"
-            className="w-full"
-            value={kind}
-            onChange={(e) => setKind(e.target.value as ChecksumKind)}
-          >
-            <NativeSelectOption value="sums">{t("images.checksums.sums")}</NativeSelectOption>
-            <NativeSelectOption value="sha256">{t("images.checksums.sha256")}</NativeSelectOption>
-            <NativeSelectOption value="sha512">{t("images.checksums.sha512")}</NativeSelectOption>
-          </NativeSelect>
+        <Field
+          id="catalog-kind"
+          label={t("images.checksum")}
+          help={t("help.images.add.checksumKind")}
+          info="images.checksum"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="catalog-kind"
+              className="w-full"
+              value={kind}
+              onChange={(e) => setKind(e.target.value as ChecksumKind)}
+              {...a11y}
+            >
+              <NativeSelectOption value="sums">{t("images.checksums.sums")}</NativeSelectOption>
+              <NativeSelectOption value="sha256">{t("images.checksums.sha256")}</NativeSelectOption>
+              <NativeSelectOption value="sha512">{t("images.checksums.sha512")}</NativeSelectOption>
+            </NativeSelect>
+          )}
         </Field>
         {text(
           "checksum",
           kind === "sums" ? t("images.sumsUrl") : t("images.digest"),
           checksum,
           setChecksum,
-          { mono: kind !== "sums" },
+          {
+            mono: kind !== "sums",
+            hint: t(kind === "sums" ? "help.images.add.sumsUrl" : "help.images.add.digest"),
+          },
         )}
         <div className="grid grid-cols-2 gap-4">
-          {text("user", t("images.defaultUser"), defaultUser, setDefaultUser)}
-          {text("size", t("images.minSize"), sizeGib, setSizeGib)}
+          {text("user", t("images.defaultUser"), defaultUser, setDefaultUser, {
+            hint: t("help.images.add.defaultUser"),
+          })}
+          {text("size", t("images.minSize"), sizeGib, setSizeGib, {
+            hint: t("help.images.add.minSize"),
+          })}
         </div>
       </div>
     </FormDialog>

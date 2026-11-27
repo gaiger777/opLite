@@ -159,7 +159,7 @@ it("deploys several VMs from a name pattern with overrides", async () => {
   await user.selectOptions(within(dialog).getByLabelText("nic0 network"), "dmz");
   await user.type(within(dialog).getByLabelText("disk0 new size (GiB, grow only)"), "8");
   // 여러 VM에 같은 호스트 이름은 거절한다.
-  await user.click(within(dialog).getByLabelText("Configure the guest with cloud-init"));
+  await user.click(within(dialog).getByLabelText("Set up the guest on first boot (cloud-init)"));
   await user.type(within(dialog).getByLabelText("Host name"), "web");
   await user.click(within(dialog).getByLabelText("Start after deploying"));
   await user.click(within(dialog).getByRole("button", { name: "Deploy" }));
@@ -304,4 +304,28 @@ it("checks the template's NUMA nodes against an overridden vCPU count", async ()
   await user.click(within(dialog).getByRole("button", { name: "Deploy" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toMatchObject({ vcpus: 4, numa: { nodes: 1 } });
+});
+
+it("shows how to get a first template when there is none", async () => {
+  mockLists({ vm: [web1], volume: [], node: [NODE] });
+  renderPage(<TemplatesPage />);
+  expect(await screen.findByText("No templates yet")).toBeInTheDocument();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Get one from the image library" })).toHaveAttribute(
+    "href",
+    "/images",
+  );
+  expect(screen.getByRole("link", { name: "Turn a VM into a template" })).toHaveAttribute(
+    "href",
+    "/vms",
+  );
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});
+
+it("shows no template buttons to a viewer", async () => {
+  mockLists({ vm: [], volume: [], node: [NODE] });
+  renderPage(<TemplatesPage />, { as: VIEWER });
+  expect(await screen.findByText("No templates yet")).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Get one from the image library" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
 });

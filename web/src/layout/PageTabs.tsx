@@ -7,7 +7,7 @@ import { usePermissions } from "@/auth/usePermissions";
 import { navOf, onListPage, visiblePages } from "@/layout/nav";
 
 /**
- * 화면 안 탭: 사이드바 항목 하나에 화면이 둘 이상일 때(라우터 | 공인 IP) 그 목록 화면 위에 보인다. 경로가 바뀌므로
+ * 화면 안 탭: 사이드바 항목 하나에 화면이 둘 이상일 때(라우터 | 유동 IP) 그 목록 화면 위에 보인다. 경로가 바뀌므로
  * `role=tablist`가 아니라 `<nav>`이고 지금 화면은 `aria-current="page"`다. 상세 화면과 보이는 화면이 하나뿐이면 없다.
  * 밑줄은 목록 안쪽 그림자다(스크롤 상자에 테두리를 겹치면 1px 넘쳐 세로 스크롤바가 생겼다).
  */

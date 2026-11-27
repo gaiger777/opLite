@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2 } from "lucide-react";
+import { KeyRound, Plus, Trash2 } from "lucide-react";
 import { useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -10,6 +10,7 @@ import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
@@ -72,6 +73,8 @@ export function TokensPage() {
       <PageHeader
         id="tokens-title"
         title={t("nav.tokens")}
+        help="tokens"
+        intro={t("help.tokens.intro")}
         actions={
           <Button ref={opener} onClick={() => setCreating(true)}>
             <Plus />
@@ -79,46 +82,60 @@ export function TokensPage() {
           </Button>
         }
       />
-      <p className="text-sm text-muted-foreground">{t("tokens.note")}</p>
-      <Table aria-labelledby="tokens-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            {admin && <TableHead>{t("tokens.owner")}</TableHead>}
-            <TableHead>{t("tokens.created")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(tokens.data ?? []).length === 0 && (
-            <TableMessage colSpan={admin ? 4 : 3} query={tokens} empty={t("tokens.empty")} />
-          )}
-          {(tokens.data ?? []).map((token) => {
-            const time = uuidTime(token.id);
-            return (
-              <TableRow key={token.id}>
-                <TableCell className="font-medium">{token.name}</TableCell>
-                {admin && <TableCell>{owner(token)}</TableCell>}
-                <TableCell className="whitespace-nowrap">
-                  <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>
-                </TableCell>
-                <TableCell className="text-right">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={t("common.deleteNamed", { name: token.name })}
-                    onClick={() => setDeleting(token)}
-                  >
-                    <Trash2 />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+      {tokens.isSuccess && tokens.data.length === 0 ? (
+        <EmptyState
+          icon={KeyRound}
+          title={t("tokens.empty")}
+          description={t("help.tokens.empty")}
+          help="tokens.page"
+          action={
+            <Button onClick={() => setCreating(true)}>
+              <Plus />
+              {t("tokens.createTitle")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="tokens-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              {admin && <TableHead>{t("tokens.owner")}</TableHead>}
+              <TableHead>{t("tokens.created")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {(tokens.data ?? []).length === 0 && (
+              <TableMessage colSpan={admin ? 4 : 3} query={tokens} empty={t("tokens.empty")} />
+            )}
+            {(tokens.data ?? []).map((token) => {
+              const time = uuidTime(token.id);
+              return (
+                <TableRow key={token.id}>
+                  <TableCell className="font-medium">{token.name}</TableCell>
+                  {admin && <TableCell>{owner(token)}</TableCell>}
+                  <TableCell className="whitespace-nowrap">
+                    <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("common.deleteNamed", { name: token.name })}
+                      onClick={() => setDeleting(token)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {creating && (
         <CreateTokenDialog
           returnFocus={opener}
@@ -180,7 +197,7 @@ function CreateTokenDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="token-name" label={t("common.name")} error={error}>
+      <Field id="token-name" label={t("common.name")} error={error} help={t("help.tokens.name")}>
         {(a11y) => (
           <Input
             id="token-name"

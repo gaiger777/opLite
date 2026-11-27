@@ -86,7 +86,9 @@ it("creates a VM in the user's folder without reading nodes or picking a machine
   // 루트에는 만들 수 없으니 자기 폴더가 골라져 있다. 노드 칸은 없고 머신은 자동이다.
   expect(screen.getByLabelText("Folder")).toHaveDisplayValue("/teamA");
   expect(screen.queryByLabelText("Node")).not.toBeInTheDocument();
-  expect(screen.getByLabelText("Machine type")).toHaveDisplayValue("Automatic (cluster default)");
+  expect(screen.getByLabelText("Virtual motherboard (advanced)")).toHaveDisplayValue(
+    "Automatic (cluster default)",
+  );
   await user.click(screen.getByRole("button", { name: "Create" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   const spec = (bodies[0] as { spec: Record<string, unknown> }).spec;
@@ -143,7 +145,7 @@ it("resets an x86 level when the automatic machine becomes virt", async () => {
   );
   const user = userEvent.setup();
   renderPage(<VmCreatePage />, { path: "/vms/-new", as: ALICE });
-  const machine = await screen.findByLabelText("Machine type");
+  const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   expect(machine).toHaveValue("");
   await screen.findAllByRole("option", { name: /x86-64-v3/ });
   await user.selectOptions(screen.getByLabelText("CPU model"), "x86-64-v3");

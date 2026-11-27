@@ -2,7 +2,7 @@
   "clusterMap": {
     "label": {
       "node": "Node {{name}}",
-      "witness": "Witness node {{name}}",
+      "witness": "Vote-only node {{name}}",
       "slab": "group {{name}}",
       "noGroup": "no group",
       "online": "online",
@@ -125,7 +125,7 @@
       "uplinkUp": "Uplinks up",
       "uplinkDegraded": "Some uplinks down",
       "uplinkDown": "No uplink",
-      "noFencing": "No fencing (runs no HA VMs)",
+      "noFencing": "No fencing device (runs no HA VMs)",
       "haVm": "HA VM",
       "recommendation": "Recommended move",
       "portUp": "Port up",
@@ -170,11 +170,11 @@
       "applyDescription": "Live-migrates {{vm}} from {{from}} to {{to}}, as Apply on the placement page does."
     },
     "tagAlloc": "alloc {{pct}}%",
-    "tagFence": "fence check failed",
+    "tagFence": "fencing check failed",
     "drag": {
       "here": "the VM is already here",
       "hereTag": "here",
-      "witness": "{{node}} is a witness node",
+      "witness": "{{node}} is a vote-only node (runs no VMs)",
       "offline": "{{node}} is offline",
       "frozen": "{{node}} is frozen after a shutdown",
       "maintenance": "{{node}} is in maintenance",

@@ -25,7 +25,7 @@ const web = vm("web", "running", {
 it("lists groups with their rule counts and the VMs that use them", async () => {
   mockLists({ "security-group": [ssh, securityGroup("empty")], vm: [web] });
   renderPage(<SecurityGroupsPage />);
-  const table = await screen.findByRole("table", { name: "Security groups" });
+  const table = await screen.findByRole("table", { name: "Firewall (security groups)" });
   const headers = within(table).getAllByRole("columnheader");
   const cell = (row: HTMLElement, name: string) =>
     within(row).getAllByRole("cell")[headers.findIndex((h) => h.textContent === name)];
@@ -73,7 +73,7 @@ it("creates a group and opens it to add rules", async () => {
   await userEvent.type(within(dialog).getByLabelText("Name"), "Web");
   await userEvent.type(within(dialog).getByLabelText("Description (optional)"), "x".repeat(201));
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-  expect(within(dialog).getByText(/lowercase letters/)).toBeVisible();
+  expect(within(dialog).getByText(/^Use 1–63 lowercase letters/)).toBeVisible();
   expect(within(dialog).getByText("Use at most 200 characters.")).toBeVisible();
   expect(body).toBeUndefined();
 
@@ -129,10 +129,23 @@ it("counts the simple and SDN interfaces that use a group", async () => {
   };
   mockLists({ "security-group": [ssh], vm: [both], network: [tenant] });
   renderPage(<SecurityGroupsPage />);
-  const table = await screen.findByRole("table", { name: "Security groups" });
+  const table = await screen.findByRole("table", { name: "Firewall (security groups)" });
   const row = (await within(table).findByRole("link", { name: "ssh" })).closest("tr")!;
   expect(await within(row).findByText("1 simple · 1 SDN")).toBeVisible();
+  // SDN 카드와의 차이(OVN ACL)는 화면 도움말 패널로 옮겼다.
   expect(
-    screen.getByText(/The same groups apply to SDN interfaces through OVN ACLs/),
+    screen.getByRole("button", { name: "Help: About Firewall (security groups)" }),
   ).toBeVisible();
+});
+
+it("explains an empty group list with a create button and more help", async () => {
+  mockLists({ "security-group": [] });
+  renderPage(<SecurityGroupsPage />);
+  expect(await screen.findByText("No security groups (firewall rule bundles).")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Create a security group" }));
+  expect(
+    await screen.findByRole("dialog", { name: "Create a security group" }),
+  ).toBeInTheDocument();
 });

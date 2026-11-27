@@ -126,3 +126,15 @@ it("deletes a token after confirming", async () => {
   expect(await screen.findByText("Deleted API token cli.")).toBeInTheDocument();
   expect(await screen.findByText("No API tokens.")).toBeInTheDocument();
 });
+
+it("explains an empty list and offers to create a token", async () => {
+  tokens([]);
+  renderPage(<TokensPage />);
+  const empty = (await screen.findByText("No API tokens.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("It is shown only once, when created.");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(within(empty).getByRole("button", { name: "Create an API token" }));
+  expect(await screen.findByRole("dialog", { name: "Create an API token" })).toBeInTheDocument();
+});

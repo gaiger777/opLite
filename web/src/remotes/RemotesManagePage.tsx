@@ -9,6 +9,7 @@ import { api, call } from "@/api/client";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
@@ -48,7 +49,8 @@ export function RemotesManagePage() {
       <PageHeader
         id="remotes-title"
         title={t("nav.remotes")}
-        description={t("remotes.manageHint")}
+        help="remotes"
+        intro={t("remotes.manageHint")}
         actions={
           <Button
             onClick={(e) => {
@@ -61,68 +63,88 @@ export function RemotesManagePage() {
           </Button>
         }
       />
-      <Table aria-labelledby="remotes-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("remotes.url")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={4} query={remotes} empty={t("remotes.empty")} />
-          )}
-          {list.map((remote) => (
-            <TableRow key={remote.id}>
-              <TableCell className="font-medium">
-                <Link
-                  to={`/remotes/${encodeURIComponent(remote.name)}`}
-                  className="underline-offset-4 hover:underline"
-                >
-                  {remote.name}
-                </Link>
-              </TableCell>
-              <TableCell className="font-mono text-xs">{remote.url}</TableCell>
-              <TableCell>
-                {remote.status.reachable ? (
-                  <Badge>{t("remotes.reachable")}</Badge>
-                ) : (
-                  <Badge variant="destructive">{t("remotes.unreachable")}</Badge>
-                )}
-              </TableCell>
-              <TableCell className="text-right">
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("remotes.editNamed", { name: remote.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDialog({ remote });
-                  }}
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("common.deleteNamed", { name: remote.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDeleting(remote);
-                    setDeleteOpen(true);
-                  }}
-                >
-                  <Trash2 />
-                </Button>
-              </TableCell>
+      {remotes.isSuccess && list.length === 0 ? (
+        <EmptyState
+          title={t("remotes.empty")}
+          description={t("help.remotes.empty")}
+          diagram="replicationDr"
+          help="remotes.page"
+          action={
+            <Button
+              onClick={(e) => {
+                opener.current = e.currentTarget;
+                setDialog({ remote: null });
+              }}
+            >
+              <Plus />
+              {t("remotes.addTitle")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="remotes-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("remotes.url")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={4} query={remotes} empty={t("remotes.empty")} />
+            )}
+            {list.map((remote) => (
+              <TableRow key={remote.id}>
+                <TableCell className="font-medium">
+                  <Link
+                    to={`/remotes/${encodeURIComponent(remote.name)}`}
+                    className="underline-offset-4 hover:underline"
+                  >
+                    {remote.name}
+                  </Link>
+                </TableCell>
+                <TableCell className="font-mono text-xs">{remote.url}</TableCell>
+                <TableCell>
+                  {remote.status.reachable ? (
+                    <Badge>{t("remotes.reachable")}</Badge>
+                  ) : (
+                    <Badge variant="destructive">{t("remotes.unreachable")}</Badge>
+                  )}
+                </TableCell>
+                <TableCell className="text-right">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={t("remotes.editNamed", { name: remote.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDialog({ remote });
+                    }}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={t("common.deleteNamed", { name: remote.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDeleting(remote);
+                      setDeleteOpen(true);
+                    }}
+                  >
+                    <Trash2 />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {dialog && (
         <RemoteDialog
           remote={dialog.remote}
@@ -248,7 +270,12 @@ function RemoteDialog({
       onSubmit={submit}
     >
       {!remote && (
-        <Field id="remote-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="remote-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.remotes.name")}
+        >
           {(a11y) => (
             <Input
               id="remote-name"
@@ -265,7 +292,7 @@ function RemoteDialog({
         label={t("remotes.url")}
         error={probeError ? "remotes.errors.probe" : errors.url}
         errorValues={probeError ? { error: probeError } : undefined}
-        hint={t("remotes.urlHint")}
+        help={t("remotes.urlHint")}
       >
         {(a11y) => (
           <div className="flex gap-2">
@@ -330,7 +357,8 @@ function RemoteDialog({
         id="remote-token"
         label={t("remotes.token")}
         error={errors.token}
-        hint={t(remote ? "remotes.tokenSaved" : "remotes.tokenHint")}
+        help={t(remote ? "remotes.tokenSaved" : "remotes.tokenHint")}
+        info="remotes.token"
       >
         {(a11y) => (
           <Input

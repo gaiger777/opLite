@@ -56,7 +56,7 @@ it("names nodes, tiles and arrows for screen readers in English", () => {
   expect(labels.get(`node:${n5.id}`)).toBe(
     "Node n5, group rack-a, online, leader, load unknown, no VMs",
   );
-  expect(labels.get(`node:${w.id}`)).toBe("Witness node w1, group rack-a, online");
+  expect(labels.get(`node:${w.id}`)).toBe("Vote-only node w1, group rack-a, online");
   expect(labels.get(`node:${off.id}`)).toBe(
     "Node n7, no group, offline, frozen, load unknown, 1 VM (1 running)",
   );

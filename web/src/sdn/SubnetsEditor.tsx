@@ -2,6 +2,7 @@ import { Plus, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -54,7 +55,13 @@ export function SubnetsEditor({
             aria-label={t("sdn.subnets.n", { n: i + 1 })}
             className="grid grid-cols-1 items-end gap-2 rounded-md border p-3 sm:grid-cols-2"
           >
-            <Field id={at("cidr")} label={t("sdn.subnets.cidr")} error={err("cidr")}>
+            <Field
+              id={at("cidr")}
+              label={t("sdn.subnets.cidr")}
+              error={err("cidr")}
+              help={t("help.sdn.cidr")}
+              info="sdn.subnet"
+            >
               {(a11y) => (
                 <Input
                   id={at("cidr")}
@@ -70,7 +77,7 @@ export function SubnetsEditor({
               id={at("gateway")}
               label={t("sdn.subnets.gateway")}
               error={err("gateway")}
-              hint={row.saved ? undefined : t("sdn.subnets.gatewayHint")}
+              help={t(row.saved ? "help.sdn.gatewaySaved" : "sdn.subnets.gatewayHint")}
             >
               {(a11y) => (
                 <Input
@@ -86,7 +93,7 @@ export function SubnetsEditor({
               id={at("dns")}
               label={t("sdn.subnets.dns")}
               error={err("dns")}
-              hint={t("sdn.subnets.dnsHint")}
+              help={t("sdn.subnets.dnsHint")}
             >
               {(a11y) => (
                 <Input
@@ -101,7 +108,7 @@ export function SubnetsEditor({
               id={at("pools")}
               label={t("sdn.subnets.pools")}
               error={err("pools")}
-              hint={t("sdn.subnets.poolsHint")}
+              help={t("sdn.subnets.poolsHint")}
             >
               {(a11y) => (
                 <Input
@@ -118,7 +125,8 @@ export function SubnetsEditor({
                 id={at("floating")}
                 label={t("sdn.subnets.floating")}
                 error={err("floating")}
-                hint={t("sdn.subnets.floatingHint")}
+                help={t("sdn.subnets.floatingHint")}
+                info="fip.range"
               >
                 {(a11y) => (
                   <Input
@@ -136,7 +144,8 @@ export function SubnetsEditor({
                 id={at("ipv6Mode")}
                 label={t("sdn.subnets.ipv6Mode")}
                 error={err("ipv6Mode")}
-                hint={t("sdn.subnets.ipv6ModeHint")}
+                help={t("sdn.subnets.ipv6ModeHint")}
+                info="sdn.ipv6Mode"
               >
                 {(a11y) => (
                   <NativeSelect
@@ -160,6 +169,7 @@ export function SubnetsEditor({
               id={at("description")}
               label={t("sdn.subnets.description")}
               error={err("description")}
+              help={t("help.sdn.subnetDescription")}
             >
               {(a11y) => (
                 <Input
@@ -179,6 +189,11 @@ export function SubnetsEditor({
                     onCheckedChange={(on) => set(i, { dhcp: on === true })}
                   />
                   <Label htmlFor={at("dhcp")}>{t("sdn.subnets.dhcp")}</Label>
+                  <InfoButton
+                    topic="sdn.dhcp"
+                    label={t("sdn.subnets.dhcp")}
+                    line={t("help.sdn.dhcp")}
+                  />
                 </div>
               ) : (
                 <span className="text-xs text-muted-foreground">{t("sdn.subnets.noDhcp6")}</span>

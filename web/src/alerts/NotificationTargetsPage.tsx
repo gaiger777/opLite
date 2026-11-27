@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Send, Trash2, X } from "lucide-react";
+import { Mail, Pencil, Plus, Send, Trash2, X } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -19,6 +19,7 @@ import {
 import { api, call } from "@/api/client";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
@@ -58,7 +59,11 @@ export function NotificationTargetsPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.notificationTargets")} />
+        <PageHeader
+          title={t("nav.notificationTargets")}
+          help="notificationTargets"
+          intro={t("help.notificationTargets.intro")}
+        />
         <p className="text-sm text-muted-foreground">{t("alerts.targets.adminOnly")}</p>
       </div>
     );
@@ -92,6 +97,8 @@ export function NotificationTargetsPage() {
       <PageHeader
         id="targets-title"
         title={t("nav.notificationTargets")}
+        help="notificationTargets"
+        intro={t("help.notificationTargets.intro")}
         actions={
           <Button
             disabled={!targets.isSuccess}
@@ -105,79 +112,98 @@ export function NotificationTargetsPage() {
           </Button>
         }
       />
-      <p className="text-sm text-muted-foreground">{t("alerts.targets.pageHint")}</p>
-      <Table aria-labelledby="targets-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("alerts.targets.kind")}</TableHead>
-            <TableHead>{t("alerts.targets.destination")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={5} query={targets} empty={t("alerts.targets.empty")} />
-          )}
-          {list.map((target) => (
-            <TableRow key={target.id}>
-              <TableCell className="font-medium">{target.name}</TableCell>
-              <TableCell>
-                {target.target.kind === "smtp"
-                  ? t("alerts.targets.kinds.smtp")
-                  : t(`alerts.targets.formats.${target.target.format}`)}
-              </TableCell>
-              <TableCell className="font-mono text-xs break-all">
-                {destinationText(target)}
-              </TableCell>
-              <TableCell>
-                <Badge variant={target.enabled ? "default" : "outline"}>
-                  {t(target.enabled ? "alerts.targets.on" : "alerts.targets.off")}
-                </Badge>
-              </TableCell>
-              <TableCell className="text-right whitespace-nowrap">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={testing === target.id}
-                  aria-label={t("alerts.targets.testNamed", { name: target.name })}
-                  onClick={() => void test(target)}
-                >
-                  <Send />
-                  {t("alerts.targets.test")}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  className="ml-2"
-                  aria-label={t("alerts.targets.editNamed", { name: target.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDialog({ target });
-                  }}
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("common.deleteNamed", { name: target.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDeleting(target);
-                    setDeleteOpen(true);
-                  }}
-                >
-                  <Trash2 />
-                </Button>
-              </TableCell>
+      {targets.isSuccess && list.length === 0 ? (
+        <EmptyState
+          icon={Mail}
+          title={t("alerts.targets.empty")}
+          description={t("help.notificationTargets.empty")}
+          help="notificationTargets.page"
+          action={
+            <Button
+              onClick={(e) => {
+                opener.current = e.currentTarget;
+                setDialog({ target: null });
+              }}
+            >
+              <Plus />
+              {t("alerts.targets.createTitle")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="targets-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("alerts.targets.kind")}</TableHead>
+              <TableHead>{t("alerts.targets.destination")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={5} query={targets} empty={t("alerts.targets.empty")} />
+            )}
+            {list.map((target) => (
+              <TableRow key={target.id}>
+                <TableCell className="font-medium">{target.name}</TableCell>
+                <TableCell>
+                  {target.target.kind === "smtp"
+                    ? t("alerts.targets.kinds.smtp")
+                    : t(`alerts.targets.formats.${target.target.format}`)}
+                </TableCell>
+                <TableCell className="font-mono text-xs break-all">
+                  {destinationText(target)}
+                </TableCell>
+                <TableCell>
+                  <Badge variant={target.enabled ? "default" : "outline"}>
+                    {t(target.enabled ? "alerts.targets.on" : "alerts.targets.off")}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-right whitespace-nowrap">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={testing === target.id}
+                    aria-label={t("alerts.targets.testNamed", { name: target.name })}
+                    onClick={() => void test(target)}
+                  >
+                    <Send />
+                    {t("alerts.targets.test")}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="ml-2"
+                    aria-label={t("alerts.targets.editNamed", { name: target.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDialog({ target });
+                    }}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={t("common.deleteNamed", { name: target.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDeleting(target);
+                      setDeleteOpen(true);
+                    }}
+                  >
+                    <Trash2 />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {dialog && (
         <TargetDialog
           target={dialog.target}
@@ -261,7 +287,7 @@ function TargetDialog({
     label: string,
     hint?: string,
   ) => (
-    <Field id={id} label={label} error={errors[key]} hint={hint}>
+    <Field id={id} label={label} error={errors[key]} help={hint}>
       {(a11y) => (
         <Input
           id={id}
@@ -294,24 +320,39 @@ function TargetDialog({
       <div className="-mx-1 flex max-h-[60svh] flex-col gap-4 overflow-y-auto px-1">
         {/* 종류는 만들 때만 고른다. */}
         {!target && (
-          <Field id="target-kind" label={t("alerts.targets.kind")}>
-            <NativeSelect
-              id="target-kind"
-              className="w-full"
-              value={form.kind}
-              onChange={(e) => {
-                change({ kind: e.target.value as TargetForm["kind"] });
-                setErrors({});
-              }}
-            >
-              <NativeSelectOption value="webhook">
-                {t("alerts.targets.kinds.webhook")}
-              </NativeSelectOption>
-              <NativeSelectOption value="smtp">{t("alerts.targets.kinds.smtp")}</NativeSelectOption>
-            </NativeSelect>
+          <Field
+            id="target-kind"
+            label={t("alerts.targets.kind")}
+            help={t("help.notificationTargets.kind")}
+            info="notificationTargets.kind"
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="target-kind"
+                className="w-full"
+                value={form.kind}
+                onChange={(e) => {
+                  change({ kind: e.target.value as TargetForm["kind"] });
+                  setErrors({});
+                }}
+                {...a11y}
+              >
+                <NativeSelectOption value="webhook">
+                  {t("alerts.targets.kinds.webhook")}
+                </NativeSelectOption>
+                <NativeSelectOption value="smtp">
+                  {t("alerts.targets.kinds.smtp")}
+                </NativeSelectOption>
+              </NativeSelect>
+            )}
           </Field>
         )}
-        <Field id="target-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="target-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.notificationTargets.name")}
+        >
           {(a11y) => (
             <Input
               id="target-name"
@@ -325,22 +366,39 @@ function TargetDialog({
         </Field>
         {form.kind === "smtp" ? (
           <>
-            {text("target-host", "host", t("alerts.targets.host"))}
+            {text(
+              "target-host",
+              "host",
+              t("alerts.targets.host"),
+              t("help.notificationTargets.host"),
+            )}
             <div className="grid grid-cols-2 gap-2">
-              {text("target-port", "port", t("alerts.targets.port"))}
-              <Field id="target-tls" label={t("alerts.targets.tls")}>
-                <NativeSelect
-                  id="target-tls"
-                  className="w-full"
-                  value={form.tls}
-                  onChange={(e) => change({ tls: e.target.value as TargetForm["tls"] })}
-                >
-                  {SMTP_TLS.map((tls) => (
-                    <NativeSelectOption key={tls} value={tls}>
-                      {t(`alerts.targets.tlsModes.${tls}`)}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
+              {text(
+                "target-port",
+                "port",
+                t("alerts.targets.port"),
+                t("help.notificationTargets.port"),
+              )}
+              <Field
+                id="target-tls"
+                label={t("alerts.targets.tls")}
+                help={t("help.notificationTargets.tls")}
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id="target-tls"
+                    className="w-full"
+                    value={form.tls}
+                    onChange={(e) => change({ tls: e.target.value as TargetForm["tls"] })}
+                    {...a11y}
+                  >
+                    {SMTP_TLS.map((tls) => (
+                      <NativeSelectOption key={tls} value={tls}>
+                        {t(`alerts.targets.tlsModes.${tls}`)}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                )}
               </Field>
             </div>
             {text("target-user", "user", t("alerts.targets.user"), t("alerts.targets.userHint"))}
@@ -348,7 +406,11 @@ function TargetDialog({
               id="target-password"
               label={t("alerts.targets.password")}
               error={errors.password}
-              hint={hasPassword ? t("alerts.targets.secretSaved") : undefined}
+              help={
+                hasPassword
+                  ? t("alerts.targets.secretSaved")
+                  : t("help.notificationTargets.password")
+              }
             >
               {(a11y) => (
                 <Input
@@ -372,7 +434,12 @@ function TargetDialog({
                 <Label htmlFor="target-clear-password">{t("alerts.targets.clearPassword")}</Label>
               </div>
             )}
-            {text("target-from", "from", t("alerts.targets.from"))}
+            {text(
+              "target-from",
+              "from",
+              t("alerts.targets.from"),
+              t("help.notificationTargets.from"),
+            )}
             {text("target-to", "to", t("alerts.targets.to"), t("alerts.targets.toHint"))}
           </>
         ) : (
@@ -383,19 +450,27 @@ function TargetDialog({
               t("alerts.targets.url"),
               target ? t("alerts.targets.urlSaved") : t("alerts.targets.urlHint"),
             )}
-            <Field id="target-format" label={t("alerts.targets.format")}>
-              <NativeSelect
-                id="target-format"
-                className="w-full"
-                value={form.format}
-                onChange={(e) => change({ format: e.target.value as TargetForm["format"] })}
-              >
-                {WEBHOOK_FORMATS.map((f) => (
-                  <NativeSelectOption key={f} value={f}>
-                    {t(`alerts.targets.formats.${f}`)}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
+            <Field
+              id="target-format"
+              label={t("alerts.targets.format")}
+              help={t("help.notificationTargets.format")}
+              info="notificationTargets.format"
+            >
+              {(a11y) => (
+                <NativeSelect
+                  id="target-format"
+                  className="w-full"
+                  value={form.format}
+                  onChange={(e) => change({ format: e.target.value as TargetForm["format"] })}
+                  {...a11y}
+                >
+                  {WEBHOOK_FORMATS.map((f) => (
+                    <NativeSelectOption key={f} value={f}>
+                      {t(`alerts.targets.formats.${f}`)}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
             </Field>
             {usesToken(form.format) && (
               <>
@@ -403,7 +478,9 @@ function TargetDialog({
                   id="target-token"
                   label={t("alerts.targets.token")}
                   error={errors.token}
-                  hint={hasToken ? t("alerts.targets.secretSaved") : undefined}
+                  help={
+                    hasToken ? t("alerts.targets.secretSaved") : t("help.notificationTargets.token")
+                  }
                 >
                   {(a11y) => (
                     <Input
@@ -434,6 +511,9 @@ function TargetDialog({
             )}
             <fieldset className="flex flex-col gap-2">
               <legend className="mb-1 text-sm font-medium">{t("alerts.targets.headers")}</legend>
+              <p className="text-xs text-muted-foreground">
+                {t("help.notificationTargets.headers")}
+              </p>
               {form.headers.map((header, i) => (
                 <div key={i} className="grid grid-cols-[1fr_1fr_auto] items-center gap-2">
                   <Input
@@ -481,7 +561,7 @@ function TargetDialog({
             <Field
               id="target-ca"
               label={t("alerts.targets.caPem")}
-              hint={t("alerts.targets.caPemHint")}
+              help={t("alerts.targets.caPemHint")}
             >
               {(a11y) => (
                 <textarea

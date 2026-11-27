@@ -161,6 +161,7 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
       <PageHeader
         id="dr-plan-title"
         title={plan.name}
+        help="dr"
         description={t("dr.plan.summary", { source: plan.spec.source, pool: plan.spec.pool })}
         actions={actions}
       />
@@ -789,7 +790,11 @@ export function NewPlanPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader title={t("dr.plans.newTitle")} description={t("dr.plans.newDescription")} />
+      <PageHeader
+        title={t("dr.plans.newTitle")}
+        description={t("dr.plans.newDescription")}
+        help="dr"
+      />
       <UpgradeNotice old={old} />
       {!allowed ? (
         <p role="alert" className="text-sm text-destructive">

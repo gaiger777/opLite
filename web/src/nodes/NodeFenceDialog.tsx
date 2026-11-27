@@ -267,7 +267,7 @@ function MethodRow({
   const n = { n: i + 1 };
   const id = (field: string) => `fence-${i}-${field}`;
   const text = (field: keyof FenceRow & string, label: string, hint?: string) => (
-    <Field id={id(field)} label={label} error={errors[`${i}.${field}`]} hint={hint}>
+    <Field id={id(field)} label={label} error={errors[`${i}.${field}`]} help={hint}>
       {(a11y) => (
         <Input
           id={id(field)}
@@ -284,7 +284,7 @@ function MethodRow({
       <Field
         id={id("password")}
         label={t("nodes.fence.password")}
-        hint={row.hasPassword ? t("nodes.fence.passwordSaved") : undefined}
+        help={t(row.hasPassword ? "nodes.fence.passwordSaved" : "help.nodes.fence.password")}
       >
         {(a11y) => (
           <Input
@@ -316,7 +316,7 @@ function MethodRow({
       className="flex flex-col gap-3 rounded-lg border p-3"
     >
       <div className="flex items-end gap-2">
-        <Field id={id("kind")} label={t("nodes.fence.kind", n)}>
+        <Field id={id("kind")} label={t("nodes.fence.kind", n)} info="nodes.fence">
           <NativeSelect
             id={id("kind")}
             value={row.kind}
@@ -364,9 +364,9 @@ function MethodRow({
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {row.kind === "ipmi" && (
           <>
-            {text("address", t("nodes.fence.address"))}
-            {text("port", t("nodes.fence.port"))}
-            {text("user", t("nodes.fence.user"))}
+            {text("address", t("nodes.fence.address"), t("help.nodes.fence.address"))}
+            {text("port", t("nodes.fence.port"), t("help.nodes.fence.port"))}
+            {text("user", t("nodes.fence.user"), t("help.nodes.fence.user"))}
             {password}
             <div className="flex items-center gap-2">
               <Checkbox
@@ -380,21 +380,28 @@ function MethodRow({
         )}
         {row.kind === "redfish" && (
           <>
-            {text("address", t("nodes.fence.url"), "https://bmc.example.com")}
+            {text("address", t("nodes.fence.url"), t("help.nodes.fence.url"))}
             {text("systemId", t("nodes.fence.systemId"), t("nodes.fence.systemIdHint"))}
-            {text("user", t("nodes.fence.user"))}
+            {text("user", t("nodes.fence.user"), t("help.nodes.fence.user"))}
             {password}
             <div className="sm:col-span-2">
-              <Field id={id("caPem")} label={t("nodes.fence.caPem")}>
-                <textarea
-                  id={id("caPem")}
-                  rows={3}
-                  spellCheck={false}
-                  autoComplete="off"
-                  value={row.caPem}
-                  onChange={(e) => onChange({ caPem: e.target.value })}
-                  className="w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 py-1 font-mono text-xs break-all outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30"
-                />
+              <Field
+                id={id("caPem")}
+                label={t("nodes.fence.caPem")}
+                help={t("help.nodes.fence.caPem")}
+              >
+                {(a11y) => (
+                  <textarea
+                    id={id("caPem")}
+                    rows={3}
+                    spellCheck={false}
+                    autoComplete="off"
+                    value={row.caPem}
+                    onChange={(e) => onChange({ caPem: e.target.value })}
+                    className="w-full min-w-0 rounded-lg border border-input bg-transparent px-2.5 py-1 font-mono text-xs break-all outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30"
+                    {...a11y}
+                  />
+                )}
               </Field>
             </div>
             <div className="flex items-center gap-2">

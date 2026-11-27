@@ -510,7 +510,12 @@ function EscrowDialog({ store, onClose }: { store: BackupStore; onClose(): void 
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="escrow-passphrase" label={t("backupStores.passphrase")} error={errors.passphrase}>
+      <Field
+        id="escrow-passphrase"
+        label={t("backupStores.passphrase")}
+        error={errors.passphrase}
+        help={t("help.backupStores.escrowPassphrase")}
+      >
         {(a11y) => (
           <Input
             id="escrow-passphrase"
@@ -522,7 +527,12 @@ function EscrowDialog({ store, onClose }: { store: BackupStore; onClose(): void 
           />
         )}
       </Field>
-      <Field id="escrow-again" label={t("backupStores.passphraseAgain")} error={errors.again}>
+      <Field
+        id="escrow-again"
+        label={t("backupStores.passphraseAgain")}
+        error={errors.again}
+        help={t("help.backupStores.passphraseAgain")}
+      >
         {(a11y) => (
           <Input
             id="escrow-again"
@@ -581,7 +591,8 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
             id="settings-gc-at"
             label={t("backupStores.gcAt")}
             error={errors.gcAt}
-            hint={t("backupJobs.atHint")}
+            help={t("help.backupStores.gcAt")}
+            info="backupStores.gc"
           >
             {(a11y) => (
               <Input
@@ -607,7 +618,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
             id="settings-streams"
             label={t("backupStores.maxStreams")}
             error={errors.maxStreams}
-            hint={t("backupStores.maxStreamsHint")}
+            help={t("backupStores.maxStreamsHint")}
           >
             {(a11y) => (
               <Input
@@ -622,7 +633,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
           <Field
             id="settings-access-key"
             label={t("backupStores.newAccessKeyId")}
-            hint={t("backupStores.credentialsHint")}
+            help={t("backupStores.credentialsHint")}
             error={errors.accessKeyId}
           >
             {(a11y) => (
@@ -641,6 +652,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
             id="settings-secret-key"
             label={t("backupStores.newSecretKey")}
             error={errors.secretKey}
+            help={t("backupStores.credentialsHint")}
           >
             {(a11y) => (
               <Input

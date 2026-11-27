@@ -119,10 +119,10 @@ it("lists catalog images by architecture with downloads in progress", async () =
   });
   const arches = mockCatalog([entry(), custom]);
   renderPage(<ImagesPage />, { as: OPERATOR });
-  const table = await screen.findByRole("table", { name: "Image library" });
+  const table = await screen.findByRole("table", { name: "OS images" });
   const ubuntu = (await within(table).findByText("Ubuntu 24.04 LTS")).closest("tr")!;
-  expect(ubuntu).toHaveTextContent("Built-in");
-  expect(ubuntu).toHaveTextContent("Checksum file");
+  expect(ubuntu).toHaveTextContent("Built in");
+  expect(ubuntu).toHaveTextContent("Publisher's checksum file");
   expect(await within(ubuntu).findByText("Fetching the checksum file")).toBeInTheDocument();
   const mine = within(table).getByText("My OS 1.0").closest("tr")!;
   expect(mine).toHaveTextContent("myos-1-0-arm64");
@@ -223,7 +223,7 @@ it("explains the catalog to users without root system.read", async () => {
   );
   renderPage(<ImagesPage />, { as: { ...OPERATOR, role: "none" } });
   expect(await screen.findByText(/needs permission to read the system/)).toBeInTheDocument();
-  expect(screen.queryByRole("table", { name: "Image library" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("table", { name: "OS images" })).not.toBeInTheDocument();
   expect(asked).toBe(false);
 });
 
@@ -281,7 +281,7 @@ it("lets admins add and remove custom entries", async () => {
   );
   renderPage(<ImagesPage />);
   const user = userEvent.setup();
-  const table = await screen.findByRole("table", { name: "Image library" });
+  const table = await screen.findByRole("table", { name: "OS images" });
   const ubuntu = (await within(table).findByText("Ubuntu 24.04 LTS")).closest("tr")!;
   // 내장 항목은 지울 수 없다.
   expect(within(ubuntu).queryByRole("button", { name: /^Delete/ })).not.toBeInTheDocument();
@@ -293,7 +293,7 @@ it("lets admins add and remove custom entries", async () => {
   await user.click(screen.getByRole("button", { name: "Add entry" }));
   const dialog = await screen.findByRole("dialog", { name: "Add a catalog entry" });
   await user.type(within(dialog).getByLabelText("id"), "Bad");
-  await user.selectOptions(within(dialog).getByLabelText("Checksum"), "sha512");
+  await user.selectOptions(within(dialog).getByLabelText("File check"), "sha512");
   await user.type(within(dialog).getByLabelText("Hash (hex)"), "abc");
   await user.click(within(dialog).getByRole("button", { name: "Add entry" }));
   expect(within(dialog).getByText("Use 128 hex digits.")).toBeVisible();
@@ -321,4 +321,16 @@ it("lets admins add and remove custom entries", async () => {
     source_format: "qcow2",
     firmware: "uefi",
   });
+});
+
+it("explains an empty catalog with an add button and more help", async () => {
+  mockLists({ node: [NODE] });
+  mockCatalog([]);
+  renderPage(<ImagesPage />);
+  expect(await screen.findByText("No catalog entries.")).toBeVisible();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  const [, add] = screen.getAllByRole("button", { name: "Add entry" });
+  await userEvent.click(add!);
+  expect(await screen.findByRole("dialog", { name: "Add a catalog entry" })).toBeInTheDocument();
 });

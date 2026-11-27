@@ -40,7 +40,8 @@ export function ScheduleSection({
         <Field
           id="vm-schedule-every"
           label={t("vmForm.scheduleEvery")}
-          hint={t("vmForm.scheduleNote")}
+          help={t("vmForm.scheduleNote")}
+          info="vmForm.schedule"
         >
           {(a11y) => (
             <NativeSelect
@@ -77,6 +78,7 @@ export function ScheduleSection({
               id="vm-schedule-keep"
               label={t("vmForm.scheduleKeep")}
               error={errors["schedule.keep"]}
+              help={t("help.vmForm.scheduleKeep")}
             >
               {(a11y) => (
                 <Input

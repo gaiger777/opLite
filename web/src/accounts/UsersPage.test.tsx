@@ -272,3 +272,15 @@ it("shows two-step verification and resets it for others but not for yourself", 
     screen.queryByRole("menuitem", { name: "Reset two-step verification" }),
   ).not.toBeInTheDocument();
 });
+
+it("explains an empty user list and offers to create a user", async () => {
+  users([]);
+  renderPage(<UsersPage />);
+  const empty = (await screen.findByText("No users.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("sign in as operators or viewers");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(within(empty).getByRole("button", { name: "Create a user" }));
+  expect(await screen.findByRole("dialog", { name: "Create a user" })).toBeInTheDocument();
+});

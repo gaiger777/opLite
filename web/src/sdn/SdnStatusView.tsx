@@ -9,6 +9,7 @@ import { useList } from "@/api/live";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -154,18 +155,25 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
                 <p className="text-sm text-muted-foreground">{t("sdn.noNodes")}</p>
               ) : (
                 <div className="flex flex-wrap items-end gap-2">
-                  <Field id="sdn-move-node" label={t("sdn.move.node")}>
-                    <NativeSelect
-                      id="sdn-move-node"
-                      value={target}
-                      onChange={(e) => setMoveTo(e.target.value)}
-                    >
-                      {targets.map((n) => (
-                        <NativeSelectOption key={n.id} value={n.id}>
-                          {n.name}
-                        </NativeSelectOption>
-                      ))}
-                    </NativeSelect>
+                  <Field
+                    id="sdn-move-node"
+                    label={t("sdn.move.node")}
+                    help={t("help.sdn.moveNode")}
+                  >
+                    {(a11y) => (
+                      <NativeSelect
+                        id="sdn-move-node"
+                        value={target}
+                        onChange={(e) => setMoveTo(e.target.value)}
+                        {...a11y}
+                      >
+                        {targets.map((n) => (
+                          <NativeSelectOption key={n.id} value={n.id}>
+                            {n.name}
+                          </NativeSelectOption>
+                        ))}
+                      </NativeSelect>
+                    )}
                   </Field>
                   <Button
                     variant="outline"
@@ -193,9 +201,17 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
       <StraysBand sdn={sdn} admin={admin} />
       <CentralsTable sdn={sdn} admin={admin} />
       <section aria-labelledby="sdn-chassis" className="flex flex-col gap-2">
-        <h2 id="sdn-chassis" className="font-medium">
-          {t("sdn.chassis.title")}
-        </h2>
+        <div className="flex items-center gap-1">
+          <h2 id="sdn-chassis" className="font-medium">
+            {t("sdn.chassis.title")}
+          </h2>
+          <InfoButton
+            topic="sdn.chassis"
+            label={t("sdn.chassis.title")}
+            line={t("help.sdn.chassis")}
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">{t("help.sdn.chassis")}</p>
         <ChassisTable sdn={sdn} admin={admin} />
       </section>
       {/* 계획 67: OVN 접근 잠금(§10.5)과 "SDN 경보 켜기"(§11) */}
@@ -217,9 +233,16 @@ function CentralsTable({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
   return (
     <section aria-labelledby="sdn-centrals" className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
-        <h2 id="sdn-centrals" className="font-medium">
-          {t("sdn.centrals.title")}
-        </h2>
+        <div className="flex items-center gap-1">
+          <h2 id="sdn-centrals" className="font-medium">
+            {t("sdn.centrals.title")}
+          </h2>
+          <InfoButton
+            topic="sdn.centrals"
+            label={t("sdn.centrals.title")}
+            line={t("sdn.centrals.hint")}
+          />
+        </div>
         {write && (
           <Button
             variant="outline"
@@ -417,22 +440,30 @@ function AddCentralDialog({ sdn, onClose }: { sdn: SdnView; onClose(): void }) {
       {choices.length === 0 ? (
         <p className="text-sm text-muted-foreground">{t("sdn.noNodes")}</p>
       ) : (
-        <Field id="sdn-central-node" label={t("common.node")}>
-          <NativeSelect
-            id="sdn-central-node"
-            className="w-full"
-            value={chosen}
-            onChange={(e) => setNode(e.target.value)}
-          >
-            {choices.map((n) => {
-              const blocked = nodeBlocker(n, true);
-              return (
-                <NativeSelectOption key={n.id} value={n.id} disabled={blocked !== null}>
-                  {blocked ? `${n.name} (${t(blocked)})` : n.name}
-                </NativeSelectOption>
-              );
-            })}
-          </NativeSelect>
+        <Field
+          id="sdn-central-node"
+          label={t("common.node")}
+          help={t("help.sdn.centralNode")}
+          info="sdn.centrals"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="sdn-central-node"
+              className="w-full"
+              value={chosen}
+              onChange={(e) => setNode(e.target.value)}
+              {...a11y}
+            >
+              {choices.map((n) => {
+                const blocked = nodeBlocker(n, true);
+                return (
+                  <NativeSelectOption key={n.id} value={n.id} disabled={blocked !== null}>
+                    {blocked ? `${n.name} (${t(blocked)})` : n.name}
+                  </NativeSelectOption>
+                );
+              })}
+            </NativeSelect>
+          )}
         </Field>
       )}
       {count % 2 === 0 && (

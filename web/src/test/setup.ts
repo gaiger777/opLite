@@ -7,6 +7,8 @@ import mapKo from "@/clusterMap/i18n/ko.json";
 import dndEn from "@/dnd/i18n/en.json";
 import dndKo from "@/dnd/i18n/ko.json";
 import i18n from "@/i18n";
+import mainEn from "@/i18n/en.json";
+import mainKo from "@/i18n/ko.json";
 import { FakeXhr } from "@/test/fakeXhr";
 import { server } from "@/test/server";
 import builderEn from "@/vmBuilder/i18n/en.json";
@@ -25,11 +27,14 @@ import physicalEn from "@/physical/i18n/en.json";
 import physicalKo from "@/physical/i18n/ko.json";
 import drEn from "@/dr/i18n/en.json";
 import drKo from "@/dr/i18n/ko.json";
+import helpEn from "@/help/i18n/en.json";
+import helpKo from "@/help/i18n/ko.json";
 
-// 늦게 받는 문구(클러스터 지도 — `clusterMap/strings.ts`, 끌기 틀 — `dnd/strings.ts`, VM 빌더 —
+// 늦게 받는 문구(첫 화면 묶음도 언어마다 늦게 받는다 — `i18n/index.ts`, 클러스터 지도 — `clusterMap/strings.ts`, 끌기 틀 — `dnd/strings.ts`, VM 빌더 —
 // `vmBuilder/strings.ts`, VMware 이전 — `vmware/strings.ts`, VM 내보내기 — `exports/strings.ts`, 설정 기록·선언 묶음·인증서 —
 // `declarative/strings.ts`, 운영자 대시보드 — `physical/strings.ts`)도 시험에서는 처음부터 둔다.
 for (const [en, ko] of [
+  [mainEn, mainKo],
   [mapEn, mapKo],
   [dndEn, dndKo],
   [builderEn, builderKo],
@@ -40,6 +45,7 @@ for (const [en, ko] of [
   [certsEn, certsKo],
   [physicalEn, physicalKo],
   [drEn, drKo],
+  [helpEn, helpKo],
 ] as const) {
   i18n.addResourceBundle("en", "translation", en, false, false);
   i18n.addResourceBundle("ko", "translation", ko, false, false);

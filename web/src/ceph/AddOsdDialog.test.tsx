@@ -44,7 +44,7 @@ it("adds an OSD on an empty disk", async () => {
   expect(within(table).getByText("/dev/sdb").closest("tr")).toHaveTextContent(
     "/dev/sdbwwn-0x5000c500a1b2c3d420 GiBHDDST2000 · Z1X2Available",
   );
-  const add = screen.getByRole("button", { name: "Add OSD" });
+  const add = screen.getByRole("button", { name: "Add Ceph disk (OSD)" });
   expect(add).toBeDisabled();
   await user.click(screen.getByRole("radio", { name: "/dev/sdb" }));
   await user.click(add);
@@ -96,10 +96,10 @@ it("shows why the server refused the disk", async () => {
     ),
   );
   await user.click(await screen.findByRole("radio", { name: "/dev/sdb" }));
-  await user.click(screen.getByRole("button", { name: "Add OSD" }));
+  await user.click(screen.getByRole("button", { name: "Add Ceph disk (OSD)" }));
   expect(
     await screen.findByText(
-      "The disk cannot hold an OSD: /dev/sdb cannot hold an OSD: mounted at /srv",
+      "The disk cannot be used as a Ceph disk (OSD): /dev/sdb cannot hold an OSD: mounted at /srv",
     ),
   ).toBeInTheDocument();
 });

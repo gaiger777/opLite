@@ -244,3 +244,13 @@ it("names the balancer's automatic moves and shows what moved", async () => {
     /^POST \/vms\/\{key\}\/actions\/\{action\}$/,
   );
 });
+
+it("explains an empty range", async () => {
+  mockAudit({ entries: [] });
+  renderPage(<AuditPage />, { as: ADMIN });
+  const empty = (await screen.findByText("No audit entries in this range.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("Widen the time range");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});

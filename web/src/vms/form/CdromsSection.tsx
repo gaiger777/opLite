@@ -53,7 +53,11 @@ export function CdromsSection({
             className="flex items-end gap-2 rounded-md border p-3"
           >
             <div className="flex-1">
-              <Field id={`cdrom-${i}-iso`} label={t("vmForm.cdromMedia", { n: i })}>
+              <Field
+                id={`cdrom-${i}-iso`}
+                label={t("vmForm.cdromMedia", { n: i })}
+                info="vmForm.cdromMedia"
+              >
                 <NativeSelect
                   id={`cdrom-${i}-iso`}
                   className="w-full"

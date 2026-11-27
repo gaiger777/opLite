@@ -533,7 +533,7 @@ it("fills the reprotect dialog from the existing job and keeps its retention", a
   await user.click(await screen.findByRole("button", { name: "Reprotect" }));
   const dialog = await screen.findByRole("dialog", { name: "Reprotect web-tier" });
   expect(await within(dialog).findByLabelText("Daily at (UTC)")).toHaveValue("04:30");
-  await user.click(within(dialog).getByRole("button", { name: "Create job" }));
+  await user.click(within(dialog).getByRole("button", { name: "Create schedule" }));
   await waitFor(() =>
     expect(sent).toEqual([
       {

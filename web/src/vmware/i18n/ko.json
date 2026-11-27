@@ -10,12 +10,12 @@
     "rollbackFailedAt": "되돌림 실패: {{step}}",
     "sources": {
       "title": "저장한 vCenter·ESXi 연결입니다. 비밀번호는 클러스터에만 두고 다시 보이지 않습니다.",
-      "empty": "VMware 원본이 없습니다",
-      "emptyHint": "vCenter나 ESXi 연결을 더하면 인벤토리를 보고 이전을 계획할 수 있습니다."
+      "empty": "연결한 vCenter·ESXi가 없습니다",
+      "heading": "연결한 vCenter·ESXi"
     },
     "source": {
-      "add": "원본 더하기",
-      "addTitle": "VMware 원본 더하기",
+      "add": "vCenter·ESXi 연결",
+      "addTitle": "vCenter·ESXi 연결 더하기",
       "editTitle": "{{name}} 바꾸기",
       "editNamed": "{{name}} 바꾸기",
       "checkNamed": "{{name}} 다시 확인",
@@ -26,12 +26,12 @@
       "user": "사용자",
       "password": "비밀번호",
       "passwordKeep": "비우면 저장한 비밀번호를 그대로 씁니다(호스트·포트·사용자를 바꾸지 않을 때만).",
-      "datacenter": "데이터센터 힌트",
-      "datacenterHint": "선택. ESXi 호스트는 ha-datacenter입니다.",
+      "datacenter": "데이터센터(선택)",
+      "datacenterHint": "vCenter에 데이터센터가 여럿이면 쓸 데이터센터 이름을 적습니다. ESXi 호스트는 ha-datacenter이고, 비워도 됩니다.",
       "vddk": "VDDK로 디스크 읽기",
       "vddkHint": "vSAN·vVols에 필요합니다. 운영자가 노드에 nbdkit과 VDDK를 설치합니다.",
       "libdir": "VDDK 라이브러리 디렉터리",
-      "libdirHint": "비우면 노드 설정 [vmware] vddk_libdir입니다.",
+      "libdirHint": "노드에 VDDK를 푼 디렉터리입니다. 비우면 노드 설정의 [vmware] vddk_libdir를 씁니다.",
       "connect": "연결",
       "trust": "믿고 연결",
       "untrusted": "{{host}}가 이 클러스터가 처음 보는 인증서를 냈습니다. 믿기 전에 vCenter의 지문과 견주어 보세요.",
@@ -44,7 +44,10 @@
       "transportFolder": "데이터스토어 파일",
       "transportVddk": "VDDK",
       "checkedAt": "확인",
-      "kind": { "vcenter": "vCenter", "esxi": "ESXi" },
+      "kind": {
+        "vcenter": "vCenter",
+        "esxi": "ESXi"
+      },
       "state": {
         "ok": "연결됨",
         "error": "실패",
@@ -68,10 +71,8 @@
       }
     },
     "migrations": {
-      "title": "VMware VM 여러 대를 규칙 하나로 옮깁니다. 따뜻한 이전은 켜진 VM을 복사하고 전환할 때까지 바뀐 블록을 계속 맞춥니다.",
       "new": "새 이전",
-      "empty": "VMware 이전 계획이 없습니다",
-      "emptyHint": "VMware 원본을 더한 뒤 인벤토리에서 VM을 고르세요."
+      "empty": "VMware 이전 계획이 없습니다"
     },
     "phase": {
       "draft": "초안",
@@ -112,10 +113,24 @@
       "powered-off": "꺼짐",
       "suspended": "일시 중단"
     },
-    "tools": { "running": "실행 중", "notRunning": "멈춤", "other": "설치 안 됨" },
-    "shutdown": { "guest": "게스트 종료", "power-off": "전원 끄기" },
-    "level": { "ok": "통과", "warn": "경고", "blocked": "막힘" },
-    "problemLevel": { "error": "막힘", "warn": "경고" },
+    "tools": {
+      "running": "실행 중",
+      "notRunning": "멈춤",
+      "other": "설치 안 됨"
+    },
+    "shutdown": {
+      "guest": "게스트 종료",
+      "power-off": "전원 끄기"
+    },
+    "level": {
+      "ok": "통과",
+      "warn": "경고",
+      "blocked": "막힘"
+    },
+    "problemLevel": {
+      "error": "막힘",
+      "warn": "경고"
+    },
     "migration": {
       "source": "원본",
       "mode": "방식",
@@ -150,7 +165,7 @@
       "round": "회차",
       "copied": "복사",
       "copiedOf": "{{name}} 복사",
-      "lastDelta": "마지막 델타",
+      "lastDelta": "마지막 변경분",
       "estimate": "예상 내리는 시간",
       "nextSync": "다음 동기화",
       "target": "대상 VM",
@@ -184,7 +199,7 @@
       "capacity": "크기",
       "copied": "복사함",
       "copiedOf": "{{file}} 복사함",
-      "lastDelta": "마지막 델타",
+      "lastDelta": "마지막 변경분",
       "history": "기록",
       "cutoverRequested": "전환 요청",
       "sourceStopped": "원본 끈 시각",
@@ -198,7 +213,7 @@
       "confirm": "전환",
       "estimate": "약 {{time}} 내림",
       "noEstimate": "아직 예상 없음",
-      "delta": "마지막 델타 {{size}}",
+      "delta": "마지막 변경분 {{size}}",
       "total": "모두 합해 약 {{time}} 내립니다(차례대로 할 때 가장 길게).",
       "shutdown": {
         "guest": "VMware Tools로 게스트를 종료합니다({{timeout}}초까지 기다림).",
@@ -231,7 +246,7 @@
     },
     "wizard": {
       "title": "새 VMware 이전",
-      "hint": "원본을 고르고, VM을 고르고, 네트워크·데이터스토어를 한 번 맞추고, VM마다 확인한 뒤 시작합니다.",
+      "hint": "① 연결과 방식 ② VM 고르기 ③ 네트워크·저장소 맞추기 ④ 한도와 전환 ⑤ VM마다 확인, 차례로 진행합니다. 시작하기 전까지는 초안으로 남습니다.",
       "steps": "단계",
       "step": {
         "source": "원본",
@@ -322,24 +337,24 @@
     },
     "policy": {
       "maxParallel": "동시 VM 수",
-      "maxParallelHint": "이 계획에서 함께 도는 동기화·전환(1–64).",
+      "maxParallelHint": "이 계획에서 동시에 복사·전환하는 VM 수(1–64)입니다. 늘리면 빨라지지만 원본과 네트워크 부담이 커집니다.",
       "maxPerHost": "ESXi 호스트당",
-      "maxPerHostHint": "1–64",
+      "maxPerHostHint": "ESXi 호스트 하나에서 동시에 읽는 VM 수(1–64)입니다. 줄이면 원본 호스트의 부담이 줄어듭니다.",
       "maxPerNode": "Orbivisor 노드당",
-      "maxPerNodeHint": "1–64",
+      "maxPerNodeHint": "Orbivisor 노드 하나가 동시에 받는 VM 수(1–64)입니다.",
       "bandwidth": "대역(MiB/s)",
-      "bandwidthHint": "비우면 한도 없음.",
+      "bandwidthHint": "복사에 쓸 최대 대역입니다. 운영 시간에 네트워크를 지키려면 넣으세요. 비우면 한도 없음.",
       "interval": "동기화 주기(분)",
-      "intervalHint": "5–1440",
+      "intervalHint": "바뀐 블록을 다시 옮기는 간격(5–1440분)입니다. 짧을수록 전환 때 옮길 양이 적습니다.",
       "stopAfter": "동기화 멈춤(일 뒤)",
-      "stopAfterHint": "원본에 우리 스냅샷이 오래 남지 않게 합니다. 0은 멈추지 않음.",
+      "stopAfterHint": "이만큼 지나도 전환하지 않으면 동기화를 멈춥니다. 원본에 우리 스냅샷이 오래 남지 않게 합니다. 0은 멈추지 않음.",
       "shutdownTimeout": "게스트 종료 기다림(초)",
-      "shutdownTimeoutHint": "30–3600",
-      "maxFinalDelta": "마지막 델타 한도(GiB)",
-      "maxFinalDeltaHint": "마지막 델타가 더 크면 원본을 건드리기 전에 전환을 멈춥니다. 비우면 한도 없음.",
+      "shutdownTimeoutHint": "VMware Tools로 게스트를 끌 때 기다리는 최대 시간(30–3600초)입니다.",
+      "maxFinalDelta": "마지막 변경분 한도(GiB)",
+      "maxFinalDeltaHint": "마지막 변경분이 이보다 크면 원본을 건드리기 전에 전환을 멈춥니다. 비우면 한도 없음.",
       "shutdown": "원본 끄기",
       "cutoverAt": "예약 전환",
-      "cutoverAtHint": "비우면 손으로 전환합니다.",
+      "cutoverAtHint": "이 시각에 자동으로 전환합니다. 비우면 준비된 뒤 직접 전환합니다.",
       "protectSource": "원본 보호",
       "protectSourceHint": "원본 NIC를 켤 때 끊긴 채로 두게 하고 설명을 붙입니다."
     },
@@ -379,6 +394,28 @@
       "preflight_blocked": "지금은 원본 VM을 전환할 수 없습니다:",
       "name_taken": "이미 쓰는 이름입니다: {{message}}",
       "confirm_mismatch": "되돌리려면 Orbivisor VM의 지금 이름을 그대로 적으세요."
+    },
+    "help": {
+      "sourcesIntro": "VMware에서 VM을 옮겨 오려면 먼저 vCenter나 ESXi를 여기 연결합니다. 연결해 두면 VMware 이전에서 그 VM 목록을 보고 고를 수 있습니다.",
+      "sourcesEmpty": "vCenter나 ESXi의 주소와 계정을 한 번 저장하면, VMware 이전에서 그 VM을 골라 옮길 수 있습니다.",
+      "migrationsIntro": "VMware VM 여러 대를 한 계획으로 옮깁니다. 따뜻한 이전은 VM을 켠 채로 복사하고, 마지막 전환 때만 잠깐 끕니다.",
+      "migrationsEmpty": "연결한 vCenter·ESXi에서 VM을 고르고 네트워크·저장소를 한 번 맞추면, 여러 대를 한꺼번에 옮깁니다.",
+      "name": "이 연결을 부를 이름입니다(예: vcenter-seoul). 소문자·숫자·하이픈(하이픈으로 시작·끝 안 됨), 만든 뒤에는 바꿀 수 없습니다.",
+      "port": "HTTPS 포트입니다. 보통 443입니다.",
+      "user": "VMware에 로그인할 사용자입니다(예: administrator@vsphere.local). VM 읽기, 스냅샷 만들기·지우기, 설정 바꾸기(CBT 켜고 끄기·NIC 연결·설명), 게스트 종료·전원 끄고 켜기 권한이 있어야 합니다.",
+      "password": "그 사용자의 비밀번호입니다. 클러스터에만 두고 다시 보여 주지 않습니다.",
+      "planName": "이 이전 계획을 부를 이름입니다(예: wave-1). 소문자·숫자·하이픈(하이픈으로 시작·끝 안 됨).",
+      "source": "VM을 읽어 올 vCenter·ESXi 연결입니다. 없으면 '연결한 vCenter·ESXi'에서 먼저 더하세요.",
+      "defaultPool": "위 표에서 '기본 풀'로 둔 데이터스토어의 디스크가 갈 풀입니다. 공유 풀이면 VM을 노드 사이로 쉽게 옮깁니다.",
+      "folderKind": "옮긴 VM을 폴더 하나에 모을지, VMware의 폴더 구조를 그대로 만들지 고릅니다.",
+      "folder": "옮긴 VM(이나 VMware 폴더 구조)을 둘 Orbivisor 폴더입니다. 폴더의 권한을 이어받습니다.",
+      "node": "새 VM을 만들 노드입니다. 자동이면 여유 있는 노드를 고릅니다.",
+      "driverIso": "Windows VM에 넣어 둘 virtio 드라이버 ISO입니다. 옮긴 뒤 빠른 가상 장치로 바꿀 때 씁니다.",
+      "devices": "디스크·네트워크 카드 종류를 게스트 OS에 맞춰 자동으로 정할지, 모든 VM에 같게 둘지 고릅니다.",
+      "diskBus": "이 값이 옮기는 모든 VM에 같게 걸립니다. virtio-blk: 빠른 가상 장치 — 모든 VM에 드라이버가 있을 때만(Windows는 미리 설치, 없으면 부팅 못 함). SATA: Windows가 드라이버 없이 알아보는 호환 장치.",
+      "nicModel": "이 값이 옮기는 모든 VM에 같게 걸립니다. virtio: 빠른 가상 장치 — 모든 VM에 드라이버가 있을 때만(Windows는 미리 설치). e1000e: 드라이버 없이 동작하는 호환 장치.",
+      "shutdown": "전환 때 원본을 끄는 방법입니다. 게스트 종료(권장)는 OS가 스스로 꺼지게 하고, 전원 끄기는 바로 끊습니다.",
+      "startAfter": "켜면 전환이 끝나자마자 새 VM을 켭니다. 끄면 꺼진 채로 두어 직접 확인한 뒤 켭니다."
     }
   }
 }

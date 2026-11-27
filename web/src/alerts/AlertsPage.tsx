@@ -1,3 +1,4 @@
+import { BellOff, Send } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSearchParams } from "react-router";
@@ -6,6 +7,7 @@ import { AlertList } from "@/alerts/AlertList";
 import { AlertRulesTab } from "@/alerts/AlertRulesTab";
 import { HISTORY_PERIODS, useAlertHistory, useAlerts, type HistoryPeriod } from "@/alerts/alerts";
 import { usePermissions } from "@/auth/usePermissions";
+import { EmptyState } from "@/components/EmptyState";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { StatusChip } from "@/components/StatusChip";
@@ -35,7 +37,7 @@ export function AlertsPage() {
   const tab = tabs.find((id) => id === params.get("tab")) ?? "active";
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader title={t("nav.alerts")} />
+      <PageHeader title={t("nav.alerts")} help="alerts" intro={t("help.alerts.intro")} />
       <Tabs
         value={tab}
         onValueChange={(value) =>
@@ -98,11 +100,20 @@ function ActiveAlerts() {
   }
   return (
     <div className="flex flex-col gap-2">
-      <AlertList
-        alerts={alerts.data.alerts}
-        label={t("alerts.tab.active")}
-        subjectHref={alertHref}
-      />
+      {alerts.data.alerts.length === 0 ? (
+        <EmptyState
+          icon={BellOff}
+          title={t("alerts.none")}
+          description={t("help.alerts.empty")}
+          help="alerts.page"
+        />
+      ) : (
+        <AlertList
+          alerts={alerts.data.alerts}
+          label={t("alerts.tab.active")}
+          subjectHref={alertHref}
+        />
+      )}
       <MissingNodes unreachable={alerts.data.unreachable} unsupported={alerts.data.unsupported} />
     </div>
   );
@@ -131,48 +142,57 @@ function NotificationHistory() {
           ))}
         </NativeSelect>
       </div>
-      <Table aria-label={t("alerts.tab.history")}>
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("alerts.history.at")}</TableHead>
-            <TableHead>{t("alerts.history.state")}</TableHead>
-            <TableHead>{t("alerts.history.rule")}</TableHead>
-            <TableHead>{t("alerts.history.subject")}</TableHead>
-            <TableHead>{t("alerts.history.target")}</TableHead>
-            <TableHead>{t("common.node")}</TableHead>
-            <TableHead>{t("alerts.history.result")}</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {records.length === 0 && (
-            <TableMessage colSpan={7} query={history} empty={t("alerts.history.empty")} />
-          )}
-          {records.map((r, i) => (
-            <TableRow key={`${r.at}/${r.node}/${r.target}/${i}`}>
-              <TableCell className="whitespace-nowrap">
-                {formatTime(new Date(r.at), i18n.language)}
-              </TableCell>
-              <TableCell>{t(`alerts.history.states.${r.state}`)}</TableCell>
-              <TableCell>{r.rule ?? "—"}</TableCell>
-              <TableCell className="font-mono text-xs">{r.subject ?? "—"}</TableCell>
-              <TableCell>{r.target ?? "—"}</TableCell>
-              <TableCell>{r.node}</TableCell>
-              <TableCell>
-                {r.ok ? (
-                  <StatusChip tone="success">{t("alerts.history.sent")}</StatusChip>
-                ) : (
-                  <>
-                    <StatusChip tone="danger">{t("alerts.history.failed")}</StatusChip>
-                    {r.error && (
-                      <span className="block text-xs text-muted-foreground">{r.error}</span>
-                    )}
-                  </>
-                )}
-              </TableCell>
+      {history.isSuccess && records.length === 0 ? (
+        <EmptyState
+          icon={Send}
+          title={t("alerts.history.empty")}
+          description={t("help.alerts.historyEmpty")}
+          help="alerts.page"
+        />
+      ) : (
+        <Table aria-label={t("alerts.tab.history")}>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("alerts.history.at")}</TableHead>
+              <TableHead>{t("alerts.history.state")}</TableHead>
+              <TableHead>{t("alerts.history.rule")}</TableHead>
+              <TableHead>{t("alerts.history.subject")}</TableHead>
+              <TableHead>{t("alerts.history.target")}</TableHead>
+              <TableHead>{t("common.node")}</TableHead>
+              <TableHead>{t("alerts.history.result")}</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {records.length === 0 && (
+              <TableMessage colSpan={7} query={history} empty={t("alerts.history.empty")} />
+            )}
+            {records.map((r, i) => (
+              <TableRow key={`${r.at}/${r.node}/${r.target}/${i}`}>
+                <TableCell className="whitespace-nowrap">
+                  {formatTime(new Date(r.at), i18n.language)}
+                </TableCell>
+                <TableCell>{t(`alerts.history.states.${r.state}`)}</TableCell>
+                <TableCell>{r.rule ?? "—"}</TableCell>
+                <TableCell className="font-mono text-xs">{r.subject ?? "—"}</TableCell>
+                <TableCell>{r.target ?? "—"}</TableCell>
+                <TableCell>{r.node}</TableCell>
+                <TableCell>
+                  {r.ok ? (
+                    <StatusChip tone="success">{t("alerts.history.sent")}</StatusChip>
+                  ) : (
+                    <>
+                      <StatusChip tone="danger">{t("alerts.history.failed")}</StatusChip>
+                      {r.error && (
+                        <span className="block text-xs text-muted-foreground">{r.error}</span>
+                      )}
+                    </>
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {history.data?.truncated && (
         <p className="text-sm text-muted-foreground">{t("alerts.history.truncated")}</p>
       )}

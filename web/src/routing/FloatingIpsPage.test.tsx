@@ -72,6 +72,8 @@ it("shows the empty state", async () => {
   mockLists({ node: [N1] });
   const { container } = renderPage(<FloatingIpsPage />);
   expect(await screen.findByText("No floating IPs")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Create a floating IP" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
   await expectNoAxeViolations(container);
 });
 

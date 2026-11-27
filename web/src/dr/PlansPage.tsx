@@ -1,4 +1,4 @@
-import { LifeBuoy, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate } from "react-router";
 
@@ -67,7 +67,8 @@ export function PlansPage() {
       <PageHeader
         id="dr-plans-title"
         title={t("nav.dr")}
-        description={t("dr.plans.description")}
+        help="dr"
+        intro={t("dr.help.intro")}
         actions={items.length > 0 && newButton}
       />
       <UpgradeNotice old={old} />
@@ -75,9 +76,10 @@ export function PlansPage() {
         <ListPending error={plans.error} />
       ) : items.length === 0 ? (
         <EmptyState
-          icon={LifeBuoy}
           title={t("dr.plans.empty")}
           description={t("dr.plans.emptyHint")}
+          diagram="replicationDr"
+          help="dr.page"
           action={newButton}
         />
       ) : (

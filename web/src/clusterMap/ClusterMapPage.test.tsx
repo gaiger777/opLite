@@ -205,7 +205,7 @@ it("draws node blocks with their state and the VMs on them", async () => {
     within(map).getByRole("button", { name: /^Node n3, group b, offline, load unknown/ }),
   ).toBeVisible();
   expect(
-    within(map).getByRole("button", { name: "Witness node w1, group b, online" }),
+    within(map).getByRole("button", { name: "Vote-only node w1, group b, online" }),
   ).toBeVisible();
   expect(within(map).getByRole("button", { name: "Not placed, 1 VM" })).toBeVisible();
   // 꼬리표는 모양 + 글(색만이 아님)

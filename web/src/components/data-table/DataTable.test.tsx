@@ -31,10 +31,12 @@ function Harness({
   rows = ROWS,
   pending = false,
   error,
+  emptyState,
 }: {
   rows?: Row[];
   pending?: boolean;
   error?: Error;
+  emptyState?: React.ReactNode;
 }) {
   const state = useTableState("demo", ["kind"]);
   return (
@@ -48,6 +50,7 @@ function Harness({
         rowName={(r) => r.name}
         query={{ isPending: pending, isError: error !== undefined, error }}
         empty="Nothing."
+        emptyState={emptyState}
         labelledBy="demo-title"
         state={state}
         search={(r) => r.name}
@@ -296,4 +299,14 @@ it("has no accessibility violations with rows selected", async () => {
   await screen.findByRole("table", { name: "Demo" });
   await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
   await expectNoAxeViolations(container, { disable: ["region"] });
+});
+
+it("shows the empty state for an empty list and a no-match line for a filtered one (plan 77-4)", async () => {
+  const { unmount } = renderPage(<Harness rows={[]} emptyState={<p>No demos yet.</p>} />);
+  expect(await screen.findByText("No demos yet.")).toBeInTheDocument();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  unmount();
+  renderPage(<Harness emptyState={<p>No demos yet.</p>} />, { url: "/?q=zzz" });
+  expect(await screen.findByText("Nothing matches the search or filter.")).toBeInTheDocument();
+  expect(screen.queryByText("No demos yet.")).not.toBeInTheDocument();
 });

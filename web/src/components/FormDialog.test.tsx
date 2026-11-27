@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ApiError } from "@/api/client";
+import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 
 function setup(onSubmit: () => Promise<boolean | void>) {
@@ -54,4 +55,18 @@ it("submits once when submitted twice in the same tick", () => {
   fireEvent.submit(form);
   fireEvent.submit(form);
   expect(onSubmit).toHaveBeenCalledOnce();
+});
+
+it("focuses the first input, not the ⓘ next to its label", async () => {
+  render(
+    <FormDialog title="Create" submitLabel="Save" onClose={() => {}} onSubmit={async () => {}}>
+      <Field id="kind" label="Kind" info="pools.kind">
+        <select id="kind">
+          <option>dir</option>
+        </select>
+      </Field>
+    </FormDialog>,
+  );
+  expect(screen.getByRole("button", { name: "Help: Kind" })).toBeInTheDocument();
+  await vi.waitFor(() => expect(screen.getByLabelText("Kind")).toHaveFocus());
 });

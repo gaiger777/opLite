@@ -106,9 +106,9 @@ it("builds a VM with the keyboard only and gives focus back on Escape", async ()
   open();
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "web");
-  keyDrop(part(/^Medium/), () => slot("Compute"));
-  expect(within(slot("Compute")).getByText("2 vCPU · 4 GiB · CPU host")).toBeInTheDocument();
-  expect(live()).toHaveTextContent("Dropped Medium on Compute.");
+  keyDrop(part(/^Medium/), () => slot("CPU & memory"));
+  expect(within(slot("CPU & memory")).getByText("2 vCPU · 4 GiB · CPU host")).toBeInTheDocument();
+  expect(live()).toHaveTextContent("Dropped Medium on CPU & memory.");
 
   keyDrop(part(/^New disk in ceph/), () => slot(/^Disks \(top boots first\)/));
   // 놓으면 새 블록으로 초점이 가고 개수를 읽는다.
@@ -157,7 +157,7 @@ it("picks with a tap and drops with a tap on a lit slot", async () => {
   const nics = slot("NICs");
   expect(nics).toHaveAttribute("data-drop", "ok");
   expect(within(nics).getByText("Drop here")).toBeInTheDocument();
-  expect(slot("Compute")).toHaveAttribute("data-drop", "no");
+  expect(slot("CPU & memory")).toHaveAttribute("data-drop", "no");
   fireEvent.click(nics);
   expect(block("NIC 1 (lan)")).toBeInTheDocument();
 });
@@ -242,8 +242,8 @@ it("gives focus to the slot heading after a keyboard drop on a slot that is not 
   world();
   open();
   await screen.findByLabelText("Name");
-  keyDrop(part(/^Medium/), () => slot("Compute"));
-  expect(screen.getByRole("heading", { name: "Compute" })).toHaveFocus();
+  keyDrop(part(/^Medium/), () => slot("CPU & memory"));
+  expect(screen.getByRole("heading", { name: "CPU & memory" })).toHaveFocus();
 });
 
 it("drags with the mouse onto a slot and reads why another slot refuses", async () => {
@@ -321,11 +321,11 @@ it("edits the chosen block in the inspector: sliders, numbers and the form's clo
   open();
   const user = userEvent.setup();
   await quickVm(user);
-  await user.click(within(slot("Compute")).getByRole("button", { name: "Inspect" }));
+  await user.click(within(slot("CPU & memory")).getByRole("button", { name: "Edit" }));
   const memory = screen.getByLabelText("Memory (MiB)", { selector: "input:not([type=range])" });
   await user.clear(memory);
   await user.type(memory, "8192");
-  expect(within(slot("Compute")).getByText("2 vCPU · 8 GiB · CPU host")).toBeInTheDocument();
+  expect(within(slot("CPU & memory")).getByText("2 vCPU · 8 GiB · CPU host")).toBeInTheDocument();
   // 메모리 밀대는 256 MiB 단위·로그 눈금
   fireEvent.change(screen.getByRole("slider", { name: "Memory (MiB)" }), {
     target: { value: "11" },
@@ -334,13 +334,13 @@ it("edits the chosen block in the inspector: sliders, numbers and the form's clo
   await user.click(screen.getByRole("button", { name: "Close settings" }));
 
   await user.click(screen.getByRole("button", { name: "Ways to add User and SSH keys" }));
-  await user.click(screen.getByRole("menuitem", { name: "Add to cloud-init" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to First-boot setup" }));
   // cloud-init 조각을 놓으면 살피기가 폼의 cloud-init 칸으로 열린다.
   expect(
-    await screen.findByRole("heading", { name: "Settings of cloud-init" }),
+    await screen.findByRole("heading", { name: "Settings of First-boot setup" }),
   ).toBeInTheDocument();
   await user.type(screen.getByLabelText("User"), "ops");
-  expect(within(slot("cloud-init")).getByText("ops")).toBeInTheDocument();
+  expect(within(slot("First-boot setup")).getByText("ops")).toBeInTheDocument();
 });
 
 it("checks with the server after a pause, shows problems on their slots and blocks Create on errors", async () => {
@@ -695,7 +695,7 @@ it("reuses the zone rule of a failed create only while it is the same, and delet
   );
   expect(rules).toHaveLength(1);
   // hard → soft: 지난 규칙(r1)을 곧 지우고, 만들 때 새로 만든다.
-  await user.click(within(slot("Placement")).getByRole("button", { name: "Inspect" }));
+  await user.click(within(slot("Placement")).getByRole("button", { name: "Edit" }));
   await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
   await waitFor(() => expect(deleted).toEqual(["r1"]));
   // 지운 뒤의 확인은 새 규칙(soft)을 "만들 규칙"으로 보낸다.
@@ -790,7 +790,7 @@ it("waits for the old zone rule to go before checking, and deletes it again on C
   await waitFor(() => expect(checks.at(-1)?.rules).toEqual([]), { timeout: 3000 });
   const before = checks.length;
   // hard → soft: 지난 hard 규칙을 지우지 못했다 — 서버는 아직 그것으로 확인하니 묻지 않고 기다린다.
-  await user.click(within(slot("Placement")).getByRole("button", { name: "Inspect" }));
+  await user.click(within(slot("Placement")).getByRole("button", { name: "Edit" }));
   await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Could not delete the placement rule web-zone left by the last try: The server failed: store is down",
@@ -922,7 +922,9 @@ it("deploys from a template with the clone request and keeps its devices fixed",
   await user.type(await screen.findByLabelText("Name"), "from-tmpl");
   await user.click(screen.getByRole("button", { name: /^Ways to add tmpl/ }));
   await user.click(screen.getByRole("menuitem", { name: "Add to VM" }));
-  expect(screen.getByText("Base: template tmpl (deployed as a copy)")).toBeInTheDocument();
+  expect(
+    screen.getByText("Starting point: template tmpl (deployed as a copy)"),
+  ).toBeInTheDocument();
   expect(block("Disk 1 (tmpl-disk0)")).toBeInTheDocument();
   // 배포는 디스크를 더하지 못한다.
   await user.click(screen.getByRole("button", { name: "Ways to add New disk in ceph" }));
@@ -938,7 +940,7 @@ it("deploys from a template with the clone request and keeps its devices fixed",
     "true",
   );
   await user.keyboard("{Escape}");
-  await user.click(within(slot("Protection")).getByRole("button", { name: "Inspect" }));
+  await user.click(within(slot("Protection")).getByRole("button", { name: "Edit" }));
   expect(
     screen.getByText("A template deployment does not set HA. Turn it on after creating."),
   ).toBeInTheDocument();
@@ -1005,7 +1007,9 @@ it("hands the values to the form and back without putting the password in histor
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "carry");
-  await user.click(screen.getByRole("checkbox", { name: "Configure the guest with cloud-init" }));
+  await user.click(
+    screen.getByRole("checkbox", { name: "Set up the guest on first boot (cloud-init)" }),
+  );
   await user.type(screen.getByLabelText("Password"), "s3cret!");
   const builder = screen.getByRole("link", { name: "Builder" });
   expect(builder).toHaveAttribute("href", "/vms/-new/builder");

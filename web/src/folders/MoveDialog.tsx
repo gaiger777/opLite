@@ -148,20 +148,23 @@ export function MoveDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="move-dest" label={t("folders.destination")}>
-        <NativeSelect
-          id="move-dest"
-          className="w-full"
-          value={dest}
-          onChange={(e) => setDest(e.target.value)}
-        >
-          {targets.length === 0 && <NativeSelectOption value="">—</NativeSelectOption>}
-          {targets.map((id) => (
-            <NativeSelectOption key={id} value={id}>
-              {label(id)}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
+      <Field id="move-dest" label={t("folders.destination")} help={t("help.folders.destination")}>
+        {(a11y) => (
+          <NativeSelect
+            id="move-dest"
+            className="w-full"
+            value={dest}
+            onChange={(e) => setDest(e.target.value)}
+            {...a11y}
+          >
+            {targets.length === 0 && <NativeSelectOption value="">—</NativeSelectOption>}
+            {targets.map((id) => (
+              <NativeSelectOption key={id} value={id}>
+                {label(id)}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        )}
       </Field>
       <p className="text-sm">
         {t("folders.moveCounts", { able: able.length, blocked: items.length - able.length })}

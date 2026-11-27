@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -66,6 +67,7 @@ export function CloudInitSection({
             onCheckedChange={(v) => set({ enabled: v === true })}
           />
           <Label htmlFor="ci-enabled">{t("vmForm.ciEnabled")}</Label>
+          <InfoButton topic="vmForm.cloudInit" label={t("vmForm.cloudInit")} />
         </div>
         <p className="text-sm text-muted-foreground">
           {running ? t("vmForm.ciRunning") : t("vmForm.ciNote")}
@@ -77,7 +79,7 @@ export function CloudInitSection({
                 id="ci-hostname"
                 label={t("vmForm.ciHostname")}
                 error={errors["ci.hostname"]}
-                hint={t("vmForm.ciHostnameHint", { name: values.name || "—" })}
+                help={t("vmForm.ciHostnameHint", { name: values.name || "—" })}
               >
                 {(a11y) => (
                   <Input
@@ -92,7 +94,7 @@ export function CloudInitSection({
                 id="ci-user"
                 label={t("vmForm.ciUser")}
                 error={errors["ci.user"]}
-                hint={t("vmForm.ciUserHint")}
+                help={t("vmForm.ciUserHint")}
               >
                 {(a11y) => (
                   <Input
@@ -121,7 +123,7 @@ export function CloudInitSection({
                 id="ci-password"
                 label={t("vmForm.ciPassword")}
                 error={errors["ci.password"]}
-                hint={t("vmForm.ciPasswordHint")}
+                help={t("vmForm.ciPasswordHint")}
               >
                 {(a11y) => (
                   <Input
@@ -140,7 +142,7 @@ export function CloudInitSection({
               label={t("vmForm.ciKeys")}
               error={errors["ci.sshKeys"]}
               errorValues={keyError?.values}
-              hint={t("vmForm.ciKeysHint")}
+              help={t("vmForm.ciKeysHint")}
             >
               {(a11y) => (
                 <textarea
@@ -175,6 +177,7 @@ export function CloudInitSection({
                     id={`ci-${i}-ipv4`}
                     label={t("vmForm.ciIpv4", { n: i })}
                     error={errors[`ci.networks.${i}.ipv4`]}
+                    info="vmForm.ciIpMode"
                   >
                     <NativeSelect
                       id={`ci-${i}-ipv4`}
@@ -193,6 +196,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv4-address`}
                         label={t("vmForm.ciAddress")}
                         error={errors[`ci.networks.${i}.ipv4Address`]}
+                        info="vmForm.ciAddress"
                       >
                         {(a11y) => (
                           <Input
@@ -208,6 +212,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv4-gateway`}
                         label={t("vmForm.ciGateway")}
                         error={errors[`ci.networks.${i}.ipv4Gateway`]}
+                        info="vmForm.ciGateway"
                       >
                         {(a11y) => (
                           <Input
@@ -222,7 +227,11 @@ export function CloudInitSection({
                   ) : (
                     <div className="sm:col-span-2" />
                   )}
-                  <Field id={`ci-${i}-ipv6`} label={t("vmForm.ciIpv6", { n: i })}>
+                  <Field
+                    id={`ci-${i}-ipv6`}
+                    label={t("vmForm.ciIpv6", { n: i })}
+                    info="vmForm.ciIpMode"
+                  >
                     <NativeSelect
                       id={`ci-${i}-ipv6`}
                       className="w-full"
@@ -241,6 +250,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv6-address`}
                         label={t("vmForm.ciAddress6")}
                         error={errors[`ci.networks.${i}.ipv6Address`]}
+                        info="vmForm.ciAddress"
                       >
                         {(a11y) => (
                           <Input
@@ -256,6 +266,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv6-gateway`}
                         label={t("vmForm.ciGateway6")}
                         error={errors[`ci.networks.${i}.ipv6Gateway`]}
+                        info="vmForm.ciGateway"
                       >
                         {(a11y) => (
                           <Input
@@ -276,7 +287,7 @@ export function CloudInitSection({
                 id="ci-dns"
                 label={t("vmForm.ciDns")}
                 error={errors["ci.dns"]}
-                hint={t("vmForm.ciListHint")}
+                help={t("vmForm.ciListHint")}
               >
                 {(a11y) => (
                   <Input
@@ -291,7 +302,7 @@ export function CloudInitSection({
                 id="ci-search"
                 label={t("vmForm.ciSearch")}
                 error={errors["ci.search"]}
-                hint={t("vmForm.ciListHint")}
+                help={t("vmForm.ciListHint")}
               >
                 {(a11y) => (
                   <Input
@@ -315,7 +326,8 @@ export function CloudInitSection({
                   id="ci-user-data"
                   label={t("vmForm.ciUserData")}
                   error={errors["ci.userData"]}
-                  hint={t("vmForm.ciUserDataHint")}
+                  help={t("vmForm.ciUserDataHint")}
+                  info="vmForm.ciUserData"
                 >
                   {(a11y) => (
                     <textarea
@@ -331,7 +343,7 @@ export function CloudInitSection({
                   id="ci-vendor-data"
                   label={t("vmForm.ciVendorData")}
                   error={errors["ci.vendorData"]}
-                  hint={t("vmForm.ciVendorDataHint")}
+                  help={t("vmForm.ciVendorDataHint")}
                 >
                   {(a11y) => (
                     <textarea

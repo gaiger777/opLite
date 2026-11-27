@@ -81,7 +81,8 @@ export function HistoryPage() {
       <PageHeader
         id="history-title"
         title={t("nav.history")}
-        description={t("history.pageHint")}
+        help="history"
+        intro={t("history.intro")}
         actions={
           <>
             <Button
@@ -223,6 +224,7 @@ export function HistoryPage() {
           icon={History}
           title={t("history.empty")}
           description={t("history.emptyHint")}
+          help="history.page"
         />
       ) : (
         <div className="flex flex-col gap-4" aria-labelledby="history-title" role="region">

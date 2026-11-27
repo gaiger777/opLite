@@ -105,8 +105,9 @@ export function SourcesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="vmware-sources-title"
-        title={t("nav.vmwareSources")}
-        description={t("vmware.sources.title")}
+        title={t("vmware.sources.heading")}
+        help="vmwareSources"
+        intro={t("vmware.help.sourcesIntro")}
         actions={items.length > 0 && addButton}
       />
       {sources.data === undefined ? (
@@ -115,7 +116,8 @@ export function SourcesPage() {
         <EmptyState
           icon={Server}
           title={t("vmware.sources.empty")}
-          description={t("vmware.sources.emptyHint")}
+          description={t("vmware.help.sourcesEmpty")}
+          help="vmwareSources.page"
           action={addButton}
         />
       ) : (

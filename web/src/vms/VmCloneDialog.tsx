@@ -164,7 +164,12 @@ export function VmCloneDialog({
       onSubmit={submit}
     >
       {busy && <p className="text-sm text-muted-foreground">{t("clone.busy")}</p>}
-      <Field id="clone-name" label={t("clone.name")} error={errors.name}>
+      <Field
+        id="clone-name"
+        label={t("clone.name")}
+        error={errors.name}
+        help={t("help.clone.name")}
+      >
         {(a11y) => (
           <Input id="clone-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}
@@ -173,7 +178,7 @@ export function VmCloneDialog({
       <Field
         id="clone-source"
         label={t("clone.source")}
-        hint={running ? t("clone.running") : gone ? t("clone.gone") : undefined}
+        help={running ? t("clone.running") : gone ? t("clone.gone") : t("help.clone.source")}
       >
         {(a11y) => (
           <NativeSelect
@@ -204,7 +209,12 @@ export function VmCloneDialog({
       ) : (
         nodes !== null && node === undefined && <ListPending error={volumes.error} />
       )}
-      <Field id="clone-pool" label={t("clone.pool")} error={errors.pool}>
+      <Field
+        id="clone-pool"
+        label={t("clone.pool")}
+        error={errors.pool}
+        help={t("help.clone.pool")}
+      >
         {(a11y) => (
           <NativeSelect
             id="clone-pool"
@@ -230,7 +240,7 @@ export function VmCloneDialog({
               id={`clone-ips-${i}`}
               label={t("clone.nicIps", { n: i + 1, network: nic.network })}
               error={errors[`ips${i}`]}
-              hint={t("vmForm.nicIpsHint")}
+              help={t("vmForm.nicIpsHint")}
             >
               {(a11y) => (
                 <Input

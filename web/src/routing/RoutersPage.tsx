@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus, Route, Trash2, X } from "lucide-react";
+import { Plus, Trash2, X } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -14,6 +14,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { StatusChip } from "@/components/StatusChip";
@@ -104,7 +105,8 @@ export function RoutersPage() {
       <PageHeader
         id="routers-title"
         title={t("nav.routers")}
-        description={t("router.pageHint")}
+        help="routers"
+        intro={t("help.routers.intro")}
         actions={
           write &&
           items.length > 0 && (
@@ -124,7 +126,8 @@ export function RoutersPage() {
         <ListPending error={routers.error} />
       ) : items.length === 0 ? (
         <EmptyState
-          icon={Route}
+          diagram="sdn"
+          help="routers.page"
           title={t("router.empty.title")}
           description={t("router.empty.description")}
           action={
@@ -380,7 +383,12 @@ function CreateRouterDialog({ onClose }: { onClose(): void }) {
       onSubmit={submit}
     >
       <FolderSelect id="router-folder" state={folder} />
-      <Field id="router-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="router-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.routers.name")}
+      >
         {(a11y) => (
           <Input
             id="router-name"
@@ -394,6 +402,7 @@ function CreateRouterDialog({ onClose }: { onClose(): void }) {
         id="router-description"
         label={t("router.descriptionOptional")}
         error={errors.description}
+        help={t("help.routers.description")}
       >
         {(a11y) => (
           <Input
@@ -472,7 +481,12 @@ function ExternalFields({
   const names = [...new Set([...externals.map((n) => n.name), ...(network ? [network] : [])])];
   return (
     <>
-      <Field id={id} label={t("router.external")} hint={t("router.externalHint")}>
+      <Field
+        id={id}
+        label={t("router.external")}
+        help={t("router.externalHint")}
+        info="routers.external"
+      >
         {(a11y) => (
           <NativeSelect
             id={id}
@@ -500,6 +514,11 @@ function ExternalFields({
             onCheckedChange={(on) => onSnat(on === true)}
           />
           <Label htmlFor={`${id}-snat`}>{t("router.snatLabel")}</Label>
+          <InfoButton
+            topic="routers.snat"
+            label={t("router.snatLabel")}
+            line={t("help.routers.snat")}
+          />
         </div>
       )}
       {network !== "" && !snat && (
@@ -683,7 +702,11 @@ function InterfacesSection({ router, writes, busy, patch }: SectionProps) {
             <p className="text-xs text-muted-foreground">{t("router.noAttachable")}</p>
           ) : (
             <>
-              <Field id="router-add-interface" label={t("router.addInterface")}>
+              <Field
+                id="router-add-interface"
+                label={t("router.addInterface")}
+                help={t("help.routers.addInterface")}
+              >
                 {(a11y) => (
                   <NativeSelect
                     id="router-add-interface"
@@ -900,6 +923,8 @@ function RoutesSection({ router, writes, busy, patch }: SectionProps) {
             id="router-route-destination"
             label={t("router.destination")}
             error={error?.field === "destination" ? error.key : undefined}
+            help={t("help.routers.destination")}
+            info="routers.routes"
           >
             {(a11y) => (
               <Input
@@ -916,6 +941,7 @@ function RoutesSection({ router, writes, busy, patch }: SectionProps) {
             id="router-route-nexthop"
             label={t("router.nexthop")}
             error={error?.field === "nexthop" ? error.key : undefined}
+            help={t("help.routers.nexthop")}
           >
             {(a11y) => (
               <Input

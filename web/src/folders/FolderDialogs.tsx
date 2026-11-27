@@ -52,7 +52,7 @@ export function CreateFolderDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="folder-name" label={t("common.name")} error={error}>
+      <Field id="folder-name" label={t("common.name")} error={error} help={t("help.folders.name")}>
         {(a11y) => (
           <Input
             id="folder-name"
@@ -94,7 +94,12 @@ export function RenameFolderDialog({ folder, onClose }: { folder: Folder; onClos
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="folder-rename" label={t("common.name")} error={error}>
+      <Field
+        id="folder-rename"
+        label={t("common.name")}
+        error={error}
+        help={t("help.folders.name")}
+      >
         {(a11y) => (
           <Input
             id="folder-rename"
@@ -217,7 +222,7 @@ export function NetworkQuotaDialog({ folder, onClose }: { folder: Folder; onClos
           id={`quota-${id}`}
           label={t(`folders.dim.${id}`)}
           error={errors[id]}
-          hint={t("folders.noLimitHint")}
+          help={t("folders.noLimitHint")}
         >
           {(a11y) => (
             <Input
@@ -294,7 +299,7 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
   }
 
   const field = (id: keyof typeof values, label: string) => (
-    <Field id={`quota-${id}`} label={label} error={errors[id]} hint={t("folders.noLimitHint")}>
+    <Field id={`quota-${id}`} label={label} error={errors[id]} help={t("folders.noLimitHint")}>
       {(a11y) => (
         <Input
           id={`quota-${id}`}

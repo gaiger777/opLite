@@ -101,7 +101,7 @@ it("lists the backup jobs that copy to remote clusters", async () => {
   });
   renderPage(<RemotesPage />);
   const jobs = await screen.findByRole("table", {
-    name: "Backup jobs that copy to remote clusters",
+    name: "Backup schedules that copy to remote clusters",
   });
   expect(await within(jobs).findByRole("link", { name: "nightly" })).toHaveAttribute(
     "href",
@@ -109,4 +109,15 @@ it("lists the backup jobs that copy to remote clusters", async () => {
   );
   expect(within(jobs).getByRole("cell", { name: "dr / dr-bk" })).toBeInTheDocument();
   expect(within(jobs).queryByText("local-only")).not.toBeInTheDocument();
+});
+
+it("explains remote clusters and links to adding one when there are none", async () => {
+  mockRemotes();
+  renderPage(<RemotesPage />);
+  expect(await screen.findByText("No remote clusters.")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  expect(screen.getByRole("link", { name: "Add a remote cluster" })).toHaveAttribute(
+    "href",
+    "/remotes/-manage",
+  );
 });

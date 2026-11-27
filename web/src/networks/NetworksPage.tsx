@@ -12,6 +12,7 @@ import { usePermissions } from "@/auth/usePermissions";
 import { FolderSelect, useNewFolder } from "@/folders/FolderSelect";
 import { PermissionsButton, PermissionsSheet } from "@/permissions/PermissionsSheet";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
@@ -202,6 +203,8 @@ export function NetworksPage() {
       <PageHeader
         id="networks-title"
         title={t("nav.networks")}
+        help="networks"
+        intro={t("help.networks.intro")}
         actions={
           <>
             <ViewToggle />
@@ -215,134 +218,155 @@ export function NetworksPage() {
         }
       />
       <p className="text-sm text-muted-foreground">{t("networks.userNote")}</p>
-      <Table aria-labelledby="networks-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("networks.kind")}</TableHead>
-            <TableHead>{t("networks.bridge")}</TableHead>
-            <TableHead>{t("networks.vlanVni")}</TableHead>
-            <TableHead>{t("networks.mtu")}</TableHead>
-            <TableHead>{t("sdn.subnets.title")}</TableHead>
-            <TableHead>{t("networks.nodes")}</TableHead>
-            <TableHead>{t("networks.vms")}</TableHead>
-            {actions && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
+      {networks.isSuccess && networks.data.length === 0 ? (
+        <EmptyState
+          title={t("networks.empty")}
+          description={t("help.networks.empty")}
+          diagram="sdn"
+          help="networks.page"
+          action={
+            (write || bridges) && (
+              <Button onClick={() => setCreating(true)}>
+                <Plus />
+                {t("networks.createTitle")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="networks-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("networks.kind")}</TableHead>
+              <TableHead>{t("networks.bridge")}</TableHead>
+              <TableHead>{t("networks.vlanVni")}</TableHead>
+              <TableHead>{t("networks.mtu")}</TableHead>
+              <TableHead>{t("sdn.subnets.title")}</TableHead>
+              <TableHead>{t("networks.nodes")}</TableHead>
+              <TableHead>{t("networks.vms")}</TableHead>
+              {actions && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {(networks.data ?? []).length === 0 && (
+              <TableMessage
+                colSpan={actions ? 9 : 8}
+                query={networks}
+                empty={t("networks.empty")}
+              />
             )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(networks.data ?? []).length === 0 && (
-            <TableMessage colSpan={actions ? 9 : 8} query={networks} empty={t("networks.empty")} />
-          )}
-          {(networks.data ?? []).map((network) => {
-            const { having, noVlan } = bridgeNodes(network, nodes.data ?? []);
-            const used = users(network);
-            const routingUse = routing(network);
-            return (
-              <TableRow key={network.id}>
-                <TableCell className="font-medium">
-                  {isSdnNetwork(network) ? (
-                    <button
-                      type="button"
-                      className="underline-offset-4 hover:underline"
-                      aria-label={t("sdn.sheet.open", { name: network.name })}
-                      onClick={() => setOpened(network.id)}
-                    >
-                      {network.name}
-                    </button>
-                  ) : (
-                    network.name
-                  )}
-                  <MigrationChip
-                    migration={migrationOf(migrations.data, network.name)}
-                    onOpen={() => setMigrating(network.id)}
-                  />
-                </TableCell>
-                <TableCell>{t(`networks.kinds.${kindOf(network.spec)}`)}</TableCell>
-                <TableCell className="font-mono text-xs">{bridgeName(network.spec)}</TableCell>
-                <TableCell>
-                  {isProvider(network)
-                    ? providerLabel(network)
-                    : (network.spec.vxlan?.vni ?? network.spec.vlan ?? "—")}
-                </TableCell>
-                <TableCell>{mtuOf(network.spec)}</TableCell>
-                <TableCell>
-                  {isSdnNetwork(network) ? <SubnetsCell network={network} /> : "—"}
-                </TableCell>
-                <TableCell>
-                  {!nodes.isSuccess ? (
-                    "—"
-                  ) : having.length === 0 ? (
-                    <span className="text-destructive">
-                      {isProvider(network)
-                        ? t("sdn.physnet.noNode", {
-                            physnet: network.spec.sdn?.provider?.physnet,
-                          })
-                        : t(isSdnNetwork(network) ? "sdn.noChassis" : "networks.noNode")}
-                    </span>
-                  ) : (
-                    having.map((n) => n.name).join(", ")
-                  )}
-                  {noVlan.length > 0 && (
-                    <div className="text-xs text-destructive">
-                      {t("networks.noVlanFiltering", {
-                        nodes: noVlan.map((n) => n.name).join(", "),
-                      })}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {used ?? "—"}
-                  {writes(network) && used !== undefined && used > 0 && (
-                    <div className="text-xs text-muted-foreground">{t("networks.inUse")}</div>
-                  )}
-                </TableCell>
-                {actions && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    {writes(network) &&
-                      canMigrate &&
-                      !isSdnNetwork(network) &&
-                      !migrationOf(migrations.data, network.name) && (
+            {(networks.data ?? []).map((network) => {
+              const { having, noVlan } = bridgeNodes(network, nodes.data ?? []);
+              const used = users(network);
+              const routingUse = routing(network);
+              return (
+                <TableRow key={network.id}>
+                  <TableCell className="font-medium">
+                    {isSdnNetwork(network) ? (
+                      <button
+                        type="button"
+                        className="underline-offset-4 hover:underline"
+                        aria-label={t("sdn.sheet.open", { name: network.name })}
+                        onClick={() => setOpened(network.id)}
+                      >
+                        {network.name}
+                      </button>
+                    ) : (
+                      network.name
+                    )}
+                    <MigrationChip
+                      migration={migrationOf(migrations.data, network.name)}
+                      onOpen={() => setMigrating(network.id)}
+                    />
+                  </TableCell>
+                  <TableCell>{t(`networks.kinds.${kindOf(network.spec)}`)}</TableCell>
+                  <TableCell className="font-mono text-xs">{bridgeName(network.spec)}</TableCell>
+                  <TableCell>
+                    {isProvider(network)
+                      ? providerLabel(network)
+                      : (network.spec.vxlan?.vni ?? network.spec.vlan ?? "—")}
+                  </TableCell>
+                  <TableCell>{mtuOf(network.spec)}</TableCell>
+                  <TableCell>
+                    {isSdnNetwork(network) ? <SubnetsCell network={network} /> : "—"}
+                  </TableCell>
+                  <TableCell>
+                    {!nodes.isSuccess ? (
+                      "—"
+                    ) : having.length === 0 ? (
+                      <span className="text-destructive">
+                        {isProvider(network)
+                          ? t("sdn.physnet.noNode", {
+                              physnet: network.spec.sdn?.provider?.physnet,
+                            })
+                          : t(isSdnNetwork(network) ? "sdn.noChassis" : "networks.noNode")}
+                      </span>
+                    ) : (
+                      having.map((n) => n.name).join(", ")
+                    )}
+                    {noVlan.length > 0 && (
+                      <div className="text-xs text-destructive">
+                        {t("networks.noVlanFiltering", {
+                          nodes: noVlan.map((n) => n.name).join(", "),
+                        })}
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {used ?? "—"}
+                    {writes(network) && used !== undefined && used > 0 && (
+                      <div className="text-xs text-muted-foreground">{t("networks.inUse")}</div>
+                    )}
+                  </TableCell>
+                  {actions && (
+                    <TableCell className="text-right whitespace-nowrap">
+                      {writes(network) &&
+                        canMigrate &&
+                        !isSdnNetwork(network) &&
+                        !migrationOf(migrations.data, network.name) && (
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={t("migration.openNamed", { name: network.name })}
+                            onClick={() => setMigrating(network.id)}
+                          >
+                            <ArrowRightLeft />
+                          </Button>
+                        )}
+                      {delegates(network) && (
+                        <PermissionsButton
+                          name={network.name}
+                          onClick={() => setSharingPerms(network)}
+                        />
+                      )}
+                      {writes(network) && (
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          aria-label={t("migration.openNamed", { name: network.name })}
-                          onClick={() => setMigrating(network.id)}
+                          aria-label={t("common.deleteNamed", { name: network.name })}
+                          // VM·라우터·유동 IP가 쓰는 네트워크는 서버가 지우지 않는다.
+                          disabled={used !== 0 || routingUse.routers + routingUse.fips > 0}
+                          onClick={() => setDeleting(network)}
                         >
-                          <ArrowRightLeft />
+                          <Trash2 />
                         </Button>
                       )}
-                    {delegates(network) && (
-                      <PermissionsButton
-                        name={network.name}
-                        onClick={() => setSharingPerms(network)}
+                      <RowConfigMenu
+                        target={{ kind: "network", id: network.id, name: network.name }}
                       />
-                    )}
-                    {writes(network) && (
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("common.deleteNamed", { name: network.name })}
-                        // VM·라우터·유동 IP가 쓰는 네트워크는 서버가 지우지 않는다.
-                        disabled={used !== 0 || routingUse.routers + routingUse.fips > 0}
-                        onClick={() => setDeleting(network)}
-                      >
-                        <Trash2 />
-                      </Button>
-                    )}
-                    <RowConfigMenu
-                      target={{ kind: "network", id: network.id, name: network.name }}
-                    />
-                  </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {creating && <CreateNetworkDialog bridges={bridges} onClose={() => setCreating(false)} />}
       {migratingNetwork && (
         <MigrationWizard source={migratingNetwork} onClose={() => setMigrating(null)} />
@@ -547,7 +571,12 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
       onSubmit={submit}
     >
       <FolderSelect id="network-folder" state={folder} />
-      <Field id="network-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="network-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.networks.name")}
+      >
         {(a11y) => (
           <Input
             id="network-name"
@@ -561,7 +590,8 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
         id="network-kind"
         label={t("networks.kind")}
         error={errors.kind}
-        hint={t(`networks.kindHint.${kind}`)}
+        help={t(`networks.kindHint.${kind}`)}
+        info="networks.kind"
       >
         {(a11y) => (
           <NativeSelect
@@ -605,7 +635,12 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
       )}
       {kind === "bridge" ? (
         <>
-          <Field id="network-bridge" label={t("networks.bridge")} error={errors.bridge}>
+          <Field
+            id="network-bridge"
+            label={t("networks.bridge")}
+            error={errors.bridge}
+            help={t("help.networks.bridge")}
+          >
             {(a11y) => (
               <Input
                 id="network-bridge"
@@ -626,7 +661,8 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             id="network-vlan"
             label={t("networks.vlanOptional")}
             error={errors.vlan}
-            hint={t("networks.vlanHint")}
+            help={t("networks.vlanHint")}
+            info="networks.vlan"
           >
             {(a11y) => (
               <Input
@@ -647,7 +683,8 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
                 id="network-physnet"
                 label={t("sdn.physnet.name")}
                 error={errors.physnet}
-                hint={t(physnets.length > 0 ? "sdn.physnet.pickHint" : "sdn.physnet.noneHint")}
+                help={t(physnets.length > 0 ? "sdn.physnet.pickHint" : "sdn.physnet.noneHint")}
+                info="networks.physnet"
               >
                 {(a11y) => (
                   <Input
@@ -669,7 +706,8 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
                 id="network-vlan"
                 label={t("networks.vlanOptional")}
                 error={errors.vlan}
-                hint={t("sdn.physnet.vlanHint")}
+                help={t("sdn.physnet.vlanHint")}
+                info="networks.vlan"
               >
                 {(a11y) => (
                   <Input
@@ -688,7 +726,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
               id="network-vni"
               label={t("networks.vni")}
               error={errors.vni}
-              hint={t("networks.vniHint")}
+              help={t("networks.vniHint")}
             >
               {(a11y) => (
                 <Input
@@ -705,13 +743,14 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             id="network-mtu"
             label={t("networks.mtuOptional")}
             error={errors.mtu}
-            hint={t(
+            help={t(
               kind === "provider"
                 ? "sdn.physnet.mtuHint"
                 : kind === "sdn"
                   ? "sdn.mtuHint"
                   : "networks.mtuHint",
             )}
+            info="networks.mtu"
           >
             {(a11y) => (
               <Input

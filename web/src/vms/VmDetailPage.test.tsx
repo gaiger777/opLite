@@ -323,7 +323,7 @@ it("shows the HA policy, broken placement rules and the HA error", async () => {
   expect(summary("HA group")).toHaveTextContent("rack");
   expect(summary("HA recovery priority")).toHaveTextContent("50");
   expect(summary("Guest agent watch")).toHaveTextContent("Off");
-  expect(summary("Broken placement rules")).toHaveTextContent("spread, ha-group:rack");
+  expect(summary("Placement rules not met")).toHaveTextContent("spread, ha-group:rack");
   expect(summary("HA error")).toHaveTextContent("HA gave up after 1 relocations");
 });
 
@@ -354,7 +354,7 @@ it("shows a VM without HA plainly", async () => {
   expect(summary("High availability")).toHaveTextContent("Off");
   expect(screen.queryByText("HA group", { selector: "dt" })).not.toBeInTheDocument();
   expect(screen.queryByText("Guest agent watch", { selector: "dt" })).not.toBeInTheDocument();
-  expect(summary("Broken placement rules")).toHaveTextContent("—");
+  expect(summary("Placement rules not met")).toHaveTextContent("—");
   expect(screen.queryByText("HA error", { selector: "dt" })).not.toBeInTheDocument();
 });
 
@@ -412,7 +412,9 @@ it("shows the running hardware, what was added while running and what waits for 
   expect(await screen.findByText("Restart needed")).toBeInTheDocument();
   expect(screen.getByText("4 (max 8)")).toBeInTheDocument();
   expect(screen.getByText("4 GiB (max 16 GiB)")).toBeInTheDocument();
-  expect(screen.getByText("1/8 hotplug ports used")).toBeInTheDocument();
+  expect(
+    screen.getByText("7 more devices can be added while running (1/8 used)"),
+  ).toBeInTheDocument();
   const pending = screen.getByRole("list", { name: "Applies at the next power cycle" });
   expect(
     within(pending)
@@ -494,7 +496,7 @@ it("says when a running VM was started without hotplug", async () => {
   });
   mockLists({ vm: [old], node: [NODE] });
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
-  expect(await screen.findByText("Not available (started without it)")).toBeInTheDocument();
+  expect(await screen.findByText("None (restart the VM to add devices)")).toBeInTheDocument();
   expect(screen.queryByText("Restart needed")).not.toBeInTheDocument();
 });
 
@@ -740,7 +742,7 @@ describe("install media", () => {
     // 보류 목록은 CD-ROM 드라이브 번호를 넣어 보인다.
     const pending = screen.getByRole("list", { name: "Applies at the next power cycle" });
     expect(pending).toHaveTextContent("Boot order of CD-ROM drive 1");
-    expect(pending).toHaveTextContent("cloud-init");
+    expect(pending).toHaveTextContent("First-boot setup");
   });
 
   it("inserts and ejects media while the VM runs and tracks the task", async () => {

@@ -116,7 +116,8 @@ export function HaSection({ write }: { write: boolean }) {
       <Field
         id="settings-ha-reserve"
         label={t("settings.ha.reserve")}
-        hint={t("settings.ha.reserveHint")}
+        help={t("settings.ha.reserveHint")}
+        info="settings.haReserve"
       >
         {(a11y) => (
           <NativeSelect
@@ -142,6 +143,7 @@ export function HaSection({ write }: { write: boolean }) {
           id="settings-ha-amount"
           label={t(`settings.ha.amount.${values.kind}`)}
           error={shown.amount}
+          help={t(`help.settings.haAmount.${values.kind}`)}
         >
           {(a11y) => (
             <Input
@@ -161,7 +163,8 @@ export function HaSection({ write }: { write: boolean }) {
         id="settings-ha-concurrency"
         label={t("settings.ha.concurrency")}
         error={shown.concurrency}
-        hint={t("settings.ha.concurrencyHint")}
+        help={t("settings.ha.concurrencyHint")}
+        info="settings.haConcurrency"
       >
         {(a11y) => (
           <Input

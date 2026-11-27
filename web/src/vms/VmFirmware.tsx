@@ -6,6 +6,7 @@ import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
 import { useVmCan } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -36,10 +37,24 @@ export function PendingNote({ vm, fields }: { vm: Vm; fields: readonly string[] 
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+/** 한 칸. `help`(한 줄)를 주면 이름 옆 ⓘ가 도움말 패널(주제 `info`)을 연다(계획 77-4). */
+function Field({
+  label,
+  help,
+  info,
+  children,
+}: {
+  label: string;
+  help?: string;
+  info?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-1">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dt className="flex items-center gap-1 text-xs text-muted-foreground">
+        {label}
+        {help && info && <InfoButton topic={info} label={label} line={help} />}
+      </dt>
       <dd className="text-sm">{children}</dd>
     </div>
   );
@@ -97,15 +112,27 @@ export function VmSecurity({ vm }: { vm: Vm }) {
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         <dl aria-labelledby="vm-security" className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-          <Field label={t("vms.security.tpm")}>
+          <Field
+            label={t("vms.security.tpm")}
+            help={t("help.vms.security.tpm")}
+            info="vms.security.tpm"
+          >
             {t(tpm ? "vms.on" : "vms.haOff")}
             {tpmDetail && <span className="block text-xs text-muted-foreground">{tpmDetail}</span>}
           </Field>
-          <Field label={t("vms.security.secureBoot")}>
+          <Field
+            label={t("vms.security.secureBoot")}
+            help={t("help.vms.security.secureBoot")}
+            info="vmForm.secureBoot"
+          >
             {t(secureBoot ? "vms.on" : "vms.haOff")}
           </Field>
           {uefi && (
-            <Field label={t("vms.security.uefiVars")}>
+            <Field
+              label={t("vms.security.uefiVars")}
+              help={t("help.vms.security.uefiVars")}
+              info="vms.security.uefiVars"
+            >
               {firmwareNode
                 ? t("vms.security.varsOn", { node: firmwareNode })
                 : t("vms.security.noVars")}

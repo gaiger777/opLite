@@ -17,6 +17,7 @@ import {
 } from "@/certs/api";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -98,7 +99,12 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
         await refreshCerts(queryClient);
       }}
     >
-      <Field id="account-name" label={t("common.name")} error={shown("name")}>
+      <Field
+        id="account-name"
+        label={t("common.name")}
+        error={shown("name")}
+        help={t("certs.help.name")}
+      >
         {(a11y) => (
           <Input
             id="account-name"
@@ -108,22 +114,35 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
           />
         )}
       </Field>
-      <Field id="account-directory" label={t("certs.account.directory")}>
-        <NativeSelect
-          id="account-directory"
-          value={directory}
-          onChange={(e) => setDirectory(e.target.value)}
-        >
-          {DIRECTORIES.map((d) => (
-            <NativeSelectOption key={d} value={d}>
-              {t(`certs.directories.${d}`)}
-            </NativeSelectOption>
-          ))}
-          <NativeSelectOption value="custom">{t("certs.directories.custom")}</NativeSelectOption>
-        </NativeSelect>
+      <Field
+        id="account-directory"
+        label={t("certs.account.directory")}
+        help={t("certs.help.directory")}
+        info="certs.directory"
+      >
+        {(a11y) => (
+          <NativeSelect
+            id="account-directory"
+            value={directory}
+            onChange={(e) => setDirectory(e.target.value)}
+            {...a11y}
+          >
+            {DIRECTORIES.map((d) => (
+              <NativeSelectOption key={d} value={d}>
+                {t(`certs.directories.${d}`)}
+              </NativeSelectOption>
+            ))}
+            <NativeSelectOption value="custom">{t("certs.directories.custom")}</NativeSelectOption>
+          </NativeSelect>
+        )}
       </Field>
       {custom && (
-        <Field id="account-url" label={t("certs.account.url")} error={shown("url")}>
+        <Field
+          id="account-url"
+          label={t("certs.account.url")}
+          error={shown("url")}
+          help={t("certs.help.url")}
+        >
           {(a11y) => (
             <Input
               id="account-url"
@@ -135,13 +154,16 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
           )}
         </Field>
       )}
-      <Field id="account-email" label={t("certs.account.email")}>
-        <Input
-          id="account-email"
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-        />
+      <Field id="account-email" label={t("certs.account.email")} help={t("certs.help.email")}>
+        {(a11y) => (
+          <Input
+            id="account-email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            {...a11y}
+          />
+        )}
       </Field>
       <div className="flex flex-col gap-1">
         <Check id="account-tos" checked={tos} onChange={setTos}>
@@ -150,10 +172,22 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
         {shown("tos") && <p className="text-xs text-destructive">{t(errors.tos!)}</p>}
       </div>
       <fieldset className="flex flex-col gap-2">
-        <legend className="mb-1 text-sm font-medium">{t("certs.account.eab")}</legend>
-        <p className="text-xs text-muted-foreground">{t("certs.account.eabHint")}</p>
+        <legend className="mb-1 flex items-center gap-1 text-sm font-medium">
+          {t("certs.account.eab")}
+          <InfoButton
+            topic="certs.eab"
+            label={t("certs.account.eab")}
+            line={t("certs.help.eabHint")}
+          />
+        </legend>
+        <p className="text-xs text-muted-foreground">{t("certs.help.eabHint")}</p>
         <div className="grid gap-2 sm:grid-cols-2">
-          <Field id="account-kid" label={t("certs.account.kid")} error={shown("eab")}>
+          <Field
+            id="account-kid"
+            label={t("certs.account.kid")}
+            error={shown("eab")}
+            help={t("certs.help.kid")}
+          >
             {(a11y) => (
               <Input
                 id="account-kid"
@@ -164,7 +198,7 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="account-hmac" label={t("certs.account.hmac")} hint={t("certs.secretOnce")}>
+          <Field id="account-hmac" label={t("certs.account.hmac")} help={t("certs.help.hmac")}>
             {(a11y) => (
               <Input
                 id="account-hmac"
@@ -178,7 +212,7 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
           </Field>
         </div>
       </fieldset>
-      <Field id="account-ca" label={t("certs.account.ca")} hint={t("certs.account.caHint")}>
+      <Field id="account-ca" label={t("certs.account.ca")} help={t("certs.help.caHint")}>
         {(a11y) => (
           <textarea
             id="account-ca"
@@ -270,39 +304,37 @@ export function DnsDialog({ onClose }: { onClose(): void }) {
         id="dns-name"
         label={t("common.name")}
         error={tried && !NAME.test(name) ? "certs.errors.name" : undefined}
+        help={t("certs.help.dnsName")}
       >
         {(a11y) => (
           <Input id="dns-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}
       </Field>
-      <Field id="dns-kind" label={t("certs.dns.kind")}>
-        <NativeSelect
-          id="dns-kind"
-          value={kind}
-          onChange={(e) => {
-            setKind(e.target.value as DnsKind);
-            setValues({});
-          }}
-        >
-          {DNS_KINDS.map((k) => (
-            <NativeSelectOption key={k} value={k}>
-              {t(`certs.dnsKinds.${k}`)}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
+      <Field id="dns-kind" label={t("certs.dns.kind")} help={t("certs.help.dnsKind")}>
+        {(a11y) => (
+          <NativeSelect
+            id="dns-kind"
+            value={kind}
+            onChange={(e) => {
+              setKind(e.target.value as DnsKind);
+              setValues({});
+            }}
+            {...a11y}
+          >
+            {DNS_KINDS.map((k) => (
+              <NativeSelectOption key={k} value={k}>
+                {t(`certs.dnsKinds.${k}`)}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        )}
       </Field>
       {fields.map((f) => (
         <Field
           key={`${kind}-${f.key}`}
           id={`dns-${f.key}`}
           label={t(`certs.dnsFields.${f.key}`)}
-          hint={
-            f.secret
-              ? t("certs.secretOnce")
-              : f.key === "path"
-                ? t("certs.dns.hookHint")
-                : undefined
-          }
+          help={t(`certs.help.dnsFields.${f.key}`)}
           error={
             tried && missing.includes(f)
               ? "certs.errors.required"
@@ -323,7 +355,7 @@ export function DnsDialog({ onClose }: { onClose(): void }) {
           )}
         </Field>
       ))}
-      <Field id="dns-zones" label={t("certs.dns.zones")} hint={t("certs.dns.zonesHint")}>
+      <Field id="dns-zones" label={t("certs.dns.zones")} help={t("certs.dns.zonesHint")}>
         {(a11y) => (
           <Input
             id="dns-zones"
@@ -408,7 +440,12 @@ export function CertificateDialog({
         await refreshCerts(queryClient);
       }}
     >
-      <Field id="cert-name" label={t("common.name")} error={tried ? errors.name : undefined}>
+      <Field
+        id="cert-name"
+        label={t("common.name")}
+        error={tried ? errors.name : undefined}
+        help={t("certs.help.certName")}
+      >
         {(a11y) => (
           <Input id="cert-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}
@@ -416,7 +453,7 @@ export function CertificateDialog({
       <Field
         id="cert-names"
         label={t("certs.cert.names")}
-        hint={t("certs.cert.namesHint")}
+        help={t("certs.cert.namesHint")}
         error={tried ? (errors.names ?? errors.wildcard) : undefined}
       >
         {(a11y) => (
@@ -433,54 +470,82 @@ export function CertificateDialog({
         id="cert-account"
         label={t("certs.cert.account")}
         error={tried ? errors.account : undefined}
+        help={t("certs.help.account")}
       >
-        <NativeSelect
-          id="cert-account"
-          value={account}
-          onChange={(e) => setAccount(e.target.value)}
-        >
-          {accounts.map((a) => (
-            <NativeSelectOption key={a.id} value={a.name}>
-              {a.name}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
-      </Field>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field id="cert-scope" label={t("certs.cert.scope")}>
+        {(a11y) => (
           <NativeSelect
-            id="cert-scope"
-            value={scope}
-            onChange={(e) => setScope(e.target.value as "per_node" | "shared")}
+            id="cert-account"
+            value={account}
+            onChange={(e) => setAccount(e.target.value)}
+            {...a11y}
           >
-            <NativeSelectOption value="shared">{t("certs.scope.shared")}</NativeSelectOption>
-            <NativeSelectOption value="per_node">{t("certs.scope.per_node")}</NativeSelectOption>
-          </NativeSelect>
-        </Field>
-        <Field id="cert-challenge" label={t("certs.cert.challenge")}>
-          <NativeSelect
-            id="cert-challenge"
-            value={challenge}
-            onChange={(e) => setChallenge(e.target.value as "http01" | "dns01")}
-          >
-            <NativeSelectOption value="http01">HTTP-01</NativeSelectOption>
-            <NativeSelectOption value="dns01">DNS-01</NativeSelectOption>
-          </NativeSelect>
-        </Field>
-      </div>
-      {challenge === "dns01" && (
-        <Field id="cert-dns" label={t("certs.cert.dns")} error={tried ? errors.dns : undefined}>
-          <NativeSelect
-            id="cert-dns"
-            value={provider}
-            onChange={(e) => setProvider(e.target.value)}
-          >
-            {dns.map((d) => (
-              <NativeSelectOption key={d.id} value={d.name}>
-                {d.name}
+            {accounts.map((a) => (
+              <NativeSelectOption key={a.id} value={a.name}>
+                {a.name}
               </NativeSelectOption>
             ))}
           </NativeSelect>
+        )}
+      </Field>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field
+          id="cert-scope"
+          label={t("certs.cert.scope")}
+          help={t("certs.help.scope")}
+          info="certs.scope"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="cert-scope"
+              value={scope}
+              onChange={(e) => setScope(e.target.value as "per_node" | "shared")}
+              {...a11y}
+            >
+              <NativeSelectOption value="shared">{t("certs.scope.shared")}</NativeSelectOption>
+              <NativeSelectOption value="per_node">{t("certs.scope.per_node")}</NativeSelectOption>
+            </NativeSelect>
+          )}
+        </Field>
+        <Field
+          id="cert-challenge"
+          label={t("certs.cert.challenge")}
+          help={t("certs.help.challenge")}
+          info="certs.challenge"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="cert-challenge"
+              value={challenge}
+              onChange={(e) => setChallenge(e.target.value as "http01" | "dns01")}
+              {...a11y}
+            >
+              <NativeSelectOption value="http01">HTTP-01</NativeSelectOption>
+              <NativeSelectOption value="dns01">DNS-01</NativeSelectOption>
+            </NativeSelect>
+          )}
+        </Field>
+      </div>
+      {challenge === "dns01" && (
+        <Field
+          id="cert-dns"
+          label={t("certs.cert.dns")}
+          error={tried ? errors.dns : undefined}
+          help={t("certs.help.dns")}
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="cert-dns"
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+              {...a11y}
+            >
+              {dns.map((d) => (
+                <NativeSelectOption key={d.id} value={d.name}>
+                  {d.name}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
       )}
       {missing.length > 0 && (
@@ -489,7 +554,7 @@ export function CertificateDialog({
         </p>
       )}
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field id="cert-key" label={t("certs.cert.key")} hint={t("certs.cert.keyHint")}>
+        <Field id="cert-key" label={t("certs.cert.key")} help={t("certs.cert.keyHint")}>
           {(a11y) => (
             <NativeSelect
               id="cert-key"
@@ -502,19 +567,22 @@ export function CertificateDialog({
             </NativeSelect>
           )}
         </Field>
-        <Field id="cert-profile" label={t("certs.cert.profile")}>
-          <NativeSelect
-            id="cert-profile"
-            value={profile}
-            onChange={(e) => setProfile(e.target.value)}
-          >
-            <NativeSelectOption value="">{t("certs.cert.defaultProfile")}</NativeSelectOption>
-            {profiles.map((p) => (
-              <NativeSelectOption key={p} value={p}>
-                {p}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field id="cert-profile" label={t("certs.cert.profile")} help={t("certs.help.profile")}>
+          {(a11y) => (
+            <NativeSelect
+              id="cert-profile"
+              value={profile}
+              onChange={(e) => setProfile(e.target.value)}
+              {...a11y}
+            >
+              <NativeSelectOption value="">{t("certs.cert.defaultProfile")}</NativeSelectOption>
+              {profiles.map((p) => (
+                <NativeSelectOption key={p} value={p}>
+                  {p}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
       </div>
     </FormDialog>

@@ -29,9 +29,8 @@
     },
     "sets": {
       "title": "Apply sets",
-      "pageHint": "Each apply set remembers what orbivisorctl apply last declared and compares it with the cluster. Drift shows who changed what since.",
       "empty": "No apply sets.",
-      "emptyHint": "orbivisorctl apply --set NAME -f DIR creates one.",
+      "emptyHint": "Getting started: 1. Get the current settings as files with Export as YAML in a page's ⋯ menu (VMs, networks, …) or orbivisorctl export 2. Keep the files in Git 3. orbivisorctl apply --set name -f folder.",
       "objects": "Objects",
       "lastApplied": "Last applied",
       "appliedBy": "{{time}} by {{user}}",
@@ -40,7 +39,8 @@
       "drifted_other": "{{count}} drifted",
       "inSync": "In sync",
       "unchecked": "Not checked yet",
-      "failed": "Last apply failed"
+      "failed": "Last apply failed",
+      "intro": "Write settings as YAML files and apply them all at once with orbivisorctl apply. The cluster remembers what was applied and tells you when someone changes it in the UI (\"differs from the file\"). Not needed if you only use the UI."
     },
     "set": {
       "history": "Config history",

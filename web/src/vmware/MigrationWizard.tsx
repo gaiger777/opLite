@@ -10,6 +10,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -63,13 +64,13 @@ interface Draft {
 function Check({
   id,
   label,
-  hint,
+  help,
   checked,
   onChange,
 }: {
   id: string;
   label: string;
-  hint?: string;
+  help?: string;
   checked: boolean;
   onChange(on: boolean): void;
 }) {
@@ -79,13 +80,13 @@ function Check({
         id={id}
         checked={checked}
         onCheckedChange={(c) => onChange(c === true)}
-        aria-describedby={hint ? `${id}-hint` : undefined}
+        aria-describedby={help ? `${id}-hint` : undefined}
       />
       <div className="flex flex-col gap-0.5">
         <Label htmlFor={id}>{label}</Label>
-        {hint && (
+        {help && (
           <p id={`${id}-hint`} className="text-xs text-muted-foreground">
-            {hint}
+            {help}
           </p>
         )}
       </div>
@@ -279,7 +280,11 @@ export function MigrationWizard() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader title={t("vmware.wizard.title")} description={t("vmware.wizard.hint")} />
+      <PageHeader
+        title={t("vmware.wizard.title")}
+        description={t("vmware.wizard.hint")}
+        help="vmwareMigrations"
+      />
       <ol aria-label={t("vmware.wizard.steps")} className="flex flex-wrap gap-2 text-sm">
         {WIZARD_STEPS.map((s, i) => (
           <li
@@ -306,7 +311,12 @@ export function MigrationWizard() {
 
         {step === "source" && (
           <div className="flex max-w-xl flex-col gap-4">
-            <Field id="vmware-wizard-name" label={t("common.name")} error={errors.name}>
+            <Field
+              id="vmware-wizard-name"
+              label={t("common.name")}
+              error={errors.name}
+              help={t("vmware.help.planName")}
+            >
               {(a11y) => (
                 <Input
                   id="vmware-wizard-name"
@@ -321,6 +331,7 @@ export function MigrationWizard() {
               id="vmware-wizard-source"
               label={t("vmware.migration.source")}
               error={errors.source}
+              help={t("vmware.help.source")}
             >
               {(a11y) => (
                 <NativeSelect
@@ -349,7 +360,10 @@ export function MigrationWizard() {
               </p>
             )}
             <fieldset className="flex flex-col gap-2">
-              <legend className="mb-1 text-sm font-medium">{t("vmware.migration.mode")}</legend>
+              <legend className="mb-1 flex items-center gap-1 text-sm font-medium">
+                {t("vmware.migration.mode")}
+                <InfoButton topic="vmwareMigrations.mode" label={t("vmware.migration.mode")} />
+              </legend>
               {(["warm", "cold"] as const).map((mode) => (
                 <label key={mode} className="flex items-start gap-2 text-sm">
                   <input
@@ -516,124 +530,179 @@ export function MigrationWizard() {
                   </TableBody>
                 </Table>
               </div>
-              <Field id="vmware-default-pool" label={t("vmware.mapping.defaultPool")}>
-                <NativeSelect
-                  id="vmware-default-pool"
-                  className="w-full"
-                  value={form.defaultPool}
-                  onChange={(e) => set({ defaultPool: e.target.value })}
-                >
-                  <NativeSelectOption value="">{t("vmware.mapping.none")}</NativeSelectOption>
-                  {ourPools.map((p) => (
-                    <NativeSelectOption key={p} value={p}>
-                      {p}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
+              <Field
+                id="vmware-default-pool"
+                label={t("vmware.mapping.defaultPool")}
+                help={t("vmware.help.defaultPool")}
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-default-pool"
+                    className="w-full"
+                    value={form.defaultPool}
+                    onChange={(e) => set({ defaultPool: e.target.value })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="">{t("vmware.mapping.none")}</NativeSelectOption>
+                    {ourPools.map((p) => (
+                      <NativeSelectOption key={p} value={p}>
+                        {p}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                )}
               </Field>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field id="vmware-folder-kind" label={t("vmware.mapping.folders")}>
-                <NativeSelect
-                  id="vmware-folder-kind"
-                  className="w-full"
-                  value={form.folderKind}
-                  onChange={(e) => set({ folderKind: e.target.value as WizardForm["folderKind"] })}
-                >
-                  <NativeSelectOption value="flat">{t("vmware.mapping.flat")}</NativeSelectOption>
-                  <NativeSelectOption value="mirror">
-                    {t("vmware.mapping.mirror")}
-                  </NativeSelectOption>
-                </NativeSelect>
+              <Field
+                id="vmware-folder-kind"
+                label={t("vmware.mapping.folders")}
+                help={t("vmware.help.folderKind")}
+                info="vmwareMigrations.folders"
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-folder-kind"
+                    className="w-full"
+                    value={form.folderKind}
+                    onChange={(e) =>
+                      set({ folderKind: e.target.value as WizardForm["folderKind"] })
+                    }
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="flat">{t("vmware.mapping.flat")}</NativeSelectOption>
+                    <NativeSelectOption value="mirror">
+                      {t("vmware.mapping.mirror")}
+                    </NativeSelectOption>
+                  </NativeSelect>
+                )}
               </Field>
               <Field
                 id="vmware-folder"
                 label={
                   form.folderKind === "flat" ? t("vmware.mapping.into") : t("vmware.mapping.under")
                 }
+                help={t("vmware.help.folder")}
               >
-                <NativeSelect
-                  id="vmware-folder"
-                  className="w-full"
-                  value={form.folder}
-                  onChange={(e) => set({ folder: e.target.value })}
-                >
-                  <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>
-                  {vmFolders.map((f) => (
-                    <NativeSelectOption key={f.id} value={f.id}>
-                      {f.path}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-folder"
+                    className="w-full"
+                    value={form.folder}
+                    onChange={(e) => set({ folder: e.target.value })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>
+                    {vmFolders.map((f) => (
+                      <NativeSelectOption key={f.id} value={f.id}>
+                        {f.path}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                )}
               </Field>
-              <Field id="vmware-node" label={t("common.node")}>
-                <NativeSelect
-                  id="vmware-node"
-                  className="w-full"
-                  value={form.node}
-                  onChange={(e) => set({ node: e.target.value })}
-                >
-                  <NativeSelectOption value="">{t("vmware.mapping.autoNode")}</NativeSelectOption>
-                  {(nodes.data ?? []).map((n) => (
-                    <NativeSelectOption key={n.id} value={n.id}>
-                      {n.name}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
+              <Field id="vmware-node" label={t("common.node")} help={t("vmware.help.node")}>
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-node"
+                    className="w-full"
+                    value={form.node}
+                    onChange={(e) => set({ node: e.target.value })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="">{t("vmware.mapping.autoNode")}</NativeSelectOption>
+                    {(nodes.data ?? []).map((n) => (
+                      <NativeSelectOption key={n.id} value={n.id}>
+                        {n.name}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                )}
               </Field>
-              <Field id="vmware-driver-iso" label={t("vmware.mapping.driverIso")}>
-                <NativeSelect
-                  id="vmware-driver-iso"
-                  className="w-full"
-                  value={form.driverIso}
-                  onChange={(e) => set({ driverIso: e.target.value })}
-                >
-                  <NativeSelectOption value="">{t("vmware.mapping.none")}</NativeSelectOption>
-                  {isos.map((iso) => (
-                    <NativeSelectOption key={iso} value={iso}>
-                      {iso}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
+              <Field
+                id="vmware-driver-iso"
+                label={t("vmware.mapping.driverIso")}
+                help={t("vmware.help.driverIso")}
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-driver-iso"
+                    className="w-full"
+                    value={form.driverIso}
+                    onChange={(e) => set({ driverIso: e.target.value })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="">{t("vmware.mapping.none")}</NativeSelectOption>
+                    {isos.map((iso) => (
+                      <NativeSelectOption key={iso} value={iso}>
+                        {iso}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                )}
               </Field>
-              <Field id="vmware-devices" label={t("vmware.mapping.devices")}>
-                <NativeSelect
-                  id="vmware-devices"
-                  className="w-full"
-                  value={form.devices}
-                  onChange={(e) => set({ devices: e.target.value as WizardForm["devices"] })}
-                >
-                  <NativeSelectOption value="auto">
-                    {t("vmware.mapping.devicesAuto")}
-                  </NativeSelectOption>
-                  <NativeSelectOption value="fixed">
-                    {t("vmware.mapping.devicesFixed")}
-                  </NativeSelectOption>
-                </NativeSelect>
+              <Field
+                id="vmware-devices"
+                label={t("vmware.mapping.devices")}
+                help={t("vmware.help.devices")}
+                info="vmwareMigrations.devices"
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-devices"
+                    className="w-full"
+                    value={form.devices}
+                    onChange={(e) => set({ devices: e.target.value as WizardForm["devices"] })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="auto">
+                      {t("vmware.mapping.devicesAuto")}
+                    </NativeSelectOption>
+                    <NativeSelectOption value="fixed">
+                      {t("vmware.mapping.devicesFixed")}
+                    </NativeSelectOption>
+                  </NativeSelect>
+                )}
               </Field>
               {form.devices === "fixed" && (
                 <div className="grid grid-cols-2 gap-2">
-                  <Field id="vmware-disk-bus" label={t("vmware.mapping.diskBus")}>
-                    <NativeSelect
-                      id="vmware-disk-bus"
-                      className="w-full"
-                      value={form.diskBus}
-                      onChange={(e) => set({ diskBus: e.target.value as WizardForm["diskBus"] })}
-                    >
-                      <NativeSelectOption value="virtio-blk">virtio-blk</NativeSelectOption>
-                      <NativeSelectOption value="sata">SATA</NativeSelectOption>
-                    </NativeSelect>
+                  <Field
+                    id="vmware-disk-bus"
+                    label={t("vmware.mapping.diskBus")}
+                    help={t("vmware.help.diskBus")}
+                  >
+                    {(a11y) => (
+                      <NativeSelect
+                        id="vmware-disk-bus"
+                        className="w-full"
+                        value={form.diskBus}
+                        onChange={(e) => set({ diskBus: e.target.value as WizardForm["diskBus"] })}
+                        {...a11y}
+                      >
+                        <NativeSelectOption value="virtio-blk">virtio-blk</NativeSelectOption>
+                        <NativeSelectOption value="sata">SATA</NativeSelectOption>
+                      </NativeSelect>
+                    )}
                   </Field>
-                  <Field id="vmware-nic-model" label={t("vmware.mapping.nicModel")}>
-                    <NativeSelect
-                      id="vmware-nic-model"
-                      className="w-full"
-                      value={form.nicModel}
-                      onChange={(e) => set({ nicModel: e.target.value as WizardForm["nicModel"] })}
-                    >
-                      <NativeSelectOption value="virtio">virtio</NativeSelectOption>
-                      <NativeSelectOption value="e1000e">e1000e</NativeSelectOption>
-                    </NativeSelect>
+                  <Field
+                    id="vmware-nic-model"
+                    label={t("vmware.mapping.nicModel")}
+                    help={t("vmware.help.nicModel")}
+                  >
+                    {(a11y) => (
+                      <NativeSelect
+                        id="vmware-nic-model"
+                        className="w-full"
+                        value={form.nicModel}
+                        onChange={(e) =>
+                          set({ nicModel: e.target.value as WizardForm["nicModel"] })
+                        }
+                        {...a11y}
+                      >
+                        <NativeSelectOption value="virtio">virtio</NativeSelectOption>
+                        <NativeSelectOption value="e1000e">e1000e</NativeSelectOption>
+                      </NativeSelect>
+                    )}
                   </Field>
                 </div>
               )}
@@ -642,20 +711,21 @@ export function MigrationWizard() {
               <Check
                 id="vmware-keep-macs"
                 label={t("vmware.mapping.keepMacs")}
-                hint={t("vmware.mapping.keepMacsHint")}
+                help={t("vmware.mapping.keepMacsHint")}
                 checked={form.keepMacs}
                 onChange={(keepMacs) => set({ keepMacs })}
               />
               <Check
                 id="vmware-reserve-ips"
                 label={t("vmware.mapping.reserveIps")}
-                hint={t("vmware.mapping.reserveIpsHint")}
+                help={t("vmware.mapping.reserveIpsHint")}
                 checked={form.reserveIps}
                 onChange={(reserveIps) => set({ reserveIps })}
               />
               <Check
                 id="vmware-start-after"
                 label={t("vmware.mapping.startAfter")}
+                help={t("vmware.help.startAfter")}
                 checked={form.startAfter}
                 onChange={(startAfter) => set({ startAfter })}
               />
@@ -687,7 +757,8 @@ export function MigrationWizard() {
                   id={`vmware-${key}`}
                   label={t(label)}
                   error={errors[key]}
-                  hint={t(`${label}Hint`)}
+                  help={t(`${label}Hint`)}
+                  info={key === "maxFinalDelta" ? "vmwareMigrations.maxFinalDelta" : undefined}
                 >
                   {(a11y) => (
                     <Input
@@ -700,26 +771,33 @@ export function MigrationWizard() {
                   )}
                 </Field>
               ))}
-              <Field id="vmware-shutdown" label={t("vmware.policy.shutdown")}>
-                <NativeSelect
-                  id="vmware-shutdown"
-                  className="w-full"
-                  value={form.shutdown}
-                  onChange={(e) => set({ shutdown: e.target.value as WizardForm["shutdown"] })}
-                >
-                  <NativeSelectOption value="guest">
-                    {t("vmware.shutdown.guest")}
-                  </NativeSelectOption>
-                  <NativeSelectOption value="power-off">
-                    {t("vmware.shutdown.power-off")}
-                  </NativeSelectOption>
-                </NativeSelect>
+              <Field
+                id="vmware-shutdown"
+                label={t("vmware.policy.shutdown")}
+                help={t("vmware.help.shutdown")}
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id="vmware-shutdown"
+                    className="w-full"
+                    value={form.shutdown}
+                    onChange={(e) => set({ shutdown: e.target.value as WizardForm["shutdown"] })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="guest">
+                      {t("vmware.shutdown.guest")}
+                    </NativeSelectOption>
+                    <NativeSelectOption value="power-off">
+                      {t("vmware.shutdown.power-off")}
+                    </NativeSelectOption>
+                  </NativeSelect>
+                )}
               </Field>
               <Field
                 id="vmware-cutover-at"
                 label={t("vmware.policy.cutoverAt")}
                 error={errors.cutoverAt}
-                hint={t("vmware.policy.cutoverAtHint")}
+                help={t("vmware.policy.cutoverAtHint")}
               >
                 {(a11y) => (
                   <Input
@@ -735,7 +813,7 @@ export function MigrationWizard() {
             <Check
               id="vmware-protect-source"
               label={t("vmware.policy.protectSource")}
-              hint={t("vmware.policy.protectSourceHint")}
+              help={t("vmware.policy.protectSourceHint")}
               checked={form.protectSource}
               onChange={(protectSource) => set({ protectSource })}
             />

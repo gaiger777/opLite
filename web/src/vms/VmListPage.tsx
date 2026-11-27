@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Plus } from "lucide-react";
+import { Copy, Monitor, Plus } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -11,6 +11,7 @@ import { objectTarget, type Privilege } from "@/auth/permissions";
 import { usePermissions } from "@/auth/usePermissions";
 import { type Column, DataTable, type Filter, useIsPhone } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { ViewToggle } from "@/layout/PageTabs";
 import { Badge } from "@/components/ui/badge";
@@ -239,6 +240,8 @@ export function VmListPage() {
       <PageHeader
         id="vms-title"
         title={t("nav.vms")}
+        help="vms"
+        intro={t("help.vms.intro")}
         actions={
           <>
             <ViewToggle />
@@ -262,6 +265,32 @@ export function VmListPage() {
         rowName={(vm) => vm.name}
         query={vms}
         empty={t("vms.empty")}
+        emptyState={
+          <EmptyState
+            icon={Monitor}
+            title={t("vms.empty")}
+            description={t("help.vms.empty")}
+            help="vms.page"
+            action={
+              create && (
+                <div className="flex flex-wrap justify-center gap-2">
+                  <Button asChild>
+                    <Link to="/vms/-new">
+                      <Plus />
+                      {t("vms.createFirst")}
+                    </Link>
+                  </Button>
+                  <Button asChild variant="outline">
+                    <Link to="/templates">
+                      <Copy />
+                      {t("vms.fromTemplate")}
+                    </Link>
+                  </Button>
+                </div>
+              )
+            }
+          />
+        }
         labelledBy="vms-title"
         state={state}
         search={(vm) => vm.name}

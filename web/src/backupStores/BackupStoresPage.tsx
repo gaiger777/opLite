@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Database, Lock, Plus, Trash2 } from "lucide-react";
+import { Lock, Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -69,16 +69,18 @@ export function BackupStoresPage() {
       <PageHeader
         id="backup-stores-title"
         title={t("nav.backupStores")}
-        description={t("backupStores.pageHint")}
+        help="backupStores"
+        intro={t("help.backupStores.intro")}
         actions={items.length > 0 && createButton}
       />
       {stores.data === undefined ? (
         <ListPending error={stores.error} />
       ) : items.length === 0 ? (
         <EmptyState
-          icon={Database}
           title={t("backupStores.empty.title")}
           description={t("backupStores.empty.description")}
+          diagram="dedupStore"
+          help="backupStores.page"
           action={createButton}
         />
       ) : (

@@ -45,6 +45,15 @@ it("offers no new plan to viewers", async () => {
   renderPage(<PlansPage />, { path: "/dr-plans", as: { ...ADMIN, role: "viewer" } });
   expect(await screen.findByText("No recovery plans")).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "New plan" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+});
+
+it("offers a new plan in the empty state to writers", async () => {
+  setup([]);
+  renderPage(<PlansPage />, { path: "/dr-plans" });
+  expect(await screen.findByText("No recovery plans")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "New plan" })).toHaveAttribute("href", "/dr-plans/-new");
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
 });
 
 it("tells which nodes lack DR plans and offers no new plan", async () => {

@@ -64,18 +64,26 @@ export function AddMonDialog({
       ) : choices.length === 0 ? (
         <p className="text-sm text-muted-foreground">{t("ceph.noNodes")}</p>
       ) : (
-        <Field id="ceph-role-node" label={t("common.node")}>
-          <NativeSelect
-            id="ceph-role-node"
-            value={chosen}
-            onChange={(e) => setNode(e.target.value)}
-          >
-            {choices.map((n) => (
-              <NativeSelectOption key={n.id} value={n.id} disabled={!n.status.online}>
-                {n.status.online ? n.name : t("ceph.offlineNode", { name: n.name })}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field
+          id="ceph-role-node"
+          label={t("common.node")}
+          help={t(role === "mon" ? "help.ceph.monNode" : "help.ceph.mgrNode")}
+          info={role === "mon" ? "ceph.mon" : undefined}
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="ceph-role-node"
+              value={chosen}
+              onChange={(e) => setNode(e.target.value)}
+              {...a11y}
+            >
+              {choices.map((n) => (
+                <NativeSelectOption key={n.id} value={n.id} disabled={!n.status.online}>
+                  {n.status.online ? n.name : t("ceph.offlineNode", { name: n.name })}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
       )}
       {!full && warning && <p className="text-sm text-warning-fg">{t(warning)}</p>}

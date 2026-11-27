@@ -24,7 +24,9 @@ import {
 import { RemoteTargetFields } from "@/backups/RemoteTargetFields";
 import { useBackupStores } from "@/backupStores/stores";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
@@ -74,7 +76,9 @@ export function BackupJobsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="backup-jobs-title"
-        title={t("nav.backupJobs")}
+        title={t("nav.item.backupJobs")}
+        help="backupJobs"
+        intro={t("help.backupJobs.intro")}
         actions={
           write && (
             <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -94,168 +98,192 @@ export function BackupJobsPage() {
           )
         }
       />
-      <p className="text-sm text-muted-foreground">{t("backupJobs.pageHint")}</p>
-      <Table aria-labelledby="backup-jobs-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("backupJobs.vms")}</TableHead>
-            <TableHead>{t("backups.target")}</TableHead>
-            <TableHead>{t("backupJobs.schedule")}</TableHead>
-            <TableHead>{t("backupJobs.keep")}</TableHead>
-            <TableHead>{t("backupJobs.replicate")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>{t("backupJobs.nextRun")}</TableHead>
-            <TableHead>{t("backupJobs.lastRun")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
+      {jobs.isSuccess && list.length === 0 ? (
+        <EmptyState
+          title={t("backupJobs.empty")}
+          description={t("help.backupJobs.empty")}
+          diagram="backupChain"
+          help="backupJobs.page"
+          action={
+            write && (
+              <Button
+                disabled={!pools.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("backupJobs.createTitle")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="backup-jobs-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("backupJobs.vms")}</TableHead>
+              <TableHead>{t("backups.target")}</TableHead>
+              <TableHead>{t("backupJobs.schedule")}</TableHead>
+              <TableHead>{t("backupJobs.keep")}</TableHead>
+              <TableHead>{t("backupJobs.replicate")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
+              <TableHead>{t("backupJobs.nextRun")}</TableHead>
+              <TableHead>{t("backupJobs.lastRun")}</TableHead>
+              {write && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={write ? 10 : 9} query={jobs} empty={t("backupJobs.empty")} />
             )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={write ? 10 : 9} query={jobs} empty={t("backupJobs.empty")} />
-          )}
-          {list.map((job) => {
-            const { vms, schedule, enabled, replicate, full_every: fullEvery = 0 } = job.spec;
-            const { run: running, last_run: last, next_run: next, errors } = job.status;
-            const days = schedule.days ?? [];
-            const keep = keepParts(job.spec.keep);
-            return (
-              <TableRow key={job.id}>
-                <TableCell className="font-medium">{job.name}</TableCell>
-                <TableCell>
-                  {"all" in vms ? (
-                    t("backupJobs.targets.all")
-                  ) : "names" in vms ? (
-                    vms.names.join(", ")
-                  ) : (
-                    <span className="font-mono text-xs">
-                      {Object.entries(vms.labels)
-                        .map(([k, v]) => `${k}=${v}`)
-                        .join(", ")}
-                    </span>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {job.spec.store ? (
-                    <span className="flex flex-col">
-                      <span>{job.spec.store}</span>
-                      <span className="text-xs text-muted-foreground">
-                        {t("backups.storeTarget")}
+            {list.map((job) => {
+              const { vms, schedule, enabled, replicate, full_every: fullEvery = 0 } = job.spec;
+              const { run: running, last_run: last, next_run: next, errors } = job.status;
+              const days = schedule.days ?? [];
+              const keep = keepParts(job.spec.keep);
+              return (
+                <TableRow key={job.id}>
+                  <TableCell className="font-medium">{job.name}</TableCell>
+                  <TableCell>
+                    {"all" in vms ? (
+                      t("backupJobs.targets.all")
+                    ) : "names" in vms ? (
+                      vms.names.join(", ")
+                    ) : (
+                      <span className="font-mono text-xs">
+                        {Object.entries(vms.labels)
+                          .map(([k, v]) => `${k}=${v}`)
+                          .join(", ")}
                       </span>
-                      {/* 다른 저장소로 보내는 복사본(계획 68 §12.5) */}
-                      {job.spec.copy_to && (
-                        <span className="text-xs text-muted-foreground">
-                          {t("backupJobs.copiesTo", { store: job.spec.copy_to.store })}
-                        </span>
-                      )}
-                    </span>
-                  ) : (
-                    job.spec.pool
-                  )}
-                </TableCell>
-                <TableCell>
-                  {days.length === 0
-                    ? t("backupJobs.everyDay")
-                    : days.map((d) => t(`backupJobs.day.${d}`)).join(", ")}{" "}
-                  {schedule.at}
-                  {fullEvery > 0 && (
-                    <div className="text-xs text-muted-foreground">
-                      {t("backupJobs.fullEveryShort", { count: fullEvery })}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {keep.length === 0
-                    ? t("backupJobs.keepAll")
-                    : keep.map(([unit, n]) => t(`backupJobs.keepUnit.${unit}`, { n })).join(", ")}
-                </TableCell>
-                <TableCell>{replicate ? `${replicate.remote} / ${replicate.pool}` : "—"}</TableCell>
-                <TableCell>
-                  {running ? (
-                    <>
-                      <Badge>{t("backupJobs.state.running")}</Badge>
-                      <div className="text-xs text-muted-foreground">
-                        {t("backupJobs.waiting", { count: running.queue?.length ?? 0 })}
-                      </div>
-                    </>
-                  ) : (
-                    <Badge variant={enabled ? "secondary" : "outline"}>
-                      {t(enabled ? "backupJobs.state.enabled" : "backupJobs.state.disabled")}
-                    </Badge>
-                  )}
-                </TableCell>
-                <TableCell>{enabled && next !== null ? formatUtc(next) : "—"}</TableCell>
-                <TableCell>
-                  {last ? (
-                    <>
-                      {formatUtc(last.finished_at)}
-                      <div className="text-xs text-muted-foreground">
-                        {t("backupJobs.result", { ok: last.ok, failed: last.failed })}
-                      </div>
-                    </>
-                  ) : (
-                    "—"
-                  )}
-                  {/* 마지막(또는 진행 중인) 실행에서 백업하지 못한 VM */}
-                  {errors.length > 0 && (
-                    <ul className="max-w-xs text-xs whitespace-normal break-words text-destructive">
-                      {errors.map((e) => (
-                        <li key={e.vm}>
-                          {e.vm}: {e.error}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </TableCell>
-                {write && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      aria-label={t("backupJobs.runNamed", { name: job.name })}
-                      // 서버는 진행 중이거나 꺼 둔 작업을 거절한다.
-                      disabled={running !== null || !enabled}
-                      onClick={() => void run(job)}
-                    >
-                      <Play />
-                      {t("backupJobs.runNow")}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      className="ml-2"
-                      aria-label={t("backupJobs.editNamed", { name: job.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setEditing(job);
-                      }}
-                    >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("backupJobs.deleteNamed", { name: job.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setDeleting(job);
-                        setDeleteOpen(true);
-                      }}
-                    >
-                      <Trash2 />
-                    </Button>
-                    <RowConfigMenu target={{ kind: "backup-job", id: job.id, name: job.name }} />
+                    )}
                   </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                  <TableCell>
+                    {job.spec.store ? (
+                      <span className="flex flex-col">
+                        <span>{job.spec.store}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {t("backups.storeTarget")}
+                        </span>
+                        {/* 다른 저장소로 보내는 복사본(계획 68 §12.5) */}
+                        {job.spec.copy_to && (
+                          <span className="text-xs text-muted-foreground">
+                            {t("backupJobs.copiesTo", { store: job.spec.copy_to.store })}
+                          </span>
+                        )}
+                      </span>
+                    ) : (
+                      job.spec.pool
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {days.length === 0
+                      ? t("backupJobs.everyDay")
+                      : days.map((d) => t(`backupJobs.day.${d}`)).join(", ")}{" "}
+                    {schedule.at}
+                    {fullEvery > 0 && (
+                      <div className="text-xs text-muted-foreground">
+                        {t("backupJobs.fullEveryShort", { count: fullEvery })}
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {keep.length === 0
+                      ? t("backupJobs.keepAll")
+                      : keep.map(([unit, n]) => t(`backupJobs.keepUnit.${unit}`, { n })).join(", ")}
+                  </TableCell>
+                  <TableCell>
+                    {replicate ? `${replicate.remote} / ${replicate.pool}` : "—"}
+                  </TableCell>
+                  <TableCell>
+                    {running ? (
+                      <>
+                        <Badge>{t("backupJobs.state.running")}</Badge>
+                        <div className="text-xs text-muted-foreground">
+                          {t("backupJobs.waiting", { count: running.queue?.length ?? 0 })}
+                        </div>
+                      </>
+                    ) : (
+                      <Badge variant={enabled ? "secondary" : "outline"}>
+                        {t(enabled ? "backupJobs.state.enabled" : "backupJobs.state.disabled")}
+                      </Badge>
+                    )}
+                  </TableCell>
+                  <TableCell>{enabled && next !== null ? formatUtc(next) : "—"}</TableCell>
+                  <TableCell>
+                    {last ? (
+                      <>
+                        {formatUtc(last.finished_at)}
+                        <div className="text-xs text-muted-foreground">
+                          {t("backupJobs.result", { ok: last.ok, failed: last.failed })}
+                        </div>
+                      </>
+                    ) : (
+                      "—"
+                    )}
+                    {/* 마지막(또는 진행 중인) 실행에서 백업하지 못한 VM */}
+                    {errors.length > 0 && (
+                      <ul className="max-w-xs text-xs whitespace-normal break-words text-destructive">
+                        {errors.map((e) => (
+                          <li key={e.vm}>
+                            {e.vm}: {e.error}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </TableCell>
+                  {write && (
+                    <TableCell className="text-right whitespace-nowrap">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        aria-label={t("backupJobs.runNamed", { name: job.name })}
+                        // 서버는 진행 중이거나 꺼 둔 작업을 거절한다.
+                        disabled={running !== null || !enabled}
+                        onClick={() => void run(job)}
+                      >
+                        <Play />
+                        {t("backupJobs.runNow")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="ml-2"
+                        aria-label={t("backupJobs.editNamed", { name: job.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setEditing(job);
+                        }}
+                      >
+                        <Pencil />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("backupJobs.deleteNamed", { name: job.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setDeleting(job);
+                          setDeleteOpen(true);
+                        }}
+                      >
+                        <Trash2 />
+                      </Button>
+                      <RowConfigMenu target={{ kind: "backup-job", id: job.id, name: job.name }} />
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {editing !== undefined && (
         <JobDialog
           job={editing}
@@ -374,7 +402,12 @@ function JobDialog({
       onSubmit={submit}
     >
       {!job && (
-        <Field id="job-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="job-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.backupJobs.name")}
+        >
           {(a11y) => (
             <Input
               id="job-name"
@@ -393,6 +426,8 @@ function JobDialog({
           id="job-target-store"
           label={t("backups.target")}
           error={errors.pool ?? errors.store}
+          help={t("backups.targetHint")}
+          info="backups.target"
         >
           {(a11y) => (
             <NativeSelect
@@ -433,7 +468,12 @@ function JobDialog({
           )}
         </Field>
       ) : (
-        <Field id="job-pool" label={t("backups.pool")} error={errors.pool}>
+        <Field
+          id="job-pool"
+          label={t("backups.pool")}
+          error={errors.pool}
+          help={t("help.backups.pool")}
+        >
           {(a11y) => (
             <NativeSelect
               id="job-pool"
@@ -451,26 +491,29 @@ function JobDialog({
           )}
         </Field>
       )}
-      <Field id="job-target" label={t("backupJobs.target")}>
-        <NativeSelect
-          id="job-target"
-          className="w-full"
-          value={form.target}
-          onChange={(e) => change({ target: e.target.value as JobForm["target"] })}
-        >
-          {(["all", "names", "labels"] as const).map((target) => (
-            <NativeSelectOption key={target} value={target}>
-              {t(`backupJobs.targets.${target}`)}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
+      <Field id="job-target" label={t("backupJobs.target")} help={t("help.backupJobs.target")}>
+        {(a11y) => (
+          <NativeSelect
+            id="job-target"
+            className="w-full"
+            value={form.target}
+            onChange={(e) => change({ target: e.target.value as JobForm["target"] })}
+            {...a11y}
+          >
+            {(["all", "names", "labels"] as const).map((target) => (
+              <NativeSelectOption key={target} value={target}>
+                {t(`backupJobs.targets.${target}`)}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        )}
       </Field>
       {form.target === "names" && (
         <Field
           id="job-names"
           label={t("backupJobs.names")}
           error={errors.names}
-          hint={t("backupJobs.namesHint")}
+          help={t("backupJobs.namesHint")}
         >
           {(a11y) => (
             <Input
@@ -488,7 +531,7 @@ function JobDialog({
           id="job-labels"
           label={t("backupJobs.labels")}
           error={errors.labels}
-          hint={t("backupJobs.labelsHint")}
+          help={t("backupJobs.labelsHint")}
         >
           {(a11y) => (
             <Input
@@ -501,7 +544,7 @@ function JobDialog({
           )}
         </Field>
       )}
-      <Field id="job-at" label={t("backupJobs.at")} error={errors.at} hint={t("backupJobs.atHint")}>
+      <Field id="job-at" label={t("backupJobs.at")} error={errors.at} help={t("backupJobs.atHint")}>
         {(a11y) => (
           <Input
             id="job-at"
@@ -533,7 +576,14 @@ function JobDialog({
         <p className="text-xs text-muted-foreground">{t("backupJobs.daysHint")}</p>
       </fieldset>
       <fieldset className="flex flex-col gap-1.5">
-        <legend className="mb-1.5 text-sm font-medium">{t("backupJobs.retention")}</legend>
+        <legend className="mb-1.5 flex items-center gap-1 text-sm font-medium">
+          {t("backupJobs.retention")}
+          <InfoButton
+            topic="backupJobs.retention"
+            label={t("backupJobs.retention")}
+            line={t("backupJobs.retentionHint")}
+          />
+        </legend>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           {KEEP_UNITS.map((unit) => (
             <div key={unit} className="flex flex-col gap-1.5">
@@ -559,7 +609,8 @@ function JobDialog({
         id="job-full-every"
         label={t("backupJobs.fullEvery")}
         error={errors.fullEvery}
-        hint={t("backupJobs.fullEveryHint")}
+        help={t("backupJobs.fullEveryHint")}
+        info="backupJobs.fullEvery"
       >
         {(a11y) => (
           <Input
@@ -579,7 +630,7 @@ function JobDialog({
             id="job-copy-store"
             label={t("backupJobs.copyStore")}
             error={errors.copyStore}
-            hint={t("backupJobs.copyHint")}
+            help={t("backupJobs.copyHint")}
           >
             {(a11y) => (
               <NativeSelect
@@ -634,7 +685,7 @@ function JobDialog({
         id="job-replicate"
         label={t("backupJobs.replicateLabel")}
         none={t("backupJobs.noReplicate")}
-        hint={t(
+        help={t(
           form.targetKind === "store"
             ? "backupJobs.replicateStoreHint"
             : "backupJobs.replicateHint",

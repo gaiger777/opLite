@@ -440,7 +440,7 @@ function LabelsDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="node-labels" label={t("nodes.labels")} error={error} hint={t("nodes.labelsHint")}>
+      <Field id="node-labels" label={t("nodes.labels")} error={error} help={t("nodes.labelsHint")}>
         {(a11y) => (
           <Input
             id="node-labels"

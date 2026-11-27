@@ -166,7 +166,7 @@ it.each(OLD_NAV_PATHS)("still opens %s", async (path) => {
 it.each([
   ["/vmware-migrations", "VMware migrations"],
   ["/vmware-migrations/-new", "New VMware migration"],
-  ["/vmware-sources", "VMware sources"],
+  ["/vmware-sources", "Connected vCenter & ESXi"],
   ["/vm-exports", "Exports"],
 ])("opens %s lazily", async (path, title) => {
   server.use(

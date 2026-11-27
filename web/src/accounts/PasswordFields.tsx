@@ -26,7 +26,7 @@ export function PasswordFields({
         id={`${id}-password`}
         label={t("accounts.newPassword")}
         error={errors.password}
-        hint={t("accounts.passwordHint")}
+        help={t("accounts.passwordHint")}
       >
         {(a11y) => (
           <Input
@@ -39,7 +39,12 @@ export function PasswordFields({
           />
         )}
       </Field>
-      <Field id={`${id}-confirm`} label={t("accounts.confirmPassword")} error={errors.confirm}>
+      <Field
+        id={`${id}-confirm`}
+        label={t("accounts.confirmPassword")}
+        error={errors.confirm}
+        help={t("help.accounts.confirm")}
+      >
         {(a11y) => (
           <Input
             id={`${id}-confirm`}

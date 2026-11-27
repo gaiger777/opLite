@@ -46,6 +46,7 @@ function initTask(state: Task["status"]["state"], extra: Partial<Task["status"]>
 async function startSetup(user: ReturnType<typeof userEvent.setup>) {
   const start = await screen.findByRole("button", { name: "Start the Ceph setup" });
   expect(screen.getByText("No Ceph cluster")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
   await user.click(start);
 }
 
@@ -151,7 +152,7 @@ it("goes through the monitor, OSD, pool and client steps", async () => {
   expect(await screen.findByText("Monitors now: 1 (node-a)")).toBeInTheDocument();
   expect(screen.getByText(/^3\. Monitors/)).toHaveAttribute("aria-current", "step");
   await user.click(screen.getByRole("button", { name: "Next" }));
-  expect(screen.getByRole("button", { name: "Add OSD" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Add Ceph disk (OSD)" })).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Next" }));
   expect(await screen.findByText("Hosts with OSDs up: 1")).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Next" }));
@@ -225,7 +226,7 @@ it("warns when the status is old and says when it cannot be read at all", async 
     ),
   ).toBeInTheDocument();
   // 상태를 읽지 못해도 동작 단추는 있다.
-  expect(screen.getByRole("button", { name: "Add OSD" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Add Ceph disk (OSD)" })).toBeEnabled();
 });
 
 it("shows the last error of an unfinished setup and retries it", async () => {

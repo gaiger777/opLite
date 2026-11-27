@@ -47,10 +47,10 @@ it("names the job that made each backup", async () => {
   const headers = within(table).getAllByRole("columnheader");
   const job = async (name: string) =>
     within((await within(table).findByText(name)).closest("tr")!).getAllByRole("cell")[
-      headers.findIndex((h) => h.textContent === "Job")
+      headers.findIndex((h) => h.textContent === "Schedule")
     ];
   expect(await job("web-2")).toHaveTextContent("nightly");
-  expect(await job("web-3")).toHaveTextContent("Deleted job");
+  expect(await job("web-3")).toHaveTextContent("Deleted schedule");
   expect(await job("web-1")).toHaveTextContent("—");
 });
 
@@ -94,7 +94,7 @@ it("shows where a received copy came from and the state of remote copies", async
   const origin = within(await cell("web-copy", "Name")).getByText("From prod");
   expect(origin).toHaveAttribute(
     "title",
-    "Copy of backup 019a0f3c-0000-7000-8006-0000000000aa (job nightly) on cluster prod",
+    "Copy of backup 019a0f3c-0000-7000-8006-0000000000aa (backup schedule nightly) on cluster prod",
   );
   // 툴팁 없이도(화면 읽기) 원본 백업 id와 작업이 읽힌다.
   expect(within(await cell("web-copy", "Name")).getByText(/^Copy of backup/)).toHaveClass(
@@ -571,4 +571,13 @@ it("explains why a parent backup cannot be deleted", async () => {
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
     'This backup is still needed: backup "web-1" is the parent of 1 incremental backup(s); delete them first',
   );
+});
+
+it("explains how backups are made when there are none", async () => {
+  mockLists({ vm: [web], backup: [] });
+  renderPage(<BackupsPage />);
+  expect(await screen.findByText("No backups.")).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.getByText(/create a backup schedule/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
 });

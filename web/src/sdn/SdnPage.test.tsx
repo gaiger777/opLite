@@ -52,12 +52,13 @@ it("tells viewers that SDN is not set up and offers admins the wizard", async ()
   cluster([sdnNode(1)], ["n1"]);
   const { unmount } = renderPage(<SdnPage />, { as: VIEWER });
   expect(
-    await screen.findByText("SDN (OVN) is not set up. An administrator can set it up here."),
+    await screen.findByText("SDN is not set up yet. An administrator can set it up here."),
   ).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Start the SDN setup" })).not.toBeInTheDocument();
   unmount();
   renderPage(<SdnPage />);
   expect(await screen.findByRole("button", { name: "Start the SDN setup" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
 });
 
 it("sets up the centrals one at a time and installs the chassis", async () => {
@@ -174,7 +175,10 @@ it("shows why the setup failed and retries on the same node", async () => {
   renderPage(<SdnPage />);
   const user = userEvent.setup();
   await user.click(await screen.findByRole("button", { name: "Start the SDN setup" }));
-  await user.type(await screen.findByLabelText(/Central address/), "10.0.0.1");
+  await user.type(
+    await screen.findByLabelText("Central address of the first node (optional)"),
+    "10.0.0.1",
+  );
   await user.click(screen.getByRole("button", { name: "Install" }));
   expect(
     await screen.findByText("The setup failed: apt-get install ovn-central failed"),
@@ -345,8 +349,8 @@ it("shows centrals, roles, sync and chassis, and removes a central", async () =>
     expect(screen.getByRole("alert")).toHaveTextContent("not voting cluster members: node-b"),
   );
   expect(screen.getByRole("alert")).toHaveTextContent("2 central nodes tolerate no more failures");
-  expect(screen.getByText("Chassis applied 8 of 9.")).toBeInTheDocument();
-  const chassis = screen.getByRole("table", { name: "Chassis" });
+  expect(screen.getByText("Nodes applied 8 of 9 (settings version).")).toBeInTheDocument();
+  const chassis = screen.getByRole("table", { name: "Node connectors (chassis)" });
   const rowC = within(chassis).getByText("node-c").closest("tr")!;
   expect(rowC).toHaveTextContent("Down");
   expect(rowC).toHaveTextContent("connection refused");

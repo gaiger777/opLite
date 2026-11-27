@@ -113,9 +113,13 @@ it("registers an ACME account only after agreeing to the terms, with EAB", async
     }),
   );
   renderPage(<CertificatesPage />, { path: "/settings/certificates" });
-  expect(await screen.findByText("Add an ACME account first.")).toBeInTheDocument();
+  expect(
+    await screen.findByText(
+      "To get a certificate, first add an ACME account (your account at the certificate authority) below.",
+    ),
+  ).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Add certificate" })).toBeDisabled();
-  await user.click(screen.getByRole("button", { name: "Add account" }));
+  await user.click(screen.getAllByRole("button", { name: "Add account" })[0]!);
   const dialog = await screen.findByRole("dialog", { name: "Add an ACME account" });
   await user.type(within(dialog).getByLabelText("Name"), "zero");
   await user.selectOptions(within(dialog).getByLabelText("Directory"), "zerossl");
@@ -159,7 +163,7 @@ it("adds a DNS provider with its secret in a password field", async () => {
   await user.type(within(dialog).getByLabelText("TSIG key name"), "acme.");
   const secret = within(dialog).getByLabelText("TSIG secret (base64)");
   expect(secret).toHaveAttribute("type", "password");
-  expect(within(dialog).getAllByText("Not shown again after saving.")).toHaveLength(1);
+  expect(within(dialog).getAllByText(/not shown again after saving/)).toHaveLength(1);
   await user.type(secret, "a2V5");
   await user.type(within(dialog).getByLabelText("Zones"), "example.com");
   await user.click(within(dialog).getByRole("button", { name: "Add" }));
@@ -187,11 +191,11 @@ it("warns about nodes without the port 80 listener for HTTP-01 and creates the c
   const dialog = await screen.findByRole("dialog", { name: "Add a certificate" });
   await user.type(within(dialog).getByLabelText("Name"), "vip");
   await user.type(within(dialog).getByLabelText("Names"), "*.example.com");
-  await user.selectOptions(within(dialog).getByLabelText("Challenge"), "http01");
+  await user.selectOptions(within(dialog).getByLabelText("Ownership check"), "http01");
   expect(within(dialog).getByRole("alert")).toHaveTextContent("Missing on: node-a.");
   await user.click(within(dialog).getByRole("button", { name: "Add" }));
   expect(within(dialog).getByText("Wildcard names need DNS-01.")).toBeInTheDocument();
-  await user.selectOptions(within(dialog).getByLabelText("Challenge"), "dns01");
+  await user.selectOptions(within(dialog).getByLabelText("Ownership check"), "dns01");
   expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
   await user.selectOptions(within(dialog).getByLabelText("Profile"), "shortlived");
   await user.click(within(dialog).getByRole("button", { name: "Add" }));
@@ -207,4 +211,21 @@ it("warns about nodes without the port 80 listener for HTTP-01 and creates the c
       profile: "shortlived",
     }),
   );
+});
+
+it("explains empty lists and starts from the ACME account", async () => {
+  const user = userEvent.setup();
+  mockCerts({ accounts: [], dns: [], certs: [] });
+  renderPage(<CertificatesPage />, { path: "/settings/certificates" });
+  const accounts = (await screen.findByText("No ACME accounts.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(accounts).toHaveTextContent("All it needs is an email and accepting the terms.");
+  expect(within(accounts).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  const dns = screen
+    .getByText("No DNS providers.")
+    .closest<HTMLElement>("[data-slot=empty-state]")!;
+  expect(dns).toHaveTextContent("wildcard names");
+  await user.click(within(accounts).getByRole("button", { name: "Add account" }));
+  expect(await screen.findByRole("dialog", { name: "Add an ACME account" })).toBeInTheDocument();
 });

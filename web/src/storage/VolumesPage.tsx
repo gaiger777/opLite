@@ -10,6 +10,7 @@ import type { components } from "@/api/schema";
 import type { Vm, Volume } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
@@ -272,7 +273,9 @@ export function VolumesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         id="volumes-title"
-        title={t("nav.volumes")}
+        title={t("nav.item.volumes")}
+        help="volumes"
+        intro={t("help.volumes.intro")}
         actions={
           write && (
             <div className="flex flex-wrap gap-2">
@@ -300,6 +303,25 @@ export function VolumesPage() {
         rowName={(volume) => volume.name}
         query={volumes}
         empty={t("volumes.empty")}
+        emptyState={
+          // ISO만 숨겨 비었으면 표(와 "ISO 이미지도 보기")를 그대로 둔다.
+          volumes.isSuccess && volumes.data.length === 0 ? (
+            <EmptyState
+              title={t("volumes.empty")}
+              description={t("help.volumes.empty")}
+              diagram="storageSharing"
+              help="volumes.page"
+              action={
+                write && (
+                  <Button onClick={() => setCreating(true)}>
+                    <Plus />
+                    {t("volumes.createTitle")}
+                  </Button>
+                )
+              }
+            />
+          ) : undefined
+        }
         labelledBy="volumes-title"
         state={state}
         search={(volume) => `${volume.name} ${volume.spec.pool}`}
@@ -410,7 +432,12 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="volume-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="volume-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.volumes.name")}
+      >
         {(a11y) => (
           <Input
             id="volume-name"
@@ -421,7 +448,12 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
         )}
       </Field>
       {!pools.isSuccess && <ListPending error={pools.error} />}
-      <Field id="volume-pool" label={t("volumes.pool")} error={errors.pool}>
+      <Field
+        id="volume-pool"
+        label={t("volumes.pool")}
+        error={errors.pool}
+        help={t("help.volumes.pool")}
+      >
         {(a11y) => (
           <NativeSelect
             id="volume-pool"
@@ -440,7 +472,13 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
         )}
       </Field>
       <div className="grid grid-cols-2 gap-4">
-        <Field id="volume-size" label={t("vmForm.sizeGib")} error={errors.size}>
+        <Field
+          id="volume-size"
+          label={t("vmForm.sizeGib")}
+          error={errors.size}
+          help={t("help.volumes.size")}
+          info="volumes.size"
+        >
           {(a11y) => (
             <Input
               id="volume-size"
@@ -451,19 +489,27 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
             />
           )}
         </Field>
-        <Field id="volume-format" label={t("volumes.format")}>
-          <NativeSelect
-            id="volume-format"
-            className="w-full"
-            value={format}
-            onChange={(e) => setFormat(e.target.value as typeof format)}
-          >
-            {formats.map((f) => (
-              <NativeSelectOption key={f} value={f}>
-                {f}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field
+          id="volume-format"
+          label={t("volumes.format")}
+          help={t("help.volumes.format")}
+          info="volumes.format"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="volume-format"
+              className="w-full"
+              value={format}
+              onChange={(e) => setFormat(e.target.value as typeof format)}
+              {...a11y}
+            >
+              {formats.map((f) => (
+                <NativeSelectOption key={f} value={f}>
+                  {f}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
       </div>
     </FormDialog>
@@ -519,7 +565,12 @@ function ResizeVolumeDialog({
       <p className="text-sm">
         {t("volumes.currentSize", { size: formatBytes(volume.spec.size_bytes) })}
       </p>
-      <Field id="volume-new-size" label={t("volumes.newSize")} error={error}>
+      <Field
+        id="volume-new-size"
+        label={t("volumes.newSize")}
+        error={error}
+        help={t("help.volumes.newSize")}
+      >
         {(a11y) => (
           <Input
             id="volume-new-size"

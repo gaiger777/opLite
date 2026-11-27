@@ -33,7 +33,7 @@ it("lists tasks newest first and filters failures", async () => {
   expect(rows[2]).toHaveTextContent("node-a");
   expect(rows[2]).toHaveTextContent("no firmware");
 
-  expect(screen.getByRole("table", { name: "Tasks" })).toBeInTheDocument();
+  expect(screen.getByRole("table", { name: "Task history" })).toBeInTheDocument();
   expect(rows[2]!.querySelector("time")).toHaveAttribute("datetime", "2025-10-23T04:03:37.104Z");
 
   await userEvent.click(screen.getByLabelText("Failed only"));
@@ -310,4 +310,14 @@ it("names Ceph tasks by their node and shows their stage", async () => {
   expect(rows[4]).toHaveTextContent("Preparing the OSD");
   expect(rows[5]).toHaveTextContent("Add a Ceph monitor on node-b");
   expect(rows[5]).toHaveTextContent("Waiting for quorum");
+});
+
+it("explains an empty task list", async () => {
+  mockLists({ task: [] });
+  renderPage(<TasksPage />);
+  const empty = (
+    await screen.findByText(/its progress and result collect here/)
+  ).closest<HTMLElement>("[data-slot=empty-state]")!;
+  expect(empty).toHaveTextContent("No tasks.");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
 });

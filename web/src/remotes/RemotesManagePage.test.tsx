@@ -30,6 +30,8 @@ it("adds a remote after the CA fingerprint is fetched and confirmed", async () =
   );
   renderPage(<RemotesManagePage />);
   expect(await screen.findByText("No remote clusters.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Add a remote cluster" })).toBeVisible();
   await userEvent.click(screen.getByRole("button", { name: "Add" }));
   const dialog = await screen.findByRole("dialog", { name: "Add a remote cluster" });
   await userEvent.type(within(dialog).getByLabelText("Name"), "dr");

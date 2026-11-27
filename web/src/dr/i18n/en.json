@@ -10,7 +10,7 @@
       "newTitle": "New recovery plan",
       "newDescription": "Pick the production cluster, the boot groups and how networks and IPs change on this cluster.",
       "empty": "No recovery plans",
-      "emptyHint": "Replicate backups of a remote cluster here, then make a plan to test and run failover."
+      "emptyHint": "Replicate backups of a remote cluster here, then make a plan, test it, and fail over when disaster strikes."
     },
     "plan": {
       "source": "Source cluster",
@@ -90,25 +90,25 @@
     },
     "reprotect": {
       "title": "Reprotect {{name}}",
-      "description": "Creates backup job {{job}} for the recovered VMs that replicates to the remote, to prepare failing back.",
-      "submit": "Create job",
+      "description": "Creates backup schedule {{job}} for the recovered VMs that replicates to the remote, to prepare failing back.",
+      "submit": "Create schedule",
       "remote": "Replicate to",
       "backupPool": "Local backup pool",
       "backupPoolHint": "Backup pool here that keeps the recovered VMs' backups",
       "at": "Daily at (UTC)",
-      "done": "Backup job {{job}} is set.",
+      "done": "Backup schedule {{job}} is set.",
       "days": "Only on: {{days}}",
       "keepHint": "Old backups beyond these counts are deleted. All zero keeps every backup."
     },
     "edit": {
       "basics": "Basics",
-      "sourceHint": "The production cluster, registered as a remote. Its copies here are the recovery points.",
+      "sourceHint": "The production cluster the VMs run on now (registered as a remote). The backup copies it sent here are the recovery points.",
       "choose": "Choose…",
       "pool": "Restore pool",
       "folder": "Folder",
       "folderHint": "Folder for VMs made by a failover. Empty: the backed up VM's folder.",
       "rpo": "RPO target (hours)",
-      "rpoHint": "Alert when a recovery point is older. 0 turns it off.",
+      "rpoHint": "Alert when the newest copy is older than this. For example 24 warns when more than a day of data could be lost. 0 turns it off.",
       "onTimeout": "When a VM fails or times out",
       "groups": "Boot groups",
       "addGroup": "Add group",
@@ -402,6 +402,17 @@
       "noPoint": "No recovery point — skipped.",
       "alreadyRecovered": "Already recovered by this plan — skipped.",
       "preempted": "A failover stopped the test — skipped."
+    },
+    "help": {
+      "intro": "A plan to start the VMs of a production site on this cluster, in a set order, when that site stops. Rehearse it first with 'Test', which does not touch production.",
+      "name": "The name of this plan, such as prod-to-dr. It cannot be changed later.",
+      "pool": "The pool on this cluster that holds the recovered VMs' disks. Each VM can pick another pool.",
+      "onTimeout": "What to do when a VM does not start or is not ready in time. Usually 'Continue with the rest'.",
+      "groupName": "The name of this group, such as db, app or web.",
+      "wait": "Which state this group's VMs must reach before the next group starts. For VMs that must come first, such as databases, 'reports its IP' is safest.",
+      "timeout": "How long (seconds) to wait for this group's VMs to be ready. After that the 'When a VM fails or times out' choice applies.",
+      "delay": "Extra seconds to wait after this group is ready before starting the next. Usually 0.",
+      "reprotectRemote": "The remote cluster that receives backup copies of the recovered VMs, so you can move back when the production site returns."
     }
   }
 }

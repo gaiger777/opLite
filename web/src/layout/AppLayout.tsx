@@ -53,6 +53,7 @@ import { PageTabs } from "@/layout/PageTabs";
 import { NavProgress } from "@/layout/RouteError";
 import { NotificationBell } from "@/layout/NotificationBell";
 import { TaskDrawer } from "@/tasks/TaskDrawer";
+import { HelpPanel } from "@/help/HelpPanel";
 import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
 import { NavTree, Sidebar, useRail } from "@/layout/Sidebar";
 import { type Density, useDensity } from "@/lib/density";
@@ -197,6 +198,7 @@ export function AppLayout() {
         />
         <ShortcutsHelp open={help} onOpenChange={setHelp} />
         <TaskDrawer />
+        <HelpPanel />
       </div>
     </div>
   );

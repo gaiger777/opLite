@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { BellRing, Pencil, Plus, Trash2 } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -35,8 +35,10 @@ import { SEVERITIES } from "@/alerts/severity";
 import { api, call } from "@/api/client";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { StatusChip } from "@/components/StatusChip";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
@@ -122,76 +124,98 @@ export function AlertRulesTab() {
           </Button>
         </div>
       )}
-      <Table aria-label={t("alerts.tab.rules")}>
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("alerts.rules.condition")}</TableHead>
-            <TableHead>{t("alerts.rules.severity")}</TableHead>
-            <TableHead>{t("alerts.rules.targets")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            {admin && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={cols} query={rules} empty={t("alerts.rules.empty")} />
-          )}
-          {list.map((rule) => (
-            <TableRow key={rule.id}>
-              <TableCell className="font-medium">{rule.name}</TableCell>
-              <TableCell>
-                {conditionText(t, rule.spec.condition)}
-                {rule.spec.for_secs > 0 && (
-                  <span className="block text-xs text-muted-foreground">
-                    {t("alerts.rules.forText", { secs: rule.spec.for_secs })}
-                  </span>
-                )}
-              </TableCell>
-              <TableCell>
-                <SeverityBadge severity={rule.spec.severity} />
-              </TableCell>
-              <TableCell>{rule.spec.targets.join(", ")}</TableCell>
-              <TableCell>
-                <StatusChip tone={rule.spec.enabled ? "success" : "neutral"}>
-                  {t(rule.spec.enabled ? "alerts.rules.on" : "alerts.rules.off")}
-                </StatusChip>
-              </TableCell>
+      {rules.isSuccess && list.length === 0 ? (
+        <EmptyState
+          icon={BellRing}
+          title={t("alerts.rules.empty")}
+          description={t("help.alertRules.empty")}
+          help="alerts.page"
+          action={
+            admin && (
+              <Button
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setDialog({ rule: null });
+                }}
+              >
+                <Plus />
+                {t("alerts.rules.create")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-label={t("alerts.tab.rules")}>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("alerts.rules.condition")}</TableHead>
+              <TableHead>{t("alerts.rules.severity")}</TableHead>
+              <TableHead>{t("alerts.rules.targets")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
               {admin && (
-                <TableCell className="text-right whitespace-nowrap">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={t("alerts.rules.editNamed", { name: rule.name })}
-                    onClick={(e) => {
-                      opener.current = e.currentTarget;
-                      setDialog({ rule });
-                    }}
-                  >
-                    <Pencil />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={t("common.deleteNamed", { name: rule.name })}
-                    onClick={(e) => {
-                      opener.current = e.currentTarget;
-                      setDeleting(rule);
-                      setDeleteOpen(true);
-                    }}
-                  >
-                    <Trash2 />
-                  </Button>
-                </TableCell>
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
               )}
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={cols} query={rules} empty={t("alerts.rules.empty")} />
+            )}
+            {list.map((rule) => (
+              <TableRow key={rule.id}>
+                <TableCell className="font-medium">{rule.name}</TableCell>
+                <TableCell>
+                  {conditionText(t, rule.spec.condition)}
+                  {rule.spec.for_secs > 0 && (
+                    <span className="block text-xs text-muted-foreground">
+                      {t("alerts.rules.forText", { secs: rule.spec.for_secs })}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell>
+                  <SeverityBadge severity={rule.spec.severity} />
+                </TableCell>
+                <TableCell>{rule.spec.targets.join(", ")}</TableCell>
+                <TableCell>
+                  <StatusChip tone={rule.spec.enabled ? "success" : "neutral"}>
+                    {t(rule.spec.enabled ? "alerts.rules.on" : "alerts.rules.off")}
+                  </StatusChip>
+                </TableCell>
+                {admin && (
+                  <TableCell className="text-right whitespace-nowrap">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("alerts.rules.editNamed", { name: rule.name })}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setDialog({ rule });
+                      }}
+                    >
+                      <Pencil />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("common.deleteNamed", { name: rule.name })}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setDeleting(rule);
+                        setDeleteOpen(true);
+                      }}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </TableCell>
+                )}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {dialog && (
         <RuleDialog
           rule={dialog.rule}
@@ -277,8 +301,9 @@ function RuleDialog({
       "value" | "percent" | "ops" | "ports" | "forSecs" | "repeatSecs" | "nodes" | "vms" | "plans",
     label: string,
     hint?: string,
+    info?: string,
   ) => (
-    <Field id={id} label={label} error={errors[key]} hint={hint}>
+    <Field id={id} label={label} error={errors[key]} help={hint} info={info}>
       {(a11y) => (
         <Input
           id={id}
@@ -303,7 +328,12 @@ function RuleDialog({
       onSubmit={submit}
     >
       <div className="-mx-1 flex max-h-[60svh] flex-col gap-4 overflow-y-auto px-1">
-        <Field id="rule-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="rule-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.alertRules.name")}
+        >
           {(a11y) => (
             <Input
               id="rule-name"
@@ -315,123 +345,152 @@ function RuleDialog({
             />
           )}
         </Field>
-        <Field id="rule-kind" label={t("alerts.rules.condition")}>
-          <NativeSelect
-            id="rule-kind"
-            className="w-full"
-            value={form.kind}
-            onChange={(e) => {
-              const kind = e.target.value as RuleForm["kind"];
-              // 권하는 심각도가 있는 조건(dr_source_returned → critical)은 고를 때 그것으로 바꾼다(고칠 수 있다).
-              const severity = SUGGESTED_SEVERITY[kind];
-              change({ kind, ...(severity && { severity }) });
-              setErrors({});
-            }}
-          >
-            {CONDITION_KINDS.filter(
-              (kind) => !isSdn(kind) && !isBackupStore(kind) && !isDr(kind),
-            ).map((kind) => (
-              <NativeSelectOption key={kind} value={kind}>
-                {t(`alerts.kind.${kind}`)}
-              </NativeSelectOption>
-            ))}
-            {/* SDN 묶음(계획 67 §11) */}
-            <optgroup label={t("alerts.sdnGroup")}>
-              {CONDITION_KINDS.filter(isSdn).map((kind) => (
+        <Field
+          id="rule-kind"
+          label={t("alerts.rules.condition")}
+          help={t("help.alertRules.condition")}
+          info="alertRules.condition"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="rule-kind"
+              className="w-full"
+              {...a11y}
+              value={form.kind}
+              onChange={(e) => {
+                const kind = e.target.value as RuleForm["kind"];
+                // 권하는 심각도가 있는 조건(dr_source_returned → critical)은 고를 때 그것으로 바꾼다(고칠 수 있다).
+                const severity = SUGGESTED_SEVERITY[kind];
+                change({ kind, ...(severity && { severity }) });
+                setErrors({});
+              }}
+            >
+              {CONDITION_KINDS.filter(
+                (kind) => !isSdn(kind) && !isBackupStore(kind) && !isDr(kind),
+              ).map((kind) => (
                 <NativeSelectOption key={kind} value={kind}>
                   {t(`alerts.kind.${kind}`)}
                 </NativeSelectOption>
               ))}
-            </optgroup>
-            {/* 백업 저장소 묶음(계획 68) */}
-            <optgroup label={t("alerts.backupGroup")}>
-              {CONDITION_KINDS.filter(isBackupStore).map((kind) => (
-                <NativeSelectOption key={kind} value={kind}>
-                  {t(`alerts.kind.${kind}`)}
-                </NativeSelectOption>
-              ))}
-            </optgroup>
-            {/* DR 묶음(계획 76) */}
-            <optgroup label={t("alerts.drGroup")}>
-              {CONDITION_KINDS.filter(isDr).map((kind) => (
-                <NativeSelectOption key={kind} value={kind}>
-                  {t(`alerts.kind.${kind}`)}
-                </NativeSelectOption>
-              ))}
-            </optgroup>
-          </NativeSelect>
+              {/* SDN 묶음(계획 67 §11) */}
+              <optgroup label={t("alerts.sdnGroup")}>
+                {CONDITION_KINDS.filter(isSdn).map((kind) => (
+                  <NativeSelectOption key={kind} value={kind}>
+                    {t(`alerts.kind.${kind}`)}
+                  </NativeSelectOption>
+                ))}
+              </optgroup>
+              {/* 백업 저장소 묶음(계획 68) */}
+              <optgroup label={t("alerts.backupGroup")}>
+                {CONDITION_KINDS.filter(isBackupStore).map((kind) => (
+                  <NativeSelectOption key={kind} value={kind}>
+                    {t(`alerts.kind.${kind}`)}
+                  </NativeSelectOption>
+                ))}
+              </optgroup>
+              {/* DR 묶음(계획 76) */}
+              <optgroup label={t("alerts.drGroup")}>
+                {CONDITION_KINDS.filter(isDr).map((kind) => (
+                  <NativeSelectOption key={kind} value={kind}>
+                    {t(`alerts.kind.${kind}`)}
+                  </NativeSelectOption>
+                ))}
+              </optgroup>
+            </NativeSelect>
+          )}
         </Field>
         {metric && (
           <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-2">
-            <Field id="rule-metric" label={t("alerts.rules.metric")}>
-              <NativeSelect
-                id="rule-metric"
-                className="w-full"
-                value={form.kind === "node_metric" ? form.nodeMetric : form.vmMetric}
-                onChange={(e) =>
-                  change(
-                    form.kind === "node_metric"
-                      ? { nodeMetric: e.target.value as RuleForm["nodeMetric"] }
-                      : { vmMetric: e.target.value as RuleForm["vmMetric"] },
-                  )
-                }
-              >
-                {(form.kind === "node_metric" ? NODE_METRICS : VM_METRICS).map((m) => (
-                  <NativeSelectOption key={m} value={m}>
-                    {t(`alerts.metric.${m}`)}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
+            <Field
+              id="rule-metric"
+              label={t("alerts.rules.metric")}
+              help={t("help.alertRules.metric")}
+            >
+              {(a11y) => (
+                <NativeSelect
+                  id="rule-metric"
+                  className="w-full"
+                  {...a11y}
+                  value={form.kind === "node_metric" ? form.nodeMetric : form.vmMetric}
+                  onChange={(e) =>
+                    change(
+                      form.kind === "node_metric"
+                        ? { nodeMetric: e.target.value as RuleForm["nodeMetric"] }
+                        : { vmMetric: e.target.value as RuleForm["vmMetric"] },
+                    )
+                  }
+                >
+                  {(form.kind === "node_metric" ? NODE_METRICS : VM_METRICS).map((m) => (
+                    <NativeSelectOption key={m} value={m}>
+                      {t(`alerts.metric.${m}`)}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
             </Field>
-            <Field id="rule-op" label={t("alerts.rules.op")}>
-              <NativeSelect
-                id="rule-op"
-                value={form.op}
-                onChange={(e) => change({ op: e.target.value as RuleForm["op"] })}
-              >
-                <NativeSelectOption value="gt">{t("alerts.rules.gt")}</NativeSelectOption>
-                <NativeSelectOption value="lt">{t("alerts.rules.lt")}</NativeSelectOption>
-              </NativeSelect>
+            <Field id="rule-op" label={t("alerts.rules.op")} help={t("help.alertRules.op")}>
+              {(a11y) => (
+                <NativeSelect
+                  id="rule-op"
+                  value={form.op}
+                  onChange={(e) => change({ op: e.target.value as RuleForm["op"] })}
+                  {...a11y}
+                >
+                  <NativeSelectOption value="gt">{t("alerts.rules.gt")}</NativeSelectOption>
+                  <NativeSelectOption value="lt">{t("alerts.rules.lt")}</NativeSelectOption>
+                </NativeSelect>
+              )}
             </Field>
-            {input("rule-value", "value", t("alerts.rules.value"))}
+            {input("rule-value", "value", t("alerts.rules.value"), t("help.alertRules.value"))}
           </div>
         )}
         {metric && (
           <p className="-mt-2 text-xs text-muted-foreground">{t("alerts.rules.unitHint")}</p>
         )}
-        {form.kind === "pool_usage" && input("rule-percent", "percent", t("alerts.rules.percent"))}
+        {form.kind === "pool_usage" &&
+          input("rule-percent", "percent", t("alerts.rules.percent"), t("help.alertRules.percent"))}
         {form.kind === "task_failed" &&
           input("rule-ops", "ops", t("alerts.rules.ops"), t("alerts.rules.opsHint"))}
         {form.kind === "node_link_down" && (
           <>
-            <Field id="rule-role" label={t("alerts.rules.role")}>
-              <NativeSelect
-                id="rule-role"
-                className="w-full"
-                value={form.role}
-                onChange={(e) => change({ role: e.target.value as RuleForm["role"] })}
-              >
-                {LINK_ROLES.map((r) => (
-                  <NativeSelectOption key={r} value={r}>
-                    {t(`alerts.rules.roles.${r}`)}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
+            <Field id="rule-role" label={t("alerts.rules.role")} help={t("help.alertRules.role")}>
+              {(a11y) => (
+                <NativeSelect
+                  id="rule-role"
+                  className="w-full"
+                  value={form.role}
+                  onChange={(e) => change({ role: e.target.value as RuleForm["role"] })}
+                  {...a11y}
+                >
+                  {LINK_ROLES.map((r) => (
+                    <NativeSelectOption key={r} value={r}>
+                      {t(`alerts.rules.roles.${r}`)}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
             </Field>
             {input("rule-ports", "ports", t("alerts.rules.ports"), t("alerts.rules.portsHint"))}
           </>
         )}
         {!event &&
-          input("rule-for", "forSecs", t("alerts.rules.forSecs"), t("alerts.rules.forSecsHint"))}
+          input(
+            "rule-for",
+            "forSecs",
+            t("alerts.rules.forSecs"),
+            t("alerts.rules.forSecsHint"),
+            "alertRules.forSecs",
+          )}
         <Field
           id="rule-severity"
           label={t("alerts.rules.severity")}
-          hint={
+          info="alertRules.severity"
+          help={
             SUGGESTED_SEVERITY[form.kind]
-              ? t("alerts.rules.suggestedSeverity", {
+              ? `${t("help.alertRules.severity")} ${t("alerts.rules.suggestedSeverity", {
                   severity: t(`alerts.severity.${SUGGESTED_SEVERITY[form.kind]}`),
-                })
-              : undefined
+                })}`
+              : t("help.alertRules.severity")
           }
         >
           {(a11y) => (
@@ -490,6 +549,7 @@ function RuleDialog({
             "repeatSecs",
             t("alerts.rules.repeatSecs"),
             t("alerts.rules.repeatSecsHint"),
+            "alertRules.repeatSecs",
           )}
         {!event && (
           <div className="flex items-center gap-2">
@@ -499,6 +559,11 @@ function RuleDialog({
               onCheckedChange={(on) => change({ sendResolved: on === true })}
             />
             <Label htmlFor="rule-send-resolved">{t("alerts.rules.sendResolved")}</Label>
+            <InfoButton
+              topic="alertRules.sendResolved"
+              label={t("alerts.rules.sendResolved")}
+              line={t("help.alertRules.sendResolved")}
+            />
           </div>
         )}
         {takesNodes(form.kind) &&

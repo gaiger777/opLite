@@ -179,7 +179,7 @@ it("opens the group of a page in another group and marks its item", async () => 
   });
   expect(item).toHaveAttribute("aria-current", "page");
   expect(item).toHaveAttribute("href", "/routers");
-  // 화면 안 탭(라우터 | 공인 IP)
+  // 화면 안 탭(라우터 | 유동 IP)
   const tabs = screen.getByRole("navigation", { name: "Routers & floating IPs pages" });
   expect(links(tabs)).toEqual([
     ["Routers", "/routers"],
@@ -473,7 +473,8 @@ it("switches density, language and theme from the account menu", async () => {
   await user.click(screen.getByRole("button", { name: "Account (admin)" }));
   await user.click(await screen.findByRole("menuitem", { name: "Language" }));
   fireEvent.click(await screen.findByRole("menuitemradio", { name: "한국어" }));
-  expect(i18n.language).toBe("ko");
+  // 다른 언어의 문구는 바꿀 때 받으므로 바뀌기까지 기다린다.
+  await vi.waitFor(() => expect(i18n.language).toBe("ko"));
   // 머리줄에는 언어·테마 단추가 따로 없다.
   expect(screen.queryByRole("button", { name: /^(언어|테마|Language|Theme)$/ })).toBeNull();
   document.documentElement.classList.remove("dark");

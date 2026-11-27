@@ -104,7 +104,9 @@ it("lets a folder delegator who cannot list users add a grant by id", async () =
       .getAllByRole("option")
       .map((o) => o.textContent);
   expect(offered()).toEqual(["Operator"]);
-  await user.click(within(dialog).getByRole("checkbox", { name: /Also apply to subfolders/ }));
+  await user.click(
+    within(dialog).getByRole("checkbox", { name: /Apply inside the folder and its subfolders/ }),
+  );
   expect(offered()).toEqual(["Operator", "vm-user"]);
   await user.selectOptions(role, "vm-user");
   await user.click(within(dialog).getByRole("button", { name: "Add permission" }));
@@ -403,4 +405,20 @@ it("reads routers and floating IPs only for panels that name them", async () => 
     fips: true,
   });
   expect(routingGrants(undefined)).toEqual({ routers: false, fips: false });
+});
+
+it("explains an empty group list and offers to create a group", async () => {
+  server.use(
+    http.get(apiUrl("/users"), () => HttpResponse.json({ revision: 1, items: [] })),
+    http.get(apiUrl("/realms"), () => HttpResponse.json({ revision: 1, items: [] })),
+    http.get(apiUrl("/groups"), () => HttpResponse.json({ revision: 1, items: [] })),
+  );
+  renderPage(<GroupsPage />, { as: ADMIN });
+  const empty = (await screen.findByText("No groups.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("give permissions once to the group");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await userEvent.click(within(empty).getByRole("button", { name: "Create a group" }));
+  expect(await screen.findByRole("dialog", { name: "Create a group" })).toBeInTheDocument();
 });

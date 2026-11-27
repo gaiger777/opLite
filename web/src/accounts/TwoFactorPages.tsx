@@ -66,23 +66,37 @@ function ProofDialog({
       onClose={onClose}
       onSubmit={() => run(code.trim() ? { code: code.trim() } : { password })}
     >
-      <Field id="proof-code" label={t("twoFactor.codeOrRecovery")}>
-        <Input
-          id="proof-code"
-          autoComplete="one-time-code"
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-        />
+      <Field
+        id="proof-code"
+        label={t("twoFactor.codeOrRecovery")}
+        help={t("help.twoFactor.proofCode")}
+      >
+        {(a11y) => (
+          <Input
+            id="proof-code"
+            autoComplete="one-time-code"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            {...a11y}
+          />
+        )}
       </Field>
       {local && (
-        <Field id="proof-password" label={t("twoFactor.orPassword")}>
-          <Input
-            id="proof-password"
-            type="password"
-            autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+        <Field
+          id="proof-password"
+          label={t("twoFactor.orPassword")}
+          help={t("help.twoFactor.proofPassword")}
+        >
+          {(a11y) => (
+            <Input
+              id="proof-password"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              {...a11y}
+            />
+          )}
         </Field>
       )}
     </FormDialog>
@@ -130,7 +144,8 @@ export function AccountPage() {
       <PageHeader
         id={titleId}
         title={t("nav.account")}
-        description={t("twoFactor.pageHint")}
+        help="account"
+        intro={t("help.account.intro")}
         actions={s.required && <Badge variant="secondary">{t("twoFactor.required")}</Badge>}
       />
       {!s.available && (
@@ -288,7 +303,7 @@ export function SecurityPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.security")} />
+        <PageHeader title={t("nav.security")} help="security" intro={t("help.security.intro")} />
         <p className="text-sm text-muted-foreground">{t("users.adminOnly")}</p>
       </div>
     );
@@ -368,7 +383,7 @@ function PolicyForm({
 
   return (
     <form onSubmit={(e) => void save(e)} className="flex flex-col gap-4">
-      <PageHeader title={t("nav.security")} description={t("twoFactor.policyHint")} />
+      <PageHeader title={t("nav.security")} help="security" intro={t("help.security.intro")} />
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}
@@ -406,7 +421,7 @@ function PolicyForm({
           </div>
         ))}
       </fieldset>
-      <Field id="policy-rp" label={t("twoFactor.rpId")} hint={t("twoFactor.rpIdHint")}>
+      <Field id="policy-rp" label={t("twoFactor.rpId")} help={t("twoFactor.rpIdHint")}>
         {(a11y) => (
           <Input
             id="policy-rp"

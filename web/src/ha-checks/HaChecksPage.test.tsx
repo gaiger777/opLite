@@ -54,21 +54,21 @@ it("lists checks with their target, reaction and grace", async () => {
   mockLists({ node: NODES, "storage-pool": POOLS });
   checks(stor, lan);
   renderPage(<HaChecksPage />);
-  const table = await screen.findByRole("table", { name: "HA checks" });
+  const table = await screen.findByRole("table", { name: "Failure detection (HA checks)" });
   await within(table).findByText("stor");
   const s = cells(table, "stor");
-  expect(s("Role")).toHaveTextContent("Storage");
+  expect(s("What it checks")).toHaveTextContent("Shared storage connection");
   expect(s("Target")).toHaveTextContent("pool:nas");
   // 대응을 정하지 않으면 역할의 기본이다.
-  expect(s("On failure")).toHaveTextContent("Restart elsewhere(role default)");
-  expect(s("Grace")).toHaveTextContent("15 s");
+  expect(s("On failure")).toHaveTextContent("Restart elsewhere(default)");
+  expect(s("Wait time")).toHaveTextContent("15 s");
   expect(s("Node overrides")).toHaveTextContent("node-b=pool:nas");
   expect(s("State")).toHaveTextContent("On");
   const l = cells(table, "lan");
   expect(l("Target")).toHaveTextContent("ping:10.0.0.1,10.0.0.2@bond0 need=2");
   expect(l("On failure")).toHaveTextContent("Power off the node");
   // 서버가 쓰지 않은 기본 grace
-  expect(l("Grace")).toHaveTextContent("10 s");
+  expect(l("Wait time")).toHaveTextContent("10 s");
   expect(l("Node overrides")).toHaveTextContent("—");
   expect(l("State")).toHaveTextContent("Off");
   expect(
@@ -104,7 +104,7 @@ it("creates a check with a node override and reads the list again", async () => 
   ).toBeVisible();
   await user.clear(within(dialog).getByLabelText("Name"));
   await user.type(within(dialog).getByLabelText("Name"), "uplink");
-  await user.selectOptions(within(dialog).getByLabelText("Role"), "vm");
+  await user.selectOptions(within(dialog).getByLabelText("What it checks"), "vm");
   // VM 네트워크 검사는 풀을 보지 않는다.
   expect(
     within(within(dialog).getByLabelText("Check")).queryByRole("option", { name: "Pool" }),
@@ -117,7 +117,7 @@ it("creates a check with a node override and reads the list again", async () => 
   ).toEqual(["bond0", "eno1", "eno2", "vmbr0"]);
   await user.type(iface, "vmbr0");
   await user.selectOptions(within(dialog).getByLabelText("On failure"), "restart_elsewhere");
-  await user.type(within(dialog).getByLabelText("Grace (seconds)"), "30");
+  await user.type(within(dialog).getByLabelText("Wait time (seconds)"), "30");
   await user.click(within(dialog).getByRole("button", { name: "Add node override" }));
   // 위트니스는 고를 수 없고, 남은 첫 노드가 골라진다.
   const node = within(dialog).getByLabelText("Node of override 1");
@@ -269,8 +269,19 @@ it("lets only admins change checks", async () => {
   mockLists({ node: NODES, "storage-pool": POOLS });
   checks(stor);
   renderPage(<HaChecksPage />, { as: OPERATOR });
-  const table = await screen.findByRole("table", { name: "HA checks" });
+  const table = await screen.findByRole("table", { name: "Failure detection (HA checks)" });
   await within(table).findByText("stor");
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Edit HA check stor" })).not.toBeInTheDocument();
+});
+
+it("explains HA checks and offers to create one when there are none", async () => {
+  mockLists({ node: NODES, "storage-pool": POOLS });
+  checks();
+  renderPage(<HaChecksPage />);
+  expect(await screen.findByText("No HA checks.")).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Create HA check" }));
+  expect(await screen.findByRole("dialog", { name: "Create HA check" })).toBeVisible();
 });

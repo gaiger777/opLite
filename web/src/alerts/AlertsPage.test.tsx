@@ -69,6 +69,21 @@ it("lists active alerts and nodes that did not answer", async () => {
   expect(screen.getByText(/older version without alerts: node-c/)).toBeInTheDocument();
 });
 
+it("explains an empty list of active alerts", async () => {
+  server.use(
+    http.get(apiUrl("/alerts"), () =>
+      HttpResponse.json({ alerts: [], unreachable: [], unsupported: [] }),
+    ),
+  );
+  renderPage(<AlertsPage />, { path: "/alerts" });
+  const empty = (await screen.findByText("No active alerts.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("When a problem matches a rule, it shows up here.");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  expect(screen.queryByRole("list", { name: "Active" })).not.toBeInTheDocument();
+});
+
 it("shows rules read-only to a viewer", async () => {
   server.use(rules());
   renderPage(<AlertsPage />, { path: "/alerts", url: "/alerts?tab=rules", as: VIEWER });
@@ -113,8 +128,13 @@ it("creates a rule with the chosen targets", async () => {
   );
   const user = userEvent.setup();
   renderPage(<AlertsPage />, { path: "/alerts", url: "/alerts?tab=rules" });
-  expect(await screen.findByText("No alert rules.")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Create rule" }));
+  // 빈 목록은 빈 상태(설명·만들기·자세히)로 보인다.
+  const empty = (await screen.findByText("No alert rules.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("A rule watches a condition");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await user.click(within(empty).getByRole("button", { name: "Create rule" }));
   const dialog = await screen.findByRole("dialog", { name: "Create alert rule" });
   await user.type(within(dialog).getByLabelText("Name"), "pool-full");
   await user.selectOptions(within(dialog).getByLabelText("Condition"), "pool_usage");
@@ -330,6 +350,6 @@ it("suggests critical for the DR source-returned condition (plan 76 review 1)", 
   expect(severity).toHaveValue("warning");
   await user.selectOptions(within(dialog).getByLabelText("Condition"), "dr_source_returned");
   expect(severity).toHaveValue("critical");
-  expect(within(dialog).getByText("Recommended: Critical")).toBeInTheDocument();
+  expect(within(dialog).getByText(/Recommended: Critical/)).toBeInTheDocument();
   expect(within(dialog).getByLabelText("Only recovery plans")).toBeInTheDocument();
 });

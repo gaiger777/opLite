@@ -177,22 +177,30 @@ export function AddOsdDialog({
         <p className="text-sm text-muted-foreground">{t("ceph.noNodes")}</p>
       ) : (
         <>
-          <Field id="ceph-osd-node" label={t("common.node")}>
-            <NativeSelect
-              id="ceph-osd-node"
-              value={chosenNode}
-              onChange={(e) => {
-                setNode(e.target.value);
-                setPath("");
-                setTyped("");
-              }}
-            >
-              {choices.map((n) => (
-                <NativeSelectOption key={n.id} value={n.id}>
-                  {n.name}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+          <Field
+            id="ceph-osd-node"
+            label={t("common.node")}
+            help={t("help.ceph.osdNode")}
+            info="ceph.osd"
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="ceph-osd-node"
+                value={chosenNode}
+                onChange={(e) => {
+                  setNode(e.target.value);
+                  setPath("");
+                  setTyped("");
+                }}
+                {...a11y}
+              >
+                {choices.map((n) => (
+                  <NativeSelectOption key={n.id} value={n.id}>
+                    {n.name}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
           <div className="max-h-[40vh] overflow-y-auto">
             {disks.data ? (
@@ -213,7 +221,7 @@ export function AddOsdDialog({
             <Field
               id="ceph-osd-confirm"
               label={t("ceph.osd.typeDevice", { device: disk.path })}
-              hint={t("ceph.osd.wipeWarning", { reasons: diskReasons(disk) })}
+              help={t("ceph.osd.wipeWarning", { reasons: diskReasons(disk) })}
             >
               {(a11y) => (
                 <Input

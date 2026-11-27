@@ -132,7 +132,7 @@ export function RestoreToVmDialog({
       <Field
         id="fr-vm"
         label={t("fileRestore.vm")}
-        hint={running.length === 0 ? t("fileRestore.noRunningVms") : undefined}
+        help={t(running.length === 0 ? "fileRestore.noRunningVms" : "help.fileRestore.vm")}
       >
         {(a11y) => (
           <NativeSelect
@@ -178,7 +178,7 @@ export function RestoreToVmDialog({
         id="fr-target"
         label={t("fileRestore.targetDir")}
         error={dirError}
-        hint={t("fileRestore.targetDirHint")}
+        help={t("fileRestore.targetDirHint")}
       >
         {(a11y) => (
           <Input

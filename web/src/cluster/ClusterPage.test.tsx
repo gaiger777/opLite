@@ -69,19 +69,21 @@ it("shows the CA and the members", async () => {
   expect(within(table).getByText("node-a").closest("tr")).toHaveTextContent("Leader");
   expect(within(table).getByText("node-b").closest("tr")).toHaveTextContent("(this node)");
   const joining = within(table).getByText("n3").closest("tr")!;
-  expect(joining).toHaveTextContent("Learner");
+  expect(joining).toHaveTextContent("Joining");
   expect(joining).toHaveTextContent("Offline");
   // 관찰 노드(Raft 밖에서 투표 멤버를 따름)는 learner와 따로 보인다.
   const observer = within(table).getByText("node-o").closest("tr")!;
-  expect(observer).toHaveTextContent("Observer");
-  expect(observer).not.toHaveTextContent("Learner");
+  expect(observer).toHaveTextContent("Read-only member");
+  expect(observer).not.toHaveTextContent("Joining");
   // 위트니스는 역할 옆에 배지가 붙는다.
-  expect(within(table).getByText("witness-w").closest("tr")).toHaveTextContent("VoterWitness");
-  expect(within(table).queryAllByText("Witness")).toHaveLength(1);
+  expect(within(table).getByText("witness-w").closest("tr")).toHaveTextContent(
+    "VoterVote-only node",
+  );
+  expect(within(table).queryAllByText("Vote-only node")).toHaveLength(1);
   // 펜싱이 꺼졌거나(null) 모르면(옛 서버) 대시다.
   const column = within(table)
     .getAllByRole("columnheader")
-    .findIndex((h) => h.textContent === "Fencing");
+    .findIndex((h) => h.textContent === "Forced reboot on failure");
   const fencing = (name: string) =>
     within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column];
   expect(fencing("node-a")).toHaveTextContent("Watchdog");

@@ -12,6 +12,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
@@ -60,6 +61,8 @@ export function PlacementRulesPage() {
       <PageHeader
         id="placement-rules-title"
         title={t("nav.placementRules")}
+        help="placementRules"
+        intro={t("help.placementRules.intro")}
         actions={
           write && (
             <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -79,97 +82,123 @@ export function PlacementRulesPage() {
           )
         }
       />
-      <p className="text-sm text-muted-foreground">{t("placementRules.pageHint")}</p>
-      <Table aria-labelledby="placement-rules-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("placementRules.kind")}</TableHead>
-            <TableHead>{t("placementRules.vms")}</TableHead>
-            <TableHead>{t("placementRules.nodes")}</TableHead>
-            <TableHead>{t("placementRules.weight")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
+      {rules.isSuccess && list.length === 0 ? (
+        <EmptyState
+          title={t("placementRules.empty")}
+          description={t("help.placementRules.empty")}
+          diagram="placement"
+          help="placementRules.page"
+          action={
+            write && (
+              <Button
+                disabled={!nodes.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("placementRules.createTitle")}
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="placement-rules-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("placementRules.kind")}</TableHead>
+              <TableHead>{t("placementRules.vms")}</TableHead>
+              <TableHead>{t("placementRules.nodes")}</TableHead>
+              <TableHead>{t("placementRules.weight")}</TableHead>
+              <TableHead>{t("common.state")}</TableHead>
+              {write && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage
+                colSpan={write ? 7 : 6}
+                query={rules}
+                empty={t("placementRules.empty")}
+              />
             )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={write ? 7 : 6} query={rules} empty={t("placementRules.empty")} />
-          )}
-          {list.map((rule) => {
-            const s = rule.spec;
-            return (
-              <TableRow key={rule.id}>
-                <TableCell className="font-medium">{rule.name}</TableCell>
-                <TableCell>{t(`placementRules.kinds.${s.kind}`)}</TableCell>
-                <TableCell>
-                  {s.vm_tag != null ? (
-                    <span className="font-mono text-xs">{s.vm_tag}</span>
-                  ) : (
-                    (s.vms ?? []).join(", ")
-                  )}
-                </TableCell>
-                <TableCell>
-                  {s.node_tag != null ? (
-                    <span className="font-mono text-xs">{s.node_tag}</span>
-                  ) : (
-                    (s.nodes ?? []).join(", ") || "—"
-                  )}
-                </TableCell>
-                <TableCell>{isHard(s.kind) ? "—" : (s.weight ?? DEFAULT_WEIGHT)}</TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap gap-1">
-                    <Badge variant={s.enabled ? "secondary" : "outline"}>
-                      {t(
-                        s.enabled
-                          ? "placementRules.state.enabled"
-                          : "placementRules.state.disabled",
-                      )}
-                    </Badge>
-                    {s.ha_may_violate && (
-                      <Badge variant="outline">{t("placementRules.haMayViolateShort")}</Badge>
+            {list.map((rule) => {
+              const s = rule.spec;
+              return (
+                <TableRow key={rule.id}>
+                  <TableCell className="font-medium">{rule.name}</TableCell>
+                  <TableCell>{t(`placementRules.kinds.${s.kind}`)}</TableCell>
+                  <TableCell>
+                    {s.vm_tag != null ? (
+                      <span className="font-mono text-xs">{s.vm_tag}</span>
+                    ) : (
+                      (s.vms ?? []).join(", ")
                     )}
-                  </div>
-                </TableCell>
-                {write && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("placementRules.editNamed", { name: rule.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setEditing(rule);
-                      }}
-                    >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("placementRules.deleteNamed", { name: rule.name })}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setDeleting(rule);
-                        setDeleteOpen(true);
-                      }}
-                    >
-                      <Trash2 />
-                    </Button>
-                    <RowConfigMenu
-                      target={{ kind: "placement-rule", id: rule.id, name: rule.name }}
-                    />
                   </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                  <TableCell>
+                    {s.node_tag != null ? (
+                      <span className="font-mono text-xs">{s.node_tag}</span>
+                    ) : (
+                      (s.nodes ?? []).join(", ") || "—"
+                    )}
+                  </TableCell>
+                  <TableCell>{isHard(s.kind) ? "—" : (s.weight ?? DEFAULT_WEIGHT)}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      <Badge variant={s.enabled ? "secondary" : "outline"}>
+                        {t(
+                          s.enabled
+                            ? "placementRules.state.enabled"
+                            : "placementRules.state.disabled",
+                        )}
+                      </Badge>
+                      {s.ha_may_violate && (
+                        <Badge variant="outline">{t("placementRules.haMayViolateShort")}</Badge>
+                      )}
+                    </div>
+                  </TableCell>
+                  {write && (
+                    <TableCell className="text-right whitespace-nowrap">
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("placementRules.editNamed", { name: rule.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setEditing(rule);
+                        }}
+                      >
+                        <Pencil />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("placementRules.deleteNamed", { name: rule.name })}
+                        onClick={(e) => {
+                          opener.current = e.currentTarget;
+                          setDeleting(rule);
+                          setDeleteOpen(true);
+                        }}
+                      >
+                        <Trash2 />
+                      </Button>
+                      <RowConfigMenu
+                        target={{ kind: "placement-rule", id: rule.id, name: rule.name }}
+                      />
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {editing !== undefined && (
         <RuleDialog
           rule={editing}
@@ -258,7 +287,12 @@ function RuleDialog({
       onSubmit={submit}
     >
       {!rule && (
-        <Field id="rule-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="rule-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.placementRules.name")}
+        >
           {(a11y) => (
             <Input
               id="rule-name"
@@ -272,7 +306,8 @@ function RuleDialog({
       <Field
         id="rule-kind"
         label={t("placementRules.kind")}
-        hint={t(`placementRules.kindHint.${form.kind}`)}
+        help={t(`placementRules.kindHint.${form.kind}`)}
+        info="placementRules.kind"
       >
         {(a11y) => (
           <NativeSelect
@@ -290,23 +325,26 @@ function RuleDialog({
           </NativeSelect>
         )}
       </Field>
-      <Field id="rule-vm-by" label={t("placementRules.vmBy")}>
-        <NativeSelect
-          id="rule-vm-by"
-          className="w-full"
-          value={form.vmBy}
-          onChange={(e) => change({ vmBy: e.target.value as RuleForm["vmBy"] })}
-        >
-          <NativeSelectOption value="names">{t("placementRules.byNames")}</NativeSelectOption>
-          <NativeSelectOption value="tag">{t("placementRules.byLabel")}</NativeSelectOption>
-        </NativeSelect>
+      <Field id="rule-vm-by" label={t("placementRules.vmBy")} help={t("help.placementRules.vmBy")}>
+        {(a11y) => (
+          <NativeSelect
+            id="rule-vm-by"
+            className="w-full"
+            value={form.vmBy}
+            onChange={(e) => change({ vmBy: e.target.value as RuleForm["vmBy"] })}
+            {...a11y}
+          >
+            <NativeSelectOption value="names">{t("placementRules.byNames")}</NativeSelectOption>
+            <NativeSelectOption value="tag">{t("placementRules.byLabel")}</NativeSelectOption>
+          </NativeSelect>
+        )}
       </Field>
       {form.vmBy === "names" ? (
         <Field
           id="rule-vms"
           label={t("placementRules.vmNames")}
           error={errors.vms}
-          hint={t("placementRules.vmNamesHint")}
+          help={t("placementRules.vmNamesHint")}
         >
           {(a11y) => (
             <Input
@@ -323,7 +361,7 @@ function RuleDialog({
           id="rule-vm-tag"
           label={t("placementRules.vmTag")}
           error={errors.vms}
-          hint={t("placementRules.vmTagHint")}
+          help={t("placementRules.vmTagHint")}
         >
           {(a11y) => (
             <Input
@@ -338,16 +376,23 @@ function RuleDialog({
       )}
       {!isVmRule(form.kind) && (
         <>
-          <Field id="rule-node-by" label={t("placementRules.nodeBy")}>
-            <NativeSelect
-              id="rule-node-by"
-              className="w-full"
-              value={form.nodeBy}
-              onChange={(e) => change({ nodeBy: e.target.value as RuleForm["nodeBy"] })}
-            >
-              <NativeSelectOption value="names">{t("placementRules.byNames")}</NativeSelectOption>
-              <NativeSelectOption value="tag">{t("placementRules.byLabel")}</NativeSelectOption>
-            </NativeSelect>
+          <Field
+            id="rule-node-by"
+            label={t("placementRules.nodeBy")}
+            help={t("help.placementRules.nodeBy")}
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="rule-node-by"
+                className="w-full"
+                value={form.nodeBy}
+                onChange={(e) => change({ nodeBy: e.target.value as RuleForm["nodeBy"] })}
+                {...a11y}
+              >
+                <NativeSelectOption value="names">{t("placementRules.byNames")}</NativeSelectOption>
+                <NativeSelectOption value="tag">{t("placementRules.byLabel")}</NativeSelectOption>
+              </NativeSelect>
+            )}
           </Field>
           {form.nodeBy === "names" ? (
             <fieldset className="flex flex-col gap-1.5">
@@ -378,7 +423,7 @@ function RuleDialog({
               id="rule-node-tag"
               label={t("placementRules.nodeTag")}
               error={errors.nodes}
-              hint={t("placementRules.nodeTagHint")}
+              help={t("placementRules.nodeTagHint")}
             >
               {(a11y) => (
                 <Input
@@ -398,7 +443,8 @@ function RuleDialog({
           id="rule-weight"
           label={t("placementRules.weight")}
           error={errors.weight}
-          hint={t("placementRules.weightHint")}
+          help={t("placementRules.weightHint")}
+          info="placementRules.weight"
         >
           {(a11y) => (
             <Input

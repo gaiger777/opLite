@@ -536,7 +536,8 @@ function HostResourcesDialog({
           id="res-reserved"
           label={t("numa.sets.reserved")}
           error={errors.reserved}
-          hint={t("numa.resources.reservedHint")}
+          help={t("numa.resources.reservedHint")}
+          info="numa.reserved"
         >
           {(a11y) => (
             <Input
@@ -553,7 +554,8 @@ function HostResourcesDialog({
           id="res-dedicated"
           label={t("numa.sets.dedicated")}
           error={errors.dedicated}
-          hint={t("numa.resources.dedicatedHint")}
+          help={t("numa.resources.dedicatedHint")}
+          info="numa.dedicated"
         >
           {(a11y) => (
             <Input
@@ -597,7 +599,7 @@ function HostResourcesDialog({
               aria-label={t("numa.resources.reserve", { n: i + 1 })}
               className="flex flex-wrap items-end gap-2"
             >
-              <Field id={`res-hp-${i}-size`} label={t("numa.resources.size")}>
+              <Field id={`res-hp-${i}-size`} label={t("numa.resources.size")} info="numa.hpSize">
                 <NativeSelect
                   id={`res-hp-${i}-size`}
                   value={h.size}
@@ -611,6 +613,7 @@ function HostResourcesDialog({
                 id={`res-hp-${i}-count`}
                 label={t("numa.resources.count")}
                 error={errors[`hugepages.${i}.count`]}
+                info="numa.hpCount"
               >
                 {(a11y) => (
                   <Input
@@ -623,7 +626,11 @@ function HostResourcesDialog({
                   />
                 )}
               </Field>
-              <Field id={`res-hp-${i}-node`} label={t("numa.resources.hostNode")}>
+              <Field
+                id={`res-hp-${i}-node`}
+                label={t("numa.resources.hostNode")}
+                info="numa.hpNode"
+              >
                 <NativeSelect
                   id={`res-hp-${i}-node`}
                   value={h.hostNode}

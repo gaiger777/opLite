@@ -307,7 +307,13 @@ function TargetStep({
           <Label htmlFor="mig-existing">{t("migration.existing")}</Label>
         </div>
         {!create && (
-          <Field id="mig-target" label={t("migration.targetNetwork")} error={errors.target}>
+          <Field
+            id="mig-target"
+            label={t("migration.targetNetwork")}
+            error={errors.target}
+            help={t("help.migration.target")}
+            info="migration.target"
+          >
             {(a11y) => (
               <NativeSelect
                 id="mig-target"
@@ -338,7 +344,12 @@ function TargetStep({
         </div>
         {create && (
           <div className="grid gap-2 sm:grid-cols-3">
-            <Field id="mig-new-name" label={t("common.name")} error={errors.name}>
+            <Field
+              id="mig-new-name"
+              label={t("common.name")}
+              error={errors.name}
+              help={t("help.migration.name")}
+            >
               {(a11y) => (
                 <Input
                   id="mig-new-name"
@@ -352,7 +363,7 @@ function TargetStep({
               id="mig-new-cidr"
               label={t("migration.cidr")}
               error={errors.cidr}
-              hint={t("migration.cidrHint")}
+              help={t("migration.cidrHint")}
             >
               {(a11y) => (
                 <Input
@@ -367,7 +378,7 @@ function TargetStep({
             <Field
               id="mig-new-gateway"
               label={t("migration.gateway")}
-              hint={t("migration.gatewayHint")}
+              help={t("migration.gatewayHint")}
             >
               {(a11y) => (
                 <Input
@@ -383,7 +394,12 @@ function TargetStep({
         )}
       </fieldset>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field id="mig-mode" label={t("migration.mode")} hint={t(`migration.modeHint.${mode}`)}>
+        <Field
+          id="mig-mode"
+          label={t("migration.mode")}
+          help={t(`migration.modeHint.${mode}`)}
+          info="migration.mode"
+        >
           {(a11y) => (
             <NativeSelect
               id="mig-mode"
@@ -400,7 +416,12 @@ function TargetStep({
             </NativeSelect>
           )}
         </Field>
-        <Field id="mig-parallel" label={t("migration.parallel")} error={errors.parallel}>
+        <Field
+          id="mig-parallel"
+          label={t("migration.parallel")}
+          error={errors.parallel}
+          help={t("help.migration.parallel")}
+        >
           {(a11y) => (
             <Input
               id="mig-parallel"
@@ -432,7 +453,11 @@ function TargetStep({
           </div>
           <p className="text-xs text-muted-foreground">{t("migration.bridgeHint")}</p>
           {bridge && (
-            <Field id="mig-bridge-node" label={t("migration.bridgeNode")}>
+            <Field
+              id="mig-bridge-node"
+              label={t("migration.bridgeNode")}
+              help={t("help.migration.bridgeNode")}
+            >
               {(a11y) => (
                 <NativeSelect
                   id="mig-bridge-node"
@@ -636,7 +661,7 @@ function PlanStep({
         </p>
       )}
       <div className="flex flex-wrap items-end gap-3">
-        <Field id="mig-plan-mode" label={t("migration.mode")}>
+        <Field id="mig-plan-mode" label={t("migration.mode")} info="migration.mode">
           {(a11y) => (
             <NativeSelect
               id="mig-plan-mode"
@@ -1042,7 +1067,7 @@ function ProgressStep({
         <Field
           id="mig-resume-node"
           label={t("migration.newBridgeNode")}
-          hint={
+          help={
             bridgeOffline
               ? t("migration.newBridgeNodeOffline", { node: bridgeHost.name })
               : t("migration.newBridgeNodeHint")
@@ -1231,7 +1256,7 @@ function FinishStep({
           {t("migration.finishLeft", { count: left })}
         </p>
       )}
-      <Field id="mig-router" label={t("migration.router")} hint={t("migration.routerHint")}>
+      <Field id="mig-router" label={t("migration.router")} help={t("migration.routerHint")}>
         {(a11y) => (
           <NativeSelect
             id="mig-router"

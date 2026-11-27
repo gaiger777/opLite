@@ -172,8 +172,13 @@ it("creates an ntfy target with a token", async () => {
   );
   const user = userEvent.setup();
   renderPage(<NotificationTargetsPage />, at);
-  expect(await screen.findByText(/No notification targets/)).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  // 빈 목록은 빈 상태(설명·만들기·자세히)로 보인다.
+  const empty = (await screen.findByText(/No notification targets/)).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("Create one place to receive them.");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await user.click(within(empty).getByRole("button", { name: "Create notification target" }));
   const dialog = await screen.findByRole("dialog", { name: "Create notification target" });
   await user.type(within(dialog).getByLabelText("Name"), "phone");
   await user.type(within(dialog).getByLabelText("URL"), "https://ntfy.sh/orbivisor");

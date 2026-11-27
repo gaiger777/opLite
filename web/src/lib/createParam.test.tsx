@@ -20,7 +20,7 @@ beforeEach(() => mockLists({ "storage-pool": [pool("backup", { backups: true })]
 it.each([
   ["/storage-pools", <PoolsPage />, "Create a storage pool"],
   ["/networks", <NetworksPage />, "Create a network"],
-  ["/backup-jobs", <BackupJobsPage />, "Create backup job"],
+  ["/backup-jobs", <BackupJobsPage />, "Create backup schedule"],
   ["/isos", <IsosPage />, "Upload an ISO image"],
   ["/imports", <ImportsPage />, "Upload an OVA"],
 ])(

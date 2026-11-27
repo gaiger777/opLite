@@ -144,6 +144,19 @@ it("offers to reload when someone else changed the group first", async () => {
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
+it("explains a group without rules and adds the first rule from there", async () => {
+  mockLists({ "security-group": [securityGroup("empty", [])] });
+  renderPage(<SecurityGroupPage />, {
+    path: "/security-groups/:name",
+    url: "/security-groups/empty",
+  });
+  expect(await screen.findByText("No rules")).toBeInTheDocument();
+  expect(screen.queryByRole("table", { name: "Rules" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeEnabled();
+  await userEvent.click(screen.getByRole("button", { name: "Add a rule" }));
+  expect(screen.getByLabelText("Direction of rule 1")).toBeInTheDocument();
+});
+
 it("shows the rules read-only to operators", async () => {
   mockLists({ "security-group": [ssh] });
   open({ ...ADMIN, role: "operator" });

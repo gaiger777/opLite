@@ -56,7 +56,11 @@ it("shows a non-admin only the folders and VMs they can see, with keyboard tree 
   const items = () => within(tree).getAllByRole("treeitem");
   expect(items().map((i) => i.textContent)).toEqual(["All VMs", "teamA"]);
   // 루트 아래 바로 든 VM은 없다(alice의 VM은 모두 /teamA 안).
-  expect(await screen.findByText("Nothing in this folder.")).toBeInTheDocument();
+  const empty = (await screen.findByText("Nothing in this folder.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("Drag rows here");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
 
   // 화살표: 아래로 teamA, →로 펼치기, ↓로 prod, Enter로 고르기
   items()[0]!.focus();

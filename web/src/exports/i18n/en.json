@@ -1,8 +1,6 @@
 {
   "vmExports": {
-    "pageHint": "OVF packages written to a pool. Download one as a single OVA for vSphere, Workstation or VirtualBox. Start an export from a stopped VM's menu.",
     "empty": "No exports",
-    "emptyHint": "Choose \"Export as OVA…\" in a stopped VM's menu.",
     "vm": "VM",
     "vmGone": "Deleted",
     "pool": "Pool",
@@ -22,19 +20,19 @@
     "deleteDescription": "The OVF files are removed from the pool. The VM stays.",
     "dialog": {
       "title": "Export {{name}} as OVA",
-      "description": "The disks are written as stream-optimized VMDK with an OVF descriptor and SHA-256 manifest. The VM must stay off until the export is done.",
+      "description": "The VM's disks are converted to VMware's format (VMDK) and written to a pool as an OVA package. The VM must stay off until it is written.",
       "submit": "Export",
       "pool": "Pool",
-      "poolHint": "A directory or NFS pool with room for the disks.",
+      "poolHint": "The directory or NFS pool the OVA is written to. It needs as much free space as the VM's disks.",
       "noPool": "No directory or NFS pool",
       "name": "Name",
-      "nameHint": "Empty uses the VM name and the time.",
+      "nameHint": "The name of this export and of the downloaded file. Empty uses the VM name and the time.",
       "guestOs": "VMware guest OS",
-      "guestOsHint": "VMware guestId. Empty uses the original value of an imported VM, else otherGuest64.",
+      "guestOsHint": "The value VMware uses to recognise the OS (guestId, e.g. ubuntu64Guest). Empty uses the imported VM's original value, else otherGuest64.",
       "hwVersion": "Hardware version",
-      "hwVersionHint": "vmx-7 to vmx-21. 14 runs on ESXi 6.7 and later.",
+      "hwVersionHint": "The virtual hardware version the receiving VMware can open (7–21). 14 opens on ESXi 6.7 or later.",
       "keepMacs": "Keep MAC addresses",
-      "keepMacsHint": "Without it the importing product picks new MACs.",
+      "keepMacsHint": "When on, the network cards keep their MAC addresses. Off lets the receiving product choose new ones.",
       "started": "Exporting {{name}}.",
       "errors": {
         "pool": "Choose a pool.",
@@ -49,6 +47,11 @@
       "export_busy": "Another task is working on this export.",
       "export_not_ready": "The export is not finished yet.",
       "link_expired": "The download link expired. Try again."
+    },
+    "help": {
+      "intro": "VMs made into OVA files that VMware or VirtualBox can open. Start an export from a stopped VM's menu, then download it here when it is done.",
+      "emptyHint": "Choose 'Export as OVA…' in a stopped VM's menu; it appears here and can be downloaded once written.",
+      "openVms": "Open the VM list"
     }
   }
 }

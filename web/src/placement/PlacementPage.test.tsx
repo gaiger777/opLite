@@ -9,6 +9,7 @@ import { resetTasks } from "@/tasks/tasks";
 import { PLACEMENT, task } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
+import helpEn from "@/help/i18n/en.json";
 
 afterEach(() => {
   toast.dismiss();
@@ -60,8 +61,10 @@ it("shows the balancer, the node load and the recommendations", async () => {
   // 서버가 쓰지 않은 기본 설정
   expect(summary("Mode")).toHaveTextContent("Recommend");
   expect(summary("Policy")).toHaveTextContent("Balance");
-  expect(summary("Threshold")).toHaveTextContent("15%");
-  expect(summary("Imbalance")).toHaveTextContent("21.0% (CPU 18.2%, memory 23.8%)");
+  expect(summary("Move threshold")).toHaveTextContent("15%");
+  expect(summary("Load difference between nodes")).toHaveTextContent(
+    "21.0% (CPU 18.2%, memory 23.8%)",
+  );
   expect(screen.queryByText("Paused", { selector: "dt" })).not.toBeInTheDocument();
   const a = cells(nodes, "node-a");
   expect(within(a("CPU")!).getByRole("meter", { name: "CPU" })).toHaveAttribute(
@@ -72,17 +75,17 @@ it("shows the balancer, the node load and the recommendations", async () => {
   expect(a("CPU 5 min")).toHaveTextContent("88.0%");
   expect(a("Memory")).toHaveTextContent("75.0%Used 12 GiB · Allocated 10 GiB / 16 GiB");
   expect(a("VMs")).toHaveTextContent("5");
-  expect(a("Summary age")).toHaveTextContent("3 s");
+  expect(a("Since last report")).toHaveTextContent("3 s");
   // 요약이 없는 노드
   const b = cells(nodes, "node-b");
   expect(b("CPU 1 min")).toHaveTextContent("—");
   expect(b("Memory")).toHaveTextContent("Used — · Allocated 2 GiB / 16 GiB");
-  expect(b("Summary age")).toHaveTextContent("No summary");
+  expect(b("Since last report")).toHaveTextContent("No report");
   const moves = screen.getByRole("table", { name: "Recommendations" });
   const web = cells(moves, "web1");
   expect(web("From")).toHaveTextContent("node-a");
   expect(web("To")).toHaveTextContent("node-b");
-  expect(web("Reason")).toHaveTextContent("BalanceImbalance −8.5%");
+  expect(web("Reason")).toHaveTextContent("BalanceLoad difference −8.5%");
   expect(web("Cost")).toHaveTextContent("4 GiB");
   expect(cells(moves, "db1")("Reason")).toHaveTextContent("RuleBreaks only-b");
   // 뷰어는 적용하지도, 설정을 바꾸지도 못한다.
@@ -165,7 +168,7 @@ it("shows started moves and why the balancer is paused in auto mode", async () =
   const moves = await screen.findByRole("table", { name: "Moves started" });
   expect(summary("Mode")).toHaveTextContent("Automatic");
   expect(summary("Policy")).toHaveTextContent("Pack");
-  expect(summary("Threshold")).toHaveTextContent("20%");
+  expect(summary("Move threshold")).toHaveTextContent("20%");
   expect(summary("Paused")).toHaveTextContent(
     "The policy is pack, so the balancer does not move VMs for balance.",
   );
@@ -207,13 +210,13 @@ it("changes only the balancer settings an admin edited", async () => {
   const mode = await screen.findByLabelText("Mode");
   expect(mode).toHaveValue("recommend");
   expect(screen.getByLabelText("Policy")).toHaveValue("balance");
-  const threshold = screen.getByLabelText("Threshold");
+  const threshold = screen.getByLabelText("Move threshold");
   expect(threshold).toHaveValue(15);
-  // 문턱 설명: 문턱의 0.8배 아래가 될 때까지 옮기고, 평균보다 문턱의 2배 넘게 높은 노드는 따로 던다.
-  expect(screen.getByText(/goes on until it is below 0\.8 times this/)).toBeInTheDocument();
-  expect(
-    screen.getByText(/more than twice this above the average is relieved/),
-  ).toBeInTheDocument();
+  expect(screen.getByText(/Default 15%\. Smaller moves more often/)).toBeInTheDocument();
+  // 기준의 자세한 뜻(도움말 패널): 기준의 0.8배 아래가 될 때까지 옮기고, 평균보다 기준의 2배 넘게 바쁜 노드는 따로 던다.
+  expect(screen.getByRole("button", { name: "Help: Move threshold" })).toBeInTheDocument();
+  expect(helpEn.helpInfo.placement.threshold.how).toMatch(/stop below 0\.8 times it/);
+  expect(helpEn.helpInfo.placement.threshold.how).toMatch(/more than twice this is relieved/);
   const save = screen.getByRole("button", { name: "Save" });
   expect(save).toBeDisabled();
   await user.selectOptions(mode, "auto");

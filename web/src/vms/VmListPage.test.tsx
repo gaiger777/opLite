@@ -665,3 +665,18 @@ it("puts a power button on each phone card", async () => {
     window.matchMedia = original;
   }
 });
+
+it("offers to create the first VM when there is none", async () => {
+  mockLists({ vm: [], node: [NODE] });
+  renderPage(<VmListPage />);
+  expect(await screen.findByText("No virtual machines.")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Create your first VM" })).toHaveAttribute(
+    "href",
+    "/vms/-new",
+  );
+  expect(screen.getByRole("link", { name: "Quick start from a template" })).toHaveAttribute(
+    "href",
+    "/templates",
+  );
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});

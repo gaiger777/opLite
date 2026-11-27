@@ -972,8 +972,10 @@ it("offers sockets that divide the maximum vCPUs and explains hotplug memory", a
       .getAllByRole("option")
       .map((o) => o.textContent),
   ).toEqual(["1", "2"]);
-  expect(screen.getByText(/With memory hotplug, Any uses 2 MiB pages/)).toBeInTheDocument();
-  expect(screen.getByText(/memory above their sum is spread evenly/)).toBeInTheDocument();
+  expect(
+    screen.getByText(/memory can grow while running, Any uses 2 MiB pages/),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/added memory is spread evenly/)).toBeInTheDocument();
 });
 
 /** 리뷰 2 웹 I1: 복제·배포·가져오기의 NUMA 칸은 받은 오류를 보이며 펼친다. */

@@ -45,7 +45,7 @@ function cells(table: HTMLElement, name: string) {
 it("lists groups with their nodes by priority, options and VMs", async () => {
   mockLists({ "ha-group": [rack, plain], node: NODES, vm: [db, vm("web", "running")] });
   renderPage(<HaGroupsPage />);
-  const table = await screen.findByRole("table", { name: "HA groups" });
+  const table = await screen.findByRole("table", { name: "Automatic recovery (HA)" });
   await within(table).findByText("rack");
   const row = cells(table, "rack");
   // 우선순위가 높은 노드부터
@@ -162,8 +162,18 @@ it("says why a group in use cannot be deleted", async () => {
 it("lets only admins change groups", async () => {
   mockLists({ "ha-group": [rack], node: NODES });
   renderPage(<HaGroupsPage />, { as: OPERATOR });
-  const table = await screen.findByRole("table", { name: "HA groups" });
+  const table = await screen.findByRole("table", { name: "Automatic recovery (HA)" });
   await within(table).findByText("rack");
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Edit HA group rack" })).not.toBeInTheDocument();
+});
+
+it("explains HA groups and offers to create one when there are none", async () => {
+  mockLists({ "ha-group": [], node: NODES, vm: [] });
+  renderPage(<HaGroupsPage />);
+  expect(await screen.findByText("No HA groups.")).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(screen.getByRole("button", { name: "Learn more" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Create HA group" }));
+  expect(await screen.findByRole("dialog", { name: "Create HA group" })).toBeVisible();
 });

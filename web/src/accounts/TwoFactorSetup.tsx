@@ -140,15 +140,18 @@ export function TotpSetup({ onDone, prove }: { onDone(codes: string[]): void; pr
           {error}
         </p>
       )}
-      <Field id="totp-confirm" label={t("twoFactor.code")}>
-        <Input
-          id="totp-confirm"
-          inputMode="numeric"
-          autoComplete="one-time-code"
-          className="w-40"
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-        />
+      <Field id="totp-confirm" label={t("twoFactor.code")} help={t("help.twoFactor.code")}>
+        {(a11y) => (
+          <Input
+            id="totp-confirm"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            className="w-40"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            {...a11y}
+          />
+        )}
       </Field>
       <div>
         <Button type="submit" disabled={busy || code.trim().length < 6}>
@@ -214,14 +217,21 @@ export function PasskeySetup({ onDone, prove }: { onDone(codes: string[]): void;
           {error}
         </p>
       )}
-      <Field id="passkey-name" label={t("twoFactor.passkeyName")}>
-        <Input
-          id="passkey-name"
-          autoComplete="off"
-          className="w-64"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
+      <Field
+        id="passkey-name"
+        label={t("twoFactor.passkeyName")}
+        help={t("help.twoFactor.passkeyName")}
+      >
+        {(a11y) => (
+          <Input
+            id="passkey-name"
+            autoComplete="off"
+            className="w-64"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            {...a11y}
+          />
+        )}
       </Field>
       <div>
         <Button type="submit" variant="outline" disabled={busy || name.trim().length === 0}>

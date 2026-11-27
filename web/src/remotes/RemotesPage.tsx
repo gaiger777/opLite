@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { usePermissions } from "@/auth/usePermissions";
+import { EmptyState } from "@/components/EmptyState";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
@@ -51,11 +52,23 @@ export function RemotesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader title={t("nav.replication")} description={t("remotes.pageHint")} />
+      <PageHeader title={t("nav.replication")} help="remotes" intro={t("help.remotes.intro")} />
       {!remotes.data ? (
         <ListPending error={remotes.error} />
       ) : remotes.data.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{t("remotes.empty")}</p>
+        <EmptyState
+          title={t("remotes.empty")}
+          description={t("help.remotes.empty")}
+          diagram="replicationDr"
+          help="remotes.page"
+          action={
+            admin && (
+              <Button asChild>
+                <Link to="/remotes/-manage">{t("remotes.addTitle")}</Link>
+              </Button>
+            )
+          }
+        />
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {remotes.data.map((remote) => (
