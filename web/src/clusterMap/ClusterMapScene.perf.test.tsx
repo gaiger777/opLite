@@ -12,6 +12,11 @@ import { bigCluster, physicalTopology } from "@/test/clusterMap";
 
 /** 이 Mac 기록의 예산(ms). CI 기계는 느리고 다른 일과 나누므로 넉넉히(벽시계 시험의 흔들림). */
 const BUDGET_MS = import.meta.env.CI ? 150 : 30;
+/**
+ * 노드당 VM 수백(계획 77-8)의 예산. 칸이 모두 한 층에 보여(위 층이 가리는 윗면이 없음) 같은 VM 수의 100 × 50보다 경로 글이
+ * 1.4배 길다 — 이 Mac 혼자 20ms 안팎이고, 전체 시험을 함께 돌리면(작업자 여럿) 30ms를 넘는 때가 있어 따로 둔다.
+ */
+const BUSY_BUDGET_MS = import.meta.env.CI ? 150 : 45;
 
 function build(input: ReturnType<typeof bigCluster>) {
   const scene = layoutCluster(toModel(input));
@@ -110,7 +115,7 @@ it("lays out 20 nodes × 300 VMs (busy nodes: folded stopped VMs, dense grids) w
     build(input);
     best = Math.min(best, performance.now() - t0);
   }
-  expect(best).toBeLessThan(BUDGET_MS);
+  expect(best).toBeLessThan(BUSY_BUDGET_MS);
   const { scene, tiles } = build(input);
   // 노드마다 한 층, 꺼진 VM은 띠 하나
   for (const n of scene.nodes) {
