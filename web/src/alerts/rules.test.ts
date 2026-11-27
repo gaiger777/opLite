@@ -11,6 +11,7 @@ import {
   ruleFormOf,
   ruleSpecOf,
   SDN_DEFAULTS,
+  SUGGESTED_SEVERITY,
   takesNodes,
 } from "@/alerts/rules";
 
@@ -179,7 +180,11 @@ it("keeps a certificate rule's threshold when another field is edited", () => {
 });
 
 it("edits the DR conditions with a plan filter (plan 76)", () => {
-  expect(CONDITION_KINDS.filter(isDr)).toEqual(["dr_rpo_exceeded", "dr_run_failed"]);
+  expect(CONDITION_KINDS.filter(isDr)).toEqual([
+    "dr_rpo_exceeded",
+    "dr_run_failed",
+    "dr_source_returned",
+  ]);
   expect(takesNodes("dr_rpo_exceeded")).toBe(false);
   // 실행 실패는 한 번 울리는 이벤트, RPO 넘음은 이어지는 상태
   expect(isEvent("dr_run_failed")).toBe(true);
@@ -205,4 +210,22 @@ it("edits the DR conditions with a plan filter (plan 76)", () => {
     plans: "alerts.rules.errors.plans",
   });
   expect(checkRuleForm({ ...form, plans: "web-tier" }, [])).toEqual({});
+});
+
+it("edits the DR source-returned condition and suggests critical (plan 76 review 1)", () => {
+  expect(SUGGESTED_SEVERITY.dr_source_returned).toBe("critical");
+  // 운영 쪽이 돌아온 동안 이어지는 상태(이벤트가 아니다)
+  expect(isEvent("dr_source_returned")).toBe(false);
+  expect(takesNodes("dr_source_returned")).toBe(false);
+  const form = {
+    ...emptyRuleForm(),
+    name: "back",
+    targets: ["ops"],
+    kind: "dr_source_returned" as const,
+    plans: "web-tier",
+  };
+  const spec = ruleSpecOf(form);
+  expect(spec.condition).toEqual({ kind: "dr_source_returned", plans: ["web-tier"] });
+  const back = ruleFormOf(rule({ condition: spec.condition }));
+  expect([back.kind, back.plans]).toEqual(["dr_source_returned", "web-tier"]);
 });

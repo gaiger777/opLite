@@ -26,6 +26,7 @@ import {
   NODE_METRICS,
   ruleFormOf,
   ruleSpecOf,
+  SUGGESTED_SEVERITY,
   takesNodes,
   VM_METRICS,
   type RuleForm,
@@ -77,7 +78,8 @@ export function conditionText(t: TFunction, c: AlertCondition): string {
       return c.ports ? `${text} (${c.ports})` : text;
     }
     case "dr_rpo_exceeded":
-    case "dr_run_failed": {
+    case "dr_run_failed":
+    case "dr_source_returned": {
       const text = t(`alerts.condition.${c.kind}`);
       return c.plans?.length ? `${text} (${c.plans.join(", ")})` : text;
     }
@@ -319,7 +321,10 @@ function RuleDialog({
             className="w-full"
             value={form.kind}
             onChange={(e) => {
-              change({ kind: e.target.value as RuleForm["kind"] });
+              const kind = e.target.value as RuleForm["kind"];
+              // 권하는 심각도가 있는 조건(dr_source_returned → critical)은 고를 때 그것으로 바꾼다(고칠 수 있다).
+              const severity = SUGGESTED_SEVERITY[kind];
+              change({ kind, ...(severity && { severity }) });
               setErrors({});
             }}
           >
@@ -418,19 +423,32 @@ function RuleDialog({
         )}
         {!event &&
           input("rule-for", "forSecs", t("alerts.rules.forSecs"), t("alerts.rules.forSecsHint"))}
-        <Field id="rule-severity" label={t("alerts.rules.severity")}>
-          <NativeSelect
-            id="rule-severity"
-            className="w-full"
-            value={form.severity}
-            onChange={(e) => change({ severity: e.target.value as RuleForm["severity"] })}
-          >
-            {SEVERITIES.map((s) => (
-              <NativeSelectOption key={s} value={s}>
-                {t(`alerts.severity.${s}`)}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field
+          id="rule-severity"
+          label={t("alerts.rules.severity")}
+          hint={
+            SUGGESTED_SEVERITY[form.kind]
+              ? t("alerts.rules.suggestedSeverity", {
+                  severity: t(`alerts.severity.${SUGGESTED_SEVERITY[form.kind]}`),
+                })
+              : undefined
+          }
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="rule-severity"
+              className="w-full"
+              value={form.severity}
+              onChange={(e) => change({ severity: e.target.value as RuleForm["severity"] })}
+              {...a11y}
+            >
+              {SEVERITIES.map((s) => (
+                <NativeSelectOption key={s} value={s}>
+                  {t(`alerts.severity.${s}`)}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
         <fieldset
           className="flex flex-col gap-2"

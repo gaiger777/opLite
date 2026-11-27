@@ -3165,7 +3165,8 @@
       "node_link_down_any": "랜 포트 링크 끊김",
       "bond_degraded": "본딩 저하",
       "dr_rpo_exceeded": "DR 복구 지점이 RPO를 넘음",
-      "dr_run_failed": "DR 실행 실패"
+      "dr_run_failed": "DR 실행 실패",
+      "dr_source_returned": "DR 장애 조치 뒤 운영 클러스터가 돌아옴"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3201,7 +3202,8 @@
       "node_link_down": "랜 포트 링크 끊김",
       "bond_degraded": "본딩 저하",
       "dr_rpo_exceeded": "DR 복구 지점이 RPO를 넘음",
-      "dr_run_failed": "DR 실행 실패"
+      "dr_run_failed": "DR 실행 실패",
+      "dr_source_returned": "DR 운영 클러스터 돌아옴"
     },
     "rules": {
       "create": "규칙 만들기",
@@ -3257,7 +3259,8 @@
         "repeatSecs": "0이나 60~604800 사이의 초를 정수로 넣으세요.",
         "targets": "알림 대상을 1~16개 고르세요.",
         "plans": "복구 계획 이름: 소문자·숫자·'-'로 1~63자, 쉼표로 나눕니다."
-      }
+      },
+      "suggestedSeverity": "권함: {{severity}}"
     },
     "targets": {
       "adminOnly": "알림 대상은 관리자만 다룹니다.",

@@ -3165,7 +3165,8 @@
       "node_link_down_any": "LAN port link down",
       "bond_degraded": "Bond degraded",
       "dr_rpo_exceeded": "DR recovery point over RPO",
-      "dr_run_failed": "DR run failed"
+      "dr_run_failed": "DR run failed",
+      "dr_source_returned": "Source cluster back after a DR failover"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3201,7 +3202,8 @@
       "node_link_down": "LAN port link down",
       "bond_degraded": "Bond degraded",
       "dr_rpo_exceeded": "DR recovery point over RPO",
-      "dr_run_failed": "DR run failed"
+      "dr_run_failed": "DR run failed",
+      "dr_source_returned": "DR source cluster back"
     },
     "rules": {
       "create": "Create rule",
@@ -3257,7 +3259,8 @@
         "repeatSecs": "Enter 0, or whole seconds from 60 to 604800.",
         "targets": "Choose 1 to 16 notification targets.",
         "plans": "Recovery plan names: 1–63 lowercase letters, digits and '-', separated by commas."
-      }
+      },
+      "suggestedSeverity": "Recommended: {{severity}}"
     },
     "targets": {
       "adminOnly": "Only administrators can manage notification targets.",

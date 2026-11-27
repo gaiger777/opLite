@@ -316,3 +316,20 @@ it("offers the DR conditions with a recovery plan filter (plan 76)", async () =>
     ]),
   );
 });
+
+it("suggests critical for the DR source-returned condition (plan 76 review 1)", async () => {
+  server.use(
+    rules([]),
+    http.get(apiUrl("/notification-targets"), () => HttpResponse.json({ revision: 1, items: [] })),
+  );
+  const user = userEvent.setup();
+  renderPage(<AlertsPage />, { path: "/alerts", url: "/alerts?tab=rules" });
+  await user.click(await screen.findByRole("button", { name: "Create rule" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create alert rule" });
+  const severity = within(dialog).getByLabelText("Severity");
+  expect(severity).toHaveValue("warning");
+  await user.selectOptions(within(dialog).getByLabelText("Condition"), "dr_source_returned");
+  expect(severity).toHaveValue("critical");
+  expect(within(dialog).getByText("Recommended: Critical")).toBeInTheDocument();
+  expect(within(dialog).getByLabelText("Only recovery plans")).toBeInTheDocument();
+});

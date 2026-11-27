@@ -36,6 +36,7 @@ export const CONDITION_KINDS: readonly ConditionKind[] = [
   // DR(계획 76 §3.4) — 리더가 복구 계획의 보호 상태와 실행으로 평가한다.
   "dr_rpo_exceeded",
   "dr_run_failed",
+  "dr_source_returned",
 ];
 export const LINK_ROLES: readonly LinkRole[] = ["uplink", "any"];
 export const NODE_METRICS: readonly NodeMetric[] = [
@@ -70,9 +71,19 @@ export function isEvent(kind: ConditionKind): boolean {
 }
 
 /** DR 조건(서버 `AlertCondition::is_dr`) — 노드·VM이 아니라 복구 계획(`plans`, 비면 모두)으로 거른다. */
-export function isDr(kind: ConditionKind): kind is "dr_rpo_exceeded" | "dr_run_failed" {
-  return kind === "dr_rpo_exceeded" || kind === "dr_run_failed";
+export function isDr(
+  kind: ConditionKind,
+): kind is "dr_rpo_exceeded" | "dr_run_failed" | "dr_source_returned" {
+  return kind === "dr_rpo_exceeded" || kind === "dr_run_failed" || kind === "dr_source_returned";
 }
+
+/**
+ * 고르면 심각도를 이것으로 바꿔 권하는 조건(서버 경보 묶음과 같은 값): 재해 뒤 운영 쪽이 돌아와 같은 VM이 두 벌 돌 수 있음은
+ * critical이다.
+ */
+export const SUGGESTED_SEVERITY: Partial<Record<ConditionKind, Severity>> = {
+  dr_source_returned: "critical",
+};
 
 /** 백업 저장소 조건(서버 `AlertCondition::is_backup_store`) — 노드·VM으로 거르지 않는다. */
 export function isBackupStore(kind: ConditionKind): boolean {
@@ -214,7 +225,9 @@ export function ruleFormOf(rule: AlertRule): RuleForm {
     ...(c.kind === "pool_usage" && { percent: String(c.percent) }),
     ...(c.kind === "task_failed" && { ops: (c.ops ?? []).join(", ") }),
     ...(c.kind === "node_link_down" && { ports: c.ports ?? "", role: c.role ?? "uplink" }),
-    ...((c.kind === "dr_rpo_exceeded" || c.kind === "dr_run_failed") && {
+    ...((c.kind === "dr_rpo_exceeded" ||
+      c.kind === "dr_run_failed" ||
+      c.kind === "dr_source_returned") && {
       plans: (c.plans ?? []).join(", "),
     }),
     ...(!CONDITION_KINDS.includes(c.kind) && { rawCondition: c }),
@@ -316,7 +329,8 @@ function conditionOf(form: RuleForm): AlertCondition {
       return { kind: "node_link_down", role: form.role, ...(ports !== "" && { ports }) };
     }
     case "dr_rpo_exceeded":
-    case "dr_run_failed": {
+    case "dr_run_failed":
+    case "dr_source_returned": {
       const plans = splitNames(form.plans);
       return plans.length > 0 ? { kind: form.kind, plans } : { kind: form.kind };
     }
