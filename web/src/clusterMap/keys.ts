@@ -2,7 +2,7 @@
 // 노드)와 타일 단계(한 노드 위 타일 사이). `]`가 노드의 첫 타일로 들어가고 `[`·`Esc`가 노드로 나온다.
 // 네트워크 층(계획 75): `p`가 노드의 포트 줄로 들어가고(←·→ 포트 사이), 포트에서 `↓`가 그 포트의 레일로(←·→ 판의 레일
 // 사이, `↑`는 다시 포트), `[`·`Esc`가 노드로 나온다. 화면 초점은 늘 노드 `<g>` 하나다(한 탭 정지).
-import { nodeTop, type MapScene, type NodeItem, type TileCell } from "@/clusterMap/layout";
+import { nodeTop, type MapScene, type NodeItem, TILE, type TileCell } from "@/clusterMap/layout";
 
 export type Focus =
   | { kind: "node"; key: string }
@@ -151,6 +151,17 @@ function tileNeighbor(
 ): TileCell | null {
   const i = cells.indexOf(at);
   const per = node.grid?.perLayer ?? 1;
+  if ((node.grid?.size ?? TILE) < TILE && (key === "ArrowUp" || key === "ArrowDown")) {
+    // 촘촘한 격자(한 층 — 계획 77-8 리뷰 S1): 뒤·앞 줄의 가장 가까운 열(앞 줄 끝은 꺼진 VM 띠)
+    const row = at.row + (key === "ArrowDown" ? 1 : -1);
+    let best: TileCell | null = null;
+    for (const c of cells) {
+      if (c.row === row && (!best || Math.abs(c.col - at.col) < Math.abs(best.col - at.col))) {
+        best = c;
+      }
+    }
+    return best;
+  }
   switch (key) {
     case "ArrowLeft":
       return cells[i - 1] ?? null;
@@ -228,7 +239,7 @@ function railNeighbor(scene: MapScene, node: NodeItem, key: string, nav: NavKey)
 /**
  * 키 하나 → 다음 초점. 움직일 곳이 없으면 `null`(초점 그대로). 초점이 없거나 장면에서 사라졌으면 첫 노드.
  * 노드 단계: ←·→ 같은 줄의 열, ↑·↓ 줄(판 끝에서는 옆·앞뒤 판), Home·End 첫·끝 노드, `]` 첫 타일.
- * 타일 단계: ←·→ 이름 순 앞뒤 칸, ↑·↓ 위·아래 층의 같은 자리, Home·End 첫·끝 칸, `[`·Esc 노드로.
+ * 타일 단계: ←·→ 이름 순 앞뒤 칸, ↑·↓ 위·아래 층의 같은 자리(촘촘한 격자는 뒤·앞 줄), Home·End 첫·끝 칸, `[`·Esc 노드로.
  */
 export function neighbor(scene: MapScene, focus: Focus | null, key: NavKey): Focus | null {
   const order = readingOrder(scene);

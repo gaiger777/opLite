@@ -327,6 +327,23 @@ it("focuses the element named in ?focus=", async () => {
   expect(within(sheet).getByRole("heading", { name: "web" })).toBeVisible();
 });
 
+it("unfolds a busy node's stopped VMs to focus one named in ?focus=", async () => {
+  // n1에 VM 130대 더(반은 꺼짐) — 꺼진 VM은 띠 하나로 접혀 있다(리뷰 I11)
+  const bulk = Array.from({ length: 130 }, (_, i) =>
+    mapVm(100 + i, `bulk${String(i).padStart(3, "0")}`, A.id, i % 2 === 0 ? "stopped" : "running"),
+  );
+  mockCluster({ vms: [...VMS, ...bulk] });
+  renderPage(<ClusterMapPage />, { path: "/cluster/map", url: "/cluster/map?focus=vm:bulk004" });
+  const map = await picture();
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  await waitFor(() => expect(document.activeElement).toBe(n1));
+  expect(within(map).getByText("65 stopped ▾")).toBeInTheDocument();
+  // 초점은 그 VM 칸 — Enter가 그 VM의 서랍을 연다
+  fireEvent.keyDown(n1, { key: "Enter" });
+  const sheet = await screen.findByRole("dialog");
+  expect(within(sheet).getByRole("heading", { name: "bulk004" })).toBeVisible();
+});
+
 it("switches to the list view and remembers the view, layers and grouping per user", async () => {
   mockCluster();
   const user = userEvent.setup();

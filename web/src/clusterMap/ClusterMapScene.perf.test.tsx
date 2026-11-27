@@ -126,3 +126,30 @@ it("lays out 20 nodes × 300 VMs (busy nodes: folded stopped VMs, dense grids) w
   expect(elementCount(scene, tiles, "tiles")).toBeLessThan(1000);
   expect(elementCount(scene, tiles, "detail")).toBeLessThan(1000);
 });
+
+it("lays out 2 nodes × 1000 VMs (one dense grid each, nothing past +N) within the budgets", () => {
+  const input = bigCluster(2, 1000, 1);
+  build(input);
+  let best = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    build(input);
+    best = Math.min(best, performance.now() - t0);
+  }
+  expect(best).toBeLessThan(BUDGET_MS);
+  const { scene, tiles } = build(input);
+  for (const n of scene.nodes) {
+    const cells = n.grid!.cells;
+    expect(n.grid!.layers).toBe(1);
+    expect(cells.filter((c) => c.kind === "fold")).toHaveLength(1);
+    expect(cells.some((c) => c.kind === "more")).toBe(false);
+  }
+  // 펼친 노드(꺼진 VM도 칸)는 1000칸 모두 — DENSE_MAX 안
+  const open = layoutCluster(toModel(input), { open: new Set([scene.nodes[0]!.key]) });
+  expect(open.nodes[0]!.grid!.cells.filter((c) => c.kind === "vm")).toHaveLength(1000);
+  expect(elementCount(scene, scenePaths(scene, "summary"), "summary")).toBeLessThan(100);
+  expect(elementCount(scene, tiles, "tiles")).toBeLessThan(200);
+  expect(elementCount(scene, tiles, "detail")).toBeLessThan(200);
+  const openTiles = scenePaths(open, "tiles");
+  expect(elementCount(open, openTiles, "detail")).toBeLessThan(200);
+});

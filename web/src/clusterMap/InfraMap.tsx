@@ -24,6 +24,7 @@ import type { RailTone } from "@/clusterMap/network";
 import { MAP_LAYERS, type MapLayer } from "@/clusterMap/paths";
 import {
   focusOf,
+  foldedOwner,
   keyOfSelection,
   type MapSelection,
   parseFocus,
@@ -347,7 +348,14 @@ function InfraMapBody({ variant, selected, onSelect, focus: focusProp, focusSeq 
     setFocusLit(null);
   }
   const focusKey = `${focusParam}#${focusSeq}`;
-  if (model && scene && focusTarget && focusParam && applied !== focusKey && !waitNet) {
+  // 접힌 꺼진 VM이면 먼저 그 덩어리를 펼친다 — 다음 그리기에서 그 칸으로 맞춘다(리뷰 I11)
+  const unfold =
+    model && scene && focusTarget && applied !== focusKey
+      ? foldedOwner(focusTarget, model, scene)
+      : null;
+  if (unfold) {
+    setOpen(new Set(open).add(unfold));
+  } else if (model && scene && focusTarget && focusParam && applied !== focusKey && !waitNet) {
     setApplied(focusKey);
     const f = focusOf(focusTarget, model, scene);
     if (f) {
