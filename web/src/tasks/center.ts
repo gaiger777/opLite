@@ -44,3 +44,28 @@ export function isActive(task: Task): boolean {
 export function isRinging(alert: AlertView): boolean {
   return alert.state === "firing" && alert.severity !== "info";
 }
+
+/** Task 상세 서랍을 여는 함수(`TaskDrawer`가 정한다 — 주소에 `?task=<id>`). 서랍이 없으면 센터를 연다. */
+let taskOpener: ((id: string) => void) | null = null;
+
+/** 서랍을 여는 함수를 정한다. 해제 함수를 돌려준다. */
+export function setTaskOpener(opener: (id: string) => void) {
+  taskOpener = opener;
+  return () => {
+    if (taskOpener === opener) {
+      taskOpener = null;
+    }
+  };
+}
+
+/** Task 상세 서랍을 연다(실패 알림의 "보기"). */
+export function openTask(id: string) {
+  if (taskOpener) {
+    taskOpener(id);
+  } else {
+    setCenterOpen(true);
+  }
+}
+
+/** Task 상세 서랍을 여는 주소의 쿼리 키 */
+export const TASK_PARAM = "task";

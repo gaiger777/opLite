@@ -8,7 +8,7 @@ import type { Task } from "@/api/types";
 import { Toaster } from "@/components/ui/sonner";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
-import { isCenterOpen, setCenterOpen } from "@/tasks/center";
+import { isCenterOpen, setCenterOpen, setTaskOpener } from "@/tasks/center";
 import {
   describeDetail,
   describeProgress,
@@ -98,11 +98,30 @@ it("leaves running and success toasts to the open center and offers View on fail
     i18n.t,
   );
   expect(success).not.toHaveBeenCalled();
-  // 실패는 센터가 열려 있어도 알리고, "보기"가 센터를 연다.
+  // 실패는 센터가 열려 있어도 알리고, "보기"는 그 Task의 상세 서랍을 연다(계획 77 — 서랍이 없으면 센터).
   expect(await screen.findByText("Start db: failed. no firmware")).toBeInTheDocument();
   setCenterOpen(false);
   fireEvent.click(screen.getByRole("button", { name: "View" }));
   expect(isCenterOpen()).toBe(true);
+});
+
+it("opens the task drawer from View when the shell has one", async () => {
+  render(
+    <ThemeProvider>
+      <Toaster />
+    </ThemeProvider>,
+  );
+  const opened = vi.fn();
+  const off = setTaskOpener(opened);
+  try {
+    trackTask(task("22", "pending"), "Start web");
+    settleTasks({ revision: 2, items: [task("22", "failed", "boom")] }, i18n.t);
+    fireEvent.click(await screen.findByRole("button", { name: "View" }));
+    expect(opened).toHaveBeenCalledWith(task("22", "failed").id);
+    expect(isCenterOpen()).toBe(false);
+  } finally {
+    off();
+  }
 });
 
 it("offers to turn a stopped VM on again", async () => {

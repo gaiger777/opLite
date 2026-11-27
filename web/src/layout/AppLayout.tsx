@@ -40,6 +40,7 @@ import {
 } from "@/layout/nav";
 import { NavProgress } from "@/layout/RouteError";
 import { NotificationBell } from "@/layout/NotificationBell";
+import { TaskDrawer } from "@/tasks/TaskDrawer";
 import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
 import { AreaLinks, Sidebar, useRail } from "@/layout/Sidebar";
 import { type Density, useDensity } from "@/lib/density";
@@ -174,6 +175,7 @@ export function AppLayout() {
           onHelp={() => setHelp(true)}
         />
         <ShortcutsHelp open={help} onOpenChange={setHelp} />
+        <TaskDrawer />
       </div>
     </div>
   );

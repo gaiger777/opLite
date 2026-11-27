@@ -184,7 +184,7 @@ function RecentTasksWidget() {
         </Link>
       }
     >
-      <TaskTable tasks={newestFirst(tasks.data ?? []).slice(0, 5)} labelledBy={id} />
+      <TaskTable tasks={newestFirst(tasks.data ?? []).slice(0, 5)} labelledBy={id} compact />
     </WidgetCard>
   );
 }

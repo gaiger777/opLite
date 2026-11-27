@@ -6,7 +6,7 @@ import { type List, listKey } from "@/api/live";
 import type { Task } from "@/api/types";
 import { formatBytes } from "@/lib/format";
 import { UNDO_MS } from "@/lib/undo";
-import { isCenterOpen, setCenterOpen } from "@/tasks/center";
+import { isCenterOpen, openTask, setCenterOpen } from "@/tasks/center";
 
 /** 결과를 기다리는 Task: id → 알림에 쓸 설명과 만든 revision */
 const pending = new Map<string, { label: string; revision: number }>();
@@ -55,7 +55,7 @@ export interface TaskToastAction {
 /**
  * 끝난 Task의 알림을 결과로 바꾼다. Task 목록이 바뀔 때마다 부른다. 만든 뒤에 읽은 목록에 없는 Task는
  * watch가 끊긴 사이 정리 작업이 지운 것이므로 결과를 알 수 없다고 알린다. 작업·알림 센터가 열려 있으면 단추 없는
- * 성공 알림은 띄우지 않는다(센터에 보인다, 설계 §5.4). 실패 알림에는 센터를 여는 "보기"를 단다. `actionFor`는
+ * 성공 알림은 띄우지 않는다(센터에 보인다, 설계 §5.4). 실패 알림에는 그 Task의 상세 서랍을 여는 "보기"를 단다(계획 77). `actionFor`는
  * 성공 알림에 달 단추를 정한다(정지 뒤 "다시 켜기", §5.8).
  */
 export function settleTasks(
@@ -96,7 +96,8 @@ export function settleTasks(
         id,
         duration: Infinity,
         closeButton: true,
-        action: { label: t("center.view"), onClick: () => setCenterOpen(true) },
+        // 그 Task의 상세 서랍(원문 오류 전체·대상·요청자, 계획 77)
+        action: { label: t("center.view"), onClick: () => openTask(id) },
       });
     }
   }

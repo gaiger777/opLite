@@ -213,6 +213,21 @@ it("shows the recent tasks in their own card", async () => {
   const card = await screen.findByRole("region", { name: "Recent tasks" });
   const table = within(card).getByRole("table", { name: "Recent tasks" });
   expect(await within(table).findByText("Start web")).toBeInTheDocument();
+  // 좁은 카드라 작업(시각은 그 아래)과 상태 두 열만, 작업은 상세 서랍을 연다(계획 77).
+  expect(
+    within(table)
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent),
+  ).toEqual(["Operation", "State"]);
+  expect(within(table).getByRole("link", { name: "Start web" })).toHaveAttribute(
+    "href",
+    "/?task=019a0f3c-8a10-7000-8000-000000000009",
+  );
+  expect(
+    within(table)
+      .getByRole("row", { name: /Start web/ })
+      .querySelector("time"),
+  ).not.toBeNull();
   expect(within(card).getByRole("link", { name: "All tasks" })).toHaveAttribute("href", "/tasks");
 });
 

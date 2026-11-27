@@ -24,8 +24,9 @@ it("lists tasks newest first and filters failures", async () => {
     ],
   });
   renderPage(<TasksPage />);
+  // 작업 이름은 그 Task의 상세 서랍을 연다(계획 77).
   const stop = await screen.findByRole("link", { name: "Stop web" });
-  expect(stop).toHaveAttribute("href", "/vms/web");
+  expect(stop).toHaveAttribute("href", "/?task=019a0f3c-9a10-7000-8000-000000000002");
   const rows = await screen.findAllByRole("row");
   expect(within(rows[1]!).getByRole("link")).toBe(stop);
   expect(rows[2]).toHaveTextContent("Start web");
@@ -98,10 +99,9 @@ it("names backup tasks by the backup and the VM being restored", async () => {
     ],
   });
   renderPage(<TasksPage />);
-  // 백업 Task는 VM의 백업 탭으로 이어진다.
   expect(await screen.findByRole("link", { name: "Back up web" })).toHaveAttribute(
     "href",
-    "/vms/web?tab=backups",
+    "/?task=019a0f3c-8a10-7000-8000-000000000001",
   );
   expect(await screen.findByText("Delete backup web-1")).toBeInTheDocument();
   expect(screen.getByText("Restore a backup as web2")).toBeInTheDocument();
@@ -138,7 +138,7 @@ it("names import tasks by the new VM and the import", async () => {
   expect(await screen.findByText("Import VM web")).toBeInTheDocument();
   expect(await screen.findByRole("link", { name: "Delete import web01" })).toHaveAttribute(
     "href",
-    "/imports/web01",
+    "/?task=019a0f3c-8a10-7000-8000-000000000002",
   );
 });
 

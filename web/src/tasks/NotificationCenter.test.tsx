@@ -88,7 +88,8 @@ it("counts running tasks and ringing alerts on the bell and opens the center wit
 
   const running = await within(center).findByRole("list", { name: "Running (1)" });
   const migrate = await within(running).findByRole("link", { name: "Migrate web" });
-  expect(migrate).toHaveAttribute("href", "/vms/web");
+  // 작업 이름은 상세 서랍을 연다(계획 77).
+  expect(migrate).toHaveAttribute("href", "/?task=019a0f3c-8a10-7000-8000-000000000001");
   expect(within(running).getByRole("progressbar", { name: "Migrate web" })).toHaveAttribute(
     "aria-valuenow",
     "50",

@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
+import { hashKey, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
-import { useList } from "@/api/live";
+import { listKey, useList } from "@/api/live";
 import type { Task } from "@/api/types";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { PageHeader } from "@/components/PageHeader";
@@ -11,7 +12,9 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Pager, usePage } from "@/components/Pager";
 import { Label } from "@/components/ui/label";
 import { formatTime, uuidTime } from "@/lib/format";
-import { type TargetLookup, taskTarget } from "@/tasks/target";
+import { TaskErrorText } from "@/tasks/TaskErrorText";
+import { requesterName, useTaskHref } from "@/tasks/taskLink";
+import { type Named, type TargetLookup, taskTarget } from "@/tasks/target";
 import { describeDetail, describeProgress, describeTask } from "@/tasks/tasks";
 
 /** 한 페이지에 보일 Task 수. API에 페이지 나누기가 없어 모두 받아 화면에서 나눈다. */
@@ -35,23 +38,83 @@ export function TaskStateBadge({ task }: { task: Task }) {
   );
 }
 
-/** Task 대상의 이름과 화면(`taskTarget`). 이미 받은 목록으로 찾는다. */
-export function useTaskTarget() {
+/**
+ * 대상 이름을 찾을 그 밖의 목록(계획 77): 이미 받은 것만 쓴다(이 때문에 새로 읽지 않는다 — 없으면 서버가 단 이름 레이블).
+ * 감시 목록(`listKey`)과 화면이 읽는 보기 목록 모두 `{ items }`다.
+ */
+const CACHED_LISTS: { key: readonly unknown[]; kind: string }[] = [
+  { key: listKey("network"), kind: "network" },
+  { key: listKey("storage-pool"), kind: "storage-pool" },
+  { key: listKey("backup-job"), kind: "backup-job" },
+  { key: listKey("ha-group"), kind: "ha-group" },
+  { key: ["backup-stores"], kind: "backup-store" },
+  { key: ["apply-sets"], kind: "apply-set" },
+  { key: ["vm-exports"], kind: "vm-export" },
+  { key: ["certificates"], kind: "certificate" },
+  { key: ["vmware-migrations"], kind: "vmware-migration" },
+  { key: ["dr-plans"], kind: "recovery-plan" },
+  { key: ["remotes"], kind: "remote" },
+  // 옛 Task(요청자 이름 레이블 없음)의 요청자
+  { key: ["users"], kind: "user" },
+];
+const CACHED_HASHES = new Set(CACHED_LISTS.map((c) => hashKey(c.key)));
+
+/** 이미 받은 그 밖의 목록에서 id → 이름·종류. 그 목록이 바뀌면 다시 만든다. */
+function useCachedNames(): Map<string, Named> {
+  const queryClient = useQueryClient();
+  const [tick, setTick] = useState(0);
+  useEffect(
+    () =>
+      queryClient.getQueryCache().subscribe((event) => {
+        if (event.type === "updated" && CACHED_HASHES.has(event.query.queryHash)) {
+          setTick((n) => n + 1);
+        }
+      }),
+    [queryClient],
+  );
+  return useMemo(() => {
+    void tick;
+    const names = new Map<string, Named>();
+    for (const { key, kind } of CACHED_LISTS) {
+      const items = queryClient.getQueryData<{ items?: unknown }>(key)?.items;
+      if (!Array.isArray(items)) {
+        continue;
+      }
+      for (const item of items as { id?: unknown; name?: unknown }[]) {
+        if (typeof item?.id === "string" && typeof item.name === "string") {
+          names.set(item.id, { name: item.name, kind });
+        }
+      }
+    }
+    return names;
+  }, [queryClient, tick]);
+}
+
+/** Task 대상을 찾을 목록(`taskTarget`·`relatedLinks`). 이미 받은 목록으로 찾는다. */
+export function useTargetLookup(): TargetLookup {
   const vms = useList("vm");
   const nodes = useList("node");
   const volumes = useList("volume");
   const backups = useList("backup");
   const imports = useList("vm-import");
-  return useMemo(() => {
-    const lookup: TargetLookup = {
+  const named = useCachedNames();
+  return useMemo(
+    () => ({
       vm: new Map(vms.data?.map((v) => [v.id, v])),
       volume: new Map(volumes.data?.map((v) => [v.id, v])),
       backup: new Map(backups.data?.map((b) => [b.id, b])),
       import: new Map(imports.data?.map((i) => [i.id, i])),
       node: new Map(nodes.data?.map((n) => [n.id, n])),
-    };
-    return (task: Task) => taskTarget(task, lookup);
-  }, [vms.data, volumes.data, backups.data, imports.data, nodes.data]);
+      named,
+    }),
+    [vms.data, volumes.data, backups.data, imports.data, nodes.data, named],
+  );
+}
+
+/** Task 대상의 이름과 화면(`taskTarget`). 이미 받은 목록으로 찾는다. */
+export function useTaskTarget() {
+  const lookup = useTargetLookup();
+  return useMemo(() => (task: Task) => taskTarget(task, lookup), [lookup]);
 }
 
 /**
@@ -63,45 +126,60 @@ export function TaskTable({
   labelledBy,
   empty,
   keys = false,
+  compact = false,
 }: {
   tasks: Task[];
   labelledBy?: string;
   empty?: string;
   /** 화면의 주 목록이면 목록 단축키를 받는다. */
   keys?: boolean;
+  /** 좁은 카드(홈 위젯): 작업(아래에 시각)과 상태 두 열만 — 노드·요청자는 상세 서랍에(계획 77) */
+  compact?: boolean;
 }) {
   const { t, i18n } = useTranslation();
-  const target = useTaskTarget();
+  const lookup = useTargetLookup();
+  const target = (task: Task) => taskTarget(task, lookup);
+  const taskHref = useTaskHref();
   const nodes = useList("node");
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
-  const columns: Column<Task>[] = [
+  const timeOf = (task: Task) => {
+    const time = uuidTime(task.id);
+    return <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>;
+  };
+  const all: Column<Task>[] = [
     {
       id: "time",
       header: t("tasks.time"),
       className: "whitespace-nowrap",
-      cell: (task) => {
-        const time = uuidTime(task.id);
-        return <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>;
-      },
+      cell: timeOf,
     },
     {
+      // 작업 이름(누르면 상세 서랍), 기록 설명, 오류(2줄 + 펼침 — 좁은 폭·휴대폰 카드에도 보인다, 계획 77)
       id: "operation",
       header: t("tasks.operation"),
       cell: (task) => {
-        const { name, href } = target(task);
+        const { name } = target(task);
         const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
         const detail = describeDetail(task, t);
+        const error = task.status.error;
         return (
-          <>
-            {href ? (
-              <Link to={href} className="underline-offset-4 hover:underline">
-                {label}
-              </Link>
-            ) : (
-              label
-            )}
+          <div className="min-w-0 max-w-2xl">
+            <Link
+              to={taskHref(task.id)}
+              className="font-medium break-words underline-offset-4 hover:underline"
+            >
+              {label}
+            </Link>
+            {compact && <span className="block text-xs text-muted-foreground">{timeOf(task)}</span>}
             {detail && <span className="block text-xs text-muted-foreground">{detail}</span>}
-          </>
+            {error && (
+              <TaskErrorText
+                text={error}
+                warning={task.status.state === "succeeded"}
+                className="mt-0.5"
+              />
+            )}
+          </div>
         );
       },
     },
@@ -110,6 +188,13 @@ export function TaskTable({
       header: t("common.node"),
       priority: 2,
       cell: (task) => nodeById.get(task.spec.node)?.name ?? "—",
+    },
+    {
+      id: "requester",
+      header: t("tasks.requester"),
+      priority: 3,
+      className: "whitespace-nowrap",
+      cell: (task) => requesterName(task, t, lookup.named),
     },
     {
       id: "state",
@@ -128,20 +213,11 @@ export function TaskTable({
         );
       },
     },
-    {
-      id: "error",
-      header: t("tasks.error"),
-      priority: 2,
-      cell: (task) => (
-        <div className="max-w-md truncate" title={task.status.error ?? undefined}>
-          {task.status.error ?? ""}
-        </div>
-      ),
-    },
   ];
+  const columns = compact ? all.filter((c) => c.id === "operation" || c.id === "state") : all;
   return (
     <DataTable
-      id="tasks"
+      id={compact ? "tasks-compact" : "tasks"}
       rows={tasks}
       columns={columns}
       rowId={(task) => task.id}

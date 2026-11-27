@@ -1,5 +1,5 @@
 import type { Task } from "@/api/types";
-import { alertHref, type TargetLookup, taskTarget } from "@/tasks/target";
+import { alertHref, relatedLinks, type TargetLookup, taskTarget } from "@/tasks/target";
 import { backup, NODE, task, vm, vmImport, volume } from "@/test/fixtures";
 
 const web = vm("web", "running");
@@ -87,4 +87,59 @@ it("links declarative apply and ACME order tasks (plan 73)", () => {
   expect(taskTarget(op("acme-order", "c", { certificate: "c" }), lookup).href).toBe(
     "/settings/certificates",
   );
+});
+
+it("names targets from lists already read and from the server's name labels (plan 77)", () => {
+  const store = "019a0f3c-0000-7000-8068-000000000001";
+  const set = "019a0f3c-0000-7000-8073-0000000000a1";
+  const named: TargetLookup = {
+    ...lookup,
+    named: new Map([
+      [store, { name: "lab-store", kind: "backup-store" }],
+      [set, { name: "p73", kind: "apply-set" }],
+    ]),
+  };
+  expect(taskTarget(op("backup-store-gc", store), named)).toEqual({
+    name: "lab-store",
+    href: `/backup-stores?open=${store}`,
+  });
+  // 적용 Task는 그 묶음의 상세로 간다(목록이 아니라).
+  expect(taskTarget(op("apply", set, { plan: "p", set }), named)).toEqual({
+    name: "p73",
+    href: "/apply-sets/p73",
+  });
+  // 목록에 없으면 만들 때 적은 이름. 지운 VM은 화면이 없다.
+  const gone = "019a0f3c-0000-7000-8000-00000000beef";
+  const labelled = (kind: string, name: string, k: string) => ({
+    ...op(kind, gone),
+    labels: { "target-name": name, "target-kind": k },
+  });
+  expect(taskTarget(labelled("vm-migrate", "web-01", "vm"), lookup)).toEqual({ name: "web-01" });
+  expect(taskTarget(labelled("backup-store-gc", "lab-store", "backup-store"), lookup)).toEqual({
+    name: "lab-store",
+    href: `/backup-stores?open=${gone}`,
+  });
+  expect(taskTarget(labelled("apply", "p73", "apply-set"), lookup).href).toBe("/apply-sets/p73");
+});
+
+it("lists what a task is tied to besides its target", () => {
+  expect(relatedLinks(op("vm-backup", web.id, { backup: bk.id }), lookup)).toEqual([
+    { kind: "backup", name: "web-1", href: "/backups?q=web-1" },
+  ]);
+  expect(relatedLinks(op("backup-restore", "x", { backup: bk.id, name: "w2" }), lookup)).toEqual([
+    { kind: "sourceBackup", name: "web-1", href: "/backups?q=web-1" },
+  ]);
+  expect(relatedLinks(op("backup-replicate", bk.id, { remote: "dr", pool: "p" }), lookup)).toEqual([
+    { kind: "remote", name: "dr", href: "/remotes/dr" },
+  ]);
+  const set = "019a0f3c-0000-7000-8073-0000000000a1";
+  const applied = {
+    ...op("apply", set, { plan: "019a0f3c-0000-7000-8073-0000000000b2", set }),
+    labels: { "target-name": "p73", "target-kind": "apply-set" },
+  };
+  // 묶음은 대상 줄에 이미 있으므로 계획만
+  expect(relatedLinks(applied, lookup)).toEqual([
+    { kind: "plan", name: "000000b2", href: "/history" },
+  ]);
+  expect(relatedLinks(op("vm-start", web.id), lookup)).toEqual([]);
 });

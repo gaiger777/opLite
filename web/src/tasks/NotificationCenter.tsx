@@ -17,6 +17,8 @@ import { errorMessage } from "@/i18n/errors";
 import { formatTime, uuidTime } from "@/lib/format";
 import { isActive, isRinging, setCenterOpen } from "@/tasks/center";
 import { latestTasks, type Retry, retryOf } from "@/tasks/retry";
+import { TaskErrorText } from "@/tasks/TaskErrorText";
+import { useTaskHref } from "@/tasks/taskLink";
 import { alertHref } from "@/tasks/target";
 import { describeProgress, describeTask } from "@/tasks/tasks";
 import { newestFirst, TaskStateBadge, useTaskTarget } from "@/tasks/TasksPage";
@@ -124,11 +126,12 @@ function Empty({ children }: { children: React.ReactNode }) {
   return <p className="text-sm text-muted-foreground">{children}</p>;
 }
 
-/** Task 목록: 상태 칩, 대상 화면으로 가는 설명, 진행률, 시각과 오류, 실패한 전원·백업 작업의 다시 하기 */
+/** Task 목록: 상태 칩, 상세 서랍을 여는 설명, 진행률, 시각과 오류(2줄 + 펼침), 실패한 전원·백업 작업의 다시 하기 */
 function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string }) {
   const { t, i18n } = useTranslation();
   const perms = usePermissions();
   const target = useTaskTarget();
+  const taskHref = useTaskHref();
   const nodes = useList("node");
   const vms = useList("vm");
   const backups = useList("backup");
@@ -182,7 +185,7 @@ function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string })
   return (
     <ul aria-labelledby={labelledBy} className="flex flex-col divide-y">
       {tasks.map((task) => {
-        const { name, href } = target(task);
+        const { name } = target(task);
         const label = describeTask(task, t, name, nodeName);
         const progress = describeProgress(task, t);
         const pct = percent(task);
@@ -190,18 +193,15 @@ function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string })
         const time = uuidTime(task.id);
         return (
           <li key={task.id} className="flex flex-col gap-1 py-2">
-            <div className="flex items-center gap-2">
+            <div className="flex items-start gap-2">
               <TaskStateBadge task={task} />
-              {href ? (
-                <Link
-                  to={href}
-                  className="min-w-0 truncate font-medium underline-offset-4 hover:underline"
-                >
-                  {label}
-                </Link>
-              ) : (
-                <span className="min-w-0 truncate font-medium">{label}</span>
-              )}
+              {/* 누르면 그 Task의 상세 서랍(계획 77). 이름은 자르지 않고 줄바꿈한다. */}
+              <Link
+                to={taskHref(task.id)}
+                className="min-w-0 font-medium break-words underline-offset-4 hover:underline"
+              >
+                {label}
+              </Link>
               <time
                 dateTime={time.toISOString()}
                 className="ml-auto shrink-0 text-xs text-muted-foreground"
@@ -223,7 +223,7 @@ function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string })
             )}
             {progress && <span className="text-xs text-muted-foreground">{progress}</span>}
             {task.status.error && (
-              <span className="line-clamp-2 text-xs text-danger-fg">{task.status.error}</span>
+              <TaskErrorText text={task.status.error} warning={task.status.state === "succeeded"} />
             )}
             {again && (
               <div className="flex items-center gap-2">
