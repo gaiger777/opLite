@@ -4,6 +4,7 @@ import "uplot/dist/uPlot.min.css";
 
 import { useChartColors, withAlpha, type ChartColors } from "@/charts/chartColors";
 import { formatValue, type Unit } from "@/charts/format";
+import { formatTime } from "@/lib/format";
 
 /** 차트의 선 하나. `max`·`min`이 있으면 그 사이를 옅은 띠로 그린다. `null`은 끊어 그린다. */
 export interface ChartLine {
@@ -32,8 +33,10 @@ function options(
 ): uPlot.Options {
   const series: uPlot.Series[] = [{}];
   const bands: uPlot.Band[] = [];
+  const mains: number[] = [];
   for (const line of lines) {
     const color = colors.series[line.color % colors.series.length]!;
+    mains.push(series.length);
     series.push({ label: line.label, stroke: color, width: 1.5, points: { show: false } });
     if (line.max && line.min) {
       const edge = { stroke: withAlpha(color, 0.25), width: 1, points: { show: false } };
@@ -52,11 +55,78 @@ function options(
     series,
     bands,
     legend: { show: false },
+    plugins: [tooltipPlugin(mains, unit)],
     scales: { y: { range: (_u, _min, max) => [0, max > 0 ? max * 1.1 : 1] } },
     axes: [
       axis,
       { ...axis, size: 72, values: (_u, splits) => splits.map((v) => formatValue(v, unit)) },
     ],
+  };
+}
+
+/**
+ * 가리키는 시각의 값 풍선(범례를 끄면 uPlot은 십자선만 그린다). 차트 위 겹(`u.over`)에 붙고 포인터를 가로채지 않는다.
+ * `mains`는 AVG 선의 시리즈 번호(MAX·MIN 띠 가장자리는 빼고)다. 값은 `setData`로 바뀌어도 늘 `u.data`에서 읽는다.
+ */
+export function tooltipPlugin(mains: number[], unit: Unit): uPlot.Plugin {
+  let tip: HTMLDivElement | null = null;
+  const row = (text: string, value?: string, color?: string) => {
+    const el = document.createElement("div");
+    el.className = "flex items-center gap-1.5";
+    if (color) {
+      const dot = document.createElement("span");
+      dot.className = "inline-block size-2 shrink-0 rounded-full";
+      dot.style.background = color;
+      el.append(dot);
+    }
+    const name = document.createElement("span");
+    name.textContent = text;
+    el.append(name);
+    if (value !== undefined) {
+      const v = document.createElement("span");
+      v.className = "ml-auto pl-3 font-medium tabular-nums";
+      v.textContent = value;
+      el.append(v);
+    }
+    return el;
+  };
+  return {
+    hooks: {
+      init: (u) => {
+        tip = document.createElement("div");
+        tip.setAttribute("aria-hidden", "true");
+        tip.dataset.slot = "chart-tooltip";
+        tip.className =
+          "pointer-events-none absolute top-1 left-0 z-10 rounded-md border bg-popover px-2 py-1 text-xs whitespace-nowrap text-popover-foreground shadow-md";
+        tip.style.display = "none";
+        u.over.append(tip);
+      },
+      setCursor: (u) => {
+        if (!tip) {
+          return;
+        }
+        const { idx, left } = u.cursor;
+        const time = idx === null || idx === undefined ? undefined : u.data[0][idx];
+        if (time === undefined || left === undefined || left < 0) {
+          tip.style.display = "none";
+          return;
+        }
+        tip.replaceChildren(
+          row(formatTime(new Date(time * 1000), document.documentElement.lang || "en")),
+          ...mains.map((i) => {
+            const s = u.series[i];
+            const color = typeof s?.stroke === "string" ? s.stroke : undefined;
+            return row(String(s?.label ?? ""), formatValue(u.data[i]?.[idx!], unit), color);
+          }),
+        );
+        tip.style.display = "block";
+        // 커서 오른쪽, 넘치면 왼쪽
+        const width = tip.offsetWidth;
+        const room = u.over.clientWidth;
+        const x = left + 12 + width > room ? left - 12 - width : left + 12;
+        tip.style.transform = `translateX(${Math.max(0, Math.round(x))}px)`;
+      },
+    },
   };
 }
 
