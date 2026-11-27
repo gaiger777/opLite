@@ -78,7 +78,7 @@ it("shows input errors without calling the API", async () => {
   await user.clear(screen.getByLabelText("Memory (MiB)"));
   await user.type(screen.getByLabelText("Memory (MiB)"), "32");
   await user.click(screen.getByRole("button", { name: "Create" }));
-  expect(screen.getByText(/lowercase letters/)).toBeInTheDocument();
+  expect(screen.getByText(/^Use 1–63 lowercase letters/)).toBeInTheDocument();
   expect(screen.getByText("At least 64 MiB.")).toBeInTheDocument();
 });
 
@@ -93,7 +93,7 @@ it("follows the chosen node's architecture until a machine is picked", async () 
   mockLists({ node: [arm, x86] });
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
-  const machine = await screen.findByLabelText("Machine type");
+  const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   // 아키텍처가 섞여 있으면 q35다.
   expect(machine).toHaveValue("q35");
   await user.selectOptions(screen.getByLabelText("Node"), "node-a");
@@ -119,7 +119,7 @@ it("does not offer witness nodes", async () => {
   mockLists({ node: [arm, witness] });
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   // 위트니스의 아키텍처는 머신 기본값에 섞이지 않는다.
-  expect(await screen.findByLabelText("Machine type")).toHaveValue("virt");
+  expect(await screen.findByLabelText("Virtual motherboard (advanced)")).toHaveValue("virt");
   expect(screen.getByRole("option", { name: "node-a" })).toBeInTheDocument();
   expect(screen.queryByRole("option", { name: "node-w" })).not.toBeInTheDocument();
 });
@@ -135,7 +135,7 @@ it("keeps the machine of an edited VM when its node changes", async () => {
   mockLists({ vm: [vm("web", "stopped")], node: [arm, x86] });
   renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
   const user = userEvent.setup();
-  const machine = await screen.findByLabelText("Machine type");
+  const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   expect(machine).toHaveValue("virt");
   await screen.findByRole("option", { name: "node-b" });
   await user.selectOptions(screen.getByLabelText("Node"), "node-b");
@@ -413,7 +413,7 @@ it("sets a snapshot schedule and checks how many to keep", async () => {
   await user.type(keep, "0");
   await user.click(screen.getByRole("button", { name: "Save" }));
   expect(keep).toHaveAttribute("aria-invalid", "true");
-  expect(keep).toHaveAccessibleDescription("From 1 to 100.");
+  expect(keep).toHaveAccessibleDescription(expect.stringContaining("From 1 to 100."));
   expect(bodies).toHaveLength(0);
 
   await user.clear(keep);
@@ -467,7 +467,7 @@ it("explains the schedule and warns about raw disks", async () => {
   const user = userEvent.setup();
   const every = await screen.findByLabelText("Take snapshots");
   expect(every).toHaveAccessibleDescription(
-    "Takes snapshots periodically and keeps only the newest scheduled ones. Snapshots you take yourself are never deleted. All disks must be qcow2, all in LVM-thin pools, all in ZFS pools, or all in Ceph RBD pools.",
+    "Takes snapshots automatically and keeps only the newest scheduled ones (manual snapshots stay). All disks must be qcow2 files or all on one pool type (LVM-thin, ZFS, Ceph RBD).",
   );
   // 끈 동안은 경고하지 않는다.
   expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
@@ -610,16 +610,18 @@ it("turns HA on only for nodes with fencing on and says why not", async () => {
   expect(ha).toBeEnabled();
   await user.selectOptions(screen.getByLabelText("Node"), "node-b");
   expect(ha).toBeDisabled();
-  expect(screen.getByText("node-b has fencing off and cannot run HA VMs.")).toBeInTheDocument();
+  expect(
+    screen.getByText("node-b has failed-node isolation (fencing) off, so it can't run HA VMs."),
+  ).toBeInTheDocument();
   await user.selectOptions(screen.getByLabelText("Node"), "node-a");
   expect(ha).toBeEnabled();
-  expect(screen.queryByText(/has fencing off/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/has failed-node isolation \(fencing\) off/)).not.toBeInTheDocument();
   await user.click(ha);
   expect(ha).toBeChecked();
   await user.click(screen.getByRole("button", { name: "Create" }));
   // 서버가 거부하면 번역한 이유를 보인다.
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "The node has fencing off and cannot run HA VMs.",
+    "The node has node fencing (forced cut-off) turned off and cannot run HA VMs.",
   );
   expect(body).toMatchObject({ name: "web", spec: { node: "n1", ha: true } });
 });
@@ -643,7 +645,9 @@ it("says when no node can run HA VMs but lets an HA VM turn HA off", async () =>
   expect(ha).toBeChecked();
   expect(ha).toBeEnabled();
   expect(
-    await screen.findByText("node-b has fencing off and cannot run HA VMs."),
+    await screen.findByText(
+      "node-b has failed-node isolation (fencing) off, so it can't run HA VMs.",
+    ),
   ).toBeInTheDocument();
   await user.click(ha);
   expect(ha).toBeDisabled();
@@ -672,7 +676,9 @@ it("says when no node has fencing on", async () => {
   mockLists({ node: [UNFENCED] });
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   expect(await screen.findByRole("switch", { name: "High availability (HA)" })).toBeDisabled();
-  expect(screen.getByText("No node has fencing on, so HA VMs cannot run.")).toBeInTheDocument();
+  expect(
+    screen.getByText("No node has failed-node isolation (fencing) on, so HA VMs can't run."),
+  ).toBeInTheDocument();
 });
 
 /** HA 가능 노드의 멈춘 VM app을 편집하는 화면. 보낸 본문을 모은다. */
@@ -890,13 +896,15 @@ it("attaches a disk to a running VM and tracks the hotplug task", async () => {
   // 켤 때 단 디스크는 바꾸지도 떼지도 못한다.
   expect(within(root).getByLabelText("Volume")).toBeDisabled();
   expect(screen.getByRole("button", { name: "Remove disk 1" })).toBeDisabled();
-  expect(screen.getByText(/volumes can be attached at the end/)).toBeInTheDocument();
+  expect(screen.getByText(/you can add disks at the end/)).toBeInTheDocument();
   expect(screen.getByText(/within the maximums apply right away/)).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Attach a volume" }));
   const added = screen.getByRole("group", { name: "Disk 2" });
   await user.selectOptions(within(added).getByLabelText("Volume"), "web-data");
   // 실행 중에는 virtio-blk만 붙인다.
-  expect(within(added).getByRole("option", { name: "sata" })).toBeDisabled();
+  expect(
+    within(added).getByRole("option", { name: "SATA — compatible (before Windows drivers)" }),
+  ).toBeDisabled();
   await user.click(screen.getByRole("button", { name: "Save" }));
   expect(await screen.findByText("Change hardware of web")).toBeInTheDocument();
   expect(body!.spec.disks).toEqual([
@@ -968,7 +976,7 @@ it("asks to restart a VM started without hotplug before changing its devices", a
   renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
   expect(
     await screen.findByText(
-      "The VM was started without hotplug support. Restart it once to add or remove disks and interfaces while it runs.",
+      "This VM was started without room for adding devices. Restart it once to attach or detach disks and interfaces while running.",
     ),
   ).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Attach a volume" })).not.toBeInTheDocument();
@@ -1032,9 +1040,7 @@ describe("replication", () => {
     await user.type(await screen.findByLabelText("Name"), "web");
     await user.selectOptions(screen.getByLabelText("Node"), "node-a");
     expect(
-      screen.getByText(
-        /Only disks on node-local pools are replicated · Cannot be used together with snapshots/,
-      ),
+      screen.getByText(/Copies disks on node-local pools to other nodes on a schedule/),
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Add replication target" }));
     const row = screen.getByRole("group", { name: "Replication target 1" });
@@ -1213,7 +1219,7 @@ describe("install media", () => {
     await user.click(within(boot).getByRole("button", { name: "Move cdrom0 up" }));
     expect(within(boot).getAllByRole("listitem")[0]).toHaveTextContent("cdrom0 — alpine");
 
-    await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
+    await user.click(screen.getByLabelText("Set up the guest on first boot (cloud-init)"));
     await user.type(screen.getByLabelText("User"), "orbi");
     await user.type(screen.getByLabelText("Password"), "secret");
     await user.type(screen.getByLabelText("SSH public keys"), "ssh-ed25519 AAAA me@laptop");
@@ -1242,7 +1248,7 @@ describe("install media", () => {
     renderPage(<VmCreatePage />, { path: "/vms/-new" });
     const user = userEvent.setup();
     await user.type(await screen.findByLabelText("Name"), "web");
-    await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
+    await user.click(screen.getByLabelText("Set up the guest on first boot (cloud-init)"));
     await user.type(screen.getByLabelText("User"), "root");
     await user.type(screen.getByLabelText("SSH public keys"), "not a key");
     await user.click(screen.getByRole("button", { name: "Create" }));
@@ -1348,7 +1354,7 @@ it("fills in Windows 11 and creates the VM with TPM, Secure Boot and the guest a
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "win");
   await user.click(screen.getByRole("radio", { name: "Windows 11" }));
-  expect(screen.getByRole("status")).toHaveTextContent(/switch the disks to virtio-blk/);
+  expect(screen.getByRole("status")).toHaveTextContent(/switch to virtio for speed/);
   expect(screen.getByRole("switch", { name: "TPM 2.0" })).toBeChecked();
   expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeChecked();
   expect(screen.getByRole("switch", { name: "QEMU guest agent" })).toBeChecked();
@@ -1489,7 +1495,7 @@ it("marks the steps with input errors and sums up the VM to review", async () =>
     "5Boot order",
     "6Security",
     "7Guest agent",
-    "8cloud-init",
+    "8First-boot setup",
     "9Snapshots",
     "10Replication",
     "11Review",
@@ -1520,7 +1526,7 @@ it("fills in a Linux server and deploys from a template instead of the form", as
   await user.click(screen.getByRole("radio", { name: "Linux server" }));
   expect(screen.getByRole("switch", { name: "QEMU guest agent" })).toBeChecked();
   const review = screen.getByRole("region", { name: "Review" });
-  expect(within(review).getByText("cloud-init").nextSibling).toHaveTextContent("On");
+  expect(within(review).getByText("First-boot setup").nextSibling).toHaveTextContent("On");
   // 템플릿에서: 폼 대신 템플릿 목록, 배포 대화상자
   await user.click(screen.getByRole("radio", { name: "From a template" }));
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();

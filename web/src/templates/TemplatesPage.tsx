@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Rocket, Trash2, Undo2 } from "lucide-react";
+import { Download, List, Rocket, Trash2, Undo2 } from "lucide-react";
 import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -10,9 +10,11 @@ import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
+import { Button } from "@/components/ui/button";
 import {
   Table,
   TableBody,
@@ -52,86 +54,120 @@ export function TemplatesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader id="templates-title" title={t("nav.templates")} />
-      <p className="text-sm text-muted-foreground">{t("templates.note")}</p>
-      <Table aria-labelledby="templates-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("templates.disks")}</TableHead>
-            <TableHead>{t("volumes.pool")}</TableHead>
-            <TableHead>{t("templates.clones")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {rows.length === 0 && (
-            <TableMessage colSpan={columns} query={vms} empty={t("templates.empty")} />
-          )}
-          {rows.map(({ vm, disks, pools, clones }) => {
-            const blocked = revertReason(vm, volumes.data);
-            const reasons = `${reasonBase}-${vm.id}`;
-            const owners = cloneOwners(clones, vms.data ?? []);
-            return (
-              <TableRow key={vm.id}>
-                <TableCell className="font-medium">
-                  <Link
-                    to={`/vms/${encodeURIComponent(vm.name)}`}
-                    className="underline-offset-4 hover:underline"
-                  >
-                    {vm.name}
-                  </Link>
-                </TableCell>
-                <TableCell>{disks.length > 0 ? disks.join(", ") : "—"}</TableCell>
-                <TableCell>{pools.length > 0 ? pools.join(", ") : "—"}</TableCell>
-                <TableCell>
-                  <span title={owners.join(", ")}>{clones.length}</span>
-                </TableCell>
+      <PageHeader
+        id="templates-title"
+        title={t("nav.templates")}
+        help="templates"
+        intro={t("help.templates.intro")}
+      />
+      {vms.isSuccess && rows.length === 0 ? (
+        <EmptyState
+          title={t("templates.emptyTitle")}
+          description={t("help.templates.empty")}
+          help="templates.page"
+          action={
+            (perms.anywhere("vm.create") || write) && (
+              <div className="flex flex-wrap justify-center gap-2">
+                {perms.anywhere("vm.create") && (
+                  <Button asChild>
+                    <Link to="/images">
+                      <Download />
+                      {t("templates.fromImage")}
+                    </Link>
+                  </Button>
+                )}
                 {write && (
-                  <TableCell className="text-right">
-                    {deploy && (
+                  <Button asChild variant="outline">
+                    <Link to="/vms">
+                      <List />
+                      {t("templates.fromVm")}
+                    </Link>
+                  </Button>
+                )}
+              </div>
+            )
+          }
+        />
+      ) : (
+        <Table aria-labelledby="templates-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("templates.disks")}</TableHead>
+              <TableHead>{t("volumes.pool")}</TableHead>
+              <TableHead>{t("templates.clones")}</TableHead>
+              {write && (
+                <TableHead>
+                  <span className="sr-only">{t("vms.actions")}</span>
+                </TableHead>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.length === 0 && (
+              <TableMessage colSpan={columns} query={vms} empty={t("templates.empty")} />
+            )}
+            {rows.map(({ vm, disks, pools, clones }) => {
+              const blocked = revertReason(vm, volumes.data);
+              const reasons = `${reasonBase}-${vm.id}`;
+              const owners = cloneOwners(clones, vms.data ?? []);
+              return (
+                <TableRow key={vm.id}>
+                  <TableCell className="font-medium">
+                    <Link
+                      to={`/vms/${encodeURIComponent(vm.name)}`}
+                      className="underline-offset-4 hover:underline"
+                    >
+                      {vm.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell>{disks.length > 0 ? disks.join(", ") : "—"}</TableCell>
+                  <TableCell>{pools.length > 0 ? pools.join(", ") : "—"}</TableCell>
+                  <TableCell>
+                    <span title={owners.join(", ")}>{clones.length}</span>
+                  </TableCell>
+                  {write && (
+                    <TableCell className="text-right">
+                      {deploy && (
+                        <ReasonButton
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t("templates.deployNamed", { name: vm.name })}
+                          reasons={reasons}
+                          onClick={() => setDeploying(vm)}
+                        >
+                          <Rocket />
+                        </ReasonButton>
+                      )}
                       <ReasonButton
                         variant="ghost"
                         size="icon-sm"
-                        aria-label={t("templates.deployNamed", { name: vm.name })}
+                        aria-label={t("templates.revertNamed", { name: vm.name })}
+                        reason={blocked}
                         reasons={reasons}
-                        onClick={() => setDeploying(vm)}
+                        onClick={() => setReverting(vm)}
                       >
-                        <Rocket />
+                        <Undo2 />
                       </ReasonButton>
-                    )}
-                    <ReasonButton
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("templates.revertNamed", { name: vm.name })}
-                      reason={blocked}
-                      reasons={reasons}
-                      onClick={() => setReverting(vm)}
-                    >
-                      <Undo2 />
-                    </ReasonButton>
-                    <ReasonButton
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("common.deleteNamed", { name: vm.name })}
-                      reason={blocked}
-                      reasons={reasons}
-                      onClick={() => setDeleting(vm)}
-                    >
-                      <Trash2 />
-                    </ReasonButton>
-                    <ReasonList base={reasons} reasons={[blocked]} />
-                  </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                      <ReasonButton
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("common.deleteNamed", { name: vm.name })}
+                        reason={blocked}
+                        reasons={reasons}
+                        onClick={() => setDeleting(vm)}
+                      >
+                        <Trash2 />
+                      </ReasonButton>
+                      <ReasonList base={reasons} reasons={[blocked]} />
+                    </TableCell>
+                  )}
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {deploying && <DeployDialog template={deploying} onClose={() => setDeploying(null)} />}
       <ConfirmDialog
         open={reverting !== null}

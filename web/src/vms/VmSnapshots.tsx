@@ -466,7 +466,12 @@ function CreateSnapshotDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="snapshot-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="snapshot-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.snapshots.name")}
+      >
         {(a11y) => (
           <Input
             id="snapshot-name"
@@ -480,6 +485,7 @@ function CreateSnapshotDialog({
         id="snapshot-description"
         label={t("snapshots.description")}
         error={errors.description}
+        help={t("help.snapshots.description")}
       >
         {(a11y) => (
           <Input

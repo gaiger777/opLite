@@ -87,7 +87,9 @@ it("clones a stopped VM's current state from the list menu", async () => {
   const name = within(dialog).getByLabelText("New VM name");
   await userEvent.type(name, "web");
   await userEvent.click(within(dialog).getByRole("button", { name: "Clone" }));
-  expect(name).toHaveAccessibleDescription("A VM with this name already exists.");
+  expect(name).toHaveAccessibleDescription(
+    expect.stringContaining("A VM with this name already exists."),
+  );
   expect(name).toBeInvalid();
   expect(bodies).toEqual([]);
 
@@ -135,7 +137,7 @@ it("clones a running VM from its newest ready snapshot", async () => {
   expect(submit).toBeDisabled();
 
   await userEvent.selectOptions(source, base.id);
-  expect(source).not.toHaveAccessibleDescription();
+  expect(source).toHaveAccessibleDescription(expect.stringMatching(/^What to copy\./));
   await userEvent.type(within(dialog).getByLabelText("New VM name"), "web-old");
   await userEvent.click(submit);
   expect(await screen.findByText("Clone web to web-old")).toBeInTheDocument();
@@ -178,7 +180,7 @@ it("keeps a chosen snapshot that goes away and blocks cloning", async () => {
 
   // 다시 고르면 풀린다.
   await userEvent.selectOptions(source, upgraded.id);
-  expect(source).not.toHaveAccessibleDescription();
+  expect(source).toHaveAccessibleDescription(expect.stringMatching(/^What to copy\./));
   await userEvent.click(submit);
   expect(await screen.findByText("Clone web to web-old")).toBeInTheDocument();
   expect(bodies).toEqual([{ name: "web-old", snapshot: upgraded.id, pool: null }]);
@@ -275,7 +277,7 @@ it("points at the pool when the VM's node cannot use it", async () => {
   // 업로드의 "접속한 노드" 문구가 아니라 VM이 있는 노드를 말한다.
   await waitFor(() =>
     expect(pools).toHaveAccessibleDescription(
-      "That storage pool is not available on the node holding the VM.",
+      expect.stringContaining("That storage pool is not available on the node holding the VM."),
     ),
   );
   expect(pools).toBeInvalid();
@@ -320,7 +322,7 @@ it("offers only pools ready on the VM's node and points at one that is not", asy
   await userEvent.click(within(dialog).getByRole("button", { name: "Clone" }));
   await waitFor(() =>
     expect(pools).toHaveAccessibleDescription(
-      "That storage pool is not ready on the node holding the VM.",
+      expect.stringContaining("That storage pool is not ready on the node holding the VM."),
     ),
   );
   expect(pools).toBeInvalid();

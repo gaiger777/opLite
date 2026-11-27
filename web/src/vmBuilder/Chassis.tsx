@@ -164,6 +164,7 @@ export function Chassis() {
             // 빈 이름의 오류는 칸 밑에 바로 보이지 않는다(만들기 단추 옆 까닭이 알림).
             error={v.name === "" ? undefined : (nameProblem?.message ?? nameProblem?.key)}
             errorValues={nameProblem?.values as Record<string, string> | undefined}
+            help={t("vmBuilder.help.name")}
           >
             {(a11y) => (
               <Input

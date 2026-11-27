@@ -791,7 +791,7 @@ it("resets an x86 model and flags when the machine type switches the architectur
   mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
-  const machine = await screen.findByLabelText("Machine type");
+  const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   await user.selectOptions(machine, "q35");
   await screen.findAllByRole("option", { name: /Skylake-Server-v5/ });
   await user.selectOptions(screen.getByLabelText("CPU model"), "Skylake-Server-v5");
@@ -1051,7 +1051,7 @@ it("resets an automatically chosen cluster model when the architecture changes",
   mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
   renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
-  const machine = await screen.findByLabelText("Machine type");
+  const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   await user.selectOptions(machine, "q35");
   await waitFor(() => expect(screen.getByLabelText("CPU model")).toHaveValue("cluster"));
   // aarch64에는 기준이 없다: 효과가 고른 cluster를 host로 돌린다(리뷰 2 웹 #5).

@@ -72,6 +72,7 @@ function NumaFields({
         id={`${id}-policy`}
         label={t("numa.policy.label")}
         help={t(canDedicate ? "numa.policy.hint" : "numa.needsPrivilege")}
+        info="numa.policy"
       >
         {(a11y) => (
           <NativeSelect
@@ -99,6 +100,7 @@ function NumaFields({
             label={t("numa.threads.label")}
             error={errors["numa.threads"]}
             help={t(`numa.threads.hint.${value.threadPolicy || "prefer"}`)}
+            info="numa.threads"
           >
             {(a11y) => (
               <NativeSelect
@@ -123,6 +125,7 @@ function NumaFields({
             id={`${id}-emulator`}
             label={t("numa.emulator.label")}
             help={t("numa.emulator.hint")}
+            info="numa.emulator"
           >
             {(a11y) => (
               <NativeSelect
@@ -155,6 +158,7 @@ function NumaFields({
               ? t("numa.nodes.implicitAuto")
               : t("numa.nodes.hint")
         }
+        info="numa.nodes"
       >
         {(a11y) => (
           <NativeSelect
@@ -211,6 +215,7 @@ function NumaFields({
               ? t("numa.hugepages.anyHotplug")
               : t("numa.hugepages.hint")
         }
+        info="numa.hugepages"
       >
         {(a11y) => (
           <NativeSelect
@@ -274,6 +279,7 @@ function NodeList({
             id={`vm-numa-list-${i}-cpus`}
             label={t("numa.list.cpus", { n: i })}
             error={errors[`numa.list.${i}.cpus`]}
+            info="numa.listCpus"
           >
             {(a11y) => (
               <Input
@@ -289,6 +295,7 @@ function NodeList({
             id={`vm-numa-list-${i}-memory`}
             label={t("numa.list.memory", { n: i })}
             error={errors[`numa.list.${i}.memory`]}
+            info="numa.listMemory"
           >
             {(a11y) => (
               <Input

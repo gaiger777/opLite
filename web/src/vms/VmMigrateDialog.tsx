@@ -144,7 +144,12 @@ export function VmMigrateDialog({
       {dropped && (
         <p className="text-sm text-warning-fg">{t("migrate.nodeDropped", { node: dropped })}</p>
       )}
-      <Field id="migrate-node" label={t("migrate.node")}>
+      <Field
+        id="migrate-node"
+        label={t("migrate.node")}
+        help={t("help.migrate.node")}
+        info="migrate.node"
+      >
         {(a11y) => (
           <NativeSelect
             id="migrate-node"
@@ -211,7 +216,12 @@ export function VmMigrateDialog({
             </ul>
           </div>
           {!toReplica && (
-            <Field id="migrate-pool" label={t("migrate.pool")}>
+            <Field
+              id="migrate-pool"
+              label={t("migrate.pool")}
+              help={t("help.migrate.pool")}
+              info="migrate.pool"
+            >
               {(a11y) => (
                 <NativeSelect
                   id="migrate-pool"

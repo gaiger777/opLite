@@ -158,7 +158,7 @@ it("plans, shows blockers and the cloud-init warning, then creates and starts", 
 
   // ② 계획 표
   expect(await within(sheet).findByRole("alert")).toHaveTextContent(
-    "Some VMs use cloud-init: their instance-id changes",
+    "Some VMs use first-boot setup (cloud-init): their instance-id changes",
   );
   const table = within(sheet).getByRole("table", { name: "Migration plan" });
   const web = within(table).getByText("web").closest("tr")!;

@@ -266,7 +266,12 @@ export function DeployDialog({
               )}
             </Field>
           </div>
-          <Field id="deploy-count" label={t("templates.count")} error={errors.count}>
+          <Field
+            id="deploy-count"
+            label={t("templates.count")}
+            error={errors.count}
+            help={t("help.deploy.count")}
+          >
             {(a11y) => (
               <Input
                 id="deploy-count"
@@ -277,7 +282,12 @@ export function DeployDialog({
               />
             )}
           </Field>
-          <Field id="deploy-first" label={t("templates.first")} error={errors.first}>
+          <Field
+            id="deploy-first"
+            label={t("templates.first")}
+            error={errors.first}
+            help={t("help.deploy.first")}
+          >
             {(a11y) => (
               <Input
                 id="deploy-first"
@@ -295,6 +305,7 @@ export function DeployDialog({
           label={t("templates.mode")}
           error={errors.mode}
           help={t(`templates.modeHint.${mode}`)}
+          info="templates.mode"
         >
           {(a11y) => (
             <NativeSelect
@@ -311,20 +322,23 @@ export function DeployDialog({
           )}
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field id="deploy-pool" label={t("clone.pool")}>
-            <NativeSelect
-              id="deploy-pool"
-              className="w-full"
-              value={pool}
-              onChange={(e) => setPool(e.target.value)}
-            >
-              <NativeSelectOption value="">{t("clone.samePool")}</NativeSelectOption>
-              {usablePools.map((p) => (
-                <NativeSelectOption key={p.id} value={p.name}>
-                  {p.name}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+          <Field id="deploy-pool" label={t("clone.pool")} help={t("help.deploy.pool")}>
+            {(a11y) => (
+              <NativeSelect
+                {...a11y}
+                id="deploy-pool"
+                className="w-full"
+                value={pool}
+                onChange={(e) => setPool(e.target.value)}
+              >
+                <NativeSelectOption value="">{t("clone.samePool")}</NativeSelectOption>
+                {usablePools.map((p) => (
+                  <NativeSelectOption key={p.id} value={p.name}>
+                    {p.name}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            )}
           </Field>
           <Field id="deploy-node" label={t("templates.node")} help={t("templates.nodeHint")}>
             {(a11y) => (
@@ -346,7 +360,12 @@ export function DeployDialog({
               </NativeSelect>
             )}
           </Field>
-          <Field id="deploy-cpus" label={t("vms.vcpus")} error={errors.cpus}>
+          <Field
+            id="deploy-cpus"
+            label={t("vms.vcpus")}
+            error={errors.cpus}
+            help={t("help.deploy.cpus")}
+          >
             {(a11y) => (
               <Input
                 id="deploy-cpus"
@@ -358,7 +377,12 @@ export function DeployDialog({
               />
             )}
           </Field>
-          <Field id="deploy-memory" label={t("templates.memoryMib")} error={errors.memory}>
+          <Field
+            id="deploy-memory"
+            label={t("templates.memoryMib")}
+            error={errors.memory}
+            help={t("help.deploy.memory")}
+          >
             {(a11y) => (
               <Input
                 id="deploy-memory"
@@ -412,6 +436,8 @@ export function DeployDialog({
                   id={`deploy-disk-${i}`}
                   label={t("templates.diskSize", { n: i })}
                   error={errors[`disk${i}`]}
+                  help={t("help.deploy.diskSize")}
+                  info="templates.diskSize"
                 >
                   {(a11y) => (
                     <Input
@@ -434,27 +460,35 @@ export function DeployDialog({
           <fieldset className="grid gap-4 sm:grid-cols-2">
             <legend className="mb-2 text-sm font-medium">{t("templates.nics")}</legend>
             {templateNics.map((nic, i) => (
-              <Field key={i} id={`deploy-nic-${i}`} label={t("templates.nicNetwork", { n: i })}>
-                <NativeSelect
-                  id={`deploy-nic-${i}`}
-                  className="w-full"
-                  value={nics[i] ?? ""}
-                  onChange={(e) => {
-                    setNics((list) => list.map((v, j) => (j === i ? e.target.value : v)));
-                    setIps((list) => list.map((v, j) => (j === i ? "" : v)));
-                  }}
-                >
-                  <NativeSelectOption value="">
-                    {t("templates.keepNetwork", { network: nic.network })}
-                  </NativeSelectOption>
-                  {(networks.data ?? [])
-                    .filter((n) => n.name !== nic.network)
-                    .map((n) => (
-                      <NativeSelectOption key={n.id} value={n.name}>
-                        {n.name}
-                      </NativeSelectOption>
-                    ))}
-                </NativeSelect>
+              <Field
+                key={i}
+                id={`deploy-nic-${i}`}
+                label={t("templates.nicNetwork", { n: i })}
+                help={t("help.deploy.nic")}
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    {...a11y}
+                    id={`deploy-nic-${i}`}
+                    className="w-full"
+                    value={nics[i] ?? ""}
+                    onChange={(e) => {
+                      setNics((list) => list.map((v, j) => (j === i ? e.target.value : v)));
+                      setIps((list) => list.map((v, j) => (j === i ? "" : v)));
+                    }}
+                  >
+                    <NativeSelectOption value="">
+                      {t("templates.keepNetwork", { network: nic.network })}
+                    </NativeSelectOption>
+                    {(networks.data ?? [])
+                      .filter((n) => n.name !== nic.network)
+                      .map((n) => (
+                        <NativeSelectOption key={n.id} value={n.name}>
+                          {n.name}
+                        </NativeSelectOption>
+                      ))}
+                  </NativeSelect>
+                )}
               </Field>
             ))}
             {templateNics.map(

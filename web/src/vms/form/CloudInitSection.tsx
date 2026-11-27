@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 
 import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -66,6 +67,7 @@ export function CloudInitSection({
             onCheckedChange={(v) => set({ enabled: v === true })}
           />
           <Label htmlFor="ci-enabled">{t("vmForm.ciEnabled")}</Label>
+          <InfoButton topic="vmForm.cloudInit" label={t("vmForm.cloudInit")} />
         </div>
         <p className="text-sm text-muted-foreground">
           {running ? t("vmForm.ciRunning") : t("vmForm.ciNote")}
@@ -175,6 +177,7 @@ export function CloudInitSection({
                     id={`ci-${i}-ipv4`}
                     label={t("vmForm.ciIpv4", { n: i })}
                     error={errors[`ci.networks.${i}.ipv4`]}
+                    info="vmForm.ciIpMode"
                   >
                     <NativeSelect
                       id={`ci-${i}-ipv4`}
@@ -193,6 +196,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv4-address`}
                         label={t("vmForm.ciAddress")}
                         error={errors[`ci.networks.${i}.ipv4Address`]}
+                        info="vmForm.ciAddress"
                       >
                         {(a11y) => (
                           <Input
@@ -208,6 +212,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv4-gateway`}
                         label={t("vmForm.ciGateway")}
                         error={errors[`ci.networks.${i}.ipv4Gateway`]}
+                        info="vmForm.ciGateway"
                       >
                         {(a11y) => (
                           <Input
@@ -222,7 +227,11 @@ export function CloudInitSection({
                   ) : (
                     <div className="sm:col-span-2" />
                   )}
-                  <Field id={`ci-${i}-ipv6`} label={t("vmForm.ciIpv6", { n: i })}>
+                  <Field
+                    id={`ci-${i}-ipv6`}
+                    label={t("vmForm.ciIpv6", { n: i })}
+                    info="vmForm.ciIpMode"
+                  >
                     <NativeSelect
                       id={`ci-${i}-ipv6`}
                       className="w-full"
@@ -241,6 +250,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv6-address`}
                         label={t("vmForm.ciAddress6")}
                         error={errors[`ci.networks.${i}.ipv6Address`]}
+                        info="vmForm.ciAddress"
                       >
                         {(a11y) => (
                           <Input
@@ -256,6 +266,7 @@ export function CloudInitSection({
                         id={`ci-${i}-ipv6-gateway`}
                         label={t("vmForm.ciGateway6")}
                         error={errors[`ci.networks.${i}.ipv6Gateway`]}
+                        info="vmForm.ciGateway"
                       >
                         {(a11y) => (
                           <Input
@@ -316,6 +327,7 @@ export function CloudInitSection({
                   label={t("vmForm.ciUserData")}
                   error={errors["ci.userData"]}
                   help={t("vmForm.ciUserDataHint")}
+                  info="vmForm.ciUserData"
                 >
                   {(a11y) => (
                     <textarea

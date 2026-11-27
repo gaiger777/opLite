@@ -8,6 +8,7 @@ import type { Vm } from "@/api/types";
 import { useVmCan } from "@/auth/usePermissions";
 import { Field as FormField } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -36,10 +37,24 @@ import {
 } from "@/vms/guest";
 import { PendingNote } from "@/vms/VmFirmware";
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+/** 한 칸. `help`(한 줄)를 주면 이름 옆 ⓘ가 도움말 패널(주제 `info`)을 연다(계획 77-4). */
+function Field({
+  label,
+  help,
+  info,
+  children,
+}: {
+  label: string;
+  help?: string;
+  info?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-1">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dt className="flex items-center gap-1 text-xs text-muted-foreground">
+        {label}
+        {help && <InfoButton topic={info ?? ""} label={label} line={help} />}
+      </dt>
       <dd className="text-sm">{children}</dd>
     </div>
   );
@@ -86,12 +101,30 @@ export function VmGuestCard({ vm }: { vm: Vm }) {
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         <dl aria-labelledby="vm-guest-agent" className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-          <Field label={t("vms.guest.settings")}>{settingLine(vm, t)}</Field>
+          <Field
+            label={t("vms.guest.settings")}
+            help={t("help.vms.guest.settings")}
+            info="vms.guest.settings"
+          >
+            {settingLine(vm, t)}
+          </Field>
           {info && (
             <>
-              <Field label={t("vms.guest.os")}>{guestOs(info) ?? "—"}</Field>
-              <Field label={t("vms.guest.hostname")}>{info.hostname ?? "—"}</Field>
-              <Field label={t("vms.guest.addresses")}>
+              <Field label={t("vms.guest.os")} help={t("help.vms.guest.os")} info="vms.guest.os">
+                {guestOs(info) ?? "—"}
+              </Field>
+              <Field
+                label={t("vms.guest.hostname")}
+                help={t("help.vms.guest.hostname")}
+                info="vms.guest.hostname"
+              >
+                {info.hostname ?? "—"}
+              </Field>
+              <Field
+                label={t("vms.guest.addresses")}
+                help={t("help.vms.guest.addresses")}
+                info="vms.guest.addresses"
+              >
                 {guestAddresses(info).join(", ") || "—"}
               </Field>
             </>
@@ -205,10 +238,30 @@ function GuestDetails({ info }: { info: GuestInfo }) {
   return (
     <>
       <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Field label={t("vms.guest.os")}>{guestOs(info) ?? "—"}</Field>
-        <Field label={t("vms.guest.kernel")}>{info.os?.kernel ?? "—"}</Field>
-        <Field label={t("vms.guest.hostname")}>{info.hostname ?? "—"}</Field>
-        <Field label={t("vms.guest.agentVersion")}>{info.agent_version ?? "—"}</Field>
+        <Field label={t("vms.guest.os")} help={t("help.vms.guest.os")} info="vms.guest.os">
+          {guestOs(info) ?? "—"}
+        </Field>
+        <Field
+          label={t("vms.guest.kernel")}
+          help={t("help.vms.guest.kernel")}
+          info="vms.guest.kernel"
+        >
+          {info.os?.kernel ?? "—"}
+        </Field>
+        <Field
+          label={t("vms.guest.hostname")}
+          help={t("help.vms.guest.hostname")}
+          info="vms.guest.hostname"
+        >
+          {info.hostname ?? "—"}
+        </Field>
+        <Field
+          label={t("vms.guest.agentVersion")}
+          help={t("help.vms.guest.agentVersion")}
+          info="vms.guest.agentVersion"
+        >
+          {info.agent_version ?? "—"}
+        </Field>
       </dl>
       <section className="flex flex-col gap-2">
         <h3 id="vm-guest-nics" className="font-medium">
@@ -326,7 +379,12 @@ export function GuestPasswordDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <FormField id="guest-user" label={t("vms.guest.user")} error={errors.user}>
+      <FormField
+        id="guest-user"
+        label={t("vms.guest.user")}
+        error={errors.user}
+        help={t("help.vms.guest.user")}
+      >
         {(a11y) => (
           <Input
             id="guest-user"
@@ -337,7 +395,12 @@ export function GuestPasswordDialog({
           />
         )}
       </FormField>
-      <FormField id="guest-password" label={t("vms.guest.newPassword")} error={errors.password}>
+      <FormField
+        id="guest-password"
+        label={t("vms.guest.newPassword")}
+        error={errors.password}
+        help={t("help.vms.guest.newPassword")}
+      >
         {(a11y) => (
           <Input
             id="guest-password"
@@ -353,6 +416,7 @@ export function GuestPasswordDialog({
         id="guest-password-again"
         label={t("vms.guest.passwordAgain")}
         error={errors.again}
+        help={t("help.vms.guest.passwordAgain")}
       >
         {(a11y) => (
           <Input

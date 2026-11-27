@@ -86,6 +86,7 @@ export function ReplicationSection({
                 id={`replication-${i}-node`}
                 label={t("common.node")}
                 error={errors[`replication.${i}.node`]}
+                info="vmForm.replicationNode"
               >
                 {(a11y) => (
                   <NativeSelect
@@ -113,6 +114,7 @@ export function ReplicationSection({
                 id={`replication-${i}-minutes`}
                 label={t("vmForm.replicationMinutes")}
                 error={errors[`replication.${i}.minutes`]}
+                info="vmForm.replicationMinutes"
               >
                 {(a11y) => (
                   <Input
@@ -126,7 +128,11 @@ export function ReplicationSection({
                   />
                 )}
               </Field>
-              <Field id={`replication-${i}-pool`} label={t("vmForm.replicationPool")}>
+              <Field
+                id={`replication-${i}-pool`}
+                label={t("vmForm.replicationPool")}
+                info="vmForm.replicationPool"
+              >
                 <NativeSelect
                   id={`replication-${i}-pool`}
                   className="w-full"

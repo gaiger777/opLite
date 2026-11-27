@@ -15,6 +15,7 @@ import { usePermissions, useVmCan } from "@/auth/usePermissions";
 import { LiveRestoreStrip } from "@/backups/LiveRestoreStrip";
 import { VmBackups } from "@/backups/VmBackups";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { ListPending } from "@/components/ListPending";
 import { useVisit } from "@/components/PinButton";
 import { Pager, usePage } from "@/components/Pager";
@@ -407,10 +408,24 @@ function VmHeader({ vm }: { vm: Vm }) {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+/** 요약의 한 칸. `help`(한 줄)를 주면 이름 옆 ⓘ가 도움말 패널(주제 `info`)을 연다(계획 77-4). */
+function Field({
+  label,
+  help,
+  info,
+  children,
+}: {
+  label: string;
+  help?: string;
+  info?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-1">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dt className="flex items-center gap-1 text-xs text-muted-foreground">
+        {label}
+        {help && <InfoButton topic={info ?? ""} label={label} line={help} />}
+      </dt>
       <dd className="text-sm">{children}</dd>
     </div>
   );
@@ -473,7 +488,7 @@ function TemplateField({ vm }: { vm: Vm }) {
   });
   if (isTemplate(vm)) {
     return (
-      <Field label={t("vms.template")}>
+      <Field label={t("vms.template")} help={t("help.vms.template")} info="vms.template">
         {t("vms.templateClones", { count: linkedClones(disks, volumes).length })}
       </Field>
     );
@@ -482,7 +497,7 @@ function TemplateField({ vm }: { vm: Vm }) {
     return null;
   }
   return (
-    <Field label={t("vms.linkedClone")}>
+    <Field label={t("vms.linkedClone")} help={t("help.vms.linkedClone")} info="vms.linkedClone">
       {linked.map((line) => (
         <span key={line} className="block">
           {line}
@@ -513,7 +528,7 @@ function Summary({ vm }: { vm: Vm }) {
       : format(now);
   return (
     <dl className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2 lg:grid-cols-3">
-      <Field label={t("vms.cpu")}>
+      <Field label={t("vms.cpu")} help={t("help.vms.cpu")} info="vms.cpu">
         {t("vms.cpuValue", {
           sockets: cpu.sockets ?? 1,
           cores: cpu.cores,
@@ -526,26 +541,48 @@ function Summary({ vm }: { vm: Vm }) {
           </span>
         )}
       </Field>
-      <Field label={t("vms.vcpus")}>{withMax(vcpus, String)}</Field>
-      <Field label={t("vms.memory")}>{withMax(memory, formatMib)}</Field>
+      <Field label={t("vms.vcpus")} help={t("help.vms.vcpus")} info="vms.vcpus">
+        {withMax(vcpus, String)}
+      </Field>
+      <Field label={t("vms.memory")} help={t("help.vms.memory")} info="vms.memory">
+        {withMax(memory, formatMib)}
+      </Field>
       {hw && (
-        <Field label={t("vms.hotplug")}>
-          {ports ? t("vms.hotplugPorts", ports) : t("vms.hotplugOff")}
+        <Field label={t("vms.hotplug")} help={t("help.vms.hotplug")} info="vms.hotplug">
+          {ports
+            ? t("vms.hotplugPorts", { ...ports, free: ports.ports - ports.used })
+            : t("vms.hotplugOff")}
         </Field>
       )}
-      <Field label={t("vms.bootOrder")}>{bootLine(vm) || t("vms.bootNone")}</Field>
-      <Field label={t("vms.cloudInit")}>
+      <Field label={t("vms.bootOrder")} help={t("help.vms.bootOrder")} info="vms.bootOrder">
+        {bootLine(vm) || t("vms.bootNone")}
+      </Field>
+      <Field label={t("vms.cloudInit")} help={t("help.vms.cloudInit")} info="vms.cloudInit">
         <CloudInitLine vm={vm} />
       </Field>
       <TemplateField vm={vm} />
-      <Field label={t("vms.firmware")}>{(vm.spec.firmware ?? "uefi").toUpperCase()}</Field>
-      <Field label={t("vms.machine")}>{vm.spec.machine}</Field>
-      <Field label={t("vms.restart")}>{t(`vms.restartPolicy.${vm.spec.restart ?? "never"}`)}</Field>
-      <Field label={t("vms.power")}>{t(`vms.powerState.${vm.spec.power ?? "stopped"}`)}</Field>
-      <Field label={t("vms.pid")}>{vm.status.pid ?? "—"}</Field>
-      <Field label={t("vms.created")}>{formatTime(uuidTime(vm.id), i18n.language)}</Field>
-      <Field label={t("vms.lastError")}>{vm.status.last_error ?? "—"}</Field>
-      <Field label={t("vms.haPolicy")}>
+      <Field label={t("vms.firmware")} help={t("help.vms.firmware")} info="vms.firmware">
+        {(vm.spec.firmware ?? "uefi").toUpperCase()}
+      </Field>
+      <Field label={t("vms.machine")} help={t("help.vms.machine")} info="vms.machine">
+        {vm.spec.machine}
+      </Field>
+      <Field label={t("vms.restart")} help={t("help.vms.restart")} info="vms.restart">
+        {t(`vms.restartPolicy.${vm.spec.restart ?? "never"}`)}
+      </Field>
+      <Field label={t("vms.power")} help={t("help.vms.power")} info="vms.power">
+        {t(`vms.powerState.${vm.spec.power ?? "stopped"}`)}
+      </Field>
+      <Field label={t("vms.pid")} help={t("help.vms.pid")} info="vms.pid">
+        {vm.status.pid ?? "—"}
+      </Field>
+      <Field label={t("vms.created")} help={t("help.vms.created")} info="vms.created">
+        {formatTime(uuidTime(vm.id), i18n.language)}
+      </Field>
+      <Field label={t("vms.lastError")} help={t("help.vms.lastError")} info="vms.lastError">
+        {vm.status.last_error ?? "—"}
+      </Field>
+      <Field label={t("vms.haPolicy")} help={t("help.vms.haPolicy")} info="vms.haPolicy">
         {ha ? t(`vms.haState.${ha.state}`) : t("vms.haOff")}
         {ha && (
           <span className="block text-xs text-muted-foreground">
@@ -553,18 +590,34 @@ function Summary({ vm }: { vm: Vm }) {
           </span>
         )}
       </Field>
-      {ha && <Field label={t("vms.haGroup")}>{ha.group ?? "—"}</Field>}
-      {ha && <Field label={t("vms.haPriority")}>{ha.priority}</Field>}
       {ha && (
-        <Field label={t("vms.guestWatch")}>
+        <Field label={t("vms.haGroup")} help={t("help.vms.haGroup")} info="vms.haGroup">
+          {ha.group ?? "—"}
+        </Field>
+      )}
+      {ha && (
+        <Field label={t("vms.haPriority")} help={t("help.vms.haPriority")} info="vms.haPriority">
+          {ha.priority}
+        </Field>
+      )}
+      {ha && (
+        <Field label={t("vms.guestWatch")} help={t("help.vms.guestWatch")} info="vms.guestWatch">
           {ha.guest_watch
             ? t("vms.guestWatchSecs", { secs: ha.guest_watch.timeout_secs })
             : t("vms.haOff")}
         </Field>
       )}
-      {vm.spec.placement?.pinned && <Field label={t("vms.pinned")}>{t("vms.pinnedOn")}</Field>}
+      {vm.spec.placement?.pinned && (
+        <Field label={t("vms.pinned")} help={t("help.vms.pinned")} info="vms.pinned">
+          {t("vms.pinnedOn")}
+        </Field>
+      )}
       {/* 리더가 계산한 배치 규칙 위반(켜진 VM만) */}
-      <Field label={t("vms.ruleViolations")}>
+      <Field
+        label={t("vms.ruleViolations")}
+        help={t("help.vms.ruleViolations")}
+        info="vms.ruleViolations"
+      >
         {violations.length > 0 ? (
           <span className="text-warning-fg">{violations.join(", ")}</span>
         ) : (
@@ -572,7 +625,7 @@ function Summary({ vm }: { vm: Vm }) {
         )}
       </Field>
       {haError && (
-        <Field label={t("vms.haError")}>
+        <Field label={t("vms.haError")} help={t("help.vms.haError")} info="vms.haError">
           <span className="text-destructive">{haError}</span>
         </Field>
       )}

@@ -97,7 +97,7 @@ export function NicsSection({
               aria-label={t("vmForm.nicN", { n: i + 1 })}
               className="grid grid-cols-2 items-end gap-2 rounded-md border p-3 sm:grid-cols-4"
             >
-              <Field id={`nic-${i}-network`} label={t("vms.network")}>
+              <Field id={`nic-${i}-network`} label={t("vms.network")} info="vmForm.nicNetwork">
                 <NativeSelect
                   id={`nic-${i}-network`}
                   className="w-full"
@@ -122,7 +122,7 @@ export function NicsSection({
                   ))}
                 </NativeSelect>
               </Field>
-              <Field id={`nic-${i}-model`} label={t("vms.model")}>
+              <Field id={`nic-${i}-model`} label={t("vms.model")} info="vmForm.nicModel">
                 <NativeSelect
                   id={`nic-${i}-model`}
                   className="w-full"
@@ -130,11 +130,20 @@ export function NicsSection({
                   value={nic.model}
                   onChange={(e) => setNic(i, { model: e.target.value as NicRow["model"] })}
                 >
-                  <NativeSelectOption value="virtio">virtio</NativeSelectOption>
-                  <NativeSelectOption value="e1000e">e1000e</NativeSelectOption>
+                  <NativeSelectOption value="virtio">
+                    {t("vmForm.nicModelVirtio")}
+                  </NativeSelectOption>
+                  <NativeSelectOption value="e1000e">
+                    {t("vmForm.nicModelE1000e")}
+                  </NativeSelectOption>
                 </NativeSelect>
               </Field>
-              <Field id={`nic-${i}-mac`} label={t("vms.mac")} error={errors[`nics.${i}.mac`]}>
+              <Field
+                id={`nic-${i}-mac`}
+                label={t("vms.mac")}
+                error={errors[`nics.${i}.mac`]}
+                info="vmForm.nicMac"
+              >
                 {(a11y) => (
                   <Input
                     id={`nic-${i}-mac`}

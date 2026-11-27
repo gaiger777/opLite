@@ -215,6 +215,7 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
         id="settings-cpu-mode"
         label={t("cpu.settings.mode")}
         help={t(`cpu.settings.modeHint.${values.mode}`)}
+        info="cpu.mode"
       >
         {(a11y) => (
           <NativeSelect
@@ -278,6 +279,7 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
               <CpuFlagsInput
                 id={`settings-cpu-pinned-flags-${arch}`}
                 label={t("cpu.settings.pinnedFlags")}
+                help={t("help.cpu.pinnedFlags")}
                 flags={p.flags}
                 arches={[arch]}
                 signed
@@ -308,6 +310,7 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
         id="settings-cpu-mask"
         label={t("cpu.settings.mask")}
         help={t("cpu.settings.maskHint")}
+        info="cpu.mask"
         flags={values.mask}
         arches={arches.length > 0 ? arches : [undefined]}
         signed={false}
