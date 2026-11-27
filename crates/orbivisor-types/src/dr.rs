@@ -731,6 +731,17 @@ pub fn bubble_network_name(plan: &str, n: usize) -> String {
     format!("{BUBBLE_PREFIX}{body}")
 }
 
+/// 실행 이름 `<plan>-<what>-<secs>`(`what`은 `test`·`failover`·`cleanup`, `secs`는 시작 시각 — 63자에 맞게 계획 이름을 줄임)
+pub fn run_name(plan: &str, what: &str, secs: u64) -> String {
+    fit_name(plan, &format!("-{what}-{secs}"), MAX_NAME)
+}
+
+/// 되돌리기용 백업 작업 이름(설계 §3.6) `dr-reprotect-<plan>`(63자에 맞게 계획 이름을 줄임)
+pub fn reprotect_job_name(plan: &str) -> String {
+    const HEAD: &str = "dr-reprotect-";
+    format!("{HEAD}{}", fit_name(plan, "", MAX_NAME - HEAD.len()))
+}
+
 /// 시험 VM 폴더 경로 `dr-test/<plan>`
 pub fn test_folder(plan: &str) -> String {
     format!("{TEST_FOLDER}/{plan}")

@@ -228,6 +228,28 @@ pub async fn create_link_default_rules(
     create_default_rules(&state, rules).await.map(Json)
 }
 
+/// "DR 경보 켜기"(계획 76 §3.4): 권하는 DR 규칙 둘을 한 번에 만든다 — `dr-rpo-exceeded`(복구 계획의 RPO 넘음) warning,
+/// `dr-run-failed`(DR 실행이 `failed`·`partial`로 끝남, 이벤트) warning. 링크 묶음과 같은 방식이다: 같은 이름의 규칙이
+/// 있으면 건드리지 않고(다시 불러도 같다), 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`dr-plans`를
+/// 알아야 한다(아니면 409 `cluster_upgrading`).
+#[utoipa::path(post, path = "/alert-rules/dr-defaults", tag = "alerts",
+    request_body = SdnDefaultsRequest,
+    responses((status = 200, body = SdnDefaultsResponse), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_dr_default_rules(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Json(req): Json<SdnDefaultsRequest>,
+) -> Result<Json<SdnDefaultsResponse>, ApiError> {
+    state.authorize(&principal, Action::Write, AlertRuleSpec::KIND)?;
+    audit.detail(format!(
+        "alert-rule dr-defaults -> {}",
+        req.targets.join(",")
+    ));
+    let rules = orbivisor_types::alert::dr_default_rules(&req.targets);
+    create_default_rules(&state, rules).await.map(Json)
+}
+
 /// 권하는 묶음 하나를 만든다. 대상·기능은 첫 규칙으로 한 번 본다(묶음 안의 규칙은 대상이 같고 같은 기능을 쓴다).
 async fn create_default_rules(
     state: &AppState,

@@ -147,6 +147,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/alert-rules/dr-defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * "DR 경보 켜기"(계획 76 §3.4): 권하는 DR 규칙 둘을 한 번에 만든다 — `dr-rpo-exceeded`(복구 계획의 RPO 넘음) warning,
+         *     `dr-run-failed`(DR 실행이 `failed`·`partial`로 끝남, 이벤트) warning. 링크 묶음과 같은 방식이다: 같은 이름의 규칙이
+         *     있으면 건드리지 않고(다시 불러도 같다), 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`dr-plans`를
+         *     알아야 한다(아니면 409 `cluster_upgrading`).
+         */
+        post: operations["create_dr_default_rules"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/alert-rules/link-defaults": {
         parameters: {
             query?: never;
@@ -1549,6 +1571,205 @@ export interface paths {
          *     노드마다 켤 수 있는지·빠진 플래그다(숨김 목록·기준을 지금처럼 적용). VM을 만들거나 고칠 수 있는 사용자가 읽는다.
          */
         get: operations["list_cpu_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_dr_plans"];
+        put?: never;
+        /**
+         * 복구 계획을 만든다(설계 §3.1). 이름이 겹치면 409 `name_taken`, 원격이 없으면 409 `dr_source_missing`. 첫 보호 상태를
+         *     곧 센다.
+         */
+        post: operations["create_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_dr_plan"];
+        /** 계획을 통째로 바꾼다. 도는 실행은 시작한 때의 계획 그대로 간다. 보호 상태는 리더가 곧 다시 센다. */
+        put: operations["update_plan"];
+        post?: never;
+        /**
+         * 계획과 그 실행 기록을 지운다. 도는 실행이 있으면 409 `dr_run_active`(취소하고 끝나기를 기다린다). 실행이 만든 VM·
+         *     네트워크는 그대로 둔다.
+         */
+        delete: operations["delete_plan"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/actions/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 도는 실행을 지금 단계 뒤에 멈추게 한다(진행 중인 Task는 끝까지, 시험이면 그 뒤 뒷정리). 도는 실행이 없으면 409
+         *     `dr_no_active_run`.
+         */
+        post: operations["cancel_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/actions/cleanup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 지난 시험이 남긴 시험 VM(끄고 지움)과 거품 네트워크를 지우는 실행을 시작한다. 장애 조치로 만든 VM은 건드리지 않는다.
+         *     남은 것이 없으면 409 `dr_nothing_to_clean`, 도는 실행이 있으면 409 `dr_run_active`.
+         */
+        post: operations["cleanup_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/actions/failover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 실제 장애 조치를 시작한다(설계 §3.2). `confirm`이 계획 이름과 다르면 400 `dr_confirm_mismatch`. `planned`는 운영 쪽에
+         *     닿아야 한다(409 `dr_source_unreachable`). 도는 실행이 있으면 409 `dr_run_active`, 원격이 없으면 409
+         *     `dr_source_missing`.
+         */
+        post: operations["failover_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/actions/reprotect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 되돌리기 준비(설계 §3.6): 장애 조치로 되살린 VM(라벨 `orbivisor.io/dr` = 계획)에 백업 작업 `dr-reprotect-<plan>`
+         *     (라벨로 고름, 복제 `{remote, pool}`)을 만든다. 이미 있으면 이 값으로 바꾼다(201 대신 200). 되살린 VM이 없으면 409
+         *     `dr_no_recovered_vms`. 원격·풀 검사는 백업 작업과 같다(400).
+         */
+        post: operations["reprotect_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/actions/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 시험 장애 조치를 시작한다(설계 §3.2): 운영 쪽을 건드리지 않고 시험 VM(`<vm>-drt`, 폴더 `dr-test/<plan>`)을 격리망
+         *     (`test_networks` 맵, 없는 원본 네트워크는 거품 SDN 네트워크)에서 되살린다. 도는 실행이 있으면 409 `dr_run_active`,
+         *     지난 시험의 VM·네트워크가 남았으면 409 `dr_cleanup_required`(먼저 `cleanup`), 원격이 없으면 409 `dr_source_missing`,
+         *     거품 네트워크가 필요한데 SDN이 세워지지 않았으면 400 `dr_test_network_required`.
+         */
+        post: operations["test_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 계획의 RPO/RTO 보고: VM별 보호 상태(복구 지점·나이·RPO 목표 — 지금 다시 셈), 최근 시험 셋의 RTO·결과·실패 VM,
+         *     지난 장애 조치, 도는 실행.
+         */
+        get: operations["plan_report"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 계획의 실행 기록(새것부터, 계획마다 최근 20개) */
+        get: operations["list_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-runs/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 실행 하나(단계마다 그룹·VM·복구 지점·단계·새 VM·Task·오류) */
+        get: operations["get_run"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6170,6 +6391,8 @@ export interface components {
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
         };
+        /** @enum {string} */
+        BubbleState: "pending" | "ready" | "removed" | "failed";
         /** @description 라이브 복원 취소 본문 */
         CancelLiveRestoreRequest: {
             /** @description 게스트가 라이브 복원 뒤 쓴 것을 버린다는 확인(참이어야 한다) */
@@ -7463,6 +7686,43 @@ export interface components {
                 weight?: number;
             };
         };
+        CreateRequest_RecoveryPlanSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description 복구 계획(DR 쪽 리소스). 운영 클러스터(`source` 원격)의 VM을 그룹 차례로 이 클러스터에 되살린다. */
+            spec: {
+                /** @description 장애 조치로 만든 VM을 둘 폴더(id나 경로). 없으면 백업한 VM의 폴더(복원 규칙)다. */
+                folder?: string;
+                /** @description 차례대로 되살리는 그룹(1~32) */
+                groups: components["schemas"]["DrGroup"][];
+                /** @description 원본 네트워크 → DR 네트워크. 없는 이름은 같은 이름이다. */
+                networks?: {
+                    [key: string]: string;
+                };
+                /** @description VM이 실패하거나 시간을 넘기면 계속할지(기본) 멈출지 */
+                on_timeout?: components["schemas"]["OnTimeout"];
+                /** @description 기본 복원 풀(VM마다 덮어씀) */
+                pool: string;
+                /**
+                 * Format: int64
+                 * @description 복구 지점이 이보다 오래되면 경보 `dr_rpo_exceeded`(초, 0 = 끔)
+                 * @default 86400
+                 */
+                rpo_target_secs: number;
+                /** @description 원본 보안 그룹 → DR 보안 그룹. 없는 이름은 같은 이름이다. */
+                security_groups?: {
+                    [key: string]: string;
+                };
+                /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
+                source: string;
+                /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
+                test_networks?: {
+                    [key: string]: string;
+                };
+            };
+        };
         CreateRequest_SecurityGroupSpec: {
             labels?: {
                 [key: string]: string;
@@ -7816,6 +8076,231 @@ export interface components {
             paths: components["schemas"]["EntryPath"][];
             volume: string;
         };
+        /** @description 시험의 거품 SDN 네트워크(라우터·업링크 없음, `like` 네트워크의 CIDR 그대로) */
+        DrBubble: {
+            error?: string;
+            /** @description CIDR을 본뜰 DR 네트워크(원본 네트워크의 `networks` 맵 값, 없으면 같은 이름) */
+            like?: string;
+            /** @description 거품 네트워크 이름 `drt-<plan>-<n>` */
+            name: string;
+            /** @description 원본 네트워크 이름(뒷정리는 비움) */
+            source?: string;
+            state: components["schemas"]["BubbleState"];
+        };
+        /** @description 뒷정리 대상: 시험 실행이 만든 VM과 거품 네트워크([`DrRunStatus::cleanup_target`]) */
+        DrCleanupTarget: {
+            networks?: string[];
+            /**
+             * Format: uuid
+             * @description 시험 실행 id
+             */
+            run: string;
+            vms?: string[];
+        };
+        /** @description 부팅 그룹 하나. 그룹 안의 VM은 함께 되살리고, 모두 끝나면(`ready`·`failed`·`timed_out`) `delay_secs` 뒤 다음 그룹이다. */
+        DrGroup: {
+            /**
+             * Format: int32
+             * @description 이 그룹이 끝난 뒤 다음 그룹 앞 쉼(초)
+             * @default 0
+             */
+            delay_secs: number;
+            name: string;
+            /**
+             * Format: int32
+             * @description 시작 Task가 끝난 뒤 이만큼(초) 지나도 준비되지 않으면 `timed_out`
+             * @default 600
+             */
+            timeout_secs: number;
+            vms: components["schemas"]["DrVm"][];
+            /** @description VM이 준비됐다고 보는 때 */
+            wait?: components["schemas"]["DrWait"];
+        };
+        /** @description NIC 하나의 주소 규칙: 고정 주소(`address`, IPv4나 IPv6 — 주소 체계마다 하나) 또는 `dhcp: true`(IPv4 DHCP) */
+        DrIpRule: {
+            /** @description `주소/접두 길이`(예: `10.20.0.5/24`) */
+            address?: string;
+            dhcp?: boolean;
+            /** @description DNS 서버(VM 전체로 모아 cloud-init `dns.servers`, 겹치지 않게 3개까지) */
+            dns?: string[];
+            gateway?: string;
+            /**
+             * Format: int32
+             * @description NIC 순번(0부터). 되살린 VM에 그 NIC가 있는지는 복원 때 본다.
+             */
+            nic: number;
+        };
+        /** @enum {string} */
+        DrPhase: "pending" | "preparing" | "restoring" | "starting" | "waiting" | "ready" | "failed" | "timed_out" | "skipped" | "deleting" | "deleted";
+        /** @description 계획된 이전에서 VM 하나의 운영 쪽 준비 */
+        DrPrepare: {
+            /**
+             * Format: int64
+             * @description 지금 단계의 원격 부름을 보낸 시각
+             */
+            requested_at?: number;
+            /** @description 운영 쪽에 뜬 마지막 백업 */
+            source_backup?: string;
+            /** Format: uuid */
+            source_backup_id?: string;
+            stage: components["schemas"]["PrepareStage"];
+        };
+        /** @description `GET /dr-plans/{key}/report`(설계 §3.5) */
+        DrReport: {
+            /**
+             * Format: int64
+             * @description 보고를 센 시각(유닉스 초) — 아래 나이는 이때의 것이다.
+             */
+            at: number;
+            /** @description 마지막으로 끝난 장애 조치 */
+            last_failover?: components["schemas"]["DrRunSummary"];
+            plan: string;
+            /** Format: uuid */
+            plan_id: string;
+            protected: number;
+            /** @description VM마다의 복구 지점(그룹 차례, 지금 다시 셈) */
+            protection: components["schemas"]["VmProtection"][];
+            /** Format: int64 */
+            rpo_target_secs: number;
+            /** @description 지금 도는 실행 */
+            running?: components["schemas"]["DrRunSummary"];
+            /** @description 운영 클러스터(원격 이름) */
+            source: string;
+            /** @description 원격이 등록돼 있는지(없으면 모든 VM이 복구 지점 없음) */
+            source_registered: boolean;
+            /** @description 최근 끝난 시험(새것부터 셋까지) */
+            tests: components["schemas"]["DrRunSummary"][];
+            /** @description 계획의 VM 수와 그 가운데 RPO를 지키는(`ok`) 수 */
+            total: number;
+        };
+        /** @enum {string} */
+        DrRunKind: "test" | "failover-planned" | "failover-disaster" | "cleanup";
+        /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
+        DrRunSpec: {
+            /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
+            cleanup?: components["schemas"]["DrCleanupTarget"];
+            kind: components["schemas"]["DrRunKind"];
+            /**
+             * Format: int32
+             * @description 동시에 진행하는 복원·시작 수(설정, 노드마다는 [`PER_NODE_PARALLEL`])
+             * @default 4
+             */
+            max_parallel: number;
+            /**
+             * Format: uuid
+             * @description 계획 id
+             */
+            plan: string;
+            /** @description 시작한 때의 계획 이름 */
+            plan_name: string;
+            /** @description 시작한 때의 계획(실행 중에 계획을 바꿔도 이 실행은 그대로 간다) */
+            plan_spec: components["schemas"]["RecoveryPlanSpec"];
+        };
+        /** @enum {string} */
+        DrRunState: "running" | "succeeded" | "partial" | "failed" | "cancelled";
+        DrRunStatus: {
+            bubbles?: components["schemas"]["DrBubble"][];
+            /** @description 취소를 받음(API가 적는다): 진행 중인 Task는 끝까지, 새 단계는 없다. */
+            cancel_requested?: boolean;
+            /**
+             * Format: int64
+             * @description 앞 그룹이 끝나 쉬는 중이면 다음 그룹을 시작할 시각
+             */
+            delay_until?: number;
+            /** @description 실행 전체의 실패 까닭(거품 네트워크 등) */
+            error?: string;
+            /** Format: int64 */
+            finished_at?: number;
+            /**
+             * Format: int32
+             * @description 지금 그룹 순번
+             */
+            group?: number;
+            /**
+             * Format: int64
+             * @description 계획된 이전: 시작부터 운영 쪽 정지·마지막 복제가 끝날 때까지(초, RTO에 든다)
+             */
+            prepare_secs?: number;
+            /**
+             * Format: int64
+             * @description 시작부터 마지막 `ready`까지(초). `ready`가 없으면 없다.
+             */
+            rto_secs?: number;
+            /**
+             * Format: int64
+             * @description 시작한 시각(유닉스 초)
+             * @default 0
+             */
+            started_at: number;
+            /** @default running */
+            state: components["schemas"]["DrRunState"];
+            steps?: components["schemas"]["DrStep"][];
+            /** @description `on_timeout: stop`이나 거품 네트워크 실패로 남은 VM을 건너뛰는 중 */
+            stopping?: boolean;
+        };
+        /** @description 실행 하나의 요약(보고) */
+        DrRunSummary: {
+            error?: string;
+            /** @description `failed`·`timed_out`으로 끝난 VM(원본 이름) */
+            failed_vms: string[];
+            /** Format: int64 */
+            finished_at?: number;
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["DrRunKind"];
+            name: string;
+            /** Format: int64 */
+            prepare_secs?: number;
+            /** Format: int64 */
+            rto_secs?: number;
+            /** Format: int64 */
+            started_at: number;
+            state: components["schemas"]["DrRunState"];
+        };
+        /** @description VM 하나의 진행 */
+        DrStep: {
+            /**
+             * Format: int64
+             * @description 지금 단계에 든 시각(유닉스 초). `waiting`은 여기서부터 `timeout_secs`, `ready`는 RTO의 끝이다.
+             */
+            at: number;
+            /** @description 복구 지점(DR 사본 이름) */
+            backup?: string;
+            /** Format: uuid */
+            backup_id?: string;
+            error?: string;
+            /** @description 그룹 이름(뒷정리는 비움) */
+            group?: string;
+            /** @description 되살린(뒷정리는 지울) VM 이름 */
+            new_vm?: string;
+            /** @description 복원·시작하는 노드(계획의 `node`, 없으면 되살린 VM의 노드를 보고 앎) */
+            node?: string;
+            phase: components["schemas"]["DrPhase"];
+            /** @description 계획된 이전의 운영 쪽 준비 */
+            prepare?: components["schemas"]["DrPrepare"];
+            /**
+             * Format: uuid
+             * @description 지금 단계의 Task(복원·시작·지우기). 있으면 다시 내지 않는다.
+             */
+            task?: string;
+            /** @description 원본 VM 이름(뒷정리는 지울 VM 이름) */
+            vm: string;
+        };
+        /** @description 계획의 VM 하나(원본 VM 이름) */
+        DrVm: {
+            /** @description 되살린 VM의 cloud-init 주소(NIC마다). 비면 백업의 cloud-init 그대로 */
+            ip?: components["schemas"]["DrIpRule"][];
+            /** @description 라이브 복원(저장소 백업만 — 디스크를 다 받기 전에 켬) */
+            live?: boolean;
+            /** @description 복원 노드(이름). 없으면 복원 API가 고른다. */
+            node?: string;
+            /** @description 복원 풀. 없으면 계획의 `pool` */
+            pool?: string;
+            /** @description 원본 VM 이름(사본의 `vm_name`) */
+            vm: string;
+        };
+        /** @enum {string} */
+        DrWait: "running" | "guest" | "ip";
         DriftItem: {
             /** @description 그 칸을 처음 바꾼 이력 줄 */
             by?: components["schemas"]["HistoryRef"];
@@ -8017,6 +8502,14 @@ export interface components {
         ExternalGroup: {
             group: string;
             realm: string;
+        };
+        /** @enum {string} */
+        FailoverMode: "planned" | "disaster";
+        /** @description `POST /dr-plans/{key}/actions/failover` 본문 */
+        FailoverRequest: {
+            /** @description 계획 이름(실수로 누르지 않게 그대로 다시 친다) */
+            confirm: string;
+            mode: components["schemas"]["FailoverMode"];
         };
         /**
          * @description 장애의 무게
@@ -9642,6 +10135,19 @@ export interface components {
             /** @description 마지막으로 본 역할(업링크·underlay·service) */
             role: components["schemas"]["PortRole"];
         };
+        /** @description 마지막 시험 장애 조치 */
+        LastTest: {
+            /**
+             * Format: int64
+             * @description 끝난 시각(유닉스 초)
+             */
+            at: number;
+            result: components["schemas"]["DrRunState"];
+            /** Format: int64 */
+            rto_secs?: number;
+            /** Format: uuid */
+            run: string;
+        };
         /** @description 바깥 VIP */
         LbExternal: {
             /**
@@ -10434,6 +10940,85 @@ export interface components {
             revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_DrRunSpec_DrRunStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
+                spec: {
+                    /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
+                    cleanup?: components["schemas"]["DrCleanupTarget"];
+                    kind: components["schemas"]["DrRunKind"];
+                    /**
+                     * Format: int32
+                     * @description 동시에 진행하는 복원·시작 수(설정, 노드마다는 [`PER_NODE_PARALLEL`])
+                     * @default 4
+                     */
+                    max_parallel: number;
+                    /**
+                     * Format: uuid
+                     * @description 계획 id
+                     */
+                    plan: string;
+                    /** @description 시작한 때의 계획 이름 */
+                    plan_name: string;
+                    /** @description 시작한 때의 계획(실행 중에 계획을 바꿔도 이 실행은 그대로 간다) */
+                    plan_spec: components["schemas"]["RecoveryPlanSpec"];
+                };
+                status: {
+                    bubbles?: components["schemas"]["DrBubble"][];
+                    /** @description 취소를 받음(API가 적는다): 진행 중인 Task는 끝까지, 새 단계는 없다. */
+                    cancel_requested?: boolean;
+                    /**
+                     * Format: int64
+                     * @description 앞 그룹이 끝나 쉬는 중이면 다음 그룹을 시작할 시각
+                     */
+                    delay_until?: number;
+                    /** @description 실행 전체의 실패 까닭(거품 네트워크 등) */
+                    error?: string;
+                    /** Format: int64 */
+                    finished_at?: number;
+                    /**
+                     * Format: int32
+                     * @description 지금 그룹 순번
+                     */
+                    group?: number;
+                    /**
+                     * Format: int64
+                     * @description 계획된 이전: 시작부터 운영 쪽 정지·마지막 복제가 끝날 때까지(초, RTO에 든다)
+                     */
+                    prepare_secs?: number;
+                    /**
+                     * Format: int64
+                     * @description 시작부터 마지막 `ready`까지(초). `ready`가 없으면 없다.
+                     */
+                    rto_secs?: number;
+                    /**
+                     * Format: int64
+                     * @description 시작한 시각(유닉스 초)
+                     * @default 0
+                     */
+                    started_at: number;
+                    /** @default running */
+                    state: components["schemas"]["DrRunState"];
+                    steps?: components["schemas"]["DrStep"][];
+                    /** @description `on_timeout: stop`이나 거품 네트워크 실패로 남은 VM을 건너뛰는 중 */
+                    stopping?: boolean;
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_FolderSpec_FolderStatus: {
             items: {
                 /** Format: uuid */
@@ -10850,6 +11435,71 @@ export interface components {
                     weight?: number;
                 };
                 status: Record<string, never>;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_RecoveryPlanSpec_RecoveryPlanStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 복구 계획(DR 쪽 리소스). 운영 클러스터(`source` 원격)의 VM을 그룹 차례로 이 클러스터에 되살린다. */
+                spec: {
+                    /** @description 장애 조치로 만든 VM을 둘 폴더(id나 경로). 없으면 백업한 VM의 폴더(복원 규칙)다. */
+                    folder?: string;
+                    /** @description 차례대로 되살리는 그룹(1~32) */
+                    groups: components["schemas"]["DrGroup"][];
+                    /** @description 원본 네트워크 → DR 네트워크. 없는 이름은 같은 이름이다. */
+                    networks?: {
+                        [key: string]: string;
+                    };
+                    /** @description VM이 실패하거나 시간을 넘기면 계속할지(기본) 멈출지 */
+                    on_timeout?: components["schemas"]["OnTimeout"];
+                    /** @description 기본 복원 풀(VM마다 덮어씀) */
+                    pool: string;
+                    /**
+                     * Format: int64
+                     * @description 복구 지점이 이보다 오래되면 경보 `dr_rpo_exceeded`(초, 0 = 끔)
+                     * @default 86400
+                     */
+                    rpo_target_secs: number;
+                    /** @description 원본 보안 그룹 → DR 보안 그룹. 없는 이름은 같은 이름이다. */
+                    security_groups?: {
+                        [key: string]: string;
+                    };
+                    /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
+                    source: string;
+                    /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
+                    test_networks?: {
+                        [key: string]: string;
+                    };
+                };
+                /** @description 리더가 1분마다 다시 세는 보호 상태와 마지막 시험·지금 실행 */
+                status: {
+                    /**
+                     * Format: int64
+                     * @description 보호 상태를 센 시각(유닉스 초)
+                     */
+                    checked_at?: number;
+                    last_test?: components["schemas"]["LastTest"];
+                    /** @description 계획의 VM마다(그룹 차례) */
+                    protection?: components["schemas"]["VmProtection"][];
+                    /**
+                     * Format: uuid
+                     * @description 지금 실행(`DrRun` id)
+                     */
+                    run?: string;
+                };
             }[];
             /** Format: int64 */
             revision: number;
@@ -13357,6 +14007,8 @@ export interface components {
             timeout_secs: number;
             username_claim: string;
         };
+        /** @enum {string} */
+        OnTimeout: "continue" | "stop";
         OsdReport: {
             /** @description 장치 클래스(`hdd`, `ssd`, `nvme`) */
             class?: string;
@@ -13970,6 +14622,8 @@ export interface components {
             /** @description 만들 VM의 스펙(우리 쪽 검사를 통과했을 때 — 채운 머신) */
             spec_preview?: components["schemas"]["VmSpec"];
         };
+        /** @enum {string} */
+        PrepareStage: "shutdown" | "stop" | "backup" | "replicate" | "done";
         /** @description 바뀌기 전 기준 */
         PreviousBaseline: {
             flags?: {
@@ -14026,6 +14680,8 @@ export interface components {
         };
         /** @enum {string} */
         PropagationCheck: "authoritative" | "skip";
+        /** @enum {string} */
+        ProtectionIssue: "no-recovery-point" | "over-rpo";
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         /** @description 공급자 네트워크가 붙는 물리 망(계획 66 §8) */
@@ -14186,6 +14842,53 @@ export interface components {
         /** @description 복구 키 */
         RecoveryKey: {
             recovery_key: string;
+        };
+        /** @description 복구 계획(DR 쪽 리소스). 운영 클러스터(`source` 원격)의 VM을 그룹 차례로 이 클러스터에 되살린다. */
+        RecoveryPlanSpec: {
+            /** @description 장애 조치로 만든 VM을 둘 폴더(id나 경로). 없으면 백업한 VM의 폴더(복원 규칙)다. */
+            folder?: string;
+            /** @description 차례대로 되살리는 그룹(1~32) */
+            groups: components["schemas"]["DrGroup"][];
+            /** @description 원본 네트워크 → DR 네트워크. 없는 이름은 같은 이름이다. */
+            networks?: {
+                [key: string]: string;
+            };
+            /** @description VM이 실패하거나 시간을 넘기면 계속할지(기본) 멈출지 */
+            on_timeout?: components["schemas"]["OnTimeout"];
+            /** @description 기본 복원 풀(VM마다 덮어씀) */
+            pool: string;
+            /**
+             * Format: int64
+             * @description 복구 지점이 이보다 오래되면 경보 `dr_rpo_exceeded`(초, 0 = 끔)
+             * @default 86400
+             */
+            rpo_target_secs: number;
+            /** @description 원본 보안 그룹 → DR 보안 그룹. 없는 이름은 같은 이름이다. */
+            security_groups?: {
+                [key: string]: string;
+            };
+            /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
+            source: string;
+            /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
+            test_networks?: {
+                [key: string]: string;
+            };
+        };
+        /** @description 리더가 1분마다 다시 세는 보호 상태와 마지막 시험·지금 실행 */
+        RecoveryPlanStatus: {
+            /**
+             * Format: int64
+             * @description 보호 상태를 센 시각(유닉스 초)
+             */
+            checked_at?: number;
+            last_test?: components["schemas"]["LastTest"];
+            /** @description 계획의 VM마다(그룹 차례) */
+            protection?: components["schemas"]["VmProtection"][];
+            /**
+             * Format: uuid
+             * @description 지금 실행(`DrRun` id)
+             */
+            run?: string;
         };
         /** @description Redfish BMC. Basic 인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`로 확인한다. */
         RedfishFence: {
@@ -14443,6 +15146,17 @@ export interface components {
              * @default *\/15
              */
             schedule: string;
+        };
+        /** @description `POST /dr-plans/{key}/actions/reprotect` 본문(설계 §3.6) */
+        ReprotectRequest: {
+            /** @description 이 클러스터에서 백업을 쓸 백업 풀. 없으면 계획의 `pool`(백업 풀이어야 한다) */
+            backup_pool?: string;
+            keep?: components["schemas"]["Keep"];
+            /** @description 그 원격의 백업 풀 */
+            pool: string;
+            /** @description 복제를 받을 원격(보통 되살아난 운영 클러스터) */
+            remote: string;
+            schedule: components["schemas"]["JobSchedule"];
         };
         /** @description `PublicKeyCredentialRequestOptions`(이진 값은 base64url) */
         RequestOptions: {
@@ -15030,6 +15744,81 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_DrRunSpec_DrRunStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
+            spec: {
+                /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
+                cleanup?: components["schemas"]["DrCleanupTarget"];
+                kind: components["schemas"]["DrRunKind"];
+                /**
+                 * Format: int32
+                 * @description 동시에 진행하는 복원·시작 수(설정, 노드마다는 [`PER_NODE_PARALLEL`])
+                 * @default 4
+                 */
+                max_parallel: number;
+                /**
+                 * Format: uuid
+                 * @description 계획 id
+                 */
+                plan: string;
+                /** @description 시작한 때의 계획 이름 */
+                plan_name: string;
+                /** @description 시작한 때의 계획(실행 중에 계획을 바꿔도 이 실행은 그대로 간다) */
+                plan_spec: components["schemas"]["RecoveryPlanSpec"];
+            };
+            status: {
+                bubbles?: components["schemas"]["DrBubble"][];
+                /** @description 취소를 받음(API가 적는다): 진행 중인 Task는 끝까지, 새 단계는 없다. */
+                cancel_requested?: boolean;
+                /**
+                 * Format: int64
+                 * @description 앞 그룹이 끝나 쉬는 중이면 다음 그룹을 시작할 시각
+                 */
+                delay_until?: number;
+                /** @description 실행 전체의 실패 까닭(거품 네트워크 등) */
+                error?: string;
+                /** Format: int64 */
+                finished_at?: number;
+                /**
+                 * Format: int32
+                 * @description 지금 그룹 순번
+                 */
+                group?: number;
+                /**
+                 * Format: int64
+                 * @description 계획된 이전: 시작부터 운영 쪽 정지·마지막 복제가 끝날 때까지(초, RTO에 든다)
+                 */
+                prepare_secs?: number;
+                /**
+                 * Format: int64
+                 * @description 시작부터 마지막 `ready`까지(초). `ready`가 없으면 없다.
+                 */
+                rto_secs?: number;
+                /**
+                 * Format: int64
+                 * @description 시작한 시각(유닉스 초)
+                 * @default 0
+                 */
+                started_at: number;
+                /** @default running */
+                state: components["schemas"]["DrRunState"];
+                steps?: components["schemas"]["DrStep"][];
+                /** @description `on_timeout: stop`이나 거품 네트워크 실패로 남은 VM을 건너뛰는 중 */
+                stopping?: boolean;
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_FloatingIpSpec_FloatingIpStatus: {
             /** Format: uuid */
             id: string;
@@ -15555,6 +16344,67 @@ export interface components {
                 weight?: number;
             };
             status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_RecoveryPlanSpec_RecoveryPlanStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 복구 계획(DR 쪽 리소스). 운영 클러스터(`source` 원격)의 VM을 그룹 차례로 이 클러스터에 되살린다. */
+            spec: {
+                /** @description 장애 조치로 만든 VM을 둘 폴더(id나 경로). 없으면 백업한 VM의 폴더(복원 규칙)다. */
+                folder?: string;
+                /** @description 차례대로 되살리는 그룹(1~32) */
+                groups: components["schemas"]["DrGroup"][];
+                /** @description 원본 네트워크 → DR 네트워크. 없는 이름은 같은 이름이다. */
+                networks?: {
+                    [key: string]: string;
+                };
+                /** @description VM이 실패하거나 시간을 넘기면 계속할지(기본) 멈출지 */
+                on_timeout?: components["schemas"]["OnTimeout"];
+                /** @description 기본 복원 풀(VM마다 덮어씀) */
+                pool: string;
+                /**
+                 * Format: int64
+                 * @description 복구 지점이 이보다 오래되면 경보 `dr_rpo_exceeded`(초, 0 = 끔)
+                 * @default 86400
+                 */
+                rpo_target_secs: number;
+                /** @description 원본 보안 그룹 → DR 보안 그룹. 없는 이름은 같은 이름이다. */
+                security_groups?: {
+                    [key: string]: string;
+                };
+                /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
+                source: string;
+                /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
+                test_networks?: {
+                    [key: string]: string;
+                };
+            };
+            /** @description 리더가 1분마다 다시 세는 보호 상태와 마지막 시험·지금 실행 */
+            status: {
+                /**
+                 * Format: int64
+                 * @description 보호 상태를 센 시각(유닉스 초)
+                 */
+                checked_at?: number;
+                last_test?: components["schemas"]["LastTest"];
+                /** @description 계획의 VM마다(그룹 차례) */
+                protection?: components["schemas"]["VmProtection"][];
+                /**
+                 * Format: uuid
+                 * @description 지금 실행(`DrRun` id)
+                 */
+                run?: string;
+            };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_RouterSpec_RouterStatus: {
@@ -18516,6 +19366,46 @@ export interface components {
                 weight?: number;
             };
         };
+        UpdateRequest_RecoveryPlanSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
+            labels?: {
+                [key: string]: string;
+            };
+            /** @description 복구 계획(DR 쪽 리소스). 운영 클러스터(`source` 원격)의 VM을 그룹 차례로 이 클러스터에 되살린다. */
+            spec: {
+                /** @description 장애 조치로 만든 VM을 둘 폴더(id나 경로). 없으면 백업한 VM의 폴더(복원 규칙)다. */
+                folder?: string;
+                /** @description 차례대로 되살리는 그룹(1~32) */
+                groups: components["schemas"]["DrGroup"][];
+                /** @description 원본 네트워크 → DR 네트워크. 없는 이름은 같은 이름이다. */
+                networks?: {
+                    [key: string]: string;
+                };
+                /** @description VM이 실패하거나 시간을 넘기면 계속할지(기본) 멈출지 */
+                on_timeout?: components["schemas"]["OnTimeout"];
+                /** @description 기본 복원 풀(VM마다 덮어씀) */
+                pool: string;
+                /**
+                 * Format: int64
+                 * @description 복구 지점이 이보다 오래되면 경보 `dr_rpo_exceeded`(초, 0 = 끔)
+                 * @default 86400
+                 */
+                rpo_target_secs: number;
+                /** @description 원본 보안 그룹 → DR 보안 그룹. 없는 이름은 같은 이름이다. */
+                security_groups?: {
+                    [key: string]: string;
+                };
+                /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
+                source: string;
+                /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
+                test_networks?: {
+                    [key: string]: string;
+                };
+            };
+        };
         UpdateRequest_VmSpec: {
             /**
              * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
@@ -18987,6 +19877,25 @@ export interface components {
             siblings: components["schemas"]["CpuSet"];
             /** @description 자리마다 pCPU(공유 VM은 빔) */
             vcpus: number[];
+            vm: string;
+        };
+        /** @description VM 하나의 복구 지점 */
+        VmProtection: {
+            /** Format: int64 */
+            age_secs?: number;
+            /** @description 복구 지점(DR 사본 이름) */
+            backup?: string;
+            /** Format: uuid */
+            backup_id?: string;
+            /** @description `ok`가 아닌 까닭 */
+            issue?: components["schemas"]["ProtectionIssue"];
+            ok: boolean;
+            /**
+             * Format: int64
+             * @description 복구 지점의 시각(원본 백업을 만든 때, 유닉스 초)
+             */
+            point_at?: number;
+            /** @description 원본 VM 이름 */
             vm: string;
         };
         VmReplicateRequest: {
@@ -20401,6 +21310,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_dr_default_rules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnDefaultsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SdnDefaultsResponse"];
                 };
             };
             "4XX": {
@@ -23050,6 +23990,417 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CpuModels"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_dr_plans: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_RecoveryPlanSpec_RecoveryPlanStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_RecoveryPlanSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_RecoveryPlanSpec_RecoveryPlanStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_dr_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_RecoveryPlanSpec_RecoveryPlanStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_plan: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRequest_RecoveryPlanSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_RecoveryPlanSpec_RecoveryPlanStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_plan: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_DrRunSpec_DrRunStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cleanup_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_DrRunSpec_DrRunStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    failover_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FailoverRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_DrRunSpec_DrRunStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reprotect_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReprotectRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupJobSpec_BackupJobStatus"];
+                };
+            };
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupJobSpec_BackupJobStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    test_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_DrRunSpec_DrRunStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    plan_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DrReport"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_runs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_DrRunSpec_DrRunStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_DrRunSpec_DrRunStatus"];
                 };
             };
             "4XX": {

@@ -10,6 +10,7 @@ use orbivisor_cluster::types::Rejection;
 use orbivisor_cluster::{Cluster, ClusterError, Typed};
 use orbivisor_types::alert::{AlertRuleSpec, AlertRuleStatus};
 use orbivisor_types::backup_job::{BackupJobSpec, BackupJobStatus};
+use orbivisor_types::dr::{RecoveryPlanSpec, RecoveryPlanStatus};
 use orbivisor_types::ha_check::{HaCheckSpec, HaCheckStatus};
 use orbivisor_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
 use orbivisor_types::node::{Node, NodeRole, NodeSpec, NodeStatus};
@@ -143,7 +144,8 @@ root_kinds!(
     HaGroupSpec,
     HaCheckSpec,
     AlertRuleSpec,
-    PlacementRuleSpec
+    PlacementRuleSpec,
+    RecoveryPlanSpec
 );
 
 macro_rules! in_folder {
@@ -400,6 +402,16 @@ list_and_get!(
     "/vmware-migrations",
     "/vmware-migrations/{key}",
     "vmware"
+);
+// DR 복구 계획(계획 76 — 루트 종류, `cluster.read`)
+list_and_get!(
+    list_dr_plans,
+    get_dr_plan,
+    RecoveryPlanSpec,
+    RecoveryPlanStatus,
+    "/dr-plans",
+    "/dr-plans/{key}",
+    "dr"
 );
 list_and_get!(
     list_ha_groups,

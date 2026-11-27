@@ -534,6 +534,32 @@ fn test_names_fit_the_name_rules() {
     assert_eq!(test_vm_name(&long), test_vm_name(&long));
 }
 
+/// 3단계: 실행 이름과 되돌리기 백업 작업 이름도 이름 규칙에 맞게 줄인다.
+#[test]
+fn run_and_reprotect_names_fit_the_name_rules() {
+    assert_eq!(
+        run_name("web-tier", "test", 1764200000),
+        "web-tier-test-1764200000"
+    );
+    assert_eq!(reprotect_job_name("web-tier"), "dr-reprotect-web-tier");
+    let long = "a".repeat(63);
+    let long2 = format!("{}b", "a".repeat(62));
+    for name in [long.as_str(), long2.as_str(), &"x".repeat(50)] {
+        let r = run_name(name, "failover", 1764200000);
+        assert!(validate_name(&r).is_ok(), "{r}");
+        assert!(r.ends_with("-failover-1764200000"), "{r}");
+        let j = reprotect_job_name(name);
+        assert!(validate_name(&j).is_ok(), "{j}");
+        assert!(j.starts_with("dr-reprotect-"), "{j}");
+    }
+    assert_eq!(
+        reprotect_job_name(&"x".repeat(50)),
+        format!("dr-reprotect-{}", "x".repeat(50))
+    );
+    assert_ne!(reprotect_job_name(&long), reprotect_job_name(&long2));
+    assert_ne!(run_name(&long, "test", 1), run_name(&long2, "test", 1));
+}
+
 // ---- 상태 기계 ----
 
 /// 가짜 클러스터: 할 일을 받아 Task를 만들고, 시험이 Task를 끝낸다.

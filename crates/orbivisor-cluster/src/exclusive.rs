@@ -24,6 +24,7 @@ pub(crate) const SHARED_IP_KINDS: [Kind; 4] =
 /// 하나).
 /// 계획 72: VMware 이전 항목의 원본 VM `vmware-vm`(`instance_uuid` — 한 원본 VM은 끝나지 않은 항목 하나에만. 끝난 항목
 /// `finalized`·`reverted`·`cancelled`는 잡지 않아 같은 VM을 새 계획에 넣을 수 있다).
+/// 계획 76: 도는(`running`) DR 실행의 계획 `dr-run`(계획 id — 한 복구 계획에 실행 하나).
 pub(crate) fn exclusive_values(
     kind: Kind,
     spec: &Value,
@@ -146,6 +147,18 @@ pub(crate) fn exclusive_values(
                 .into_iter()
                 .collect();
         }
+        Kind::DrRun => {
+            // 계획 76: 계획 하나에 도는 실행 하나(시험·장애 조치·뒷정리 모두). 끝난 실행은 잡지 않는다. 상태가 없으면
+            // 막 만든 실행(`running`)이다.
+            if status["state"].as_str().is_some_and(|s| s != "running") {
+                return Vec::new();
+            }
+            return spec["plan"]
+                .as_str()
+                .map(|p| ("dr-run", p.to_string()))
+                .into_iter()
+                .collect();
+        }
         Kind::Vm => {}
         _ => return Vec::new(),
     }
@@ -220,6 +233,25 @@ mod tests {
         for kind in [Kind::VmwareSource, Kind::VmwareMigration, Kind::VmExport] {
             assert!(values(kind, &item).is_empty(), "{kind:?}");
         }
+    }
+
+    /// 계획 76: 한 복구 계획에는 도는 실행(`running`) 하나만. 끝난 실행은 잡지 않는다.
+    #[test]
+    fn extracts_the_plan_of_running_dr_runs() {
+        let run = json!({ "plan": "0190a0b0-0000-7000-8000-000000000001", "plan_name": "web", "kind": "test" });
+        let want = vec![("dr-run", "0190a0b0-0000-7000-8000-000000000001".to_string())];
+        assert_eq!(values(Kind::DrRun, &run), want);
+        assert_eq!(
+            exclusive_values(Kind::DrRun, &run, &json!({ "state": "running" })),
+            want
+        );
+        for state in ["succeeded", "partial", "failed", "cancelled"] {
+            assert!(
+                exclusive_values(Kind::DrRun, &run, &json!({ "state": state })).is_empty(),
+                "{state}"
+            );
+        }
+        assert!(values(Kind::RecoveryPlan, &run).is_empty());
     }
 
     /// 계획 68: 백업 저장소 하나는 한 곳(풀 또는 S3 버킷·접두사)에만 둔다.

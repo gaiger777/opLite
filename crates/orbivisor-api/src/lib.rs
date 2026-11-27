@@ -24,6 +24,7 @@ mod cpu;
 mod cpu_baseline;
 mod dashboard;
 mod declarative;
+pub mod dr;
 mod drain;
 mod drift;
 pub mod error;
@@ -120,6 +121,7 @@ pub use balancer::{Balancer, BalancerConfig};
 pub use ceph::CephPeerSource;
 pub use ceph_agent::CephAgent;
 pub use cpu::CpuRefresher;
+pub use dr::{DrProtection, DrProtectionConfig};
 pub use drain::start_drain;
 pub use drift::{DriftChecker, DriftCheckerConfig};
 pub use file_restore::FileRestoreSessions;
@@ -253,6 +255,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::list_alert_rules, alerts::create_alert_rule))
         .routes(routes!(alerts::create_sdn_default_rules))
         .routes(routes!(alerts::create_link_default_rules))
+        .routes(routes!(alerts::create_dr_default_rules))
         .routes(routes!(
             r::get_alert_rule,
             alerts::update_alert_rule,
@@ -519,6 +522,17 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vmware_migrations::cutover_item))
         .routes(routes!(vmware_migrations::revert_item))
         .routes(routes!(vmware_migrations::finalize_item))
+        // DR 오케스트레이션(계획 76 §3)
+        .routes(routes!(r::list_dr_plans, dr::create_plan))
+        .routes(routes!(r::get_dr_plan, dr::update_plan, dr::delete_plan))
+        .routes(routes!(dr::plan_report))
+        .routes(routes!(dr::list_runs))
+        .routes(routes!(dr::get_run))
+        .routes(routes!(dr::test_plan))
+        .routes(routes!(dr::failover_plan))
+        .routes(routes!(dr::cleanup_plan))
+        .routes(routes!(dr::cancel_plan))
+        .routes(routes!(dr::reprotect_plan))
         .routes(routes!(vm_exports::export_vm))
         .routes(routes!(r::list_vm_exports))
         .routes(routes!(r::get_vm_export, vm_exports::delete_export))

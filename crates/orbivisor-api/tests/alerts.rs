@@ -2144,3 +2144,249 @@ async fn link_rules_wait_for_every_node_to_know_link_alerts() {
         .await;
     assert_eq!(got.0, StatusCode::FORBIDDEN);
 }
+
+// ---- DR 경보(계획 76 §3.4) ----
+
+/// 이 노드가 `dr-plans`를 알린다(4단계가 `FEATURES`에 넣기 전까지 시험이 켠다).
+async fn announce_dr(env: &Env) {
+    let mut n = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    n.status
+        .features
+        .push(orbivisor_types::node::DR_PLANS.into());
+    env.cluster
+        .update_status::<NodeSpec>(n.id, &n.status)
+        .await
+        .unwrap();
+}
+
+/// 저장소에 바로 넣은 복구 계획(보호 상태 `protection`)
+async fn dr_plan(env: &Env, name: &str, rpo: u64, protection: Value) -> Uuid {
+    use orbivisor_types::dr::RecoveryPlanSpec;
+    let spec: RecoveryPlanSpec = serde_json::from_value(json!({
+        "source": "prod", "pool": "dr", "rpo_target_secs": rpo,
+        "groups": [ { "name": "all", "vms": [ { "vm": "web3" }, { "vm": "db1" } ] } ]
+    }))
+    .unwrap();
+    let mut plan: Resource<RecoveryPlanSpec, _> = Resource::new(name, spec);
+    plan.status =
+        serde_json::from_value(json!({ "protection": protection, "checked_at": 1 })).unwrap();
+    env.cluster.create(&plan).await.unwrap();
+    plan.id
+}
+
+async fn set_protection(env: &Env, plan: Uuid, protection: Value) {
+    use orbivisor_types::dr::RecoveryPlanSpec;
+    let status =
+        serde_json::from_value(json!({ "protection": protection, "checked_at": 2 })).unwrap();
+    env.cluster
+        .update_status::<RecoveryPlanSpec>(plan, &status)
+        .await
+        .unwrap();
+}
+
+fn bad_protection() -> Value {
+    json!([
+        { "vm": "web3", "backup": "web3-a", "point_at": 1, "age_secs": 34 * 3600, "ok": false, "issue": "over-rpo" },
+        { "vm": "db1", "ok": false, "issue": "no-recovery-point" }
+    ])
+}
+
+fn good_protection() -> Value {
+    json!([
+        { "vm": "web3", "backup": "web3-b", "point_at": 1, "age_secs": 600, "ok": true },
+        { "vm": "db1", "backup": "db1-b", "point_at": 1, "age_secs": 600, "ok": true }
+    ])
+}
+
+/// `dr_rpo_exceeded`: 계획마다 경보 하나(문구는 설계 §3.4, 계획 보고 경로). RPO 목표가 0(끔)인 계획과 `plans`에 없는
+/// 계획은 울리지 않는다. 모두 지키면 해제로 알린다.
+#[tokio::test]
+async fn dr_rpo_alerts_fire_per_plan_and_resolve() {
+    let rig = Rig::start().await;
+    announce_dr(&rig.env).await;
+    rig.target("ops", "json").await;
+    let web = dr_plan(&rig.env, "web-tier", 86400, bad_protection()).await;
+    dr_plan(&rig.env, "off", 0, bad_protection()).await;
+    dr_plan(&rig.env, "other", 86400, bad_protection()).await;
+    rig.rule(
+        "rpo",
+        json!({"condition": {"kind": "dr_rpo_exceeded", "plans": ["web-tier", "off"]},
+               "severity": "warning", "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    let hits = rig.hook.wait(1).await;
+    let v = hits[0].json();
+    assert_eq!(v["state"], "firing", "{v}");
+    assert_eq!(v["rule"], "rpo");
+    assert_eq!(v["subject"]["kind"], "recovery_plan");
+    assert_eq!(v["subject"]["name"], "web-tier");
+    assert_eq!(v["subject"]["id"], web.to_string());
+    assert_eq!(
+        v["detail"],
+        "plan web-tier: 2 of 2 VMs over RPO 24h (web3 34h, db1 no recovery point)\nPlan: /api/v1/dr-plans/web-tier/report"
+    );
+    let a = rig.wait_alerts(|a| state_of(a) == ["firing"]).await;
+    assert_eq!(a["alerts"][0]["subject"]["name"], "web-tier");
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 1);
+
+    // 모두 지키면 60초 뒤 해제
+    set_protection(&rig.env, web, good_protection()).await;
+    settle().await;
+    rig.clock.advance(RESOLVE_AFTER_MS + 1000);
+    let hits = rig.hook.wait(2).await;
+    assert_eq!(hits[1].json()["state"], "resolved", "{:?}", hits[1].json());
+    rig.wait_alerts(|a| state_of(a).is_empty()).await;
+    engine.shutdown().await;
+}
+
+/// 시험이 바로 넣는 끝난 DR 실행
+async fn dr_run(env: &Env, plan: Uuid, plan_name: &str, name: &str, state: &str, finished_at: u64) {
+    use orbivisor_types::dr::{DrRunSpec, RecoveryPlanSpec};
+    let spec: RecoveryPlanSpec = serde_json::from_value(json!({
+        "source": "prod", "pool": "dr",
+        "groups": [ { "name": "all", "vms": [ { "vm": "web3" }, { "vm": "db1" } ] } ]
+    }))
+    .unwrap();
+    let mut run: Resource<DrRunSpec, _> = Resource::new(
+        name,
+        DrRunSpec {
+            plan,
+            plan_name: plan_name.into(),
+            kind: orbivisor_types::dr::DrRunKind::Test,
+            plan_spec: spec,
+            max_parallel: 4,
+            cleanup: None,
+        },
+    );
+    run.status = serde_json::from_value(json!({
+        "state": state, "started_at": finished_at - 100, "finished_at": finished_at,
+        "steps": [
+            { "group": "all", "vm": "web3", "phase": "ready", "at": 1 },
+            { "group": "all", "vm": "db1", "phase": "failed", "error": "restore failed: no space", "at": 1 }
+        ]
+    }))
+    .unwrap();
+    env.cluster.create(&run).await.unwrap();
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// `dr_run_failed`: `failed`·`partial`로 끝난 실행마다 한 번(이벤트, 계획·실행 경로). 규칙 전에 끝난 실행, 성공한 실행,
+/// `plans`에 없는 계획의 실행은 알리지 않는다.
+#[tokio::test]
+async fn dr_run_failures_are_sent_once() {
+    let rig = Rig::start().await;
+    announce_dr(&rig.env).await;
+    rig.target("ops", "json").await;
+    let web = dr_plan(&rig.env, "web-tier", 86400, good_protection()).await;
+    let other = dr_plan(&rig.env, "other", 86400, good_protection()).await;
+    // 규칙보다 먼저 끝난 실행
+    dr_run(
+        &rig.env,
+        web,
+        "web-tier",
+        "old",
+        "failed",
+        unix_now() - 3600,
+    )
+    .await;
+    rig.rule(
+        "runs",
+        json!({"condition": {"kind": "dr_run_failed", "plans": ["web-tier"]},
+               "severity": "warning", "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    settle().await;
+    let later = unix_now() + 5;
+    dr_run(&rig.env, web, "web-tier", "ok", "succeeded", later).await;
+    dr_run(&rig.env, other, "other", "theirs", "failed", later).await;
+    let run_id = {
+        dr_run(&rig.env, web, "web-tier", "t2", "partial", later).await;
+        rig.env
+            .cluster
+            .get_by_name::<orbivisor_types::dr::DrRunSpec>("t2")
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    let hits = rig.hook.wait(1).await;
+    let v = hits[0].json();
+    assert_eq!(v["state"], "event", "{v}");
+    assert_eq!(v["rule"], "runs");
+    assert_eq!(v["severity"], "warning");
+    assert_eq!(v["subject"]["kind"], "recovery_plan");
+    assert_eq!(v["subject"]["id"], web.to_string());
+    assert_eq!(
+        v["detail"],
+        format!(
+            "DR test failover t2 of plan web-tier finished partially: 1 of 2 VMs failed\n- db1: restore failed: no space\nPlan: /api/v1/dr-plans/web-tier/report\nRun: /api/v1/dr-runs/{run_id}"
+        )
+    );
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 1, "{:?}", rig.hook.hits());
+    engine.shutdown().await;
+}
+
+/// "DR 경보 켜기"(`dr-defaults`): 모든 노드가 `dr-plans`를 알아야 하고(409), 규칙 둘을 만들고 다시 부르면 그대로 둔다.
+#[tokio::test]
+async fn dr_default_rules_are_made_once() {
+    let rig = Rig::start().await;
+    let admin = rig.env.admin().await;
+    let operator = rig.env.user("operator", "operator").await;
+    rig.target("ops", "json").await;
+    assert_error(
+        &admin
+            .post("/alert-rules/dr-defaults", json!({"targets": ["ops"]}))
+            .await,
+        StatusCode::CONFLICT,
+        "cluster_upgrading",
+    );
+    announce_dr(&rig.env).await;
+    assert_eq!(
+        operator
+            .post("/alert-rules/dr-defaults", json!({"targets": ["ops"]}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_error(
+        &admin
+            .post("/alert-rules/dr-defaults", json!({"targets": ["nope"]}))
+            .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+    );
+    let (status, body) = admin
+        .post("/alert-rules/dr-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created: Vec<&str> = body["created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(created, ["dr-rpo-exceeded", "dr-run-failed"], "{body}");
+    assert_eq!(body["created"][1]["spec"]["severity"], "warning");
+    assert_eq!(
+        body["created"][1]["spec"]["condition"],
+        json!({"kind": "dr_run_failed"})
+    );
+    let (status, again) = admin
+        .post("/alert-rules/dr-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["created"], json!([]));
+    assert_eq!(
+        again["existing"],
+        json!(["dr-rpo-exceeded", "dr-run-failed"])
+    );
+}

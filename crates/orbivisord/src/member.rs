@@ -213,6 +213,8 @@ struct Services {
     replication: ReplicationScheduler,
     /// 리더가 VMware 이전의 동기화·정리 Task를 만든다(계획 72).
     vmware: VmwareScheduler,
+    /// 리더가 복구 계획의 보호 상태(RPO)를 센다(계획 76).
+    dr_protection: orbivisor_api::DrProtection,
     /// 리더가 ACME 인증서를 주문한다(계획 73).
     acme: orbivisor_api::acme::AcmeRenewer,
     drift: orbivisor_api::DriftChecker,
@@ -291,6 +293,7 @@ impl Services {
         self.backups.shutdown().await;
         self.replication.shutdown().await;
         self.vmware.shutdown().await;
+        self.dr_protection.shutdown().await;
         self.acme.shutdown().await;
         self.drift.shutdown().await;
         if let Some(h) = self.http01 {
@@ -1132,6 +1135,9 @@ impl Member {
         let vmware = on(&rt.work, || {
             VmwareScheduler::spawn(state.clone(), config.vmware_scheduler_config())
         });
+        let dr_protection = on(&rt.work, || {
+            orbivisor_api::DrProtection::spawn(state.clone(), Default::default())
+        });
         // 리더가 Raft의 SDN 네트워크를 OVN NB에 맞춘다(계획 65 — `Sdn`이 준비되기 전에는 쉰다).
         let ovn_sync = on(&rt.work, || {
             OvnSync::spawn(cluster.clone(), ovn_sync_config)
@@ -1193,6 +1199,7 @@ impl Member {
                 backups,
                 replication,
                 vmware,
+                dr_protection,
                 acme,
                 drift,
                 http01,

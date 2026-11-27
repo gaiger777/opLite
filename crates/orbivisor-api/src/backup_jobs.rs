@@ -45,7 +45,7 @@ use crate::state::AppState;
 /// 켠 작업은 옛 노드가 풀지 못하므로 모든 노드가 이 빌드일 때만 쓰고(409 `cluster_upgrading`), 원격은
 /// 등록돼 있어야 한다(400). 원격의 풀은 보낼 때 원격이 확인한다. `full_every`(증분 백업)는 모든 노드가
 /// 증분 백업을 알 때만 쓴다(409 `cluster_upgrading`).
-fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
+pub(crate) fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
     // 저장소 작업·복사본(계획 68)은 옛 노드가 풀지 못한다(검증보다 먼저).
     if spec.store.is_some() || spec.copy_to.is_some() {
         require_feature(&state.cluster, orbivisor_types::node::BACKUP_STORE)?;

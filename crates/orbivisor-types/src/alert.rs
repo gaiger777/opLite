@@ -1556,10 +1556,59 @@ pub fn link_default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpe
     ]
 }
 
+/// "DR 경보 켜기"(계획 76 §3.4)의 권하는 규칙: 복구 계획의 RPO 넘음 warning(보호 상태는 1분마다 다시 세므로 지속 시간 0),
+/// DR 실행 실패 warning(이벤트). 대상은 `targets`다. 모든 계획에 걸린다(`plans` 비움).
+pub fn dr_default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpec)> {
+    let rule = |condition| AlertRuleSpec {
+        enabled: true,
+        condition,
+        for_secs: 0,
+        severity: Severity::Warning,
+        targets: targets.to_vec(),
+        repeat_secs: DEFAULT_REPEAT_SECS,
+        send_resolved: true,
+        nodes: Vec::new(),
+        vms: Vec::new(),
+    };
+    vec![
+        (
+            "dr-rpo-exceeded",
+            rule(AlertCondition::DrRpoExceeded { plans: Vec::new() }),
+        ),
+        (
+            "dr-run-failed",
+            rule(AlertCondition::DrRunFailed { plans: Vec::new() }),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// DR 묶음(계획 76): 두 조건, 이름·심각도(둘 다 warning), 모두 검증을 지난다.
+    #[test]
+    fn dr_default_rules_are_the_two_dr_conditions() {
+        let rules = dr_default_rules(&["ops".into()]);
+        let got: Vec<_> = rules
+            .iter()
+            .map(|(name, spec)| {
+                spec.validate().unwrap();
+                assert!(spec.condition.is_dr());
+                assert_eq!(spec.condition.plans(), Some(&[][..]));
+                assert_eq!(*name, spec.condition.kind().replace('_', "-"));
+                (*name, spec.severity, spec.for_secs)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("dr-rpo-exceeded", Severity::Warning, 0),
+                ("dr-run-failed", Severity::Warning, 0)
+            ]
+        );
+    }
 
     fn rule(condition: AlertCondition) -> AlertRuleSpec {
         AlertRuleSpec {

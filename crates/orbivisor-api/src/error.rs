@@ -134,6 +134,8 @@ impl From<ClusterError> for ApiError {
                             "backup-store-target" => "store_target_in_use",
                             // 계획 72: 같은 원본 VM의 끝나지 않은 이전 항목
                             "vmware-vm" => "vm_in_migration",
+                            // 계획 76: 같은 복구 계획의 도는 실행
+                            "dr-run" => orbivisor_types::dr::ERR_RUN_ACTIVE,
                             _ => "volume_in_use",
                         },
                         message,

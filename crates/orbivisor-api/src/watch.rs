@@ -21,7 +21,7 @@ use orbivisor_cluster::types::RawResource;
 use orbivisor_types::authz::Privilege;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 31] = [
+const WATCHABLE: [Kind; 33] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
@@ -62,6 +62,9 @@ const WATCHABLE: [Kind; 31] = [
     Kind::AcmeAccount,
     Kind::AcmeDns,
     Kind::Certificate,
+    // 계획 76: 복구 계획과 DR 실행(루트 — cluster.read, 비밀 없음)
+    Kind::RecoveryPlan,
+    Kind::DrRun,
 ];
 
 /// 이벤트마다 거르는 종류(폴더를 따르는 것과 grant). 나머지는 구독할 때 종류 단위로 루트에서 본다.

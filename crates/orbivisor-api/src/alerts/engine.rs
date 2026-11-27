@@ -5,7 +5,8 @@
 //!   노드 장부(`alerts/state.json`)에 둔다. 공유 풀은 그 풀이 `ready`인 온라인 노드 가운데 id가 가장 작은 노드가 본다.
 //!   Raft에 쓰지 않는다.
 //! - **리더 경보**(`NodeOffline`·`BackupJobFailed`, 계획 67의 SDN 조건 여덟, 계획 75의 링크 조건 둘)는 리더가 평가하고
-//!   상태를 `AlertRule.status`(Raft)에 둔다. 상태를 먼저 쓰고 쓰기가 된 뒤에만 보내므로 리더가 바뀌어도 다시 보내지
+//!   상태를 `AlertRule.status`(Raft)에 둔다. 계획 76의 DR 조건 둘(`dr_rpo_exceeded` — 복구 계획의 `status.protection`,
+//!   `dr_run_failed` — 끝난 DR 실행)도 리더 경보다. 상태를 먼저 쓰고 쓰기가 된 뒤에만 보내므로 리더가 바뀌어도 다시 보내지
 //!   않는다. SDN 조건은 [`orbivisor_types::alert::sdn::evaluate`]가 Raft와 리더 OvnSync의 관찰(같은 프로세스의 메모리)로 본다.
 //!
 //! 단계는 [`orbivisor_types::alert::advance`]다: pending → firing(알림) → `repeat_secs`마다 다시 → 거짓인 채 60초 → 해제(알림).
@@ -29,6 +30,9 @@ use orbivisor_types::backup_job::{BackupJob, BackupJobSpec};
 use orbivisor_types::backup_store::BackupStoreSpec;
 use orbivisor_types::clock::{Clock, SystemClock};
 use orbivisor_types::cluster::ClusterSpec;
+use orbivisor_types::dr::{
+    self as dr, DrPhase, DrRun, DrRunKind, DrRunSpec, DrRunState, RecoveryPlanSpec,
+};
 use orbivisor_types::load_balancer::LoadBalancerSpec;
 use orbivisor_types::metrics::{MetricsQuery, MetricsScope, NodeSample, VmSample};
 use orbivisor_types::network::NetworkSpec;
@@ -712,6 +716,12 @@ impl Engine {
                     Some(f) => self.subject_rule(now, &rule, f, "The apply set was deleted."),
                     None => continue,
                 },
+                // 복구 계획의 RPO(계획 76 §3.4 — 리더가 1분마다 센 `status.protection`): 목록을 읽지 못하면 그대로 둔다.
+                AlertCondition::DrRpoExceeded { .. } => match self.rpo_findings(&rule) {
+                    Some(f) => self.subject_rule(now, &rule, f, "The recovery plan was deleted."),
+                    None => continue,
+                },
+                AlertCondition::DrRunFailed { .. } => self.dr_run_failed(now, &rule),
                 // 링크 조건(계획 75 §3.4): 노드 상태의 포트·본딩. 영향을 읽지 못하면 그대로 둔다.
                 ref c if c.is_link() => match self.link_findings(&rule, nodes, &mut link_world) {
                     Some((f, quiet)) => {
@@ -1312,6 +1322,114 @@ impl Engine {
         (status, out)
     }
 
+    /// 계획마다(규칙의 `plans`에 드는 것): 보호 상태에 RPO를 지키지 못하는 VM(복구 지점 없음·RPO 넘음)이 있으면 참.
+    /// RPO 목표가 0(끔)인 계획은 거짓이다. 문구는 [`dr::rpo_summary`]에 보고 경로를 붙인다.
+    fn rpo_findings(&self, rule: &AlertRule) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
+        let (_, plans) = self.cluster().list::<RecoveryPlanSpec>().ok()?;
+        Some(
+            plans
+                .iter()
+                .filter(|p| rule.spec.condition.applies_to_plan(&p.name))
+                .map(|p| {
+                    let detail = (p.spec.rpo_target_secs > 0)
+                        .then(|| {
+                            dr::rpo_summary(&p.name, p.spec.rpo_target_secs, &p.status.protection)
+                        })
+                        .flatten()
+                        .map(|s| format!("{s}\nPlan: {}", plan_path(&p.name)));
+                    let subject = AlertSubject {
+                        kind: SubjectKind::RecoveryPlan,
+                        id: p.id,
+                        name: p.name.clone(),
+                        node: None,
+                        port: None,
+                    };
+                    (subject, detail.is_some(), detail)
+                })
+                .collect(),
+        )
+    }
+
+    /// DR 실행이 `failed`·`partial`로 끝나면 한 번 알린다(이벤트, `backup_failed`처럼 `status.notified`에 실행 id를
+    /// 적는다 — 규칙을 만들기 전에 끝난 실행과 지운 실행은 알리지 않고 잊는다).
+    fn dr_run_failed(
+        &self,
+        now: i64,
+        rule: &AlertRule,
+    ) -> (orbivisor_types::alert::AlertRuleStatus, Vec<Pending>) {
+        let mut out = Vec::new();
+        // 읽지 못하면 그대로 둔다(빈 목록으로 보면 알린 기록을 잊어 다시 알린다).
+        let Ok((_, runs)) = self.cluster().list::<DrRunSpec>() else {
+            return (rule.status.clone(), out);
+        };
+        let mut status = rule.status.clone();
+        status.active.clear();
+        let failed = new_run_failures(&mut status.notified, &runs, created_ms(rule.id));
+        if !rule.spec.enabled {
+            return (status, out);
+        }
+        for run in failed
+            .into_iter()
+            .filter(|r| rule.spec.condition.applies_to_plan(&r.spec.plan_name))
+        {
+            let bad: Vec<&orbivisor_types::dr::DrStep> = run
+                .status
+                .steps
+                .iter()
+                .filter(|s| matches!(s.phase, DrPhase::Failed | DrPhase::TimedOut))
+                .collect();
+            let what = match run.spec.kind {
+                DrRunKind::Test => "test failover",
+                DrRunKind::FailoverPlanned => "planned failover",
+                DrRunKind::FailoverDisaster => "disaster failover",
+                DrRunKind::Cleanup => "test cleanup",
+            };
+            let verb = match run.status.state {
+                DrRunState::Partial => "finished partially",
+                _ => "failed",
+            };
+            let mut detail = format!(
+                "DR {what} {} of plan {} {verb}: {} of {} VMs failed",
+                run.name,
+                run.spec.plan_name,
+                bad.len(),
+                run.status.steps.len()
+            );
+            if let Some(e) = &run.status.error {
+                detail.push_str(&format!("\n{e}"));
+            }
+            for s in bad.iter().take(5) {
+                let why = match s.phase {
+                    DrPhase::TimedOut => "timed out".to_string(),
+                    _ => s.error.clone().unwrap_or_else(|| "failed".into()),
+                };
+                detail.push_str(&format!("\n- {}: {why}", s.vm));
+            }
+            if bad.len() > 5 {
+                detail.push_str(&format!("\n- +{} more", bad.len() - 5));
+            }
+            detail.push_str(&format!(
+                "\nPlan: {}\nRun: /api/v1/dr-runs/{}",
+                plan_path(&run.spec.plan_name),
+                run.id
+            ));
+            let subject = AlertSubject {
+                kind: SubjectKind::RecoveryPlan,
+                id: run.spec.plan,
+                name: run.spec.plan_name.clone(),
+                node: None,
+                port: None,
+            };
+            out.push(Pending {
+                alert: event_alert(rule, subject, now),
+                rule: rule.clone(),
+                state: NotificationState::Event,
+                detail: Some(detail),
+            });
+        }
+        (status, out)
+    }
+
     /// 장부에 둔다(`persist`면 파일에 먼저 쓴다). 파일에 쓰지 못하면 경고하고 메모리에는 둔다.
     async fn save(&mut self, new: NodeAlertState, persist: bool) {
         let book = self.book.clone();
@@ -1474,6 +1592,38 @@ fn new_failures<'j>(
         }
         notified.insert(job.id, at);
         out.push(job);
+    }
+    out
+}
+
+/// 복구 계획 보고의 API 경로(알림 본문의 계획 링크)
+fn plan_path(plan: &str) -> String {
+    format!("/api/v1/dr-plans/{plan}/report")
+}
+
+/// 아직 알리지 않은 `failed`·`partial`로 끝난 DR 실행(규칙을 만든 뒤 끝난 것)을 `notified`에 적고 돌려준다(끝난 차례).
+/// 지운 실행은 잊는다.
+fn new_run_failures<'r>(
+    notified: &mut BTreeMap<Uuid, i64>,
+    runs: &'r [DrRun],
+    created: i64,
+) -> Vec<&'r DrRun> {
+    notified.retain(|id, _| runs.iter().any(|r| r.id == *id));
+    let mut out: Vec<&DrRun> = runs
+        .iter()
+        .filter(|r| matches!(r.status.state, DrRunState::Failed | DrRunState::Partial))
+        .filter(|r| !notified.contains_key(&r.id))
+        .filter_map(|r| {
+            let at = i64::try_from(r.status.finished_at?)
+                .unwrap_or(i64::MAX / 1000)
+                .saturating_mul(1000);
+            (at >= created).then_some(r)
+        })
+        .collect();
+    out.sort_by_key(|r| (r.status.finished_at, r.id));
+    for r in &out {
+        let at = r.status.finished_at.unwrap_or(0) as i64 * 1000;
+        notified.insert(r.id, at);
     }
     out
 }
