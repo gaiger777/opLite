@@ -984,7 +984,8 @@ pub(crate) mod tests {
                 "operator-dashboard",
                 "link-alerts",
                 "restore-remap",
-                "dr-plans"
+                "dr-plans",
+                "chunked-uploads"
             ])
         );
         update_node_status(&cluster, |status| {
@@ -1043,7 +1044,8 @@ pub(crate) mod tests {
                 "operator-dashboard",
                 "link-alerts",
                 "restore-remap",
-                "dr-plans"
+                "dr-plans",
+                "chunked-uploads"
             ])
         );
         cluster.shutdown().await.unwrap();
@@ -1121,7 +1123,8 @@ pub(crate) mod tests {
                 "operator-dashboard",
                 "link-alerts",
                 "restore-remap",
-                "dr-plans"
+                "dr-plans",
+                "chunked-uploads"
             ])
         );
         cluster.shutdown().await.unwrap();
@@ -1379,6 +1382,7 @@ pub(crate) mod tests {
                     "link-alerts",
                     "restore-remap",
                     "dr-plans",
+                    "chunked-uploads",
                 ]),
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()
