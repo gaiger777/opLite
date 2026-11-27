@@ -709,6 +709,17 @@ it("splits a long list into pages of 50 and shows each VM's address (plan 77-6)"
   expect(await screen.findByRole("link", { name: "vm-050" })).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "vm-000" })).not.toBeInTheDocument();
   await expectNoAxeViolations(container);
+
+  // 검색·정렬이 바뀌면 1쪽부터(3쪽에 머물러 맞는 행이 앞쪽에 숨지 않게)
+  const pages = screen.getByRole("navigation", { name: "Pages" });
+  await userEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(pages).toHaveTextContent("101–131 of 131");
+  await userEvent.type(screen.getByLabelText("Search by name"), "vm-");
+  expect(pages).toHaveTextContent("1–50 of 131");
+  await userEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(pages).toHaveTextContent("51–100 of 131");
+  await userEvent.click(screen.getByRole("button", { name: /Name/ }));
+  expect(pages).toHaveTextContent("1–50 of 131");
 });
 
 it("shows only the guest address cached for the VM's current node and state (plan 77-6)", async () => {

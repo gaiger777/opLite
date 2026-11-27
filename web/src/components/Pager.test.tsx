@@ -27,6 +27,20 @@ it("moves to the last page when items shrink", () => {
   expect(result.current.page).toBe(1);
 });
 
+it("goes back to the first page when the view (search, filter, sort) changes", () => {
+  const { result, rerender } = renderHook(({ items, view }) => usePage(items, 50, view), {
+    initialProps: { items: range(200), view: "" },
+  });
+  act(() => result.current.setPage(3));
+  // 줄어든 결과가 아직 4쪽 이상이어도 1쪽부터
+  rerender({ items: range(180), view: "q=1" });
+  expect(result.current.page).toBe(0);
+  expect(result.current.pageItems[0]).toBe(1);
+  act(() => result.current.setPage(2));
+  rerender({ items: range(180), view: "q=1" });
+  expect(result.current.page).toBe(2);
+});
+
 function Paged({ total }: { total: number }) {
   const pager = usePage(range(total), 50);
   return (

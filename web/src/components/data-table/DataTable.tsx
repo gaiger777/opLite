@@ -220,7 +220,11 @@ export function DataTable<T>(props: Props<T>) {
     autoResetAll: false,
   });
   const sortedRows = table.getRowModel().rows.map((r) => r.original);
-  const paged = usePage(sortedRows, props.pageSize ?? Math.max(sortedRows.length, 1));
+  const paged = usePage(
+    sortedRows,
+    props.pageSize ?? Math.max(sortedRows.length, 1),
+    JSON.stringify([q, filterValues, sorting]),
+  );
   const rows = paged.pageItems;
   const visible = allColumns.filter((c) => !hidden.includes(c.id));
   const byId = new Map(allColumns.map((c) => [c.id, c]));

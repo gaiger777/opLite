@@ -252,7 +252,7 @@ export function TasksPage() {
       newestFirst(tasks.data ?? []).filter((task) => !failedOnly || task.status.state === "failed"),
     [tasks.data, failedOnly],
   );
-  const pager = usePage(shown, TASK_PAGE_SIZE);
+  const pager = usePage(shown, TASK_PAGE_SIZE, String(failedOnly));
   return (
     <div className="flex flex-col gap-4">
       <PageHeader

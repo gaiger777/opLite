@@ -6,14 +6,19 @@ import { Button } from "@/components/ui/button";
 
 /**
  * `items`를 `pageSize`개씩 나눈다. `page`는 0부터 센다. 항목이 줄어 지금 페이지가 없어지면 마지막
- * 페이지로 옮긴다.
+ * 페이지로 옮긴다. `view`(검색·거름·정렬)가 바뀌면 첫 페이지로 돌아간다 — 3쪽에서 검색해 맞는 행이 1~2쪽에
+ * 숨지 않게.
  */
-export function usePage<T>(items: readonly T[], pageSize: number) {
+export function usePage<T>(items: readonly T[], pageSize: number, view: string = "") {
   const [page, setPage] = useState(0);
+  const [seenView, setSeenView] = useState(view);
   const pageCount = Math.ceil(items.length / pageSize);
   const last = Math.max(pageCount - 1, 0);
-  if (page > last) {
+  if (seenView !== view) {
     // 렌더 중에 상태를 맞춘다(React가 바로 다시 그린다).
+    setSeenView(view);
+    setPage(0);
+  } else if (page > last) {
     setPage(last);
   }
   const current = Math.min(page, last);
