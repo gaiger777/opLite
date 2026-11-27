@@ -163,6 +163,8 @@ export function TaskTable({
       // 작업 이름(누르면 상세 서랍), 기록 설명, 오류(2줄 + 펼침 — 좁은 폭·휴대폰 카드에도 보인다, 계획 77)
       id: "operation",
       header: t("tasks.operation"),
+      // 긴 작업 이름·설명은 줄을 바꾼다(표 칸 기본은 한 줄 — 좁은 홈 카드에서 상태 열을 밀어내던 것, 계획 77-6)
+      className: "whitespace-normal",
       cell: (task) => {
         const { name } = target(task);
         const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
