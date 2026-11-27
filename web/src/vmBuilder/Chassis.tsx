@@ -1,11 +1,24 @@
-// VM 틀(계획 71 설계 §8.2): 칸이 정해진 틀 — 이름·폴더, 계산·배치·보호·cloud-init, 디스크(위가 먼저 부팅)·CD·NIC 블록,
-// 블록을 들면 나타나는 빼기 칸. 칸은 놓을 자리(`useDropSlot`)이고 문제는 그 칸에(오류 빨강·경고 노랑 — 아이콘과 글도).
-// 블록은 잡는 손잡이(끌기·들기)와 살피기 단추와 `⋮` 메뉴(위로·아래로·빼기 — 끌지 않는 길)다.
-import { CircleX, EllipsisVertical, GripVertical, TriangleAlert } from "lucide-react";
-import type { ReactNode } from "react";
+// VM 그림(계획 77-5 — 진단 §4.3 2단계, 계획 71 틀을 그림으로): 가운데 VM 본체(머리 줄·디스크 칸·CD 칸·부팅 순서), 왼쪽
+// 포트에 CPU·메모리(눌러 고르는 칩), 오른쪽 포트에 NIC, 아래에 첫 부팅·보호·배치·보안 모듈. 칸은 놓을 자리
+// (`useDropSlot`)이고 문제는 그 칸에(오류 빨강·경고 노랑 — 아이콘과 글도). 칸마다 "+" 단추가 기본 부품을 붙인다(끌지 않는 길).
+// 블록(디스크·CD·NIC 한 줄)은 잡는 손잡이·누르면 그림 위 카드(`Inspector`)·`⋮` 메뉴(위로·아래로·빼기)다.
+import {
+  CircleX,
+  Cpu,
+  Disc,
+  EllipsisVertical,
+  GripVertical,
+  HardDrive,
+  MemoryStick,
+  Network,
+  Pencil,
+  Plus,
+  TriangleAlert,
+} from "lucide-react";
+import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { Field } from "@/components/Field";
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -13,44 +26,58 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
 import { useDnd } from "@/dnd/DndProvider";
 import { useDraggable } from "@/dnd/useDraggable";
 import { useDropSlot } from "@/dnd/useDropSlot";
-import { folderPath, folderTree } from "@/folders/folders";
 import { formatMib } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import { bootList } from "@/vms/boot";
 import { useBuilder } from "@/vmBuilder/context";
 import { Inspector } from "@/vmBuilder/Inspector";
 import { blockLabel, problemSlot, problemText, slotLabel, type Thing } from "@/vmBuilder/labels";
 import { accepts } from "@/vmBuilder/model/accepts";
-import { drop } from "@/vmBuilder/model/drop";
-import { parts } from "@/vmBuilder/model/parts";
-import type { Problem } from "@/vmBuilder/model/problems";
+import { memoryFit } from "@/vmBuilder/model/parts";
+import { needsOs, type Problem } from "@/vmBuilder/model/problems";
+import { OsPicker } from "@/vmBuilder/OsPicker";
+import { defaultNetwork, defaultPool } from "@/vmBuilder/model/purposes";
 import type { Block, ListKind } from "@/vmBuilder/model/slots";
-import { formOnly, setName } from "@/vmBuilder/model/state";
-import { isShared } from "@/storage/pools";
+import { formOnly } from "@/vmBuilder/model/state";
+import { MAX_CDROMS } from "@/vms/form";
 
-/** 칸 하나: 놓을 자리, 제목, 비었을 때 안내, 그 칸의 문제 */
-function SlotBox({
+/** 칸 하나: 놓을 자리, 제목(아이콘·ⓘ), 비었을 때 안내, 그 칸의 문제 */
+export function SlotBox({
   id,
+  icon,
+  info,
   empty,
+  add,
   children,
   inspect = true,
+  plain = false,
+  className,
 }: {
   id: string;
+  icon?: ReactNode;
+  /** 제목 옆 ⓘ(도움말 주제와 한 줄 설명) */
+  info?: { topic: string; line: string };
   /** 비었을 때 안내(없으면 안내 없음) */
   empty?: boolean;
+  /** 제목 줄의 "+" 단추(기본 부품 붙이기) */
+  add?: ReactNode;
   children?: ReactNode;
   inspect?: boolean;
+  /** 비었을 때 안내를 점선 상자 없이(작은 모듈) */
+  plain?: boolean;
+  className?: string;
 }) {
   const { t } = useTranslation();
   const b = useBuilder();
   const dnd = useDnd();
   const label = slotLabel(t, id, b.s);
+  // VM 본체는 제목 줄 대신 그림의 머리 줄이 이름을 보인다(제목은 화면 읽기·초점용으로 남김).
+  const quietHeading = id === "vm" && !inspect && !add;
   const { ref, props, verdict } = useDropSlot<HTMLDivElement>(id, label);
   const own = b.list.filter((p) => problemSlot(p.at) === id);
-  // 틀 전체가 h2, 그 안의 칸이 h3(휴대폰에는 부품 상자 제목이 없다)
-  const Heading = id === "vm" ? "h2" : "h3";
   return (
     <div
       ref={ref}
@@ -61,26 +88,49 @@ function SlotBox({
       }
       data-slot={id}
       data-level={level(own)}
-      className="flex min-w-0 flex-col gap-2 rounded-lg border bg-card p-3"
+      className={cn("flex min-w-0 flex-col gap-1.5 rounded-lg border bg-card p-2", className)}
     >
-      <div className="flex items-center justify-between gap-2">
-        <Heading id={`vb-${id}`} tabIndex={-1} className="text-sm font-medium">
-          {label}
-        </Heading>
-        {inspect && (
-          <Button type="button" variant="ghost" size="sm" onClick={() => b.select(id)}>
-            {t("vmBuilder.page.inspect")}
-          </Button>
-        )}
+      <div
+        className={cn("flex min-h-7 items-center justify-between gap-1", quietHeading && "sr-only")}
+      >
+        <h3
+          id={`vb-${id}`}
+          tabIndex={-1}
+          className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground"
+        >
+          {icon}
+          <span className="truncate">{label}</span>
+        </h3>
+        {info && <InfoButton topic={info.topic} label={label} line={info.line} />}
+        <span className="ml-auto flex shrink-0 items-center">
+          {add}
+          {inspect && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t("vmBuilder.page.inspectSlot", { slot: label })}
+              title={t("vmBuilder.page.inspectSlot", { slot: label })}
+              onClick={() => b.select(id)}
+            >
+              <Pencil />
+            </Button>
+          )}
+        </span>
       </div>
       {children}
       {empty && (
-        <p className="rounded-md border border-dashed p-2 text-sm text-muted-foreground">
+        <p
+          className={cn(
+            "text-xs text-muted-foreground",
+            !plain && "rounded-md border border-dashed px-2 py-1.5",
+          )}
+        >
           {t(`vmBuilder.empty.${id}`)}
         </p>
       )}
       {dnd.state.phase === "picked" && verdict?.ok && (
-        <span className="flex min-h-11 items-center justify-center rounded-md border border-dashed text-sm font-medium">
+        <span className="flex min-h-9 items-center justify-center rounded-md border border-dashed text-sm font-medium">
           {t("vmBuilder.page.dropHere")}
         </span>
       )}
@@ -92,62 +142,221 @@ function SlotBox({
 const level = (list: readonly Problem[]) =>
   list.some((p) => p.level === "error") ? "error" : list.length > 0 ? "warn" : undefined;
 
+/** 이보다 긴 문제 글(서버의 원문 오류 등)은 두 줄로 줄이고 "자세히"로 펼친다(그림이 넘치지 않게). */
+const LONG = 110;
+
 function Problems({ list }: { list: readonly Problem[] }) {
+  return list.map((p, i) => <ProblemLine key={i} p={p} />);
+}
+
+function ProblemLine({ p }: { p: Problem }) {
   const { t } = useTranslation();
-  return list.map((p, i) => (
-    <p key={i} className="flex items-start gap-1 text-xs" data-level={p.level}>
+  const [open, setOpen] = useState(false);
+  const text = problemText(t, p);
+  const long = text.length > LONG;
+  return (
+    <p className="flex items-start gap-1 text-xs" data-level={p.level}>
       {p.level === "error" ? (
         <CircleX aria-hidden className="size-3.5 shrink-0" />
       ) : (
         <TriangleAlert aria-hidden className="size-3.5 shrink-0" />
       )}
-      <span>
+      <span className="min-w-0 break-words">
         <span className="sr-only">{t(`vmBuilder.check.${p.level}`)}: </span>
-        {problemText(t, p)}
+        <span className={cn(long && !open && "vb-clamp")}>{text}</span>
+        {long && (
+          <button
+            type="button"
+            aria-expanded={open}
+            className="underline"
+            onClick={() => setOpen(!open)}
+          >
+            {open ? t("vmBuilder.check.less") : t("vmBuilder.check.detail")}
+          </button>
+        )}
       </span>
     </p>
-  ));
+  );
 }
 
-export function Chassis() {
+/** "+" 단추: 칸 이름을 읽는 작은 단추 */
+function AddButton({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  disabled?: boolean;
+  onClick(): void;
+}) {
+  const b = useBuilder();
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      aria-label={label}
+      title={label}
+      disabled={disabled || b.busy}
+      onClick={onClick}
+    >
+      <Plus />
+    </Button>
+  );
+}
+
+const CORES = [1, 2, 4, 8, 16];
+const MEMORY_GIB = [1, 2, 4, 8, 16, 32];
+
+/** 눌러 고르는 값 칩 줄(지금 값은 눌린 칩) */
+function Chips({
+  label,
+  values,
+  current,
+  unit,
+  onPick,
+}: {
+  label: string;
+  values: number[];
+  current: number;
+  unit: (n: number) => string;
+  onPick(n: number): void;
+}) {
+  const b = useBuilder();
+  return (
+    <div role="group" aria-label={label} className="flex flex-wrap gap-1">
+      {values.map((n) => (
+        <button
+          key={n}
+          type="button"
+          aria-pressed={n === current}
+          aria-label={`${label} ${unit(n)}`}
+          disabled={b.busy}
+          onClick={() => onPick(n)}
+          className="min-w-7 rounded-md border px-1 py-0.5 text-xs aria-pressed:border-brand aria-pressed:bg-brand aria-pressed:text-brand-foreground"
+        >
+          {n}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** 왼쪽 포트: CPU와 메모리(칩으로 고름 — 다른 값·CPU 모델은 "고치기") */
+function Compute() {
+  const { t } = useTranslation();
+  const b = useBuilder();
+  const v = b.s.values;
+  const vcpus = v.sockets * (Number(v.cores) || 0);
+  const mib = Number(v.memory) || 0;
+  const fit = memoryFit(b.ctx, v.node, mib);
+  const set = (patch: Partial<typeof v>) => b.record({ ...b.s, values: { ...v, ...patch } });
+  return (
+    <SlotBox
+      id="compute"
+      icon={<Cpu aria-hidden className="size-3.5" />}
+      className="vb-cmp vb-port vb-port-t"
+    >
+      <p className="sr-only">
+        {t("vmBuilder.page.compute", { vcpus, memory: formatMib(mib), model: v.model })}
+      </p>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="flex flex-col gap-1">
+          <span className="flex items-baseline gap-1.5 text-xs text-muted-foreground">
+            {t("vmBuilder.pic.cores")}
+            <span className="text-base font-semibold text-foreground">{vcpus}</span>
+          </span>
+          <Chips
+            label={t("vmBuilder.pic.cores")}
+            values={CORES}
+            current={v.sockets === 1 ? Number(v.cores) : 0}
+            unit={(n) => t("vmBuilder.pic.vcpu", { count: n })}
+            onPick={(n) => set({ sockets: 1, cores: String(n) })}
+          />
+          <span className="truncate text-xs text-muted-foreground">
+            {t("vmBuilder.check.cpu", { model: v.model })}
+          </span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="flex items-baseline gap-1.5 text-xs text-muted-foreground">
+            <MemoryStick aria-hidden className="size-3.5 self-center" />
+            {t("vmBuilder.pic.memory")}
+            <span className="text-base font-semibold text-foreground">{formatMib(mib)}</span>
+          </span>
+          <Chips
+            label={t("vmBuilder.pic.memory")}
+            values={MEMORY_GIB}
+            current={mib % 1024 === 0 ? mib / 1024 : 0}
+            unit={(n) => `${n} GiB`}
+            onPick={(n) => set({ memory: String(n * 1024) })}
+          />
+          {fit && (
+            <span
+              className="text-xs text-muted-foreground"
+              data-level={fit === "over" ? "warn" : undefined}
+            >
+              {t(`vmBuilder.pic.fit.${fit}`)}
+            </span>
+          )}
+        </div>
+      </div>
+    </SlotBox>
+  );
+}
+
+export function Chassis({ narrow }: { narrow: boolean }) {
   const { t } = useTranslation();
   const b = useBuilder();
   const dnd = useDnd();
   const v = b.s.values;
-  const nameProblem = b.list.find((p) => p.at === "name");
   const holdingBlock =
     (dnd.state.phase === "dragging" || dnd.state.phase === "picked") &&
     (dnd.state.item as Thing).kind === "block";
-  const empty = v.disks.length === 0 && v.nics.length === 0 && b.s.base.kind === "blank";
-  const tree = folderTree(b.ctx.folders, "vm");
-  const node = b.ctx.nodes?.find((n) => n.id === v.node);
-
-  // "보통 크기 Linux 서버로 시작": Linux + 크기 보통 + 첫 공유 풀 새 디스크 + 첫 네트워크 NIC(설계 §8.3). 프리셋이
-  // 메모리를 정하므로 크기를 뒤에 얹는다.
-  function quickStart() {
-    let s = b.s;
-    const firstPool = b.ctx.pools.find(isShared) ?? b.ctx.pools[0];
-    const steps: [string, string][] = [
-      ["os:linux", "vm"],
-      ["size:m", "compute"],
-      ...(firstPool ? ([[`pool:${firstPool.name}`, "disks"]] as [string, string][]) : []),
-      [`network:${b.ctx.networks[0]?.name ?? "user"}`, "nics"],
-    ];
-    for (const [id, at] of steps) {
-      const part = parts(s, b.ctx).find((p) => p.id === id);
-      if (part) {
-        s = drop(s, part, at, b.ctx);
-      }
-    }
-    b.record(s);
-  }
-
-  // 틀 위 칩(설계 §8.6): 빈 VM이면 폼에서 고친 들고 다니는 칸(그대로 보냄), 템플릿 바탕이면 놓을 때 비운 칸
   const template = b.s.base.kind === "template";
+  // 그림 위 칩(설계 §8.6): 템플릿 바탕이면 놓을 때 비운 칸, 아니면 고급에서 고친 칸
   const carried = template ? (b.s.cleared ?? []) : formOnly(v);
+  const boot = bootList(
+    v.disks.map((d) => (d.bootOrder ? Number(d.bootOrder) : null)),
+    v.cdroms.map((c) => (c.bootOrder ? Number(c.bootOrder) : null)),
+  );
+  const bootText = boot.booting
+    .map((d) => t(`vmBuilder.pic.boot.${d.kind}`, { n: d.index + 1 }))
+    .join(" → ");
+  // "+" 단추: 기본 부품을 그 목록 끝에 붙인다(놓기와 같은 규칙·알림).
+  const addPart = (list: ListKind) => {
+    const part =
+      list === "disks"
+        ? defaultPool(b.s, b.ctx)
+        : list === "nics"
+          ? defaultNetwork(b.s, b.ctx)
+          : undefined;
+    if (part) {
+      const said = b.put(part as Thing, list);
+      dnd.announce(said ?? t("dnd.dropped", { item: part.name, slot: slotLabel(t, list, b.s) }));
+    } else if (list === "cdroms") {
+      b.record({ ...b.s, values: { ...v, cdroms: [...v.cdroms, { iso: "", bootOrder: "" }] } });
+      dnd.announce(t("vmBuilder.page.count.cdroms", { count: v.cdroms.length + 1 }));
+    }
+  };
 
   return (
-    <div className="flex min-w-0 flex-col gap-4">
+    <section
+      aria-label={t("vmBuilder.pic.title")}
+      className="vb-col relative flex min-w-0 flex-col gap-2"
+    >
+      <h2 className="sr-only">{t("vmBuilder.pic.title")}</h2>
+      {needsOs(b.s) && b.selected !== "os" && (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="self-start"
+          onClick={() => b.select("os")}
+        >
+          <Disc aria-hidden />
+          {t("vmBuilder.os.open")}
+        </Button>
+      )}
       {carried.length > 0 && (
         <p className="self-start rounded-full border bg-muted px-3 py-1 text-xs">
           {t(template ? "vmBuilder.page.formCleared" : "vmBuilder.page.formOnly", {
@@ -156,79 +365,72 @@ export function Chassis() {
           })}
         </p>
       )}
-      <SlotBox id="vm" inspect={template}>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field
-            id="vb-name"
-            label={t("common.name")}
-            // 빈 이름의 오류는 칸 밑에 바로 보이지 않는다(만들기 단추 옆 까닭이 알림).
-            error={v.name === "" ? undefined : (nameProblem?.message ?? nameProblem?.key)}
-            errorValues={nameProblem?.values as Record<string, string> | undefined}
-            help={t("vmBuilder.help.name")}
-          >
-            {(a11y) => (
-              <Input
-                id="vb-name"
-                value={v.name}
-                disabled={b.busy}
-                autoComplete="off"
-                onChange={(e) => b.set(setName(b.s, e.target.value))}
-                {...a11y}
-              />
-            )}
-          </Field>
-          <SlotBox id="folder" inspect={false}>
-            <p className="text-sm">{v.folder ? folderPath(tree, v.folder) : "/"}</p>
-          </SlotBox>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          {b.s.base.kind === "template"
-            ? t("vmBuilder.page.baseTemplate", {
-                name: b.ctx.vms.find((x) => x.id === (b.s.base as { id: string }).id)?.name ?? "",
-              })
-            : t("vmBuilder.page.baseBlank")}
-        </p>
-        {empty && (
-          <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed p-3">
-            <p className="text-sm text-muted-foreground">{t("vmBuilder.page.start")}</p>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={b.busy}
-              onClick={quickStart}
-            >
-              {t("vmBuilder.page.quickStart")}
-            </Button>
+      <div className="vb-pic">
+        <Compute />
+        <SlotBox
+          id="vm"
+          inspect={template}
+          className="vb-chassis vb-box gap-2 border-foreground/25 p-3 shadow-sm"
+        >
+          <div className="flex items-center gap-2 rounded-md bg-muted px-2 py-1.5">
+            <span aria-hidden className="flex gap-1">
+              <span className="vb-led" style={{ background: "var(--success)" }} />
+              <span className="vb-led" />
+              <span className="vb-led" />
+            </span>
+            <span className="min-w-0 truncate text-sm font-medium">
+              {v.name || t("vmBuilder.pic.unnamed")}
+            </span>
+            <span className="ml-auto truncate text-xs text-muted-foreground">
+              {template
+                ? t("vmBuilder.page.baseTemplate", {
+                    name:
+                      b.ctx.vms.find((x) => x.id === (b.s.base as { id: string }).id)?.name ?? "",
+                  })
+                : t(`vmBuilder.pic.preset.${b.s.preset}`)}
+            </span>
           </div>
-        )}
-        <div className="grid gap-3 sm:grid-cols-2">
-          <SlotBox id="compute">
-            <p className="text-sm">
-              {t("vmBuilder.page.compute", {
-                vcpus: v.sockets * (Number(v.cores) || 0),
-                memory: formatMib(Number(v.memory) || 0),
-                model: v.model,
-              })}
+          <ListSlot
+            list="disks"
+            icon={<HardDrive aria-hidden className="size-3.5" />}
+            add={
+              !template && (
+                <AddButton label={t("vmBuilder.pic.addDisk")} onClick={() => addPart("disks")} />
+              )
+            }
+          />
+          <ListSlot
+            list="cdroms"
+            icon={<Disc aria-hidden className="size-3.5" />}
+            add={
+              !template && (
+                <AddButton
+                  label={t("vmBuilder.pic.addCdrom")}
+                  disabled={v.cdroms.length >= MAX_CDROMS}
+                  onClick={() => addPart("cdroms")}
+                />
+              )
+            }
+          />
+          {bootText && (
+            <p className="text-xs text-muted-foreground">
+              {t("vmBuilder.pic.bootOrder", { order: bootText })}
             </p>
-          </SlotBox>
-          <SlotBox id="placement">
-            <p className="text-sm">
-              {b.s.zone
-                ? t("vmBuilder.part.zone", { name: b.s.zone.value })
-                : node
-                  ? node.name
-                  : t("vmBuilder.part.auto")}
-            </p>
-          </SlotBox>
-          <SlotBox id="protection" empty={!v.ha}>
-            {v.ha && (
-              <p className="text-sm">
-                {v.haGroup ? `${t("vmBuilder.part.ha")} · ${v.haGroup}` : t("vmBuilder.part.ha")}
-              </p>
-            )}
-          </SlotBox>
-          <SlotBox id="cloudInit" empty={!v.cloudInit.enabled}>
+          )}
+        </SlotBox>
+        <div className="vb-nic flex min-w-0 flex-col gap-2">
+          <ListSlot
+            list="nics"
+            icon={<Network aria-hidden className="size-3.5" />}
+            className="vb-port vb-port-r"
+            add={<AddButton label={t("vmBuilder.pic.addNic")} onClick={() => addPart("nics")} />}
+          />
+          <SlotBox
+            id="cloudInit"
+            plain
+            empty={!v.cloudInit.enabled}
+            info={{ topic: "vmForm.cloudInit", line: t("vmBuilder.slotInfo.cloudInit") }}
+          >
             {v.cloudInit.enabled && (
               <p className="text-sm">
                 {v.cloudInit.user || t("vmBuilder.page.ciOn")}
@@ -236,22 +438,56 @@ export function Chassis() {
               </p>
             )}
           </SlotBox>
+          <SlotBox
+            id="protection"
+            plain
+            empty={!v.ha}
+            info={{ topic: "vmForm.ha", line: t("vmBuilder.slotInfo.protection") }}
+          >
+            {v.ha && (
+              <p className="text-sm">
+                {v.haGroup ? `${t("vmBuilder.part.ha")} · ${v.haGroup}` : t("vmBuilder.part.ha")}
+              </p>
+            )}
+          </SlotBox>
         </div>
-        <ListSlot list="disks" />
-        <ListSlot list="cdroms" />
-        <ListSlot list="nics" />
-        {holdingBlock && <SlotBox id="trash" inspect={false} />}
-      </SlotBox>
-      {b.selected && <Inspector />}
-    </div>
+      </div>
+      {holdingBlock && <SlotBox id="trash" inspect={false} empty />}
+      {b.selected && (
+        <div
+          className={cn(
+            !narrow && "absolute top-0 right-0 z-10 max-h-full w-80 overflow-y-auto shadow-lg",
+          )}
+        >
+          {b.selected === "os" ? <OsPicker /> : <Inspector />}
+        </div>
+      )}
+    </section>
   );
 }
 
-function ListSlot({ list }: { list: ListKind }) {
+function ListSlot({
+  list,
+  icon,
+  add,
+  className,
+}: {
+  list: ListKind;
+  icon: ReactNode;
+  add?: ReactNode;
+  className?: string;
+}) {
   const b = useBuilder();
   const rows = b.s.values[list];
   return (
-    <SlotBox id={list} empty={rows.length === 0} inspect={false}>
+    <SlotBox
+      id={list}
+      icon={icon}
+      add={add}
+      empty={rows.length === 0}
+      inspect={false}
+      className={className}
+    >
       {rows.length > 0 && (
         <div className="flex flex-col gap-1">
           {rows.map((_, index) => (
@@ -324,15 +560,15 @@ function BlockRow({ list, index }: { list: ListKind; index: number }) {
       aria-label={label}
       data-slot={id}
       data-level={level(own)}
-      className="flex flex-col gap-1 rounded-md border bg-background p-1"
+      className="flex flex-col gap-1 rounded-md border bg-background p-0.5"
     >
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-0.5">
         <button
           type="button"
           {...drag}
           disabled={b.busy}
           aria-label={t("vmBuilder.page.grip", { name: label })}
-          className="vb-part flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted"
+          className="vb-part flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted"
         >
           <GripVertical aria-hidden className="size-4" />
         </button>
@@ -344,7 +580,7 @@ function BlockRow({ list, index }: { list: ListKind; index: number }) {
               b.select(id);
             }
           }}
-          className="min-w-0 flex-1 truncate rounded-md px-1 py-1 text-left text-sm hover:bg-muted"
+          className="min-w-0 flex-1 truncate rounded-md px-1 py-1 text-left text-xs hover:bg-muted"
         >
           <span className="font-medium">{label}</span>{" "}
           <span className="text-muted-foreground">{summary}</span>

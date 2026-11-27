@@ -30,7 +30,7 @@ export interface NavItem {
   pages: NavPage[];
   folder?: { to: string; key: string };
   match?: string[];
-  /** 아래 경로가 리소스가 아니라 같은 화면의 다른 모양이다(만들기 화면의 빌더 `/vms/-new/builder`) */
+  /** 아래 경로가 리소스가 아니라 같은 화면으로 넘기는 옛 주소다(옛 빌더 주소 `/vms/-new/builder` → `/vms/-new`) */
   leaf?: boolean;
   /** 사이드바 항목 옆 숫자 */
   badge?: "alerts" | "failedTasks";
@@ -81,7 +81,7 @@ export const GROUPS: NavGroup[] = [
         folder: { to: "/vm-folders", key: "nav.vmFolders" },
       },
       one("templates", "nav.templates", { to: "/templates" }),
-      // `/vms/-new/builder`도 이 항목이다(가장 긴 접두사).
+      // 옛 `/vms/-new/builder`(지금은 넘김)도 이 항목이다(가장 긴 접두사).
       {
         ...one("create", "nav.item.createVm", { to: "/vms/-new", anywhere: "vm.create" }),
         leaf: true,
@@ -321,6 +321,8 @@ export const LEGACY_REDIRECTS: LegacyRedirect[] = [
   { from: "/protect", to: "/backups" },
   { from: "/activity", to: "/tasks" },
   { from: "/settings/remotes", to: "/remotes/-manage" },
+  // 계획 71 빌더 보기는 계획 77-5에서 VM 만들기 한 화면이 되었다.
+  { from: "/vms/-new/builder", to: "/vms/-new" },
 ];
 
 /** 옛 주소가 지금 권한으로 갈 곳 */

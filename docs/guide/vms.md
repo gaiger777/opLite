@@ -1205,7 +1205,7 @@ disk_timeout = "12h"      # 로컬 디스크 복사가 따라잡기(ready)까지
 
 ## 만들기 전 미리 확인
 
-VM을 만들지 않고 서버가 **만들기(`POST /vms`)와 같은 검사**를 돌려 문제를 모아 준다(계획 71). 웹의 [VM 빌더](web-ui.md#vm-빌더-화면)가 값을
+VM을 만들지 않고 서버가 **만들기(`POST /vms`)와 같은 검사**를 돌려 문제를 모아 준다(계획 71). 웹의 [VM 만들기 화면](web-ui.md#vm-만들기-화면)이 값을
 바꿀 때마다(0.6초 쉬면) 이것을 부르고, CLI는 `vm create … --dry-run`이다. 아무것도 쓰지 않고 잠그지 않으며 감사 로그에 적지 않는다.
 
 ```bash
@@ -1257,7 +1257,9 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
   적은 `pool_space` 하나). `code`는 만들기가 낼 오류 코드(`forbidden`·`quota_exceeded`·`no_node`·`placement_rule`·`name_taken` 등)이고
   `message`는 그 글이다. `node`는 준 노드나 켜진 채 노드 없이 만들 때 스케줄러가 고를 노드의 이름이고(**예상** — 확인과 만들기 사이 부하가
   바뀌면 다르게 고를 수 있고, 꺼진 채 만드는 VM에도 나올 수 있다 — 켤 때 다시 고른다), 준비 단계를 지나지 못했거나 노드가 정해지지 않았거나 루트
-  `cluster.read`가 없으면 `null`이다. `machine`(채운 머신)·`cpu_model`(별칭을
+  `cluster.read`가 없으면 `null`이다. `start_node`는 **꺼진 채 노드 없이** 만들 때 지금 켜면 스케줄러가 고를 노드다(계획 77-5 — 웹 만들기
+  화면의 "놓일 노드"와 여유 막대가 쓴다, 예상이고 잡아 두지 않는다). 켜진 채이거나 노드를 줬거나 놓을 노드가 없거나(만들기는 받는다 — 켤 때
+  까닭이 나온다) 노드 이름을 볼 수 없으면 칸이 없다(노드 이름을 볼 수 없는 사용자에게는 이 예상을 셈하지도, 부하 요약을 읽지도 않는다). `machine`(채운 머신)·`cpu_model`(별칭을
   버전 모델로 고정한 것)·`ips`(NIC마다 받을 SDN 주소 — 예상이고 잡아 두지 않음)는 준비 단계를 지났을 때만 채우고, 아니면 `null`·빈 목록이다.
 - **`at` 자리**(웹 빌더의 칸이자 폼 오류 열쇠의 꼴): `name`, `compute`, `disks`·`disks.N`, `cdroms`·`cdroms.N`, `nics`·`nics.N`, `cloudInit`,
   `placement`, `protection`, `replication`, `quota`, `spec`(그 밖). `N`은 요청 spec의 `disks`·`cdroms`·`nics` 차례다. 만들 볼륨의 문제는 그 볼륨을

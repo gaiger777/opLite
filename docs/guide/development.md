@@ -148,7 +148,7 @@ cargo test -p orbivisor-api vm_checks                                     # area
 cargo test -p orbivisorctl -- vm_create_dry_run web_cross                 # vm create --dry-run(표·-o json·끝 코드), 웹 CLI 미리 보기 교차 시험(아래)
 pnpm -C web test src/dnd src/vmBuilder src/placement/hard.test.ts   # 끌기 틀(상태 기계 사건열 성질 시험·자동 스크롤·제공자), 빌더 모델(부품·놓기 규칙 표·놓기·문제·요청·JSON·CLI·무작위 놓기)과 화면(msw, axe), hard 배치 규칙 예상
 pnpm -C web test src/clusterMap/drop.test.ts src/clusterMap/ClusterMapDrag.test.tsx   # 지도 끌어 옮기기: 놓을 자리 판정 표, 마우스·터치·m 키·권한·가장자리 보기 옮기기
-pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_builds_vms_with_the_builder   # 브라우저로 빌더 만들기 셋(QEMU를 켜지 않음)
+pnpm -C web build && cargo test -p orbivisord --features web-it --test web browser_builds_vms_with_the_builder   # 브라우저로 VM 만들기 한 화면에서 셋(QEMU를 켜지 않음)
 # VMware 이전 2·OVA 내보내기(계획 72) — 가짜 vSphere(orbivisor-api 기능 `fake-vsphere`: 스냅샷 사슬·CBT·게스트 쓰기·호스트 티켓·결함 주입)
 cargo test -p orbivisor-types -- vmware vm_export                         # 순수: serde 하위 호환(빈 값 안 씀), 비밀번호 가림, 검증 표, 항목·스냅샷 이름
 cargo test -p orbivisor-api --lib -- vmware vm_imports::ovf_write vm_exports   # SOAP 봉투·결함, 인벤토리·CBT 구역, 매핑·VMware 쪽 표, 스케줄러 순수 plan, OVF 쓰개 ↔ 계획 29 읽개, ustar
@@ -474,11 +474,12 @@ pnpm -C web build && cargo test -p orbivisord --features web-it --test web brows
 트리·팔레트에 `/teamA`만 보이는지, + 만들기가 폴더를 골라 두고 노드 칸 없이 VM을 만드는지, 사용자 메뉴 › 내 2단계 인증에서 인증 앱을 켠
 뒤 둘째 단계로 다시 로그인하는지 본다.
 
-셋째 브라우저 E2E(`web/e2e/builder.spec.ts`, 계획 71)는 `web.rs`의 `browser_builds_vms_with_the_builder`가 돌린다. Rust 쪽이 dir 풀
-`local`, 이름이 겹칠 볼륨 `b1-disk0`, vCPU 할당량 1인 폴더 `/q`를 준비하고, 브라우저는 VM 빌더로 꺼진 VM 셋을 만든다: (1) 1440 × 1000
-마우스 — 폼에서 넘어온 NIC 블록을 "빼기"로 끌고, 크기·풀·네트워크를 끌어 놓고, 이름이 겹치는 볼륨의 브라우저 오류, 4096 GiB 디스크의 서버
-경고 `pool_space`(디스크 줄), 폴더 `/q`의 서버 오류 `quota_exceeded`(VM 틀, 만들기 막힘), JSON·CLI 탭 글, 만들기 → `/vms/b1`, (2) 키보드만
-(`Space`·`Tab`·`Space`, 알림 줄, `Esc` 초점), (3) 390 × 844 "Add parts" 서랍 → 누르기 → "Drop here", 가로 스크롤 없음. 끝에 Rust가 CLI로
+셋째 브라우저 E2E(`web/e2e/builder.spec.ts`, 계획 71·77-5)는 `web.rs`의 `browser_builds_vms_with_the_builder`가 돌린다. Rust 쪽이 dir 풀
+`local`, 이름이 겹칠 볼륨 `b1-disk0`, vCPU 할당량 1인 폴더 `/q`를 준비하고, 브라우저는 VM 만들기 한 화면으로 꺼진 VM 셋을 만든다: (1) 1440 × 900
+마우스 — 모든 VM › 만들기 → 용도 카드 "빈 VM", 문서 높이 ≤ 화면, 이름 전 오류 없음, user NIC를 끌어 붙인 뒤 그 블록을 "빼기"로 끌고, 풀·네트워크를
+끌어 놓고, 이름이 겹치는 볼륨의 브라우저 오류(만들기를 누르면 까닭), 4096 GiB 디스크의 서버 경고 `pool_space`(디스크 줄), 요약에서 폴더 `/q`를
+고르면 서버 오류 `quota_exceeded`(VM 본체), vCPU 1·메모리 1 GiB 칩으로 통과, 요청 보기 서랍의 JSON·CLI 글, 만들기 → `/vms/b1`, (2) 키보드만
+(메모리 칩, `Space`·`Tab`·`Space`, 알림 줄, `Esc` 초점), (3) 390 × 844 용도 카드 → "Add parts" 서랍 → 누르면 붙음, 가로 스크롤 없음. 끝에 Rust가 CLI로
 만든 VM의 스펙·볼륨·폴더를 본다. 터치 길게 누르기는 vitest에만 있다(Playwright Desktop Chrome에 터치가 없음). 세 시험은 spec 하나씩을 돌리고
 하나씩 차례로 돈다.
 

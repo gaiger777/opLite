@@ -2,8 +2,6 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
-import type { List } from "@/api/live";
-import type { Task } from "@/api/types";
 import {
   hardware,
   haGroup,
@@ -18,111 +16,26 @@ import {
   vm,
   volume,
 } from "@/test/fixtures";
-import { expectNoAxeViolations } from "@/test/axe";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
-import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
+import { VmEditPage } from "@/vms/VmFormPage";
 
-it("creates a new volume first, then the VM", async () => {
-  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
-  const bodies: unknown[] = [];
-  server.use(
-    http.post(apiUrl("/volumes"), async ({ request }) => {
-      bodies.push(await request.json());
-      return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
-    }),
-    http.post(apiUrl("/vms"), async ({ request }) => {
-      bodies.push(await request.json());
-      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
-    }),
-  );
-  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
-  await user.click(screen.getByRole("button", { name: "New empty volume" }));
-  const disk = screen.getByRole("group", { name: "Disk 1" });
-  expect(within(disk).getByLabelText("New volume")).toHaveValue("web-disk0");
-  await user.selectOptions(within(disk).getByLabelText("Storage pool"), "local");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-
-  await waitFor(() => expect(bodies).toHaveLength(1));
-  expect(bodies[0]).toEqual({
-    name: "web-disk0",
-    spec: { pool: "local", size_bytes: 16 * 1024 ** 3, format: "qcow2" },
-  });
-  // watch가 Task 완료를 알려 줄 때까지 VM은 만들지 않는다.
-  const done = {
-    ...task("t-vol", "volume-create", "v1"),
-    status: { state: "succeeded", error: null },
-  };
-  queryClient.setQueryData<List<Task>>(["list", "task"], { revision: 2, items: [done as Task] });
-  expect(await screen.findByText("moved")).toBeInTheDocument();
-  expect(bodies[1]).toMatchObject({
-    name: "web",
-    spec: {
-      machine: "q35",
-      cpu: { sockets: 1, cores: 2, model: "host" },
-      disks: [{ volume: "web-disk0", bus: "virtio-blk", boot_order: 1 }],
-      nics: [{ network: "user", model: "virtio", mac: null }],
-      node: null,
-      power: "running",
-    },
-  });
+/**
+ * 만들기는 그림 한 화면(계획 77-5, `vmBuilder/BuilderPage`)이 되었다. 폼 섹션(만들기와 고치기가 함께 쓰던 칸)은 노드 없는
+ * 멈춘 새 VM(user NIC 하나, 디스크 없음)을 고치는 화면으로 본다.
+ */
+const FRESH = vm("web", "stopped", {
+  spec: {
+    ...vm("web", "stopped").spec,
+    machine: "q35",
+    node: null,
+    nics: [{ network: "user", model: "virtio", mac: "52:54:00:00:00:01" }],
+  },
 });
 
-it("shows input errors without calling the API", async () => {
-  mockLists({ node: [NODE] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "Bad Name");
-  await user.clear(screen.getByLabelText("Memory (MiB)"));
-  await user.type(screen.getByLabelText("Memory (MiB)"), "32");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  expect(screen.getByText(/^Use 1–63 lowercase letters/)).toBeInTheDocument();
-  expect(screen.getByText("At least 64 MiB.")).toBeInTheDocument();
-});
-
-it("follows the chosen node's architecture until a machine is picked", async () => {
-  const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
-  const x86 = {
-    ...NODE,
-    id: "n2",
-    name: "node-b",
-    status: { ...NODE.status, arch: "x86_64" as const },
-  };
-  mockLists({ node: [arm, x86] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
-  // 아키텍처가 섞여 있으면 q35다.
-  expect(machine).toHaveValue("q35");
-  await user.selectOptions(screen.getByLabelText("Node"), "node-a");
-  expect(machine).toHaveValue("virt");
-  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
-  expect(machine).toHaveValue("q35");
-  // 직접 고르면 노드를 바꿔도 그대로다.
-  await user.selectOptions(machine, "virt");
-  await user.selectOptions(screen.getByLabelText("Node"), "");
-  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
-  expect(machine).toHaveValue("virt");
-});
-
-it("does not offer witness nodes", async () => {
-  const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
-  const witness = {
-    ...NODE,
-    id: "n2",
-    name: "node-w",
-    spec: { ...NODE.spec, witness: true },
-    status: { ...NODE.status, arch: "x86_64" as const },
-  };
-  mockLists({ node: [arm, witness] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  // 위트니스의 아키텍처는 머신 기본값에 섞이지 않는다.
-  expect(await screen.findByLabelText("Virtual motherboard (advanced)")).toHaveValue("virt");
-  expect(screen.getByRole("option", { name: "node-a" })).toBeInTheDocument();
-  expect(screen.queryByRole("option", { name: "node-w" })).not.toBeInTheDocument();
-});
+function editFresh() {
+  return renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+}
 
 it("keeps the machine of an edited VM when its node changes", async () => {
   const arm = { ...NODE, status: { ...NODE.status, arch: "aarch64" as const } };
@@ -205,102 +118,34 @@ it("keeps the interfaces and MAC addresses of a running VM", async () => {
   expect(screen.getByLabelText("Network")).toBeEnabled();
 });
 
-it("keeps created volumes when the VM cannot be created, and does not recreate them", async () => {
-  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
-  const volumes: string[] = [];
-  let vmPosts = 0;
-  server.use(
-    http.post(apiUrl("/volumes"), async ({ request }) => {
-      volumes.push(((await request.json()) as { name: string }).name);
-      return HttpResponse.json(task("t-vol2", "volume-create", "v1"), { status: 202 });
-    }),
-    http.post(apiUrl("/vms"), () => {
-      vmPosts += 1;
-      return HttpResponse.json({ code: "conflict", message: "name is taken" }, { status: 409 });
-    }),
-  );
-  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
-  await user.click(screen.getByRole("button", { name: "New empty volume" }));
-  await user.selectOptions(screen.getByLabelText("Storage pool"), "local");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  await waitFor(() => expect(volumes).toEqual(["web-disk0"]));
-  // 보내는 동안에는 입력을 고칠 수 없다.
-  expect(screen.getByLabelText("Name")).toBeDisabled();
-  const done = { ...task("t-vol2", "volume-create", "v1"), status: { state: "succeeded" } };
-  queryClient.setQueryData(["list", "task"], { revision: 2, items: [done] });
-  // watch가 만든 볼륨도 알려 준다.
-  queryClient.setQueryData(["list", "volume"], {
-    revision: 3,
-    items: [volume("web-disk0", "local")],
-  });
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    /^Volumes web-disk0 were created; .*name is taken/,
-  );
-
-  // 다시 보내면 볼륨은 있는 것으로 붙이고 VM만 만든다.
-  expect(
-    within(screen.getByRole("group", { name: "Disk 1" })).getByLabelText("Volume"),
-  ).toHaveValue("web-disk0");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  await waitFor(() => expect(vmPosts).toBe(2));
-  expect(volumes).toEqual(["web-disk0"]);
-});
-
-it("stops waiting for the volume and does not create the VM after leaving", async () => {
-  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
-  let posted = false;
-  let vmPosted = false;
-  server.use(
-    http.post(apiUrl("/volumes"), () => {
-      posted = true;
-      return HttpResponse.json(task("t-vol3", "volume-create", "v1"), { status: 202 });
-    }),
-    http.post(apiUrl("/vms"), () => {
-      vmPosted = true;
-      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
-    }),
-  );
-  const { queryClient, unmount } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
-  await user.click(screen.getByRole("button", { name: "New empty volume" }));
-  await user.selectOptions(screen.getByLabelText("Storage pool"), "local");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  await waitFor(() => expect(posted).toBe(true));
-  await waitFor(() => expect(queryClient.getQueryCache().hasListeners()).toBe(true));
-  unmount();
-  // 떠난 뒤 Task가 끝나도 VM을 만들지 않는다.
-  const done = { ...task("t-vol3", "volume-create", "v1"), status: { state: "succeeded" } };
-  queryClient.setQueryData(["list", "task"], { revision: 2, items: [done] });
-  await new Promise((r) => setTimeout(r, 50));
-  expect(vmPosted).toBe(false);
-});
-
 it("ties errors to their inputs and clears them when rows change", async () => {
-  mockLists({ node: [NODE] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  mockLists({
+    vm: [FRESH],
+    node: [NODE],
+  });
+  editFresh();
   const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
+  await screen.findByRole("heading", { name: "Edit web" });
   await user.click(screen.getByRole("button", { name: "Attach a volume" }));
   await user.clear(screen.getByLabelText("MAC address"));
   await user.type(screen.getByLabelText("MAC address"), "01:00:5e:00:00:01");
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
 
   const volume = within(screen.getByRole("group", { name: "Disk 1" })).getByLabelText("Volume");
   expect(volume).toHaveAttribute("aria-invalid", "true");
   expect(volume).toHaveAccessibleDescription("Choose a volume.");
   expect(screen.getByLabelText("MAC address")).toHaveAccessibleDescription(/multicast address/);
-  expect(screen.getByLabelText("Name")).not.toHaveAttribute("aria-invalid");
 
   await user.click(screen.getByRole("button", { name: "Remove disk 1" }));
   expect(screen.getByLabelText("MAC address")).not.toHaveAttribute("aria-invalid");
 });
 
 it("allows at most 16 network interfaces", async () => {
-  mockLists({ node: [NODE] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  mockLists({
+    vm: [FRESH],
+    node: [NODE],
+  });
+  editFresh();
   const user = userEvent.setup();
   const add = await screen.findByRole("button", { name: "Add an interface" });
   for (let i = 1; i < 16; i++) {
@@ -360,11 +205,12 @@ it("changes the security groups of a running VM's interfaces", async () => {
 
 it("drops the security groups of an interface moved to the user network", async () => {
   mockLists({
+    vm: [FRESH],
     node: [NODE],
     network: [{ id: "net", name: "lan", revision: 1, labels: {}, spec: { bridge: "br0" } }],
     "security-group": [securityGroup("ssh")],
   });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  editFresh();
   const user = userEvent.setup();
   const nic = await screen.findByRole("group", { name: "Network interface 1" });
   await within(nic).findByRole("option", { name: "lan" });
@@ -373,19 +219,6 @@ it("drops the security groups of an interface moved to the user network", async 
   await user.selectOptions(within(nic).getByLabelText("Network"), "user");
   await user.selectOptions(within(nic).getByLabelText("Network"), "lan");
   expect(within(nic).getByRole("checkbox", { name: "ssh" })).not.toBeChecked();
-});
-
-it("says why the create page cannot load", async () => {
-  mockLists({});
-  server.use(
-    http.get(apiUrl("/nodes"), () =>
-      HttpResponse.json({ code: "forbidden", message: "permission denied" }, { status: 403 }),
-    ),
-  );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "You do not have permission to do this.",
-  );
 });
 
 it("sets a snapshot schedule and checks how many to keep", async () => {
@@ -544,49 +377,6 @@ it("warns that disks in shared LVM pools cannot be snapshotted on a schedule", a
   expect(screen.queryByText(/saved without memory/)).not.toBeInTheDocument();
 });
 
-it("makes new volumes in LVM-thin pools raw and warns about mixed snapshot methods", async () => {
-  mockLists({
-    node: [NODE],
-    volume: [volume("data", "local")],
-    "storage-pool": [pool("local"), fast],
-  });
-  const bodies: unknown[] = [];
-  server.use(
-    http.post(apiUrl("/volumes"), async ({ request }) => {
-      bodies.push(await request.json());
-      return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
-    }),
-  );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
-  await user.click(screen.getByRole("button", { name: "New empty volume" }));
-  await user.selectOptions(
-    within(screen.getByRole("group", { name: "Disk 1" })).getByLabelText("Storage pool"),
-    "fast",
-  );
-  await user.click(screen.getByRole("button", { name: "Attach a volume" }));
-  await user.selectOptions(
-    within(screen.getByRole("group", { name: "Disk 2" })).getByLabelText("Volume"),
-    "data",
-  );
-  await user.selectOptions(screen.getByLabelText("Take snapshots"), "hourly");
-  // 새 LVM 디스크(LV 스냅샷)와 qcow2 디스크(내부 스냅샷)는 함께 스냅샷하지 못한다.
-  expect(
-    screen.getByText(
-      "Disks with different snapshot methods (qcow2, LVM-thin pools, ZFS pools, Ceph RBD pools) are mixed, so scheduled snapshots will fail.",
-    ),
-  ).toBeVisible();
-  await user.click(screen.getByRole("button", { name: "Remove disk 2" }));
-  expect(screen.queryByText(/scheduled snapshots will fail/)).not.toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  await waitFor(() => expect(bodies).toHaveLength(1));
-  expect(bodies[0]).toEqual({
-    name: "web-disk0",
-    spec: { pool: "fast", size_bytes: 16 * 1024 ** 3, format: "raw" },
-  });
-});
-
 const FENCED = {
   ...NODE,
   status: { ...NODE.status, ha: { fencing: "watchdog" as const, recover_after_secs: 65 } },
@@ -594,18 +384,22 @@ const FENCED = {
 const UNFENCED = { ...NODE, id: "n2", name: "node-b" };
 
 it("turns HA on only for nodes with fencing on and says why not", async () => {
-  mockLists({ node: [FENCED, UNFENCED] });
+  mockLists({
+    vm: [FRESH],
+    node: [FENCED, UNFENCED],
+  });
   let body: unknown;
   server.use(
-    http.post(apiUrl("/vms"), async ({ request }) => {
+    http.put(apiUrl(`/vms/${FRESH.id}`), async ({ request }) => {
       body = await request.json();
       return HttpResponse.json({ code: "ha_unsupported", message: "node is off" }, { status: 409 });
     }),
   );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  editFresh();
   const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
+  await screen.findByRole("heading", { name: "Edit web" });
   const ha = screen.getByRole("switch", { name: "High availability (HA)" });
+  await screen.findByRole("option", { name: "node-b" });
   // 자동이면 HA 가능 노드가 하나라도 있으면 켤 수 있다.
   expect(ha).toBeEnabled();
   await user.selectOptions(screen.getByLabelText("Node"), "node-b");
@@ -618,12 +412,12 @@ it("turns HA on only for nodes with fencing on and says why not", async () => {
   expect(screen.queryByText(/has failed-node isolation \(fencing\) off/)).not.toBeInTheDocument();
   await user.click(ha);
   expect(ha).toBeChecked();
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   // 서버가 거부하면 번역한 이유를 보인다.
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "The node has node fencing (forced cut-off) turned off and cannot run HA VMs.",
   );
-  expect(body).toMatchObject({ name: "web", spec: { node: "n1", ha: true } });
+  expect(body).toMatchObject({ spec: { node: "n1", ha: true } });
 });
 
 it("says when no node can run HA VMs but lets an HA VM turn HA off", async () => {
@@ -673,9 +467,13 @@ it("turns HA on for a stopped VM", async () => {
 });
 
 it("says when no node has fencing on", async () => {
-  mockLists({ node: [UNFENCED] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  expect(await screen.findByRole("switch", { name: "High availability (HA)" })).toBeDisabled();
+  mockLists({
+    vm: [FRESH],
+    node: [UNFENCED],
+  });
+  editFresh();
+  const ha = await screen.findByRole("switch", { name: "High availability (HA)" });
+  await waitFor(() => expect(ha).toBeDisabled());
   expect(
     screen.getByText("No node has failed-node isolation (fencing) on, so HA VMs can't run."),
   ).toBeInTheDocument();
@@ -988,20 +786,23 @@ it("asks to restart a VM started without hotplug before changing its devices", a
 });
 
 it("sets the hotplug maximums and checks them like the server", async () => {
-  mockLists({ node: [NODE] });
+  mockLists({
+    vm: [FRESH],
+    node: [NODE],
+  });
   let body: { spec: { cpu: unknown; max_memory_mib?: number } } | undefined;
   server.use(
-    http.post(apiUrl("/vms"), async ({ request }) => {
+    http.put(apiUrl(`/vms/${FRESH.id}`), async ({ request }) => {
       body = (await request.json()) as typeof body;
-      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      return HttpResponse.json(FRESH);
     }),
   );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  editFresh();
   const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
+  await screen.findByRole("heading", { name: "Edit web" });
   await user.type(screen.getByLabelText("Maximum vCPUs"), "1");
   await user.type(screen.getByLabelText("Maximum memory (MiB)"), "4000");
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   expect(screen.getByText("At least sockets × cores.")).toBeInTheDocument();
   expect(
     screen.getByText("With a maximum, memory and maximum memory must be multiples of 128 MiB."),
@@ -1011,7 +812,7 @@ it("sets the hotplug maximums and checks them like the server", async () => {
   await user.type(screen.getByLabelText("Maximum vCPUs"), "8");
   await user.clear(screen.getByLabelText("Maximum memory (MiB)"));
   await user.type(screen.getByLabelText("Maximum memory (MiB)"), "16384");
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   await vi.waitFor(() => expect(body).toBeDefined());
   expect(body!.spec.cpu).toEqual({ sockets: 1, cores: 2, model: "host", max_vcpus: 8 });
   expect(body!.spec.max_memory_mib).toBe(16384);
@@ -1027,17 +828,22 @@ describe("replication", () => {
   const WITNESS = { ...NODE, id: "n9", name: "node-w", spec: { ...NODE.spec, witness: true } };
 
   it("adds replication targets to a new VM, but not to its own node or a witness", async () => {
-    mockLists({ node: [NODE, NODE_B, WITNESS], "storage-pool": [pool("local"), pool("b")] });
+    mockLists({
+      vm: [FRESH],
+      node: [NODE, NODE_B, WITNESS],
+      "storage-pool": [pool("local"), pool("b")],
+    });
     let body: unknown;
     server.use(
-      http.post(apiUrl("/vms"), async ({ request }) => {
+      http.put(apiUrl(`/vms/${FRESH.id}`), async ({ request }) => {
         body = await request.json();
-        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+        return HttpResponse.json(FRESH);
       }),
     );
-    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    editFresh();
     const user = userEvent.setup();
-    await user.type(await screen.findByLabelText("Name"), "web");
+    await screen.findByRole("heading", { name: "Edit web" });
+    await screen.findByRole("option", { name: "node-a" });
     await user.selectOptions(screen.getByLabelText("Node"), "node-a");
     expect(
       screen.getByText(/Copies disks on node-local pools to other nodes on a schedule/),
@@ -1055,10 +861,9 @@ describe("replication", () => {
     await user.clear(within(row).getByLabelText("Every (minutes)"));
     await user.type(within(row).getByLabelText("Every (minutes)"), "5");
     await user.selectOptions(within(row).getByLabelText("Target pool"), "b");
-    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText("moved")).toBeInTheDocument();
     expect(body).toMatchObject({
-      name: "web",
       spec: { node: "n1", replication: [{ node: "n2", schedule: "*/5", pool: "b" }] },
     });
   });
@@ -1069,17 +874,20 @@ describe("replication", () => {
       NODE_B,
       ...["n3", "n4"].map((id) => ({ ...NODE, id, name: `node-${id}` })),
     ];
-    mockLists({ node: nodes });
+    mockLists({
+      vm: [FRESH],
+      node: nodes,
+    });
     let called = false;
     server.use(
-      http.post(apiUrl("/vms"), () => {
+      http.put(apiUrl(`/vms/${FRESH.id}`), () => {
         called = true;
-        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+        return HttpResponse.json(FRESH);
       }),
     );
-    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    editFresh();
     const user = userEvent.setup();
-    await user.type(await screen.findByLabelText("Name"), "web");
+    await screen.findByRole("heading", { name: "Edit web" });
     const add = screen.getByRole("button", { name: "Add replication target" });
     await user.click(add);
     await user.click(add);
@@ -1092,7 +900,7 @@ describe("replication", () => {
     await user.selectOptions(within(second).getByLabelText("Node"), "node-a");
     await user.clear(within(second).getByLabelText("Every (minutes)"));
     await user.type(within(second).getByLabelText("Every (minutes)"), "1441");
-    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
     expect(within(second).getByText("This node is already a target.")).toBeInTheDocument();
     expect(within(second).getByText("Enter whole minutes from 1 to 1440.")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Remove replication target 2" }));
@@ -1101,20 +909,23 @@ describe("replication", () => {
   });
 
   it("does not combine replication with scheduled snapshots", async () => {
-    mockLists({ node: [NODE, NODE_B] });
+    mockLists({
+      vm: [FRESH],
+      node: [NODE, NODE_B],
+    });
     let called = false;
     server.use(
-      http.post(apiUrl("/vms"), () => {
+      http.put(apiUrl(`/vms/${FRESH.id}`), () => {
         called = true;
-        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+        return HttpResponse.json(FRESH);
       }),
     );
-    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    editFresh();
     const user = userEvent.setup();
-    await user.type(await screen.findByLabelText("Name"), "web");
+    await screen.findByRole("heading", { name: "Edit web" });
     await user.selectOptions(screen.getByLabelText("Take snapshots"), "daily");
     await user.click(screen.getByRole("button", { name: "Add replication target" }));
-    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
     expect(
       screen.getByText(
         "Replication cannot be used together with scheduled snapshots. Turn the snapshot schedule off.",
@@ -1185,73 +996,20 @@ describe("install media", () => {
     isoVolume("ubuntu", "nas"),
   ];
 
-  it("creates a VM with a CD-ROM, a boot order and cloud-init", async () => {
-    mockLists({ node: [NODE], "storage-pool": [pool("local"), nas], volume: media });
-    let body: { spec: Record<string, unknown> } | undefined;
-    server.use(
-      http.post(apiUrl("/vms"), async ({ request }) => {
-        body = (await request.json()) as typeof body;
-        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
-      }),
-    );
-    renderPage(<VmCreatePage />, { path: "/vms/-new" });
-    const user = userEvent.setup();
-    await user.type(await screen.findByLabelText("Name"), "web");
-    await user.click(screen.getByRole("button", { name: "Attach a volume" }));
-    const disk = screen.getByRole("group", { name: "Disk 1" });
-    // ISO는 디스크로 붙이지 않는다.
-    expect(within(disk).queryByRole("option", { name: "alpine" })).not.toBeInTheDocument();
-    await user.selectOptions(within(disk).getByLabelText("Volume"), "web-root");
-    await user.click(screen.getByRole("button", { name: "Add a CD/DVD drive" }));
-    const cd = screen.getByRole("group", { name: "CD-ROM drive 0" });
-    await user.selectOptions(within(cd).getByLabelText("Media of cdrom0"), "alpine");
-
-    // 기본은 디스크 다음 CD-ROM이다. CD-ROM을 위로 올리면 목록 순서대로 적는다.
-    const boot = screen.getByRole("list", { name: "Boot order" });
-    expect(
-      within(boot)
-        .getAllByRole("listitem")
-        .map((li) => li.textContent),
-    ).toEqual([
-      expect.stringContaining("disk0 — web-root"),
-      expect.stringContaining("cdrom0 — alpine"),
-    ]);
-    await user.click(within(boot).getByRole("button", { name: "Move cdrom0 up" }));
-    expect(within(boot).getAllByRole("listitem")[0]).toHaveTextContent("cdrom0 — alpine");
-
-    await user.click(screen.getByLabelText("Set up the guest on first boot (cloud-init)"));
-    await user.type(screen.getByLabelText("User"), "orbi");
-    await user.type(screen.getByLabelText("Password"), "secret");
-    await user.type(screen.getByLabelText("SSH public keys"), "ssh-ed25519 AAAA me@laptop");
-    await user.selectOptions(screen.getByLabelText("nic0 IPv4"), "static");
-    await user.type(screen.getByLabelText("Address/prefix"), "10.0.0.5/24");
-    await user.type(screen.getByLabelText("Gateway"), "10.0.0.1");
-    await user.type(screen.getByLabelText("DNS servers"), "10.0.0.2");
-    await user.click(screen.getByRole("button", { name: "Create" }));
-    await waitFor(() => expect(body).toBeDefined());
-    expect(body!.spec).toMatchObject({
-      disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 2 }],
-      cdroms: [{ iso: "alpine", boot_order: 1 }],
-      cloud_init: {
-        user: "orbi",
-        password: "secret",
-        ssh_keys: ["ssh-ed25519 AAAA me@laptop"],
-        networks: [{ ipv4: { mode: "static", address: "10.0.0.5/24", gateway: "10.0.0.1" } }],
-        dns: { servers: ["10.0.0.2"] },
-      },
-    });
-    expect(body!.spec.cloud_init).not.toHaveProperty("hostname");
-  });
-
   it("checks cloud-init input and warns when user-data replaces the user", async () => {
-    mockLists({ node: [NODE], "storage-pool": [pool("local")], volume: media });
-    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    mockLists({
+      vm: [FRESH],
+      node: [NODE],
+      "storage-pool": [pool("local")],
+      volume: media,
+    });
+    editFresh();
     const user = userEvent.setup();
-    await user.type(await screen.findByLabelText("Name"), "web");
+    await screen.findByRole("heading", { name: "Edit web" });
     await user.click(screen.getByLabelText("Set up the guest on first boot (cloud-init)"));
     await user.type(screen.getByLabelText("User"), "root");
     await user.type(screen.getByLabelText("SSH public keys"), "not a key");
-    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
     expect(screen.getByText("Use SSH keys with the default user instead of root.")).toBeVisible();
     expect(screen.getByText("Line 1 is not an SSH public key.")).toBeVisible();
     expect(screen.queryByText(/replaces the generated user-data/)).not.toBeInTheDocument();
@@ -1336,83 +1094,32 @@ const CAPABLE = {
   status: { ...NODE.status, firmware_caps: { tpm: true, secure_boot: true } },
 };
 
-it("fills in Windows 11 and creates the VM with TPM, Secure Boot and the guest agent", async () => {
-  mockLists({ node: [CAPABLE], "storage-pool": [pool("local")] });
-  let body: { spec: Record<string, unknown> } | undefined;
-  let volumeBody: unknown;
-  server.use(
-    http.post(apiUrl("/volumes"), async ({ request }) => {
-      volumeBody = await request.json();
-      return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
-    }),
-    http.post(apiUrl("/vms"), async ({ request }) => {
-      body = (await request.json()) as typeof body;
-      return HttpResponse.json(vm("win", "stopped"), { status: 201 });
-    }),
-  );
-  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "win");
-  await user.click(screen.getByRole("radio", { name: "Windows 11" }));
-  expect(screen.getByRole("status")).toHaveTextContent(/switch to virtio for speed/);
-  expect(screen.getByRole("switch", { name: "TPM 2.0" })).toBeChecked();
-  expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeChecked();
-  expect(screen.getByRole("switch", { name: "QEMU guest agent" })).toBeChecked();
-  expect(screen.getByLabelText("Memory (MiB)")).toHaveValue(4096);
-  // 미리 채운 뒤 더한 디스크·NIC도 Windows 장치로 시작한다.
-  await user.click(screen.getByRole("button", { name: "New empty volume" }));
-  const disk = screen.getByRole("group", { name: "Disk 1" });
-  await user.selectOptions(within(disk).getByLabelText("Storage pool"), "local");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  const done = {
-    ...task("t-vol", "volume-create", "v1"),
-    status: { state: "succeeded", error: null },
-  };
-  // 볼륨 Task가 끝나야 VM을 만든다.
-  await waitFor(() => expect(volumeBody).toBeDefined());
-  queryClient.setQueryData<List<Task>>(["list", "task"], { revision: 2, items: [done as Task] });
-  await waitFor(() => expect(body).toBeDefined());
-  expect(body!.spec).toMatchObject({
-    machine: "q35",
-    firmware: "uefi",
-    cpu: { sockets: 1, cores: 2 },
-    memory_mib: 4096,
-    tpm: true,
-    secure_boot: true,
-    guest_agent: { freeze_fs: true },
-    disks: [{ volume: "win-disk0", bus: "sata" }],
-    nics: [{ network: "user", model: "e1000e" }],
-  });
-});
-
 it("says why TPM and Secure Boot cannot be turned on and needs UEFI", async () => {
   // 옛 노드는 능력을 알리지 않는다.
-  mockLists({ node: [NODE] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
+  mockLists({
+    vm: [FRESH],
+    node: [NODE],
+  });
+  editFresh();
   const tpm = await screen.findByRole("switch", { name: "TPM 2.0" });
-  expect(tpm).toBeDisabled();
+  await waitFor(() => expect(tpm).toBeDisabled());
   expect(
     screen.getByText("No node can run a TPM. Install swtpm on the nodes and restart orbivisor."),
   ).toBeInTheDocument();
   expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeDisabled();
-  // 미리 채우기는 켜 두고 쓸 수 없다고 알린다(끌 수는 있다).
-  await user.click(screen.getByRole("radio", { name: "Windows 11" }));
-  expect(tpm).toBeChecked();
-  expect(tpm).toBeEnabled();
-  await user.click(tpm);
-  expect(tpm).not.toBeChecked();
-  expect(tpm).toBeDisabled();
 });
 
 it("asks for UEFI before sending TPM", async () => {
-  mockLists({ node: [CAPABLE] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  mockLists({
+    vm: [FRESH],
+    node: [CAPABLE],
+  });
+  editFresh();
   const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
+  await screen.findByRole("heading", { name: "Edit web" });
   await user.click(screen.getByRole("switch", { name: "TPM 2.0" }));
   await user.selectOptions(screen.getByLabelText("Firmware"), "bios");
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   // 이유와 입력 오류
   expect(screen.getAllByText("Needs UEFI firmware.").length).toBeGreaterThan(0);
   expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeDisabled();
@@ -1478,92 +1185,18 @@ it("shows the server's message when Secure Boot needs a firmware reset", async (
   );
 });
 
-it("marks the steps with input errors and sums up the VM to review", async () => {
-  mockLists({ node: [NODE] });
-  const { container } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  const steps = await screen.findByRole("navigation", { name: "Form steps" });
-  expect(
-    within(steps)
-      .getAllByRole("link")
-      .map((l) => l.textContent),
-  ).toEqual([
-    "1General",
-    "2Disks",
-    "3Network",
-    "4CD/DVD",
-    "5Boot order",
-    "6Security",
-    "7Guest agent",
-    "8First-boot setup",
-    "9Snapshots",
-    "10Replication",
-    "11Review",
-  ]);
-  await user.type(screen.getByLabelText("Name"), "Bad Name");
-  await user.click(screen.getByRole("button", { name: "Create" }));
-  expect(within(steps).getByRole("link", { name: "General (1 errors)" })).toBeInTheDocument();
-  // 요약 검토
-  await user.clear(screen.getByLabelText("Name"));
-  await user.type(screen.getByLabelText("Name"), "web");
-  const review = screen.getByRole("region", { name: "Review" });
-  expect(within(review).getByText("Name").nextSibling).toHaveTextContent("web");
-  expect(within(review).getByText("Node").nextSibling).toHaveTextContent("Automatic");
-  expect(within(review).getByText("Memory (MiB)").nextSibling).toHaveTextContent("2 GiB");
-  expect(within(review).getByText("Start after creating").nextSibling).toHaveTextContent("On");
-  await expectNoAxeViolations(container, { disable: ["region"] });
-});
-
-it("fills in a Linux server and deploys from a template instead of the form", async () => {
-  const tmpl = {
-    ...vm("tmpl", "stopped"),
-    spec: { ...vm("tmpl", "stopped").spec, template: true },
-  };
-  mockLists({ node: [NODE], vm: [tmpl] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  expect(await screen.findByRole("radio", { name: "Blank VM" })).toBeChecked();
-  await user.click(screen.getByRole("radio", { name: "Linux server" }));
-  expect(screen.getByRole("switch", { name: "QEMU guest agent" })).toBeChecked();
-  const review = screen.getByRole("region", { name: "Review" });
-  expect(within(review).getByText("First-boot setup").nextSibling).toHaveTextContent("On");
-  // 템플릿에서: 폼 대신 템플릿 목록, 배포 대화상자
-  await user.click(screen.getByRole("radio", { name: "From a template" }));
-  expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
-  const list = await screen.findByRole("list", { name: "Templates" });
-  await user.click(within(list).getByRole("button", { name: "Deploy tmpl…" }));
-  expect(await screen.findByRole("dialog", { name: "Deploy from tmpl" })).toBeInTheDocument();
-});
-
-it("keeps what was entered when the preset changes, also with arrow keys", async () => {
-  mockLists({ node: [NODE], vm: [] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
-  await user.click(screen.getByRole("radio", { name: "Linux server" }));
-  await user.selectOptions(screen.getByLabelText("CPU model"), "max");
-  // 템플릿을 거쳐(화살표로) 다시 Linux: 입력이 남는다.
-  await user.click(screen.getByRole("radio", { name: "Linux server" }));
-  await user.keyboard("{ArrowRight}{ArrowRight}");
-  expect(screen.getByRole("radio", { name: "From a template" })).toBeChecked();
-  await user.keyboard("{ArrowLeft}{ArrowLeft}");
-  expect(screen.getByRole("radio", { name: "Linux server" })).toBeChecked();
-  expect(screen.getByLabelText("Name")).toHaveValue("web");
-  expect(screen.getByLabelText("CPU model")).toHaveValue("max");
-  // Windows를 지나쳐 오면 Windows 장치는 돌아간다.
-  const nic = screen.getByRole("group", { name: "Network interface 1" });
-  expect(within(nic).getByLabelText("Model")).toHaveValue("virtio");
-});
-
 it("moves focus to the first wrong input of the first step with errors", async () => {
-  mockLists({ node: [NODE], vm: [] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  mockLists({
+    vm: [FRESH],
+    node: [NODE],
+  });
+  editFresh();
   const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
+  await screen.findByRole("heading", { name: "Edit web" });
   const nic = screen.getByRole("group", { name: "Network interface 1" });
   const mac = within(nic).getByLabelText("MAC address");
   await user.type(mac, "zz");
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   expect(mac).toHaveFocus();
   expect(mac).toHaveAccessibleDescription("Use the form 52:54:00:12:34:56.");
 });
@@ -1571,10 +1204,11 @@ it("moves focus to the first wrong input of the first step with errors", async (
 it("warns when a simple-network rate limit can't run on any node (review 2 m2)", async () => {
   // NODE는 `qos`를 알리지 않는다(tc 없음 — 서버가 409 `qos_unsupported`로 막는다).
   mockLists({
+    vm: [FRESH],
     node: [NODE],
     network: [{ id: "net", name: "lan", revision: 1, labels: {}, spec: { bridge: "br0" } }],
   });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  editFresh();
   const user = userEvent.setup();
   const nic = await screen.findByRole("group", { name: "Network interface 1" });
   await within(nic).findByRole("option", { name: "lan" });

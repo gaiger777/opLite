@@ -52,6 +52,7 @@ export function GeneralSection({
   noReplica,
   vmId,
   own,
+  advanced = false,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -76,6 +77,11 @@ export function GeneralSection({
   vmId?: string;
   /** 고치는 VM이 지금 잡은 전용 CPU·hugepages("들어갈 노드" 어림) */
   own?: OwnUse;
+  /**
+   * VM 만들기 화면의 고급 서랍(계획 77-5): 그림·요약에 있는 이름·코어(소켓이 하나일 때)·메모리·폴더·노드는 빼고 카드 틀
+   * 없이
+   */
+  advanced?: boolean;
 }) {
   const { t } = useTranslation();
   const perms = usePermissions();
@@ -132,32 +138,30 @@ export function GeneralSection({
   if (values.haGroup !== "" && !groupNames.includes(values.haGroup)) {
     groupNames.unshift(values.haGroup);
   }
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("vmForm.general")}</CardTitle>
-      </CardHeader>
-      <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        {live && (
-          <p className="text-sm text-muted-foreground sm:col-span-2">{t("vmForm.liveHint")}</p>
-        )}
-        {creating && (
-          <Field
-            id="vm-name"
-            label={t("common.name")}
-            error={errors.name}
-            help={t("help.vmForm.name")}
-          >
-            {(a11y) => (
-              <Input
-                id="vm-name"
-                {...a11y}
-                value={values.name}
-                onChange={(e) => onChange({ name: e.target.value })}
-              />
-            )}
-          </Field>
-        )}
+  const basic = !advanced;
+  const body = (
+    <>
+      {live && (
+        <p className="text-sm text-muted-foreground sm:col-span-2">{t("vmForm.liveHint")}</p>
+      )}
+      {creating && basic && (
+        <Field
+          id="vm-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.vmForm.name")}
+        >
+          {(a11y) => (
+            <Input
+              id="vm-name"
+              {...a11y}
+              value={values.name}
+              onChange={(e) => onChange({ name: e.target.value })}
+            />
+          )}
+        </Field>
+      )}
+      {(basic || values.sockets > 1) && (
         <Field
           id="vm-cores"
           label={values.sockets > 1 ? t("vmForm.coresPerSocket") : t("vmForm.cores")}
@@ -183,6 +187,8 @@ export function GeneralSection({
             />
           )}
         </Field>
+      )}
+      {basic && (
         <Field
           id="vm-memory"
           label={t("vmForm.memory")}
@@ -201,378 +207,389 @@ export function GeneralSection({
             />
           )}
         </Field>
-        <Field
-          id="vm-max-vcpus"
-          label={t("vmForm.maxVcpus")}
-          error={errors.maxVcpus}
-          help={t("vmForm.maxVcpusHint")}
-          info="vmForm.maxVcpus"
-        >
-          {(a11y) => (
-            <Input
-              id="vm-max-vcpus"
-              {...a11y}
-              type="number"
-              min={1}
-              max={MAX_VCPUS}
-              value={values.maxVcpus}
-              onChange={(e) => onChange({ maxVcpus: e.target.value })}
-            />
-          )}
-        </Field>
-        <Field
-          id="vm-max-memory"
-          label={t("vmForm.maxMemory")}
-          error={errors.maxMemory}
-          help={t("vmForm.maxMemoryHint")}
-          info="vmForm.maxMemory"
-        >
-          {(a11y) => (
-            <Input
-              id="vm-max-memory"
-              {...a11y}
-              type="number"
-              min={MEMORY_HOTPLUG_ALIGN_MIB}
-              max={MAX_HOTPLUG_MEMORY_MIB}
-              step={MEMORY_HOTPLUG_ALIGN_MIB}
-              value={values.maxMemory}
-              onChange={(e) => onChange({ maxMemory: e.target.value })}
-            />
-          )}
-        </Field>
-        <CpuModelPicker
-          id="vm-cpu-model"
-          label={t("vmForm.cpuModel")}
-          value={values.model}
-          arch={archOf(values.machine)}
-          onChange={(model) => {
-            chose.current = true;
-            autoCluster.current = false;
-            setArchReset(false);
-            onChange({ model });
-          }}
-        />
-        {archReset && (
-          <p role="status" className="text-xs text-muted-foreground sm:col-span-2">
-            {t("cpu.model.archReset")}
-          </p>
+      )}
+      <Field
+        id="vm-max-vcpus"
+        label={t("vmForm.maxVcpus")}
+        error={errors.maxVcpus}
+        help={t("vmForm.maxVcpusHint")}
+        info="vmForm.maxVcpus"
+      >
+        {(a11y) => (
+          <Input
+            id="vm-max-vcpus"
+            {...a11y}
+            type="number"
+            min={1}
+            max={MAX_VCPUS}
+            value={values.maxVcpus}
+            onChange={(e) => onChange({ maxVcpus: e.target.value })}
+          />
         )}
-        <Field
-          id="vm-firmware"
-          label={t("vms.firmware")}
-          help={t("help.vmForm.firmware")}
-          info="vmForm.firmware"
-        >
+      </Field>
+      <Field
+        id="vm-max-memory"
+        label={t("vmForm.maxMemory")}
+        error={errors.maxMemory}
+        help={t("vmForm.maxMemoryHint")}
+        info="vmForm.maxMemory"
+      >
+        {(a11y) => (
+          <Input
+            id="vm-max-memory"
+            {...a11y}
+            type="number"
+            min={MEMORY_HOTPLUG_ALIGN_MIB}
+            max={MAX_HOTPLUG_MEMORY_MIB}
+            step={MEMORY_HOTPLUG_ALIGN_MIB}
+            value={values.maxMemory}
+            onChange={(e) => onChange({ maxMemory: e.target.value })}
+          />
+        )}
+      </Field>
+      <CpuModelPicker
+        id="vm-cpu-model"
+        label={t("vmForm.cpuModel")}
+        value={values.model}
+        arch={archOf(values.machine)}
+        onChange={(model) => {
+          chose.current = true;
+          autoCluster.current = false;
+          setArchReset(false);
+          onChange({ model });
+        }}
+      />
+      {archReset && (
+        <p role="status" className="text-xs text-muted-foreground sm:col-span-2">
+          {t("cpu.model.archReset")}
+        </p>
+      )}
+      <Field
+        id="vm-firmware"
+        label={t("vms.firmware")}
+        help={t("help.vmForm.firmware")}
+        info="vmForm.firmware"
+      >
+        {(a11y) => (
+          <NativeSelect
+            {...a11y}
+            id="vm-firmware"
+            className="w-full"
+            value={values.firmware}
+            onChange={(e) => onChange({ firmware: e.target.value as VmFormValues["firmware"] })}
+          >
+            <NativeSelectOption value="uefi">UEFI</NativeSelectOption>
+            <NativeSelectOption value="bios">BIOS</NativeSelectOption>
+          </NativeSelect>
+        )}
+      </Field>
+      <Field
+        id="vm-machine"
+        label={t("vms.machine")}
+        help={t("help.vmForm.machine")}
+        info="vmForm.machine"
+      >
+        {(a11y) => (
+          <NativeSelect
+            {...a11y}
+            id="vm-machine"
+            className="w-full"
+            value={values.machine}
+            onChange={(e) => {
+              onMachineChosen();
+              onChange(withMachine({ machine: e.target.value as VmFormValues["machine"] }));
+            }}
+          >
+            {/* 노드를 모르면(폴더 사용자) 서버가 클러스터 아키텍처로 고른다. */}
+            {(nodes === undefined || values.machine === "") && (
+              <NativeSelectOption value="">{t("vmForm.machineAuto")}</NativeSelectOption>
+            )}
+            <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
+            <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
+          </NativeSelect>
+        )}
+      </Field>
+      <CpuFlagsInput
+        id="vm-cpu-flags"
+        label={t("cpu.flags.label")}
+        help={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
+        info="cpu.flags"
+        flags={values.cpuFlags}
+        arches={[archOf(values.machine)]}
+        signed
+        onChange={(cpuFlags) => onChange({ cpuFlags })}
+      />
+      <NumaSection
+        sockets={values.sockets}
+        cores={values.cores}
+        maxVcpus={values.maxVcpus}
+        value={values.numa}
+        onChange={(numa) => onChange({ numa })}
+        onSockets={(sockets) => {
+          // vCPU 수(소켓 × 코어)를 그대로 둔다(리뷰 1 웹 — 소켓을 늘리면 vCPU가 곱해졌다).
+          const cores = coresFor(values.sockets, values.cores, sockets);
+          onChange(cores === null ? { sockets } : { sockets, cores: String(cores) });
+        }}
+        own={own}
+        errors={errors}
+        canDedicate={canDedicate}
+        spec={toSpec(values, "stopped")}
+        running={!creating && locked}
+      />
+      {creating && basic && (
+        <FolderField value={values.folder} onChange={(folder) => onChange({ folder })} />
+      )}
+      {/* 노드 목록을 읽을 수 없으면(폴더 사용자) 자동 배치다. */}
+      {nodes !== undefined && basic && (
+        <Field id="vm-node" label={t("common.node")} help={t("help.vmForm.node")}>
           {(a11y) => (
             <NativeSelect
               {...a11y}
-              id="vm-firmware"
+              id="vm-node"
               className="w-full"
-              value={values.firmware}
-              onChange={(e) => onChange({ firmware: e.target.value as VmFormValues["firmware"] })}
-            >
-              <NativeSelectOption value="uefi">UEFI</NativeSelectOption>
-              <NativeSelectOption value="bios">BIOS</NativeSelectOption>
-            </NativeSelect>
-          )}
-        </Field>
-        <Field
-          id="vm-machine"
-          label={t("vms.machine")}
-          help={t("help.vmForm.machine")}
-          info="vmForm.machine"
-        >
-          {(a11y) => (
-            <NativeSelect
-              {...a11y}
-              id="vm-machine"
-              className="w-full"
-              value={values.machine}
+              disabled={locked}
+              value={values.node}
               onChange={(e) => {
-                onMachineChosen();
-                onChange(withMachine({ machine: e.target.value as VmFormValues["machine"] }));
+                const node = e.target.value;
+                onChange(
+                  autoMachine
+                    ? withMachine({ node, machine: defaultMachine(nodes ?? [], node) })
+                    : { node },
+                );
               }}
             >
-              {/* 노드를 모르면(폴더 사용자) 서버가 클러스터 아키텍처로 고른다. */}
-              {(nodes === undefined || values.machine === "") && (
-                <NativeSelectOption value="">{t("vmForm.machineAuto")}</NativeSelectOption>
-              )}
-              <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
-              <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
+              <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
+              {/* 위트니스는 VM을 돌리지 않는다. */}
+              {nodes
+                ?.filter((n) => !n.spec.witness)
+                .map((n) => (
+                  <NativeSelectOption key={n.id} value={n.id}>
+                    {n.name}
+                  </NativeSelectOption>
+                ))}
             </NativeSelect>
           )}
         </Field>
-        <CpuFlagsInput
-          id="vm-cpu-flags"
-          label={t("cpu.flags.label")}
-          help={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
-          info="cpu.flags"
-          flags={values.cpuFlags}
-          arches={[archOf(values.machine)]}
-          signed
-          onChange={(cpuFlags) => onChange({ cpuFlags })}
-        />
-        <NumaSection
-          sockets={values.sockets}
-          cores={values.cores}
-          maxVcpus={values.maxVcpus}
-          value={values.numa}
-          onChange={(numa) => onChange({ numa })}
-          onSockets={(sockets) => {
-            // vCPU 수(소켓 × 코어)를 그대로 둔다(리뷰 1 웹 — 소켓을 늘리면 vCPU가 곱해졌다).
-            const cores = coresFor(values.sockets, values.cores, sockets);
-            onChange(cores === null ? { sockets } : { sockets, cores: String(cores) });
-          }}
-          own={own}
-          errors={errors}
-          canDedicate={canDedicate}
-          spec={toSpec(values, "stopped")}
-          running={!creating && locked}
-        />
-        {creating && (
-          <FolderField value={values.folder} onChange={(folder) => onChange({ folder })} />
+      )}
+      <Field id="vm-restart" label={t("vms.restart")} help={t("help.vmForm.restart")}>
+        {(a11y) => (
+          <NativeSelect
+            {...a11y}
+            id="vm-restart"
+            className="w-full"
+            value={values.restart}
+            onChange={(e) => onChange({ restart: e.target.value as VmFormValues["restart"] })}
+          >
+            <NativeSelectOption value="never">{t("vms.restartPolicy.never")}</NativeSelectOption>
+            <NativeSelectOption value="on-failure">
+              {t("vms.restartPolicy.on-failure")}
+            </NativeSelectOption>
+          </NativeSelect>
         )}
-        {/* 노드 목록을 읽을 수 없으면(폴더 사용자) 자동 배치다. */}
-        {nodes !== undefined && (
-          <Field id="vm-node" label={t("common.node")} help={t("help.vmForm.node")}>
+      </Field>
+      <div className="flex flex-col gap-1.5 sm:col-span-2">
+        <div className="flex items-center gap-2">
+          {/* 실행 중에도 바꿀 수 있다(장치 변화 없음). */}
+          <Switch
+            id="vm-pinned"
+            aria-describedby="vm-pinned-hint"
+            checked={values.pinned}
+            onCheckedChange={(pinned) => onChange({ pinned })}
+          />
+          <Label htmlFor="vm-pinned">{t("vmForm.pinned")}</Label>
+          <InfoButton
+            topic="vmForm.pinned"
+            label={t("vmForm.pinned")}
+            line={t("vmForm.pinnedHint")}
+          />
+        </div>
+        <p id="vm-pinned-hint" className="text-xs text-muted-foreground">
+          {t("vmForm.pinnedHint")}
+        </p>
+      </div>
+      <div className="flex flex-col gap-1.5 sm:col-span-2">
+        <div className="flex items-center gap-2">
+          {/* 켤 수 없어도 이미 켜진 HA는 끌 수 있다(실행 중이어도). */}
+          <Switch
+            id="vm-ha"
+            aria-describedby="vm-ha-hint"
+            disabled={noHa !== null && !values.ha}
+            checked={values.ha}
+            onCheckedChange={(ha) => onChange({ ha })}
+          />
+          <Label htmlFor="vm-ha">{t("vmForm.ha")}</Label>
+          <InfoButton topic="vmForm.ha" label={t("vmForm.ha")} line={t("vmForm.haHint")} />
+        </div>
+        <p id="vm-ha-hint" className="text-xs text-muted-foreground">
+          {t("vmForm.haHint")}
+        </p>
+        {noHa && (
+          <p
+            className={
+              haActive(values) ? "text-sm text-destructive" : "text-sm text-muted-foreground"
+            }
+          >
+            {t(noHa.key, noHa.values)}
+          </p>
+        )}
+        {noReplica && (
+          <p className="text-sm text-warning-fg">{t("vmForm.haNoReplica", noReplica)}</p>
+        )}
+      </div>
+      {values.ha && (
+        <>
+          <Field
+            id="vm-ha-state"
+            label={t("vmForm.haState")}
+            help={t(`vmForm.haStateHint.${values.haState}`)}
+            info="vmForm.haState"
+          >
             {(a11y) => (
               <NativeSelect
-                {...a11y}
-                id="vm-node"
+                id="vm-ha-state"
                 className="w-full"
-                disabled={locked}
-                value={values.node}
-                onChange={(e) => {
-                  const node = e.target.value;
-                  onChange(
-                    autoMachine
-                      ? withMachine({ node, machine: defaultMachine(nodes ?? [], node) })
-                      : { node },
-                  );
-                }}
+                value={values.haState}
+                onChange={(e) => onChange({ haState: e.target.value as VmFormValues["haState"] })}
+                {...a11y}
               >
-                <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
-                {/* 위트니스는 VM을 돌리지 않는다. */}
-                {nodes
-                  ?.filter((n) => !n.spec.witness)
-                  .map((n) => (
-                    <NativeSelectOption key={n.id} value={n.id}>
-                      {n.name}
-                    </NativeSelectOption>
-                  ))}
+                {HA_STATES.map((state) => (
+                  // 실행 중인 VM은 HA를 활성으로 바꾸지 못한다.
+                  <NativeSelectOption
+                    key={state}
+                    value={state}
+                    disabled={haLocked && state !== "ignored"}
+                  >
+                    {t(`vms.haState.${state}`)}
+                  </NativeSelectOption>
+                ))}
               </NativeSelect>
             )}
           </Field>
-        )}
-        <Field id="vm-restart" label={t("vms.restart")} help={t("help.vmForm.restart")}>
-          {(a11y) => (
-            <NativeSelect
-              {...a11y}
-              id="vm-restart"
-              className="w-full"
-              value={values.restart}
-              onChange={(e) => onChange({ restart: e.target.value as VmFormValues["restart"] })}
-            >
-              <NativeSelectOption value="never">{t("vms.restartPolicy.never")}</NativeSelectOption>
-              <NativeSelectOption value="on-failure">
-                {t("vms.restartPolicy.on-failure")}
-              </NativeSelectOption>
-            </NativeSelect>
-          )}
-        </Field>
-        <div className="flex flex-col gap-1.5 sm:col-span-2">
-          <div className="flex items-center gap-2">
-            {/* 실행 중에도 바꿀 수 있다(장치 변화 없음). */}
-            <Switch
-              id="vm-pinned"
-              aria-describedby="vm-pinned-hint"
-              checked={values.pinned}
-              onCheckedChange={(pinned) => onChange({ pinned })}
-            />
-            <Label htmlFor="vm-pinned">{t("vmForm.pinned")}</Label>
-            <InfoButton
-              topic="vmForm.pinned"
-              label={t("vmForm.pinned")}
-              line={t("vmForm.pinnedHint")}
-            />
-          </div>
-          <p id="vm-pinned-hint" className="text-xs text-muted-foreground">
-            {t("vmForm.pinnedHint")}
-          </p>
-        </div>
-        <div className="flex flex-col gap-1.5 sm:col-span-2">
-          <div className="flex items-center gap-2">
-            {/* 켤 수 없어도 이미 켜진 HA는 끌 수 있다(실행 중이어도). */}
-            <Switch
-              id="vm-ha"
-              aria-describedby="vm-ha-hint"
-              disabled={noHa !== null && !values.ha}
-              checked={values.ha}
-              onCheckedChange={(ha) => onChange({ ha })}
-            />
-            <Label htmlFor="vm-ha">{t("vmForm.ha")}</Label>
-            <InfoButton topic="vmForm.ha" label={t("vmForm.ha")} line={t("vmForm.haHint")} />
-          </div>
-          <p id="vm-ha-hint" className="text-xs text-muted-foreground">
-            {t("vmForm.haHint")}
-          </p>
-          {noHa && (
-            <p
-              className={
-                haActive(values) ? "text-sm text-destructive" : "text-sm text-muted-foreground"
-              }
-            >
-              {t(noHa.key, noHa.values)}
-            </p>
-          )}
-          {noReplica && (
-            <p className="text-sm text-warning-fg">{t("vmForm.haNoReplica", noReplica)}</p>
-          )}
-        </div>
-        {values.ha && (
-          <>
-            <Field
-              id="vm-ha-state"
-              label={t("vmForm.haState")}
-              help={t(`vmForm.haStateHint.${values.haState}`)}
-              info="vmForm.haState"
-            >
-              {(a11y) => (
-                <NativeSelect
-                  id="vm-ha-state"
-                  className="w-full"
-                  value={values.haState}
-                  onChange={(e) => onChange({ haState: e.target.value as VmFormValues["haState"] })}
-                  {...a11y}
-                >
-                  {HA_STATES.map((state) => (
-                    // 실행 중인 VM은 HA를 활성으로 바꾸지 못한다.
-                    <NativeSelectOption
-                      key={state}
-                      value={state}
-                      disabled={haLocked && state !== "ignored"}
-                    >
-                      {t(`vms.haState.${state}`)}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
-              )}
-            </Field>
-            <Field id="vm-ha-group" label={t("vmForm.haGroup")} help={t("vmForm.haGroupHint")}>
-              {(a11y) => (
-                <NativeSelect
-                  id="vm-ha-group"
-                  className="w-full"
-                  value={values.haGroup}
-                  onChange={(e) => onChange({ haGroup: e.target.value })}
-                  {...a11y}
-                >
-                  <NativeSelectOption value="">{t("vmForm.haNoGroup")}</NativeSelectOption>
-                  {groupNames.map((g) => (
-                    <NativeSelectOption key={g} value={g}>
-                      {g}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
-              )}
-            </Field>
-            <Field
-              id="vm-max-restart"
-              label={t("vmForm.maxRestart")}
-              error={errors.maxRestart}
-              help={t("vmForm.maxRestartHint")}
-            >
-              {(a11y) => (
-                <Input
-                  id="vm-max-restart"
-                  {...a11y}
-                  type="number"
-                  min={0}
-                  max={MAX_HA_COUNT}
-                  value={values.maxRestart}
-                  onChange={(e) => onChange({ maxRestart: e.target.value })}
-                />
-              )}
-            </Field>
-            <Field
-              id="vm-max-relocate"
-              label={t("vmForm.maxRelocate")}
-              error={errors.maxRelocate}
-              help={t("vmForm.maxRelocateHint")}
-            >
-              {(a11y) => (
-                <Input
-                  id="vm-max-relocate"
-                  {...a11y}
-                  type="number"
-                  min={0}
-                  max={MAX_HA_COUNT}
-                  value={values.maxRelocate}
-                  onChange={(e) => onChange({ maxRelocate: e.target.value })}
-                />
-              )}
-            </Field>
-            <Field
-              id="vm-ha-priority"
-              label={t("vmForm.haPriority")}
-              error={errors.haPriority}
-              help={t("vmForm.haPriorityHint")}
-              info="vmForm.haPriority"
-            >
-              {(a11y) => (
-                <Input
-                  id="vm-ha-priority"
-                  {...a11y}
-                  type="number"
-                  min={0}
-                  max={MAX_HA_PRIORITY}
-                  value={values.haPriority}
-                  onChange={(e) => onChange({ haPriority: e.target.value })}
-                />
-              )}
-            </Field>
-            <div className="flex flex-col gap-1.5 sm:col-span-2">
-              <div className="flex items-center gap-2">
-                <Switch
-                  id="vm-guest-watch"
-                  aria-describedby="vm-guest-watch-hint"
-                  checked={values.guestWatch}
-                  onCheckedChange={(guestWatch) => onChange({ guestWatch })}
-                />
-                <Label htmlFor="vm-guest-watch">{t("vmForm.guestWatch")}</Label>
-                <InfoButton
-                  topic="vmForm.guestWatch"
-                  label={t("vmForm.guestWatch")}
-                  line={t("vmForm.guestWatchHint")}
-                />
-              </div>
-              <p id="vm-guest-watch-hint" className="text-xs text-muted-foreground">
-                {t("vmForm.guestWatchHint")}
-              </p>
-            </div>
-            {values.guestWatch && (
-              <Field
-                id="vm-guest-watch-secs"
-                label={t("vmForm.guestWatchSecs")}
-                error={errors.guestWatchSecs}
-                help={t("vmForm.guestWatchSecsHint")}
+          <Field id="vm-ha-group" label={t("vmForm.haGroup")} help={t("vmForm.haGroupHint")}>
+            {(a11y) => (
+              <NativeSelect
+                id="vm-ha-group"
+                className="w-full"
+                value={values.haGroup}
+                onChange={(e) => onChange({ haGroup: e.target.value })}
+                {...a11y}
               >
-                {(a11y) => (
-                  <Input
-                    id="vm-guest-watch-secs"
-                    {...a11y}
-                    type="number"
-                    min={MIN_GUEST_WATCH_SECS}
-                    max={MAX_GUEST_WATCH_SECS}
-                    value={values.guestWatchSecs}
-                    onChange={(e) => onChange({ guestWatchSecs: e.target.value })}
-                  />
-                )}
-              </Field>
+                <NativeSelectOption value="">{t("vmForm.haNoGroup")}</NativeSelectOption>
+                {groupNames.map((g) => (
+                  <NativeSelectOption key={g} value={g}>
+                    {g}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
             )}
-          </>
-        )}
-      </CardContent>
+          </Field>
+          <Field
+            id="vm-max-restart"
+            label={t("vmForm.maxRestart")}
+            error={errors.maxRestart}
+            help={t("vmForm.maxRestartHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="vm-max-restart"
+                {...a11y}
+                type="number"
+                min={0}
+                max={MAX_HA_COUNT}
+                value={values.maxRestart}
+                onChange={(e) => onChange({ maxRestart: e.target.value })}
+              />
+            )}
+          </Field>
+          <Field
+            id="vm-max-relocate"
+            label={t("vmForm.maxRelocate")}
+            error={errors.maxRelocate}
+            help={t("vmForm.maxRelocateHint")}
+          >
+            {(a11y) => (
+              <Input
+                id="vm-max-relocate"
+                {...a11y}
+                type="number"
+                min={0}
+                max={MAX_HA_COUNT}
+                value={values.maxRelocate}
+                onChange={(e) => onChange({ maxRelocate: e.target.value })}
+              />
+            )}
+          </Field>
+          <Field
+            id="vm-ha-priority"
+            label={t("vmForm.haPriority")}
+            error={errors.haPriority}
+            help={t("vmForm.haPriorityHint")}
+            info="vmForm.haPriority"
+          >
+            {(a11y) => (
+              <Input
+                id="vm-ha-priority"
+                {...a11y}
+                type="number"
+                min={0}
+                max={MAX_HA_PRIORITY}
+                value={values.haPriority}
+                onChange={(e) => onChange({ haPriority: e.target.value })}
+              />
+            )}
+          </Field>
+          <div className="flex flex-col gap-1.5 sm:col-span-2">
+            <div className="flex items-center gap-2">
+              <Switch
+                id="vm-guest-watch"
+                aria-describedby="vm-guest-watch-hint"
+                checked={values.guestWatch}
+                onCheckedChange={(guestWatch) => onChange({ guestWatch })}
+              />
+              <Label htmlFor="vm-guest-watch">{t("vmForm.guestWatch")}</Label>
+              <InfoButton
+                topic="vmForm.guestWatch"
+                label={t("vmForm.guestWatch")}
+                line={t("vmForm.guestWatchHint")}
+              />
+            </div>
+            <p id="vm-guest-watch-hint" className="text-xs text-muted-foreground">
+              {t("vmForm.guestWatchHint")}
+            </p>
+          </div>
+          {values.guestWatch && (
+            <Field
+              id="vm-guest-watch-secs"
+              label={t("vmForm.guestWatchSecs")}
+              error={errors.guestWatchSecs}
+              help={t("vmForm.guestWatchSecsHint")}
+            >
+              {(a11y) => (
+                <Input
+                  id="vm-guest-watch-secs"
+                  {...a11y}
+                  type="number"
+                  min={MIN_GUEST_WATCH_SECS}
+                  max={MAX_GUEST_WATCH_SECS}
+                  value={values.guestWatchSecs}
+                  onChange={(e) => onChange({ guestWatchSecs: e.target.value })}
+                />
+              )}
+            </Field>
+          )}
+        </>
+      )}
+    </>
+  );
+  if (advanced) {
+    return <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">{body}</div>;
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("vmForm.general")}</CardTitle>
+      </CardHeader>
+      <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">{body}</CardContent>
     </Card>
   );
 }

@@ -21,7 +21,7 @@ import {
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
-import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
+import { VmEditPage } from "@/vms/VmFormPage";
 
 afterEach(() => {
   toast.dismiss();
@@ -36,22 +36,26 @@ function withNics(v: Vm, nics: Vm["spec"]["nics"], extra: Partial<Vm["spec"]> = 
 }
 
 it("gives an SDN interface addresses and keeps its security groups", async () => {
+  // 만들기는 그림 화면(계획 77-5)이라 같은 NIC 칸을 멈춘 VM 고치기에서 본다.
+  const web = withNics(vm("web", "stopped"), [
+    { network: "user", model: "virtio", mac: "52:54:00:00:00:01" },
+  ]);
   mockLists({
+    vm: [web],
     node: [NODE],
     network: [LAN, TENANT],
     "security-group": [securityGroup("ssh")],
   });
   const bodies: { spec: Vm["spec"] }[] = [];
   server.use(
-    http.post(apiUrl("/vms"), async ({ request }) => {
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
       bodies.push((await request.json()) as (typeof bodies)[number]);
-      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      return HttpResponse.json(web);
     }),
   );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
   const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "web");
-  const nic = screen.getByRole("group", { name: "Network interface 1" });
+  const nic = await screen.findByRole("group", { name: "Network interface 1" });
   await within(nic).findByRole("option", { name: "tenant" });
   await user.selectOptions(within(nic).getByLabelText("Network"), "lan");
   await user.click(await within(nic).findByRole("checkbox", { name: "ssh" }));
@@ -68,18 +72,18 @@ it("gives an SDN interface addresses and keeps its security groups", async () =>
     screen.getByText("NIC 1 is on an SDN network: its addresses come from the subnet (IPAM)."),
   ).toBeVisible();
   expect(screen.queryByLabelText("nic0 IPv4")).not.toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   expect(within(nic).getByText("Give at most one IPv4 and one IPv6 address.")).toBeVisible();
   expect(bodies).toEqual([]);
   await user.clear(ips);
   await user.type(ips, "10.10.0.5");
-  await user.click(screen.getByRole("button", { name: "Create" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]!.spec.nics).toEqual([
     {
       network: "tenant",
       model: "virtio",
-      mac: null,
+      mac: "52:54:00:00:00:01",
       security_groups: ["ssh"],
       ips: ["10.10.0.5"],
     },

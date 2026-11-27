@@ -37,7 +37,11 @@
       "quotaMemory": "This VM would go over the memory quota of {{path}}.",
       "quotaDisk": "This VM would go over the disk quota of {{path}}.",
       "userData": "Your own user-data replaces the generated one: user, password and SSH keys are not used.",
-      "noBoot": "The VM has no disk or CD drive to boot from."
+      "noBoot": "The VM has no disk or CD drive to boot from.",
+      "noOs": "Nothing to boot an OS from — attach an image or an ISO (the disks are empty and no CD has an ISO).",
+      "missedOs": "Could not apply the OS settings of the chosen use — this is a blank VM.",
+      "missedDisk": "No pool you may use, so no disk was attached.",
+      "missedNic": "No network you may use, so the NIC is on user (NAT)."
     },
     "problem": {
       "nameTaken": "A VM named {{name}} already exists."
@@ -71,8 +75,6 @@
       "dropHere": "Drop here",
       "baseBlank": "Starting point: empty VM",
       "baseTemplate": "Starting point: template {{name}} (deployed as a copy)",
-      "start": "Drag parts onto the VM, or press a part and then a place.",
-      "quickStart": "Start with a medium Linux server",
       "compute": "{{vcpus}} vCPU · {{memory}} · CPU {{model}}",
       "ciOn": "On",
       "keys": "SSH keys",
@@ -86,11 +88,11 @@
       "undone": "Undone.",
       "created": "Already created: {{names}}. {{error}}",
       "ruleLeft": "Could not delete the placement rule {{name}} left by the last try: {{error}}",
-      "formOnly_one": "Changed in the form: {{count}} field ({{names}}). It is sent as set there.",
-      "formOnly_other": "Changed in the form: {{count}} fields ({{names}}). They are sent as set there.",
-      "formCleared_one": "Cleared {{count}} field changed in the form ({{names}}): a template deployment cannot carry it. Set it after creating.",
-      "formCleared_other": "Cleared {{count}} fields changed in the form ({{names}}): a template deployment cannot carry them. Set them after creating.",
-      "side": "Check and preview",
+      "formOnly_one": "Changed in advanced settings: {{count}} field ({{names}})",
+      "formOnly_other": "Changed in advanced settings: {{count}} fields ({{names}})",
+      "formCleared_one": "Cleared {{count}} field changed in advanced settings ({{names}}): a template deployment cannot carry it. Set it after creating.",
+      "formCleared_other": "Cleared {{count}} fields changed in advanced settings ({{names}}): a template deployment cannot carry them. Set them after creating.",
+      "side": "Summary and checks",
       "creating": "Creating…",
       "blocked": "Cannot create yet: {{reason}}",
       "count": {
@@ -101,7 +103,15 @@
         "nics_one": "{{count}} NIC.",
         "nics_other": "{{count}} NICs."
       },
-      "grip": "Pick up {{name}}"
+      "grip": "Pick up {{name}}",
+      "advanced": "Advanced settings",
+      "code": "View requests (JSON, CLI)",
+      "codeText": "The exact requests Create sends — use them to create the same VM from a script or the CLI.",
+      "partsHint": "Press a part to attach it to the VM, or drag it onto a slot.",
+      "fewer": "Show fewer",
+      "morePartsN_one": "{{count}} more",
+      "morePartsN_other": "{{count}} more",
+      "inspectSlot": "Edit {{slot}}"
     },
     "group": {
       "size": "Size",
@@ -179,11 +189,11 @@
       "problems_other": "{{name}}, {{count}} problems"
     },
     "empty": {
-      "disks": "Drop a pool or a volume here.",
-      "cdroms": "Drop an ISO here.",
-      "nics": "Drop a network here.",
-      "cloudInit": "Drop a first-boot setup snippet here.",
-      "protection": "Drop HA here.",
+      "disks": "Press + or drop a pool or volume here.",
+      "cdroms": "Press an ISO or drop it here.",
+      "nics": "Press + or drop a network here.",
+      "cloudInit": "Press a snippet such as the user and SSH keys to turn it on.",
+      "protection": "Press high availability (HA) to turn it on.",
       "trash": "Drop a block here to remove it."
     },
     "inspect": {
@@ -213,7 +223,7 @@
       "pool": "Pool for copies",
       "samePool": "Same as the template",
       "blank": "Back to an empty VM",
-      "editInForm": "Edit more in the form",
+      "editInForm": "Edit more in advanced settings",
       "deployDialog": "More deploy options…"
     },
     "carried": {
@@ -230,7 +240,6 @@
     },
     "check": {
       "tab": {
-        "check": "Check",
         "json": "JSON",
         "cli": "CLI"
       },
@@ -256,10 +265,143 @@
       "error": "Error",
       "warn": "Warning",
       "copyJson": "Copy the JSON requests",
-      "copyCli": "Copy the commands"
+      "copyCli": "Copy the commands",
+      "needName": "Enter a name and the server checks whether the VM can be created.",
+      "title": "Checks",
+      "more": "Show {{count}} more",
+      "fewer": "Show fewer",
+      "detail": "More",
+      "less": "Less"
     },
     "help": {
       "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or -. It can't be changed later."
+    },
+    "purpose": {
+      "question": "What will this VM run?",
+      "intro": "Pick a use and the VM picture fills with fitting CPU, memory, disks and network. The disks start empty, so on the next screen you pick the OS (a template or image, or an installer ISO). You can change anything later.",
+      "chosen": "Use: {{name}}",
+      "change": "Change",
+      "size": "{{cores}} vCPU · {{memory}}",
+      "pickTemplate": "Pick a template to deploy",
+      "noTemplates": "No templates yet — turn a VM into a template and it shows here.",
+      "linux": {
+        "title": "Linux server",
+        "text": "A general server such as Ubuntu or Rocky. On the next screen you pick a template (image) or an installer ISO. First-boot setup and the guest agent are on."
+      },
+      "web": {
+        "title": "Web server",
+        "text": "A small web or API server: smaller than a Linux server (1 vCPU, 2 GiB), and a security group that opens 80/443 goes on the NIC if there is one."
+      },
+      "database": {
+        "title": "Database",
+        "text": "Plenty of memory, with separate OS and data disks."
+      },
+      "windows": {
+        "title": "Windows 11 or Server",
+        "text": "UEFI, Secure Boot and TPM on, with devices the Windows installer knows (SATA, e1000e). A CD drive for the installer ISO boots first."
+      },
+      "iso": {
+        "title": "Install from ISO",
+        "text": "An empty disk and a CD drive that boots first. Put the installer ISO in the drive."
+      },
+      "template": {
+        "title": "From a template",
+        "text": "Copy a template you prepared and use it right away (disks are copied too)."
+      },
+      "image": {
+        "title": "Image library",
+        "text": "Download a cloud image such as Ubuntu or Debian as a template — then create from it with \"From a template\"."
+      },
+      "blank": {
+        "title": "Blank VM",
+        "text": "A VM with nothing attached. Add each part yourself (for experts)."
+      },
+      "disks": "disk {{disks}}",
+      "noDisk": {
+        "perm": "no disk (no pool permission)",
+        "none": "no disk (no usable pool)"
+      },
+      "loading": "Reading pools, networks and templates…",
+      "noPermission": "You have no folder where you may create VMs. You can look around, but Create will be refused — ask an administrator for vm.create.",
+      "started": "Starting as {{name}}.",
+      "templateGone": "The template in the address does not exist (deleted, or not a template). Pick a use again.",
+      "blocked": "Cannot start as {{name}}: {{reason}}",
+      "windowsArm": "This cluster has only Arm (virt) nodes, so it cannot create Windows VMs."
+    },
+    "pic": {
+      "title": "VM picture",
+      "cores": "vCPUs",
+      "memory": "Memory (GiB)",
+      "vcpu_one": "{{count}}",
+      "vcpu_other": "{{count}}",
+      "unnamed": "New VM (no name yet)",
+      "preset": {
+        "blank": "Custom",
+        "linux": "Linux",
+        "windows": "Windows 11"
+      },
+      "addDisk": "Add a new disk",
+      "addCdrom": "Add a CD drive",
+      "addNic": "Add a network (NIC)",
+      "bootOrder": "Boot order: {{order}}",
+      "boot": {
+        "disk": "Disk {{n}}",
+        "cdrom": "CD {{n}}"
+      },
+      "security": "Firmware and security",
+      "secureBoot": "Secure Boot",
+      "agent": "Guest agent",
+      "inAdvanced": "Change in advanced settings",
+      "fit": {
+        "fits": "Fits easily in the node's memory.",
+        "tight": "The node's memory is tight.",
+        "over": "Larger than the node's free memory — it may not start."
+      }
+    },
+    "room": {
+      "chosen": "Room on {{node}}",
+      "server": "Room on {{node}} (server's pick)",
+      "guess": "Room on {{node}} (estimate)",
+      "cpu": "vCPUs",
+      "memory": "Memory",
+      "disk": "Disk ({{pool}})",
+      "cpuText": "{{used}}/{{total}} (+{{add}})",
+      "text": "{{used}}/{{total}} (+{{add}})",
+      "overcommit": "Hands out more vCPUs than the node has threads ({{pct}}%) — it can slow down when all are busy (overcommit).",
+      "none": "No node can take this VM now (reason below).",
+      "noneOff": "No node could start it now (creating it stopped still works).",
+      "other": "The server did not pick a node because of another problem — fix it to see the node.",
+      "diskMore_one": "Disk ({{pool}} and {{count}} more pool)",
+      "diskMore_other": "Disk ({{pool}} and {{count}} more pools)"
+    },
+    "advanced": {
+      "title": "Advanced settings",
+      "text": "If unsure, leave these as they are — the defaults work well. Each field's ⓘ explains it.",
+      "template": "A template deployment cannot carry these settings (it uses the template's values). Change them after creating, in Edit VM.",
+      "cpu": "CPU, memory, firmware, placement and HA"
+    },
+    "slotInfo": {
+      "placement": "The node the VM runs on. Automatic lets the server pick a node with room; you can also pick a node or a failure zone.",
+      "cloudInit": "First-boot setup (cloud-init): puts the account, SSH keys and addresses in on the first start. Used with cloud images and templates.",
+      "protection": "High availability (HA): if the node stops, the VM starts again on another node."
+    },
+    "os": {
+      "title": "Pick the OS",
+      "open": "Pick the OS (image or ISO)",
+      "text": "The disks are empty. Start from a template (images downloaded in the image library included — the disk is copied from that image), or put an installer ISO in the CD drive (the CD boots first).",
+      "windowsText": "Put the Windows installer ISO in the CD drive (it boots first). The disk and NIC driver ISO (virtio-win) can go in a second CD, if you want.",
+      "templates": "From a template or image",
+      "noTemplates": "No templates — download an image in the image library and it becomes a template.",
+      "iso": "Installer ISO (CD)",
+      "installIso": "Windows installer ISO",
+      "driversIso": "Driver ISO (virtio-win, optional)",
+      "noIsos": "No ISOs — upload one in ISO files.",
+      "done": "Done",
+      "later": "Pick later",
+      "library": "Open the image library",
+      "fromTemplate": "Creating from template {{name}}.",
+      "inserted": "Put ISO {{name}} in the CD drive.",
+      "close": "Close the OS picker"
     }
   }
 }

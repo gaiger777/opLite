@@ -5,19 +5,24 @@ import { http, HttpResponse } from "msw";
 import type { List } from "@/api/live";
 import type { Node, Task, Volume } from "@/api/types";
 import i18n from "@/i18n";
-import { writeUserPref } from "@/lib/prefs";
 import { expectNoAxeViolations } from "@/test/axe";
-import { CEPH, LOADS, LOCAL, network, NODE_A, NODE_B, TEMPLATE } from "@/test/builder";
-import { haGroup, isoVolume, securityGroup, task, vm, volume } from "@/test/fixtures";
+import { CEPH, LOADS, LOCAL, network, NODE_A, NODE_ARM, NODE_B, TEMPLATE } from "@/test/builder";
+import {
+  haGroup,
+  isoVolume,
+  pool,
+  poolState,
+  securityGroup,
+  task,
+  vm,
+  volume,
+} from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { BuilderPage } from "@/vmBuilder/BuilderPage";
-import { putDraft, readDraft } from "@/vmBuilder/draft";
 import builderEn from "@/vmBuilder/i18n/en.json";
 import builderKo from "@/vmBuilder/i18n/ko.json";
 import { CHECK_DELAY_MS } from "@/vmBuilder/useServerCheck";
-import { emptyForm } from "@/vms/form";
-import { VmCreatePage } from "@/vms/VmFormPage";
 
 /** 빌더의 세상: 영역 a·b의 두 노드, 공유 풀 ceph·로컬 풀, 네트워크 lan·SDN tenant, 보안 그룹, ISO, 템플릿 */
 function world({
@@ -44,8 +49,13 @@ function world({
   );
 }
 
-function open() {
-  return renderPage(<BuilderPage />, { path: "/vms/-new/builder" });
+/** 만들기 화면을 용도 `purpose`(빈 글이면 용도 카드부터)로 연다. `query`는 주소에 더할 것 */
+function open(purpose = "blank", query = "") {
+  const search = [purpose && `purpose=${purpose}`, query].filter(Boolean).join("&");
+  return renderPage(<BuilderPage />, {
+    path: "/vms/-new",
+    url: `/vms/-new${search ? `?${search}` : ""}`,
+  });
 }
 
 const part = (name: RegExp) => screen.getByRole("button", { name });
@@ -55,11 +65,13 @@ const block = (name: string) =>
   screen.getByRole("button", { name: new RegExp(`^${name.replace(/[()]/g, "\\$&")} `) });
 const live = () => document.querySelector("[aria-live=polite]")!;
 const create = () => screen.getByRole("button", { name: "Create" });
+/** 그 칸의 고치기(연필) 단추 */
+const edit = (name: string) => screen.getByRole("button", { name: `Edit ${name}` });
 
-/** 이름을 짓고 "보통 크기 Linux 서버로 시작"(보통 + Linux + ceph 새 디스크 + lan NIC) */
+/** 이름을 짓는다 — 용도 "리눅스 서버"(`open("linux")`: 보통 + Linux + ceph 새 디스크 + lan NIC)와 함께 쓴다. */
 async function quickVm(user: ReturnType<typeof userEvent.setup>, name = "web") {
   await user.type(await screen.findByLabelText("Name"), name);
-  await user.click(screen.getByRole("button", { name: "Start with a medium Linux server" }));
+  await screen.findByRole("button", { name: /^Disk 1 / });
 }
 
 /** 키보드로 부품을 들어 그 칸까지 Tab으로 가서 Space로 놓는다. */
@@ -78,27 +90,76 @@ afterEach(() => {
   localStorage.clear();
 });
 
-it("starts with an empty chassis, a parts box and a quick start, without axe violations", async () => {
+it("starts with the use cards, then shows the VM picture, the short parts box and the summary, without axe violations", async () => {
   world();
-  const { container } = open();
+  const first = open("");
   expect(
     await screen.findByRole("heading", { name: "Create a virtual machine" }),
   ).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Builder" })).toHaveAttribute("aria-current", "page");
-  expect(screen.getByRole("link", { name: "Form" })).toHaveAttribute("href", "/vms/-new");
+  expect(screen.getByRole("heading", { name: "What will this VM run?" })).toBeInTheDocument();
+  // 카드마다 기본 크기, 템플릿 카드는 안에서 템플릿을 고른다.
+  expect(screen.getByRole("button", { name: /^Database/ })).toHaveTextContent(
+    "4 vCPU · 16 GiB · disk 32 GiB + 100 GiB",
+  );
+  await expectNoAxeViolations(first.container, { disable: ["region"] });
+  await userEvent.click(screen.getByRole("button", { name: /^From a template/ }));
+  expect(screen.getByRole("button", { name: /^tmpl/ })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: /^Blank VM/ }));
+  expect(first.router.state.location.search).toBe("?purpose=blank");
   expect(
-    within(slot(/^Disks \(top boots first\)/)).getByText("Drop a pool or a volume here."),
+    within(slot(/^Disks \(top boots first\)/)).getByText("Press + or drop a pool or volume here."),
   ).toBeInTheDocument();
   expect(await screen.findByRole("button", { name: /^New disk in ceph/ })).toHaveAttribute(
     "aria-roledescription",
     "draggable part",
   );
-  expect(part(/^Medium, 2 vCPU · 4 GiB/)).toBeInTheDocument();
+  // 짧은 부품 상자: 크기·OS·CPU 모델·템플릿·폴더 묶음은 없다(칩·용도 카드·고급·요약).
+  expect(screen.queryByRole("button", { name: /^Medium/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /^Linux server/ })).toBeNull();
   expect(screen.getByRole("button", { name: /^Zone b/ })).toBeInTheDocument();
-  // 동작 줄이기: 빌더의 모양에는 움직임(키프레임·애니메이션)이 없다.
-  const style = container.querySelector("style")!.textContent!;
+  // 이름을 넣기 전에는 빨간 오류가 없다.
+  expect(screen.queryByText(/^Error/)).toBeNull();
+  expect(screen.getByLabelText("Name")).not.toHaveAttribute("aria-invalid");
+  // 동작 줄이기: 화면의 모양에는 움직임(키프레임·애니메이션)이 없다.
+  const style = first.container.querySelector("style")!.textContent!;
   expect(style).not.toMatch(/@keyframes|animation|transition/);
-  await expectNoAxeViolations(container, { disable: ["region"] });
+  await expectNoAxeViolations(first.container, { disable: ["region"] });
+});
+
+it("fills the picture from a use card and goes back to the cards", async () => {
+  world();
+  const { router } = open("");
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: /^Windows 11 or Server/ }));
+  // Windows: TPM·UEFI·SATA·e1000e, 4 vCPU·8 GiB, 64 GiB 디스크, lan NIC
+  expect(block("Disk 1 (—)")).toHaveTextContent("64 GiB · ceph · sata");
+  expect(block("NIC 1 (lan)")).toHaveTextContent("e1000e");
+  expect(screen.getByRole("button", { name: "vCPUs 4" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "Memory (GiB) 8 GiB" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(screen.getByText(/TPM/)).toBeInTheDocument();
+  // 칩으로 바꾸고 되돌린다.
+  await user.click(screen.getByRole("button", { name: "Memory (GiB) 16 GiB" }));
+  expect(within(slot(/^CPU & memory/)).getByText("4 vCPU · 16 GiB · CPU host")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Undo" }));
+  expect(within(slot(/^CPU & memory/)).getByText("4 vCPU · 8 GiB · CPU host")).toBeInTheDocument();
+  await user.click(screen.getByRole("link", { name: "Change" }));
+  expect(router.state.location.search).toBe("");
+  expect(
+    await screen.findByRole("heading", { name: "What will this VM run?" }),
+  ).toBeInTheDocument();
+  // ISO 설치: 빈 CD 드라이브가 먼저 부팅하고, ISO를 누르면 그 드라이브에 들어간다.
+  await user.click(screen.getByRole("button", { name: /^Install from ISO/ }));
+  expect(block("CD drive 1 (—)")).toHaveTextContent("empty · Boot from this CD first");
+  expect(screen.getByText("Boot order: CD 1 → Disk 1")).toBeInTheDocument();
+  const alpine = part(/^alpine/);
+  fireEvent.pointerDown(alpine, { button: 0, isPrimary: true, clientX: 10, clientY: 10 });
+  fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
+  fireEvent.click(alpine);
+  expect(block("CD drive 1 (alpine)")).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: /^CD drive \d/ })).toHaveLength(1);
 });
 
 it("builds a VM with the keyboard only and gives focus back on Escape", async () => {
@@ -106,9 +167,7 @@ it("builds a VM with the keyboard only and gives focus back on Escape", async ()
   open();
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "web");
-  keyDrop(part(/^Medium/), () => slot("CPU & memory"));
-  expect(within(slot("CPU & memory")).getByText("2 vCPU · 4 GiB · CPU host")).toBeInTheDocument();
-  expect(live()).toHaveTextContent("Dropped Medium on CPU & memory.");
+  expect(within(slot("CPU & memory")).getByText("2 vCPU · 2 GiB · CPU host")).toBeInTheDocument();
 
   keyDrop(part(/^New disk in ceph/), () => slot(/^Disks \(top boots first\)/));
   // 놓으면 새 블록으로 초점이 가고 개수를 읽는다.
@@ -138,22 +197,42 @@ it("builds a VM with the keyboard only and gives focus back on Escape", async ()
 it("moves between parts of a group with the arrow keys (one tab stop per group)", async () => {
   world();
   open();
-  const small = await screen.findByRole("button", { name: /^Small/ });
-  const medium = part(/^Medium/);
-  expect(small).toHaveAttribute("tabindex", "0");
-  expect(medium).toHaveAttribute("tabindex", "-1");
-  small.focus();
-  fireEvent.keyDown(small, { key: "ArrowDown" });
-  expect(medium).toHaveFocus();
-  expect(medium).toHaveAttribute("tabindex", "0");
+  const lan = await screen.findByRole("button", { name: /^lan/ });
+  const user = part(/^user/);
+  expect(user).toHaveAttribute("tabindex", "0");
+  expect(lan).toHaveAttribute("tabindex", "-1");
+  user.focus();
+  fireEvent.keyDown(user, { key: "ArrowDown" });
+  expect(lan).toHaveFocus();
+  expect(lan).toHaveAttribute("tabindex", "0");
 });
 
-it("picks with a tap and drops with a tap on a lit slot", async () => {
+it("attaches a part with a tap to the first slot that takes it", async () => {
   world();
   open();
   const lan = await screen.findByRole("button", { name: /^lan/ });
   fireEvent.pointerDown(lan, { button: 0, isPrimary: true, clientX: 10, clientY: 10 });
   fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
+  fireEvent.click(lan);
+  expect(block("NIC 1 (lan)")).toBeInTheDocument();
+  expect(live()).toHaveTextContent("Dropped lan on NICs.");
+  // 보안 그룹은 그것을 받는 첫 NIC에 붙는다.
+  const sg = part(/^web, 0 rules/);
+  fireEvent.pointerDown(sg, { button: 0, isPrimary: true, clientX: 10, clientY: 10 });
+  fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
+  fireEvent.click(sg);
+  expect(within(slot("NICs")).getByText("web")).toBeInTheDocument();
+  // "+"는 기본 부품(첫 공유 풀의 새 디스크)을 붙인다.
+  fireEvent.click(screen.getByRole("button", { name: "Add a new disk" }));
+  expect(block("Disk 1 (—)")).toHaveTextContent("20 GiB · ceph");
+});
+
+it("picks with the keyboard and drops with a tap on a lit slot", async () => {
+  world();
+  open();
+  const lan = await screen.findByRole("button", { name: /^lan/ });
+  lan.focus();
+  fireEvent.keyDown(lan, { key: " " });
   const nics = slot("NICs");
   expect(nics).toHaveAttribute("data-drop", "ok");
   expect(within(nics).getByText("Drop here")).toBeInTheDocument();
@@ -205,7 +284,9 @@ it("picks the tapped block when its row refuses what is held, even if the list t
     fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
     fireEvent.click(el);
   };
-  tap(part(/^New disk in ceph/));
+  const ceph = part(/^New disk in ceph/);
+  ceph.focus();
+  fireEvent.keyDown(ceph, { key: " " });
   // 풀은 있는 볼륨 디스크에 놓지 못한다(줄은 "no") — 바깥 디스크 목록은 받는다("ok").
   expect(slot(/^Disk 2 \(spare\)/)).toHaveAttribute("data-drop", "no");
   expect(slot(/^Disks \(top boots first\)/)).toHaveAttribute("data-drop", "ok");
@@ -242,8 +323,8 @@ it("gives focus to the slot heading after a keyboard drop on a slot that is not 
   world();
   open();
   await screen.findByLabelText("Name");
-  keyDrop(part(/^Medium/), () => slot("CPU & memory"));
-  expect(screen.getByRole("heading", { name: "CPU & memory" })).toHaveFocus();
+  keyDrop(part(/^Zone a/), () => slot("Placement"));
+  expect(screen.getByRole("heading", { name: "Placement" })).toHaveFocus();
 });
 
 it("drags with the mouse onto a slot and reads why another slot refuses", async () => {
@@ -318,10 +399,10 @@ it("adds a part from its menu, reorders and removes blocks from theirs, and undo
 
 it("edits the chosen block in the inspector: sliders, numbers and the form's cloud-init", async () => {
   world();
-  open();
+  open("linux");
   const user = userEvent.setup();
   await quickVm(user);
-  await user.click(within(slot("CPU & memory")).getByRole("button", { name: "Edit" }));
+  await user.click(edit("CPU & memory"));
   const memory = screen.getByLabelText("Memory (MiB)", { selector: "input:not([type=range])" });
   await user.clear(memory);
   await user.type(memory, "8192");
@@ -364,7 +445,7 @@ it("checks with the server after a pause, shows problems on their slots and bloc
       return reply();
     }),
   );
-  open();
+  open("linux");
   const user = userEvent.setup();
   await quickVm(user);
   expect(
@@ -381,7 +462,8 @@ it("checks with the server after a pause, shows problems on their slots and bloc
   expect(disk).toHaveAttribute("data-level", "warn");
   expect(within(disk).getByText("pool ceph is nearly full")).toBeInTheDocument();
   expect(slot(/^VM, 1 problem/)).toHaveAttribute("data-level", "error");
-  expect(create()).toBeDisabled();
+  // 만들기는 늘 누를 수 있다: 막는 문제가 있으면 보내지 않고 그 까닭(누르면 그 칸)을 보인다.
+  await user.click(create());
   expect(
     screen.getByRole("button", { name: "Cannot create yet: over the quota" }),
   ).toBeInTheDocument();
@@ -413,7 +495,7 @@ it("does not show a passed server check next to browser errors", async () => {
   ).toBeInTheDocument();
   await user.clear(screen.getByLabelText("Name"));
   expect(
-    screen.getByText("The server check runs when the browser finds no errors."),
+    screen.getByText("Enter a name and the server checks whether the VM can be created."),
   ).toBeInTheDocument();
   expect(screen.queryByText("Server check: passed.", { selector: "p" })).toBeNull();
 });
@@ -427,7 +509,7 @@ it("does not ask the server while the browser finds errors, or when a node lacks
     await screen.findByLabelText("Name");
     await act(() => vi.advanceTimersByTimeAsync(CHECK_DELAY_MS * 2));
     expect(
-      screen.getByText("The server check runs when the browser finds no errors."),
+      screen.getByText("Enter a name and the server checks whether the VM can be created."),
     ).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "web" } });
     await act(() => vi.advanceTimersByTimeAsync(CHECK_DELAY_MS * 2));
@@ -544,12 +626,12 @@ it("creates the new volumes, then the zone rule, then the VM", async () => {
       return HttpResponse.json(vm("web", "stopped"), { status: 201 });
     }),
   );
-  const { queryClient } = open();
+  const { queryClient } = open("linux");
   const user = userEvent.setup();
   await quickVm(user);
   await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
   await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
-  expect(within(slot("Placement")).getByText("Zone b")).toBeInTheDocument();
+  expect(screen.getByLabelText("Node")).toHaveValue("zone:b");
   await user.click(create());
   await waitFor(() => expect(order).toEqual(["volume"]));
   expect(bodies.volume).toEqual({
@@ -591,7 +673,7 @@ it("says what was already made when the VM cannot be created, and does not make 
       HttpResponse.json({ code: "quota_exceeded", message: "over the quota" }, { status: 409 }),
     ),
   );
-  const { queryClient } = open();
+  const { queryClient } = open("linux");
   const user = userEvent.setup();
   await quickVm(user);
   const done = {
@@ -630,7 +712,7 @@ it("does not make a created volume again after Undo past the failed create", asy
       );
     }),
   );
-  const { queryClient } = open();
+  const { queryClient } = open("linux");
   const user = userEvent.setup();
   await quickVm(user);
   await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
@@ -644,7 +726,7 @@ it("does not make a created volume again after Undo past the failed create", asy
   expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-disk0/);
   // 되돌리기로 영역을 뺀다 — 디스크는 그 앞의 상태에서도 "있는 볼륨"이다.
   await user.click(screen.getByRole("button", { name: "Undo" }));
-  expect(within(slot("Placement")).queryByText("Zone b")).toBeNull();
+  expect(screen.getByLabelText("Node")).toHaveValue("auto");
   // 목록이 새 볼륨을 받는다(watch).
   const listed = queryClient.getQueryData<List<Volume>>(["list", "volume"])!;
   queryClient.setQueryData<List<Volume>>(["list", "volume"], {
@@ -695,7 +777,7 @@ it("reuses the zone rule of a failed create only while it is the same, and delet
   );
   expect(rules).toHaveLength(1);
   // hard → soft: 지난 규칙(r1)을 곧 지우고, 만들 때 새로 만든다.
-  await user.click(within(slot("Placement")).getByRole("button", { name: "Edit" }));
+  await user.click(edit("Placement"));
   await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
   await waitFor(() => expect(deleted).toEqual(["r1"]));
   // 지운 뒤의 확인은 새 규칙(soft)을 "만들 규칙"으로 보낸다.
@@ -790,7 +872,7 @@ it("waits for the old zone rule to go before checking, and deletes it again on C
   await waitFor(() => expect(checks.at(-1)?.rules).toEqual([]), { timeout: 3000 });
   const before = checks.length;
   // hard → soft: 지난 hard 규칙을 지우지 못했다 — 서버는 아직 그것으로 확인하니 묻지 않고 기다린다.
-  await user.click(within(slot("Placement")).getByRole("button", { name: "Edit" }));
+  await user.click(edit("Placement"));
   await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Could not delete the placement rule web-zone left by the last try: The server failed: store is down",
@@ -892,18 +974,6 @@ it("does not navigate after the VM is created when the user already left", async
   expect(router.state.location.pathname).toBe("/elsewhere");
 });
 
-it("keeps no draft or view in this tab when the view switch opens a new tab", async () => {
-  world();
-  open();
-  await user_type_name();
-  const form = screen.getByRole("link", { name: "Form" });
-  fireEvent.click(form, { metaKey: true });
-  fireEvent.click(form, { ctrlKey: true });
-  fireEvent.click(form, { shiftKey: true });
-  expect(readDraft()).toBeNull();
-  expect(localStorage.getItem(`opl.${ADMIN.user}.vmCreate.mode`)).toBe("builder");
-});
-
 async function user_type_name() {
   await userEvent.setup().type(await screen.findByLabelText("Name"), "web");
 }
@@ -917,11 +987,9 @@ it("deploys from a template with the clone request and keeps its devices fixed",
       return HttpResponse.json(task("t-clone", "vm-clone", "from-tmpl"), { status: 202 });
     }),
   );
-  open();
+  open("template", `template=${TEMPLATE.id}`);
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "from-tmpl");
-  await user.click(screen.getByRole("button", { name: /^Ways to add tmpl/ }));
-  await user.click(screen.getByRole("menuitem", { name: "Add to VM" }));
   expect(
     screen.getByText("Starting point: template tmpl (deployed as a copy)"),
   ).toBeInTheDocument();
@@ -940,7 +1008,7 @@ it("deploys from a template with the clone request and keeps its devices fixed",
     "true",
   );
   await user.keyboard("{Escape}");
-  await user.click(within(slot("Protection")).getByRole("button", { name: "Edit" }));
+  await user.click(edit("Protection"));
   expect(
     screen.getByText("A template deployment does not set HA. Turn it on after creating."),
   ).toBeInTheDocument();
@@ -954,40 +1022,65 @@ it("deploys from a template with the clone request and keeps its devices fixed",
   expect(sent).toEqual([{ name: "from-tmpl", start: true }]);
 });
 
-it("shows the form-only fields on a chip, and clears them for a template deployment", async () => {
+it("keeps the advanced settings in a drawer, shows changed ones on a chip and sends them", async () => {
   world();
-  putDraft({
-    values: { ...emptyForm("q35"), name: "carry", restart: "on-failure", disks: [], nics: [] },
-  });
   open();
-  expect(
-    await screen.findByText(
-      "Changed in the form: 1 field (restart policy). It is sent as set there.",
-    ),
-  ).toBeInTheDocument();
   const user = userEvent.setup();
-  await user.click(screen.getByRole("tab", { name: "JSON" }));
-  expect(screen.getByRole("tabpanel")).toHaveTextContent('"restart": "on-failure"');
-  await user.click(screen.getByRole("button", { name: /^Ways to add tmpl/ }));
-  await user.click(screen.getByRole("menuitem", { name: "Add to VM" }));
+  await user.type(await screen.findByLabelText("Name"), "carry");
+  await user.click(screen.getByRole("button", { name: "Advanced settings" }));
+  const drawer = await screen.findByRole("dialog", { name: "Advanced settings" });
+  // 그림·요약에 있는 칸(이름·코어·메모리·노드)은 서랍에 없다.
+  expect(within(drawer).queryByLabelText("Name")).toBeNull();
+  expect(within(drawer).queryByLabelText("Node")).toBeNull();
+  await user.selectOptions(within(drawer).getByLabelText("Restart policy"), "on-failure");
+  await user.keyboard("{Escape}");
   expect(
-    screen.getByText(
-      "Cleared 1 field changed in the form (restart policy): a template deployment cannot carry it. Set it after creating.",
-    ),
+    screen.getByText("Changed in advanced settings: 1 field (restart policy)"),
   ).toBeInTheDocument();
-  expect(screen.queryByText(/^Changed in the form/)).toBeNull();
-  expect(screen.getByRole("tabpanel")).not.toHaveTextContent("restart");
-  // 되돌리면 빈 VM과 폼의 값이 돌아온다.
-  await user.click(screen.getByRole("button", { name: "Undo" }));
-  expect(screen.getByText(/^Changed in the form: 1 field/)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "View requests (JSON, CLI)" }));
+  expect(screen.getByRole("tabpanel")).toHaveTextContent('"restart": "on-failure"');
+});
+
+it("edits the device details and firmware of the picture in the advanced drawer", async () => {
+  world();
+  open("windows");
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "win");
+  await screen.findByRole("button", { name: /^NIC 1 / });
+  await user.click(screen.getByRole("button", { name: "Advanced settings" }));
+  const drawer = await screen.findByRole("dialog", { name: "Advanced settings" });
+  // 용도 카드가 켠 보안 부팅·TPM, 그림의 NIC가 서랍의 장치 칸에 있다(같은 값).
+  expect(within(drawer).getByRole("switch", { name: "TPM 2.0" })).toBeChecked();
+  const nic = within(drawer).getByRole("group", { name: "Network interface 1" });
+  expect(within(nic).getByLabelText("Model")).toHaveValue("e1000e");
+  await user.type(within(nic).getByLabelText("MAC address"), "52:54:00:12:34:56");
+  await user.keyboard("{Escape}");
+  expect(block("NIC 1 (lan)")).toHaveTextContent("e1000e");
+  await user.click(screen.getByRole("button", { name: "View requests (JSON, CLI)" }));
+  expect(screen.getByRole("tabpanel")).toHaveTextContent('"mac": "52:54:00:12:34:56"');
+});
+
+it("says in the advanced drawer why HA cannot run on the chosen node", async () => {
+  world();
+  open("linux");
+  const user = userEvent.setup();
+  await screen.findByRole("button", { name: /^NIC 1 / });
+  await user.selectOptions(screen.getByLabelText("Node"), "node-b");
+  await user.click(screen.getByRole("button", { name: "Advanced settings" }));
+  const drawer = await screen.findByRole("dialog", { name: "Advanced settings" });
+  expect(within(drawer).getByRole("switch", { name: "High availability (HA)" })).toBeDisabled();
+  expect(
+    within(drawer).getByText(/node-b has failed-node isolation \(fencing\) off/),
+  ).toBeVisible();
 });
 
 it("shows the JSON and CLI of the same requests, with the password masked", async () => {
   world();
-  open();
+  open("linux");
   const user = userEvent.setup();
   await quickVm(user);
-  await user.click(screen.getByRole("tab", { name: "JSON" }));
+  await user.click(screen.getByRole("button", { name: "View requests (JSON, CLI)" }));
+  expect(screen.getByRole("tab", { name: "JSON" })).toHaveAttribute("aria-selected", "true");
   const json = screen.getByRole("tabpanel").textContent!;
   expect(json).toContain("# POST /api/v1/volumes");
   expect(json).toContain("# POST /api/v1/vms");
@@ -1000,39 +1093,6 @@ it("shows the JSON and CLI of the same requests, with the password masked", asyn
   expect(screen.getByRole("tabpanel")).toHaveTextContent(/orbivisorctl vm create web/);
   // 고른 탭을 기억한다.
   expect(localStorage.getItem(`opl.${ADMIN.user}.vmBuilder.panel`)).toBe("cli");
-});
-
-it("hands the values to the form and back without putting the password in history or storage", async () => {
-  world();
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
-  const user = userEvent.setup();
-  await user.type(await screen.findByLabelText("Name"), "carry");
-  await user.click(
-    screen.getByRole("checkbox", { name: "Set up the guest on first boot (cloud-init)" }),
-  );
-  await user.type(screen.getByLabelText("Password"), "s3cret!");
-  const builder = screen.getByRole("link", { name: "Builder" });
-  expect(builder).toHaveAttribute("href", "/vms/-new/builder");
-  await user.click(builder);
-  expect(await screen.findByText("moved")).toBeInTheDocument();
-  expect(localStorage.getItem(`opl.${ADMIN.user}.vmCreate.mode`)).toBe("builder");
-  expect(readDraft()?.values.name).toBe("carry");
-  expect(JSON.stringify(window.history.state ?? null)).not.toContain("s3cret");
-  expect(sessionStorage.length).toBe(0);
-  expect(JSON.stringify({ ...localStorage })).not.toContain("s3cret");
-
-  // 빌더가 초안을 받는다(폼처럼 디스크 하나·NIC 하나).
-  open();
-  expect(await screen.findByLabelText("Name")).toHaveValue("carry");
-  expect(block("NIC 1 (user)")).toBeInTheDocument();
-  expect(readDraft()).toBeNull();
-});
-
-it("opens the builder from /vms/-new when it was the last view", async () => {
-  world();
-  writeUserPref(ADMIN.user, "vmCreate.mode", "builder");
-  renderPage(<VmCreatePage />, { path: "/vms/-new", url: "/vms/-new?folder=x" });
-  expect(await screen.findByText("moved")).toBeInTheDocument();
 });
 
 describe("on a phone", () => {
@@ -1048,7 +1108,7 @@ describe("on a phone", () => {
     );
   });
 
-  it("adds parts from a bottom drawer: press a part, then Drop here", async () => {
+  it("adds parts from a bottom drawer with a tap, and keeps Create in a bar", async () => {
     world();
     const { container } = open();
     const user = userEvent.setup();
@@ -1058,18 +1118,17 @@ describe("on a phone", () => {
     const lan = within(drawer).getByRole("button", { name: /^lan/ });
     fireEvent.pointerDown(lan, { button: 0, isPrimary: true, clientX: 10, clientY: 10 });
     fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
+    fireEvent.click(lan);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    const nics = slot("NICs");
-    expect(within(nics).getByText("Drop here")).toBeInTheDocument();
-    await expectNoAxeViolations(container, { disable: ["region"] });
-    fireEvent.click(within(nics).getByText("Drop here"));
     expect(block("NIC 1 (lan)")).toBeInTheDocument();
+    expect(create().closest(".vb-bar")).not.toBeNull();
+    await expectNoAxeViolations(container, { disable: ["region"] });
   });
 });
 
 it("has no axe violations with a full chassis and the inspector open", async () => {
   world();
-  const { container } = open();
+  const { container } = open("linux");
   const user = userEvent.setup();
   await quickVm(user);
   await user.click(block("NIC 1 (lan)"));
@@ -1080,11 +1139,11 @@ it("has no axe violations with a full chassis and the inspector open", async () 
 it("reads in Korean", async () => {
   await i18n.changeLanguage("ko");
   world();
-  open();
-  expect(
-    await screen.findByRole("button", { name: "보통 크기 Linux 서버로 시작" }),
-  ).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "빌더" })).toHaveAttribute("aria-current", "page");
+  open("");
+  expect(await screen.findByRole("heading", { name: "무엇을 돌릴 VM인가요?" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: /^리눅스 서버/ }));
+  expect(screen.getByRole("button", { name: "만들기" })).toBeInTheDocument();
+  expect(screen.getByText("용도: 리눅스 서버")).toBeInTheDocument();
 });
 
 it("has the same builder strings in English and Korean", () => {
@@ -1093,4 +1152,319 @@ it("has the same builder strings in English and Korean", () => {
       typeof v === "object" ? keys(v as object, `${p}${k}.`) : [`${p}${k}`],
     );
   expect(keys(builderKo).sort()).toEqual(keys(builderEn).sort());
+});
+
+// ---- 계획 77-5 리뷰
+
+describe("after the review of plan 77-5", () => {
+  it("opens the OS picker over the picture after a Linux card, moves focus there and says so", async () => {
+    world();
+    const { container } = open("");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /^Linux server/ }));
+    const heading = await screen.findByRole("heading", { name: "Pick the OS" });
+    await waitFor(() => expect(heading).toHaveFocus());
+    await expectNoAxeViolations(container, { disable: ["region"] });
+    expect(document.querySelector("[role=status]")).toHaveTextContent("Starting as Linux server.");
+    // 고르지 않으면 검사가 경고한다(만들기는 막지 않음).
+    await user.click(screen.getByRole("button", { name: "Pick later" }));
+    expect(screen.queryByRole("heading", { name: "Pick the OS" })).toBeNull();
+    expect(
+      screen.getAllByText(/Nothing to boot an OS from — attach an image or an ISO/).length,
+    ).toBeGreaterThan(0);
+    // 다시 열어 ISO를 넣으면 CD가 먼저 부팅하고 경고가 사라진다.
+    await user.click(screen.getByRole("button", { name: "Pick the OS (image or ISO)" }));
+    const picker = screen.getByRole("heading", { name: "Pick the OS" }).closest("section")!;
+    await user.click(within(picker).getByRole("button", { name: /^alpine/ }));
+    expect(block("CD drive 1 (alpine)")).toHaveTextContent("Boot from this CD first");
+    expect(screen.queryByText(/Nothing to boot an OS from/)).toBeNull();
+  });
+
+  it("starts a Linux card from a template, keeping the card's size", async () => {
+    world();
+    open("");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /^Database/ }));
+    await user.click(await screen.findByRole("button", { name: /^tmpl/ }));
+    expect(screen.queryByRole("heading", { name: "Pick the OS" })).toBeNull();
+    expect(
+      screen.getByText("Starting point: template tmpl (deployed as a copy)"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "vCPUs 4" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("sends a Windows card as Windows: TPM, Secure Boot, SATA, e1000e and an installer CD", async () => {
+    world();
+    const bodies: unknown[] = [];
+    server.use(
+      http.post(apiUrl("/volumes"), () =>
+        HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 }),
+      ),
+      http.post(apiUrl("/vms"), async ({ request }) => {
+        bodies.push(await request.json());
+        return HttpResponse.json(vm("win", "stopped"), { status: 201 });
+      }),
+    );
+    const { queryClient } = open("");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /^Windows 11 or Server/ }));
+    const picker = screen.getByRole("heading", { name: "Pick the OS" }).closest("section")!;
+    expect(within(picker).getByText("Driver ISO (virtio-win, optional)")).toBeInTheDocument();
+    await user.click(within(picker).getAllByRole("button", { name: /^alpine/ })[0]!);
+    await user.click(within(picker).getByRole("button", { name: "Done" }));
+    await user.type(screen.getByLabelText("Name"), "win");
+    await user.click(create());
+    const done = {
+      ...task("t-vol", "volume-create", "v1"),
+      status: { state: "succeeded", error: null },
+    };
+    queryClient.setQueryData<List<Task>>(["list", "task"], { revision: 2, items: [done as Task] });
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toMatchObject({
+      spec: {
+        machine: "q35",
+        firmware: "uefi",
+        secure_boot: true,
+        tpm: true,
+        disks: [{ bus: "sata" }],
+        nics: [{ model: "e1000e" }],
+        cdroms: [{ iso: "alpine", boot_order: 1 }],
+      },
+    });
+  });
+
+  it("dims the Windows card on an Arm-only cluster and refuses ?purpose=windows with the reason", async () => {
+    world({ nodes: [NODE_ARM] });
+    open("windows");
+    expect(
+      await screen.findByText(
+        "Cannot start as Windows 11 or Server: This cluster has only Arm (virt) nodes, so it cannot create Windows VMs.",
+      ),
+    ).toBeInTheDocument();
+    const card = screen.getByRole("button", { name: /^Windows 11 or Server/ });
+    expect(card).toBeDisabled();
+    expect(card).toHaveTextContent("This cluster has only Arm (virt) nodes");
+  });
+
+  it("does not let a card be pressed before the lists are read", async () => {
+    world();
+    let release!: () => void;
+    const late = new Promise<void>((r) => (release = r));
+    server.use(
+      http.get(apiUrl("/storage-pools"), async () => {
+        await late;
+        return HttpResponse.json({ revision: 1, items: [CEPH, LOCAL] });
+      }),
+    );
+    open("");
+    const card = await screen.findByRole("button", { name: /^Linux server/ });
+    expect(card).toBeDisabled();
+    expect(screen.getByText("Reading pools, networks and templates…")).toBeInTheDocument();
+    release();
+    await waitFor(() => expect(card).toBeEnabled());
+    expect(card).toHaveTextContent("2 vCPU · 4 GiB · disk 20 GiB");
+  });
+
+  it("says on the card and in the checks when no pool may take a disk", async () => {
+    world();
+    server.use(
+      http.get(apiUrl("/permissions/mine"), () =>
+        HttpResponse.json({
+          all: false,
+          root: ["system.read", "vm.create", "network.assign"],
+          root_contents: ["system.read", "vm.create", "network.assign"],
+          folders: {},
+          contents: {},
+          objects: [],
+        }),
+      ),
+    );
+    open("");
+    const card = await screen.findByRole("button", { name: /^Linux server/ });
+    await waitFor(() => expect(card).toHaveTextContent("no disk (no pool permission)"));
+    await userEvent.click(card);
+    expect(
+      screen.getAllByText("No pool you may use, so no disk was attached.").length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("defaults to the cluster CPU model from a card without opening the drawer", async () => {
+    world();
+    server.use(
+      http.get(apiUrl("/cpu/models"), () =>
+        HttpResponse.json({
+          arch: "x86_64",
+          nodes: 2,
+          models: [
+            { name: "host", kind: "basic", usable: 2 },
+            { name: "cluster", kind: "cluster", usable: 2, current: "Skylake-Server-v5" },
+          ],
+        }),
+      ),
+    );
+    open("");
+    const user = userEvent.setup();
+    const card = await screen.findByRole("button", { name: /^Blank VM/ });
+    await waitFor(() => expect(card).toBeEnabled());
+    await user.click(card);
+    await waitFor(() =>
+      expect(within(slot(/^CPU & memory/)).getByText(/CPU cluster/)).toBeInTheDocument(),
+    );
+    await user.click(screen.getByRole("button", { name: "View requests (JSON, CLI)" }));
+    expect(screen.getByRole("tabpanel")).toHaveTextContent('"model": "cluster"');
+  });
+
+  it("opens the drawer at the field of a problem fixed only there", async () => {
+    world();
+    open();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    await user.click(screen.getByRole("button", { name: "Advanced settings" }));
+    await user.type(await screen.findByLabelText("Maximum vCPUs"), "1");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await user.click(screen.getByRole("button", { name: /At least sockets × cores/ }));
+    await screen.findByRole("dialog", { name: "Advanced settings" });
+    await waitFor(() => expect(screen.getByLabelText("Maximum vCPUs")).toHaveFocus());
+  });
+
+  it("shows no guessed node when the server answered that none can take the VM", async () => {
+    world({ features: true });
+    server.use(
+      http.post(apiUrl("/vm-checks"), () =>
+        HttpResponse.json({
+          ok: false,
+          node: null,
+          ips: [],
+          problems: [
+            {
+              at: "placement",
+              code: "no_node",
+              level: "error",
+              message: "no node can run this VM",
+            },
+          ],
+        }),
+      ),
+    );
+    open();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    // 만든 뒤 켜기(기본)라 서버는 지금 놓을 노드를 고른다.
+    expect(screen.getByLabelText("Start after creating")).toBeChecked();
+    expect(
+      await screen.findByText(
+        "No node can take this VM now (reason below).",
+        {},
+        { timeout: CHECK_DELAY_MS + 2000 },
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("meter")).toBeNull();
+  });
+
+  it("goes back to the cards when the template in the address is gone", async () => {
+    world();
+    open("template", "template=nope");
+    expect(
+      await screen.findByText(/The template in the address does not exist/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "What will this VM run?" })).toBeInTheDocument();
+  });
+
+  it("starts the undo history at the card and keeps the typed name when changing the card", async () => {
+    world();
+    const { router } = open("");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /^Blank VM/ }));
+    // 초점은 그림의 첫 칸 제목으로(눌린 카드가 사라져도 길을 잃지 않음)
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "CPU & memory" })).toHaveFocus(),
+    );
+    expect(screen.getByRole("button", { name: "Undo" })).toBeDisabled();
+    await user.type(screen.getByLabelText("Name"), "keep");
+    await user.click(screen.getByRole("link", { name: "Change" }));
+    expect(router.state.location.search).toBe("");
+    // 지난 카드에 초점이 돌아온다.
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Blank VM/ })).toHaveFocus());
+    await user.click(screen.getByRole("button", { name: /^Install from ISO/ }));
+    expect(screen.getByLabelText("Name")).toHaveValue("keep");
+    expect(block("Disk 1 (keep-disk0)")).toBeInTheDocument();
+  });
+
+  it("tells a user who may not create VMs before they build one", async () => {
+    world();
+    server.use(
+      http.get(apiUrl("/permissions/mine"), () =>
+        HttpResponse.json({
+          all: false,
+          root: ["system.read"],
+          root_contents: ["system.read"],
+          folders: {},
+          contents: {},
+          objects: [],
+        }),
+      ),
+    );
+    open("");
+    expect(
+      await screen.findByText(/You have no folder where you may create VMs/),
+    ).toBeInTheDocument();
+  });
+
+  it("makes a new volume in an LVM-thin pool as raw", async () => {
+    world();
+    const thin = pool("thin", {
+      backend: { kind: "lvm-thin", vg: "vg", thinpool: "tp" },
+    } as Partial<typeof CEPH.spec>);
+    const nodeA = {
+      ...NODE_A,
+      status: { ...NODE_A.status, pools: { thin: poolState("thin") } },
+    };
+    mockLists({
+      node: [nodeA],
+      "storage-pool": [thin],
+      network: [network("lan")],
+      vm: [TEMPLATE],
+    });
+    const bodies: unknown[] = [];
+    server.use(
+      http.get(apiUrl("/placement"), () => HttpResponse.json({ leader: "x", nodes: LOADS })),
+      http.post(apiUrl("/volumes"), async ({ request }) => {
+        bodies.push(await request.json());
+        return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
+      }),
+    );
+    open("iso");
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "raw");
+    await user.click(create());
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toMatchObject({ spec: { pool: "thin", format: "raw" } });
+  });
+
+  it("does not create the VM when the user leaves while the new volume is still being made", async () => {
+    world();
+    let vms = 0;
+    server.use(
+      http.post(apiUrl("/volumes"), () =>
+        HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 }),
+      ),
+      http.post(apiUrl("/vms"), () => {
+        vms += 1;
+        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      }),
+    );
+    const { router, queryClient } = open("iso");
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    await user.click(create());
+    await act(() => router.navigate("/elsewhere"));
+    const done = {
+      ...task("t-vol", "volume-create", "v1"),
+      status: { state: "succeeded", error: null },
+    };
+    queryClient.setQueryData<List<Task>>(["list", "task"], { revision: 2, items: [done as Task] });
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    expect(vms).toBe(0);
+  });
 });

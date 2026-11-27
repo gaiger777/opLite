@@ -40,7 +40,12 @@ export interface BuilderState {
   preset: Preset;
   /** 템플릿을 놓을 때 비운, 폼에서 고친 칸(배포가 싣지 못함 — 틀 위 칩이 알림) */
   cleared?: CarriedKey[];
+  /** 용도 카드가 약속했지만 얹지 못한 것(OS 프리셋·디스크·NIC — 검사 경고가 알림, 계획 77-5 리뷰) */
+  missed?: Missed[];
 }
+
+/** 용도 카드가 얹지 못한 것: OS 프리셋(놓기 규칙이 거절), 새 디스크(쓸 풀 없음), NIC(쓸 네트워크 없음 — NAT로) */
+export type Missed = "os" | "disk" | "nic";
 
 /** 부품·놓기 규칙·문제가 보는 세상(목록은 watch로 늘 최신). 노드를 읽지 못하면 `nodes`가 null이다. */
 export interface BuilderCtx {
@@ -65,11 +70,16 @@ export interface BuilderCtx {
 export type { Reason };
 
 /**
- * 처음 상태: 폼과 같은 `emptyForm`이되 디스크·NIC가 없는 빈 틀(첫 놓기가 "무엇을 붙이는지"를 보이게).
+ * 처음 상태: 폼과 같은 `emptyForm`이되 디스크·NIC가 없는 빈 틀(첫 놓기가 "무엇을 붙이는지"를 보이게). `model`은 새 VM의
+ * CPU 모델 기본값이다 — 클러스터 CPU 기준이 있으면 `cluster`(계획 63 §13, 새 틀은 모두 여기서 시작한다).
  */
-export function initialState(machine: VmFormValues["machine"], folder = ""): BuilderState {
+export function initialState(
+  machine: VmFormValues["machine"],
+  folder = "",
+  model = "host",
+): BuilderState {
   return {
-    values: { ...emptyForm(machine, folder), disks: [], nics: [] },
+    values: { ...emptyForm(machine, folder), model, disks: [], nics: [] },
     base: { kind: "blank" },
     zone: null,
     autoNames: [],

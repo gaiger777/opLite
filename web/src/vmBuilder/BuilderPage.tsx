@@ -1,6 +1,9 @@
-// 끌어 놓기 VM 빌더 화면(계획 71 설계 §8): VM 탭의 만들기 화면 안 보기 "빌더"(`/vms/-new/builder`). 왼쪽 부품 상자, 가운데
-// VM 틀과 살피기, 오른쪽 확인·JSON·CLI 판과 만들기. 값은 폼과 같은 `VmFormValues`이고 요청도 같은 함수(`requests`)다.
-// 1024px 밑에서는 한 칸이 되고 부품 상자는 아래 서랍이다.
+// VM 만들기 한 화면(계획 77-5 — 계획 71 빌더와 폼을 합침, 진단 §4.3): `/vms/-new`. 첫 단계는 용도 카드(`?purpose=` 없음),
+// 고르면 VM 그림 화면이다 — 왼쪽 짧은 부품 상자(누르면 붙음, 끌어도 됨), 가운데 VM 그림(본체 둘레에 CPU·메모리·디스크·CD·
+// NIC·첫 부팅·보호 칸, 붙은 부품은 그림 위 카드로 고침), 오른쪽 고정 요약·검사(이름·폴더·배치(노드와 여유 막대)·펌웨어·
+// 서버 미리 확인·만들기), 고급은 오른쪽 서랍. 값은 폼과 같은 `VmFormValues`이고 요청도 같은 함수(`requests`)다. 1280px
+// 이상은 한 화면(부품 상자와 검사 결과만 안에서 스크롤), 그 밑은 차례대로 쌓고(이름·폴더 → 그림 → 요약) 만들기는 페이지 아래
+// 고정 띠다.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,60 +11,85 @@ import { Link, useNavigate, useSearchParams } from "react-router";
 
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
-import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions, usePermissionsReady } from "@/auth/usePermissions";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { archOf, useCpuModels } from "@/cpu/cpu";
 import { DndProvider, useDnd } from "@/dnd/DndProvider";
 import { folderTree } from "@/folders/folders";
+import { isTemplate } from "@/templates/templates";
 import { useFolderUsage } from "@/folders/UsageBars";
 import { errorMessage } from "@/i18n/errors";
 import { trackTask } from "@/tasks/tasks";
 import { Chassis } from "@/vmBuilder/Chassis";
 import { BuilderContext, type BuilderApi } from "@/vmBuilder/context";
-import { clearDraft, defaultFolder, putDraft, readDraft, writeMode } from "@/vmBuilder/draft";
+import { Advanced } from "@/vmBuilder/Advanced";
+import { defaultFolder } from "@/vmBuilder/draft";
 import type { Thing } from "@/vmBuilder/labels";
 import { accepts } from "@/vmBuilder/model/accepts";
 import { drop } from "@/vmBuilder/model/drop";
-import { blocking, browserProblems, problems } from "@/vmBuilder/model/problems";
+import { blocking, browserProblems, type Problem, problems } from "@/vmBuilder/model/problems";
 import { checkBody, requests, type RuleRequest, zoneRule } from "@/vmBuilder/model/requests";
+import {
+  applyPurpose,
+  picksOs,
+  type Purpose,
+  purposeBlocked,
+  PURPOSES,
+} from "@/vmBuilder/model/purposes";
 import { listOf, slotOf } from "@/vmBuilder/model/slots";
 import {
   type BuilderCtx,
   type BuilderState,
-  fromValues,
   type History,
   initialState,
   record,
+  setName,
   undo,
 } from "@/vmBuilder/model/state";
 import { PartsPanel } from "@/vmBuilder/PartsPanel";
-import { SidePanel } from "@/vmBuilder/SidePanel";
+import { Purposes } from "@/vmBuilder/Purposes";
+import { CodeSheet, CreateBar, focusProblem, NameFields, Summary } from "@/vmBuilder/Summary";
 import { useServerCheck } from "@/vmBuilder/useServerCheck";
 import { defaultMachine, type VmFormValues } from "@/vms/form";
 import { postVolume } from "@/vms/form/submit";
-import { ViewSwitch } from "@/vmBuilder/ViewSwitch";
 
 /** 서버 미리 확인 기능(`orbivisor_types::node::VM_CHECK`) */
 const VM_CHECK = "vm-check";
 
-// 빌더만의 모양: 첫 화면 CSS(Tailwind)에 넣지 않고 이 조각 안에 둔다(설계 §4).
+// 만들기 화면만의 모양: 첫 화면 CSS(Tailwind)에 넣지 않고 이 조각 안에 둔다(계획 71 설계 §4). 1280px 이상은 머리줄(3.5rem)과
+// 본문 여백(위아래 1.5rem)을 뺀 높이에 셋 칸이 들어가고 부품 상자와 검사 결과만 안에서 스크롤한다.
 const STYLE = `
 .vb-grid{display:grid;gap:1rem;grid-template-columns:minmax(0,1fr)}
-@media(min-width:1024px){.vb-grid{grid-template-columns:16rem minmax(0,1fr) 20rem;align-items:start}
-.vb-side{position:sticky;top:1rem}}
+@media(min-width:1280px){.vb-page{height:calc(100dvh - 6.5rem);min-height:36rem}
+.vb-grid{flex:1;min-height:0;grid-template-columns:14rem minmax(0,1fr) 19rem;align-items:stretch}
+.vb-col{min-height:0;display:flex;flex-direction:column;overflow-y:auto}
+.vb-scroll{min-height:0;flex:1;overflow-y:auto;overscroll-behavior:contain;padding-right:.25rem}
+.vb-checks{flex:1 1 auto;min-height:4.5rem;overflow-y:auto;overscroll-behavior:contain}}
+@media(max-width:1279px){.vb input,.vb select,.vb textarea,.vb button{scroll-margin-bottom:6rem}}
 .vb [data-drop=ok]{outline:2px solid var(--brand);outline-offset:2px}
 .vb [data-drop=ok][data-over]{background:color-mix(in oklab,var(--brand) 12%,transparent)}
 .vb [data-held]{outline:2px dashed var(--brand);outline-offset:1px}
 .vb-part{touch-action:pan-y;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 .vb-bar{position:sticky;bottom:0;padding-bottom:max(.5rem,env(safe-area-inset-bottom))}
+.vb-bar-page{z-index:20;margin-inline:-.25rem;border-width:1px 0 0;box-shadow:0 -4px 12px -8px rgb(0 0 0/.25)}
+.vb-clamp{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .vb-range{height:44px;width:100%;accent-color:var(--brand)}
 .vb-pre{max-height:60vh}
 .vb [data-level=error]{border-color:var(--danger)}
 .vb [data-level=warn]{border-color:var(--warning)}
 .vb p[data-level=error],.vb button[data-level=error]{color:var(--danger-fg)}
 .vb p[data-level=warn],.vb button[data-level=warn]{color:var(--warning-fg)}
+.vb-pic{display:grid;gap:.75rem;grid-template-columns:minmax(0,1fr)}
+@media(min-width:640px){.vb-pic{grid-template-columns:minmax(0,1fr) minmax(9.5rem,32%);grid-template-areas:"cmp cmp" "box nic";align-items:start}
+.vb-cmp{grid-area:cmp}.vb-chassis{grid-area:box}.vb-nic{grid-area:nic}
+.vb-port{position:relative}
+.vb-port-t::after{content:"";position:absolute;bottom:-.8rem;left:35%;height:.75rem;border-left:3px solid var(--border)}
+.vb-port-r::after{content:"";position:absolute;top:1.4rem;left:-.8rem;width:.75rem;border-top:3px solid var(--border)}}
+.vb-box{border-width:2px;border-radius:1rem;background:linear-gradient(var(--card),var(--card)) padding-box}
+.vb-led{width:.5rem;height:.5rem;border-radius:9999px;background:var(--border)}
+.vb-bars{height:.5rem;border-radius:9999px;background:var(--muted);overflow:hidden;display:flex}
+.vb-bars>span{display:block;height:100%}
 `;
 
 export function BuilderPage() {
@@ -70,15 +98,18 @@ export function BuilderPage() {
   const nodes = useList("node");
   const folders = useList("folder");
   const [params] = useSearchParams();
-  const { user } = usePrincipal();
-  // 이 보기를 열면 다음 "VM 만들기"도 빌더다(설계 §8.1).
-  useEffect(() => writeMode(user, "builder"), [user]);
   const readsNodes = perms.reads("node");
   if (!ready || (readsNodes && !nodes.data) || !folders.data) {
     return <ListPending error={nodes.error ?? folders.error} />;
   }
   const folder = defaultFolder(perms, folderTree(folders.data, "vm"), params.get("folder"));
   return <Builder machine={readsNodes ? defaultMachine(nodes.data ?? []) : ""} folder={folder} />;
+}
+
+/** 주소의 용도(`?purpose=`) — 모르는 값은 없음(카드부터) */
+function purposeOf(params: URLSearchParams): Purpose | null {
+  const p = params.get("purpose");
+  return PURPOSES.find((x) => x === p) ?? null;
 }
 
 /** 규칙 요청의 비교 열쇠(이름과 내용) */
@@ -119,13 +150,41 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
   const folders = useList("folder");
   const vms = useList("vm");
   const rules = useList("placement-rule");
-  const [hist, setHist] = useState<History>(() => {
-    const d = readDraft();
-    return { past: [], present: d ? fromValues(d.values) : initialState(machine, folder) };
-  });
-  useEffect(() => clearDraft(), []);
+  const [params, setParams] = useSearchParams();
+  // 주소의 용도를 쓸 수 없었으면(막힌 카드·없는 템플릿) 그 용도 대신 카드 화면과 까닭을 보인다(리뷰 S2).
+  const [refused, setRefused] = useState<{ purpose: Purpose; why: string } | null>(null);
+  const asked = purposeOf(params);
+  const purpose = asked && refused?.purpose === asked ? null : asked;
+  const [hist, setHist] = useState<History>(() => ({
+    past: [],
+    present: initialState(machine, folder),
+  }));
+  const apply = (next: BuilderState) => setHist((h) => record(h, next));
+  // 고른 칸(그림 위 카드 — 칸 살피기나 OS 고르기 `os`)
+  const [selected, select] = useState<string | null>(null);
+  // 주소로 바로 연 용도(`?purpose=linux`)는 세상을 읽은 뒤 한 번 얹는다(카드에서 고르면 그때 얹음).
+  const [applied, setApplied] = useState<Purpose | null>(null);
   const s = hist.present;
   const cpu = useCpuModels(archOf(s.values.machine), readsNodes);
+  // 클러스터 CPU 기준이 있으면 새 VM의 기본 모델은 `cluster`다(계획 63 §13 — 폼과 같음). 새 틀은 모두 `fresh()`에서
+  // 시작하므로(용도 카드·주소의 용도·빈 VM으로) 거기서 정한다. `autoModel`은 이 화면이 스스로 고른 모델이다 — 모델이 아직
+  // 그것이면(사용자가 고르지 않음) CPU 목록이 늦게 오거나 머신(아키텍처)이 바뀔 때 그 아키텍처의 기준을 따라 다시 고른다.
+  const clusterNow = cpu.data?.models.find((m) => m.kind === "cluster")?.current;
+  const defaultModel = clusterNow ? "cluster" : "host";
+  const fresh = () => initialState(machine, folder, defaultModel);
+  const [autoModel, setAutoModel] = useState("host");
+  if (
+    cpu.data &&
+    s.base.kind === "blank" &&
+    s.values.model === autoModel &&
+    autoModel !== defaultModel
+  ) {
+    setAutoModel(defaultModel);
+    setHist((h) => ({
+      ...h,
+      present: { ...h.present, values: { ...h.present.values, model: defaultModel } },
+    }));
+  }
   // 노드 부하(메모리 여유) — 지도와 같은 질의 열쇠(`placement/balance.ts` `PLACEMENT_KEY`)
   const placement = useQuery({
     queryKey: ["placement"],
@@ -168,6 +227,79 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     ],
   );
 
+  // 세상(풀·네트워크·템플릿)을 다 읽었는지 — 용도를 얹을 때 기본 풀·네트워크를 고르려면 필요하다(그 전에는 카드도 못 누름).
+  const loaded = [pools, volumes, networks, vms].every((q) => q.data !== undefined);
+  const templateId = params.get("template") ?? undefined;
+  const [said, setSaid] = useState("");
+  // 고른 뒤 초점을 줄 곳(블록 `data-block` 또는 칸 제목 id — 그린 뒤에 준다)
+  const focusTo = useRef<{ block: string } | { heading: string } | null>(null);
+  /**
+   * 용도 `p`로 새 틀을 만든다: 처음 틀(`fresh`)에 얹고, 쳐 둔 이름·폴더는 이어 받는다("바꾸기"로 다른 카드를 골라도). 되돌리기
+   * 쌓기의 바닥이다(되돌리기로 빈 틀이 되지 않게 — 리뷰 S4). OS를 고르는 용도면 OS 고르기 카드를 연다. 돌려준 값은 초점을
+   * 줄 칸 제목이다.
+   */
+  const start = (p: Purpose, template?: string): string => {
+    const base = fresh();
+    const kept = { ...base, values: { ...base.values, folder: s.values.folder } };
+    const next = setName(applyPurpose(kept, p, ctx, template), s.values.name);
+    setApplied(p);
+    setAutoModel(base.values.model);
+    setHist({ past: [], present: next });
+    const os = picksOs(p) && next.missed?.includes("os") !== true;
+    select(os ? "os" : null);
+    setSaid(t("vmBuilder.purpose.started", { name: t(`vmBuilder.purpose.${p}.title`) }));
+    return os ? "os" : "compute";
+  };
+  if (asked && asked !== applied && loaded) {
+    // 주소의 용도를 쓸 수 없으면(막힌 카드·없는 템플릿) 카드 화면으로 돌아가 까닭을 알린다(리뷰 S2).
+    const why =
+      asked === "template"
+        ? !templateId || !ctx.vms.some((x) => x.id === templateId && isTemplate(x))
+          ? t("vmBuilder.purpose.templateGone")
+          : undefined
+        : purposeBlocked(asked, fresh(), ctx);
+    setApplied(asked);
+    if (why) {
+      setRefused({
+        purpose: asked,
+        why:
+          typeof why === "string"
+            ? why
+            : t("vmBuilder.purpose.blocked", {
+                name: t(`vmBuilder.purpose.${asked}.title`),
+                reason: t(why.key, why.values),
+              }),
+      });
+    } else {
+      start(asked, templateId);
+    }
+  }
+  /** 카드를 골랐다: 새 틀에 그 용도를 얹고 주소에 적는다(뒤로 가면 카드). */
+  const choose = (p: Purpose, template?: string) => {
+    setRefused(null);
+    // 그림의 첫 칸(또는 OS 고르기)에 초점 — 그린 뒤에
+    focusTo.current = { heading: start(p, template) };
+    const next = new URLSearchParams(params);
+    next.set("purpose", p);
+    if (template) {
+      next.set("template", template);
+    } else {
+      next.delete("template");
+    }
+    setParams(next);
+  };
+  // 만들기를 누른 뒤에만, 또는 이름 칸을 떠난 뒤에만 이름 오류를 빨갛게 한다(설계 77-5 — 치기 전에는 조용히).
+  const [attempted, setAttempted] = useState(false);
+  const [touched, setTouched] = useState(false);
+  // 보낼 요청 보기(JSON·CLI) 서랍
+  const [code, setCode] = useState(false);
+  // 고급 서랍: 닫힘, 열림, 문제를 눌러 열림(첫 틀린 칸으로)
+  const [advanced, setAdvanced] = useState<false | "open" | "invalid">(false);
+  const openAdvanced = useCallback(
+    (focusInvalid?: boolean) => setAdvanced(focusInvalid ? "invalid" : "open"),
+    [],
+  );
+
   // 이번 화면에서 만든 배치 규칙(이름 → id·열쇠·VM 이름). VM을 만들지 못한 채 남았다: 다시 만들 때 지금 영역 규칙과
   // 같으면 다시 쓰고, 영역·hard/soft·VM 이름이 바뀌었거나 영역을 뺐으면 곧 지운다(이 화면이 방금 만든, 아직 VM 없는 규칙).
   const madeRules = useRef(new Map<string, MadeRule>());
@@ -193,12 +325,18 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     (n) => !n.spec.witness && !(n.status.features ?? []).includes(VM_CHECK),
   );
   const server = useServerCheck(body, !blocking(browser), supported, held);
-  const list = useMemo(
+  const all = useMemo(
     () => problems(s, ctx, server.stale ? null : server.check),
     [s, ctx, server.stale, server.check],
   );
+  // 보이는 문제: 이름을 아직 건드리지 않았으면 이름 문제와 이름을 따라갈 새 디스크의 빈 볼륨 이름은 숨긴다(만들기는
+  // 그래도 막힌다 — 누르면 보인다).
+  const quiet = !attempted && !touched;
+  const list = useMemo(
+    () => (quiet ? all.filter((p) => !waitsForName(p, s)) : all),
+    [all, quiet, s],
+  );
 
-  const [selected, select] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // 알림: 만들기가 실패했으면(`volumes`는 그때까지 만든 볼륨) "이미 만든 것"에 지금 남은 만든 규칙을 더해 그린다.
   const [failure, setFailure] = useState<{ message: string; volumes?: string[] } | null>(null);
@@ -207,9 +345,6 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
       setFailure({ message: t("vmBuilder.page.ruleLeft", { name, error: errorMessage(t, err) }) }),
     [t],
   );
-  // 놓은 뒤 초점을 줄 곳(블록 `data-block` 또는 칸 제목 id — 그린 뒤에 준다)
-  const focusTo = useRef<{ block: string } | { heading: string } | null>(null);
-  const [said, setSaid] = useState("");
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
 
@@ -221,8 +356,11 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
         "block" in to
           ? document.querySelector<HTMLElement>(`[data-block="${to.block}"]`)
           : document.getElementById(`vb-${to.heading}`);
-      el?.focus();
-      focusTo.current = null;
+      // 아직 그리지 않았으면(주소가 바뀐 뒤 그림이 그려짐) 다음 그리기에서 다시
+      if (el) {
+        el.focus();
+        focusTo.current = null;
+      }
     }
   });
 
@@ -261,7 +399,6 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     }
   }, [wantKey, made, busy, dropRule, leftAlert]);
 
-  const apply = (next: BuilderState) => setHist((h) => record(h, next));
   const builder: BuilderApi = {
     s,
     ctx,
@@ -269,6 +406,10 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     busy,
     selected,
     select,
+    touch: () => setTouched(true),
+    showName: !quiet,
+    check: server.stale ? null : server.check,
+    openAdvanced,
     put(thing, slot) {
       const next = drop(s, thing, slot, ctx);
       if (next === s) {
@@ -308,7 +449,7 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     record: apply,
     blank() {
       const before = [...hist.past].reverse().find((p) => p.base.kind === "blank");
-      apply(before ?? initialState(machine, folder));
+      apply(before ?? fresh());
     },
   };
 
@@ -341,6 +482,17 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     document.addEventListener("keydown", key);
     return () => document.removeEventListener("keydown", key);
   }, []);
+
+  /** 만들기: 막는 문제가 있으면 모두 보이고 첫 문제로 초점, 없으면 만든다. */
+  function tryCreate() {
+    setAttempted(true);
+    const first = blocking(all);
+    if (first) {
+      focusProblem(first, openAdvanced);
+      return;
+    }
+    void create();
+  }
 
   async function create() {
     setBusy(true);
@@ -419,12 +571,6 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     }
   }
 
-  // 폼으로: 지금 값을 초안으로(템플릿 바탕은 폼의 "템플릿에서")
-  const toForm = () =>
-    s.base.kind === "template"
-      ? putDraft({ values: initialState(machine, folder).values, preset: "template" })
-      : putDraft({ values: s.values });
-
   // 자동으로 지운 규칙은 "이미 만든 것"에서 빠진다.
   const createdNames = failure?.volumes && [...failure.volumes, ...made.keys()];
   const alert =
@@ -433,6 +579,7 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
       ? t("vmBuilder.page.created", { names: createdNames.join(", "), error: failure.message })
       : failure.message);
   const narrow = useNarrow();
+  const blocked = blocking(all);
   return (
     <BuilderContext.Provider value={builder}>
       <DndProvider<Thing>
@@ -440,29 +587,111 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
         onDrop={(item, slot) => builder.put(item, slot)}
       >
         <style>{STYLE}</style>
-        <div className="vb flex flex-col gap-4">
-          <div className="flex flex-wrap items-center gap-3">
+        <div className="vb vb-page flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-xl font-semibold">{t("vmForm.createTitle")}</h1>
-            <ViewSwitch mode="builder" onLeave={toForm} />
-            <UndoButton disabled={hist.past.length === 0 || busy} onClick={back} />
+            {purpose && (
+              <p className="flex items-center gap-1 text-sm text-muted-foreground">
+                <span>
+                  {t("vmBuilder.purpose.chosen", { name: t(`vmBuilder.purpose.${purpose}.title`) })}
+                </span>
+                <Button variant="link" size="sm" className="h-auto px-1" asChild>
+                  <Link to={{ search: withoutPurpose(params) }}>
+                    {t("vmBuilder.purpose.change")}
+                  </Link>
+                </Button>
+              </p>
+            )}
+            <div className="ml-auto flex flex-wrap items-center gap-2">
+              {purpose && (
+                <>
+                  <Button type="button" variant="outline" size="sm" onClick={() => openAdvanced()}>
+                    {t("vmBuilder.page.advanced")}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" onClick={() => setCode(true)}>
+                    {t("vmBuilder.page.code")}
+                  </Button>
+                  <UndoButton disabled={hist.past.length === 0 || busy} onClick={back} />
+                </>
+              )}
+              <Button variant="ghost" size="sm" asChild>
+                <Link to="/vms">{t("common.cancel")}</Link>
+              </Button>
+            </div>
           </div>
           <p role="status" className="sr-only">
             {said}
           </p>
-          <div className="vb-grid">
-            <PartsPanel narrow={narrow} />
-            <Chassis />
-            <SidePanel server={server} failure={alert} onCreate={() => void create()} />
-          </div>
-          <div>
-            <Button variant="ghost" asChild>
-              <Link to="/vms">{t("common.cancel")}</Link>
-            </Button>
-          </div>
+          {!purpose ? (
+            <>
+              {refused && (
+                <p role="alert" className="text-sm" data-level="warn">
+                  {refused.why}
+                </p>
+              )}
+              <Purposes state={fresh()} loading={!loaded} last={applied} onChoose={choose} />
+            </>
+          ) : (
+            <>
+              <div className="vb-grid">
+                <PartsPanel narrow={narrow} />
+                {narrow && (
+                  <div className="rounded-lg border bg-card p-3">
+                    <NameFields />
+                  </div>
+                )}
+                <Chassis narrow={narrow} />
+                <Summary
+                  server={server}
+                  failure={alert}
+                  blocked={attempted ? blocked : null}
+                  onCreate={tryCreate}
+                  narrow={narrow}
+                />
+              </div>
+              {narrow && (
+                <CreateBar
+                  fixed
+                  failure={alert}
+                  blocked={attempted ? blocked : null}
+                  onCreate={tryCreate}
+                />
+              )}
+            </>
+          )}
+          {code && <CodeSheet onClose={() => setCode(false)} />}
+          {advanced && (
+            <Advanced
+              onClose={() => setAdvanced(false)}
+              attempted={attempted}
+              focusInvalid={advanced === "invalid"}
+            />
+          )}
         </div>
       </DndProvider>
     </BuilderContext.Provider>
   );
+}
+
+/** 이름을 넣기 전이라 생긴 문제(이름 칸, 이름을 따라가는 새 디스크의 빈 볼륨 이름) */
+function waitsForName(p: Problem, s: BuilderState): boolean {
+  if (p.at === "name") {
+    return true;
+  }
+  const disk = /^disks\.(\d+)$/.exec(p.at);
+  const i = disk ? Number(disk[1]) : -1;
+  return (
+    p.key === "vmForm.errors.volume" && s.autoNames[i] === true && s.values.disks[i]?.volume === ""
+  );
+}
+
+/** 용도 없는 주소(카드로 돌아가기 — 폴더 등 다른 쿼리는 지킴) */
+function withoutPurpose(params: URLSearchParams): string {
+  const next = new URLSearchParams(params);
+  next.delete("purpose");
+  next.delete("template");
+  const q = next.toString();
+  return q ? `?${q}` : "";
 }
 
 /** 되돌리기 단추: 든 채(끌기·누르기·키보드)에는 꺼진다. */
@@ -483,9 +712,9 @@ function UndoButton({ disabled, onClick }: { disabled: boolean; onClick(): void 
   );
 }
 
-/** 1024px 밑(빌더가 한 칸이 되고 부품 상자가 서랍이 됨, 설계 §8.7) */
+/** 1280px 밑(한 칸으로 쌓고 부품 상자가 서랍이 됨 — 계획 77-5) */
 export function useNarrow(): boolean {
-  const query = "(max-width: 1023px)";
+  const query = "(max-width: 1279px)";
   const [narrow, setNarrow] = useState(() => window.matchMedia(query).matches);
   useEffect(() => {
     const media = window.matchMedia(query);

@@ -1,11 +1,12 @@
 import { expect, type Locator, type Page, test } from "@playwright/test";
 import { openItem } from "./nav";
 
-// 계획 71: VM › 만들기의 보기 "빌더"로 VM을 셋 만든다 — 넓은 화면 마우스 끌기(b1, 폼에서 넘어온 NIC 블록을 "빼기"에 끌어
-// 놓기·폴더·작게 포함), 키보드만(b2), 휴대폰 폭 서랍의 누르기 들기와 "여기에 놓기"(b3). 모두 꺼진 채 만든다(QEMU를 켜지
+// 계획 71·77-5: VM 만들기 한 화면(용도 카드 → VM 그림)으로 VM을 셋 만든다 — 넓은 화면 마우스 끌기(b1, NIC 블록을 "빼기"에
+// 끌어 놓기·폴더·vCPU/메모리 칩 포함), 키보드만(b2), 휴대폰 폭 서랍의 누르면 붙기(b3). 모두 꺼진 채 만든다(QEMU를 켜지
 // 않음). b1은 문제가 칸에 붙는지 본다: 이미 있는 볼륨 `b1-disk0`과 이름이 겹침(브라우저 오류 — 서버에 묻지 않음), 풀 여유보다
-// 큰 디스크(서버 경고 — 디스크 줄), vCPU 할당량 1인 폴더 `/q`(서버 오류 — VM 틀, 만들기 막힘). 클러스터·풀·그 볼륨·폴더는
-// Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비하고 만든 VM을 확인한다.
+// 큰 디스크(서버 경고 — 디스크 줄), vCPU 할당량 1인 폴더 `/q`(서버 오류 — VM 본체, 만들기를 누르면 까닭). 1440×900에서 문서
+// 높이가 화면을 넘지 않는다(스크롤 없음). 클러스터·풀·그 볼륨·폴더는 Rust 테스트(`crates/orbivisord/tests/web.rs`)가 준비하고
+// 만든 VM을 확인한다.
 const user = process.env.ORBIVISOR_USER ?? "admin";
 const password = process.env.ORBIVISOR_PASSWORD ?? "";
 /** 새 디스크를 만들 dir 풀 이름 */
@@ -23,17 +24,14 @@ async function signIn(page: Page) {
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
 }
 
-/** 가상 머신 › 모든 VM의 "만들기" → 보기 "빌더"(늦게 읽는 조각) */
-async function openBuilder(page: Page) {
+/** 가상 머신 › 모든 VM의 "만들기" → 용도 카드 "빈 VM"(늦게 읽는 조각) */
+async function openCreate(page: Page) {
   await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("link", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
-  await page.getByRole("link", { name: "Builder", exact: true }).click();
-  await expect(page).toHaveURL(/\/vms\/-new\/builder$/);
-  await expect(page.getByRole("link", { name: "Builder", exact: true })).toHaveAttribute(
-    "aria-current",
-    "page",
-  );
+  await expect(page.getByRole("heading", { name: "What will this VM run?" })).toBeVisible();
+  await page.getByRole("button", { name: /^Blank VM/ }).click();
+  await expect(page).toHaveURL(/\/vms\/-new\?purpose=blank$/);
 }
 
 const part = (page: Page, name: RegExp) => page.getByRole("button", { name });
@@ -42,9 +40,9 @@ const slot = (page: Page, name: string | RegExp) =>
 const esc = (s: string) => s.replace(/[()]/g, "\\$&");
 /** 끌기 틀의 알림 줄(지도의 노드 줄 `<p aria-live>`와 다름) */
 const announcer = (page: Page) => page.locator("div[role=status][aria-live=polite]");
-/** 확인 판의 상태 줄(알림 줄에도 같은 글이 있다) */
+/** 요약의 서버 확인 상태 줄(알림 줄에도 같은 글이 있다) */
 const checkStatus = (page: Page, text: string) =>
-  page.getByRole("tabpanel").getByText(text, { exact: true });
+  page.getByRole("complementary").getByText(text, { exact: true });
 const create = (page: Page) => page.getByRole("button", { name: "Create", exact: true });
 
 /** 진짜 마우스로 부품을 칸 가운데로 끈다(문턱 4px을 넘게 여러 걸음). */
@@ -85,14 +83,20 @@ test.use({ locale: "en-US" });
 test("builds a VM by dragging with the mouse, with server problems on their slots", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.setViewportSize({ width: 1440, height: 900 });
   await signIn(page);
-  await openBuilder(page);
-  // 폼에서 넘어온 값(폼의 기본 NIC 하나)을 받는다. 그 블록을 손잡이로 끌어 "빼기" 칸에 놓는다.
-  await expect(page.getByRole("button", { name: /^NIC 1 \(user\) / })).toBeVisible();
+  await openCreate(page);
+  // 한 화면: 1440×900에서 문서가 화면보다 길지 않다(부품 상자만 안에서 스크롤).
+  expect(
+    await page.evaluate(() => document.documentElement.scrollHeight <= window.innerHeight),
+  ).toBe(true);
+  // 이름을 넣기 전에는 빨간 오류가 없다.
+  await expect(page.getByLabel("Name", { exact: true })).not.toHaveAttribute("aria-invalid");
   await page.getByLabel("Name", { exact: true }).fill("b1");
+  // NIC를 끌어 붙이고, 그 블록을 손잡이로 끌어 "빼기" 칸에 놓는다.
+  await drag(page, part(page, /^user/), slot(page, "NICs"));
+  await expect(page.getByRole("button", { name: /^NIC 1 \(user\) / })).toBeVisible();
   const grip = page.getByRole("button", { name: "Pick up NIC 1 (user)" });
-  await grip.scrollIntoViewIfNeeded();
   const g = (await grip.boundingBox())!;
   await page.mouse.move(g.x + g.width / 2, g.y + g.height / 2);
   await page.mouse.down();
@@ -104,29 +108,30 @@ test("builds a VM by dragging with the mouse, with server problems on their slot
   await expect(page.getByRole("button", { name: /^NIC 1 \(user\) / })).toHaveCount(0);
   await expect(trash).toBeHidden();
 
-  await drag(page, part(page, /^Medium, 2 vCPU · 4 GiB/), slot(page, "Compute"));
-  await expect(slot(page, "Compute")).toContainText("2 vCPU · 4 GiB");
-  await expect(announcer(page)).toContainText("Dropped Medium on Compute.");
   // 거르기 칸으로 부품을 좁힌 뒤 끈다.
   const filter = page.getByRole("searchbox", { name: "Filter parts" });
   await filter.fill(pool);
   await drag(page, part(page, new RegExp(`^New disk in ${pool}`)), slot(page, "Disks"));
   await expect(page.getByRole("button", { name: /^Disk 1 \(b1-disk0\) / })).toBeVisible();
+  await expect(announcer(page)).toContainText(/Dropped New disk in .* on Disks/);
   await filter.fill("user");
   await drag(page, part(page, /^user/), slot(page, "NICs"));
   await expect(page.getByRole("button", { name: /^NIC 1 \(user\) / })).toBeVisible();
   await filter.fill("");
   await page.getByRole("checkbox", { name: "Start after creating" }).uncheck();
 
-  // 브라우저가 아는 문제: 볼륨 b1-disk0이 이미 있다 → 디스크 줄에 오류, 만들기 막힘, 서버에는 아직 묻지 않음
+  // 브라우저가 아는 문제: 볼륨 b1-disk0이 이미 있다 → 디스크 줄에 오류, 서버에는 아직 묻지 않음. 만들기를 누르면 까닭.
   const disk = slot(page, "Disk 1 (b1-disk0)");
   await expect(disk).toContainText("A volume with this name already exists.");
-  await expect(create(page)).toBeDisabled();
+  await create(page).click();
+  await expect(
+    page.getByRole("button", { name: /^Cannot create yet: A volume with this name/ }),
+  ).toBeVisible();
   await expect(
     checkStatus(page, "The server check runs when the browser finds no errors."),
   ).toBeVisible();
 
-  // 살피기에서 볼륨 이름을 바꾸고 디스크를 풀 여유보다 크게(4 TiB) → 서버 확인의 경고가 그 디스크 줄에(만들기는 막지 않음)
+  // 그림 위 카드에서 볼륨 이름을 바꾸고 디스크를 풀 여유보다 크게(4 TiB) → 서버 확인의 경고가 그 디스크 줄에
   await page.getByRole("button", { name: /^Disk 1 \(b1-disk0\) / }).click();
   await expect(page.getByRole("heading", { name: "Settings of Disk 1 (b1-disk0)" })).toBeVisible();
   await page.getByLabel("Volume name").fill("b1-root");
@@ -135,32 +140,29 @@ test("builds a VM by dragging with the mouse, with server problems on their slot
   const big = slot(page, "Disk 1 (b1-root)");
   await expect(big).toContainText(`storage pool "${pool}" has`, { timeout: 15_000 });
   await expect(big).toHaveAttribute("data-level", "warn");
-  await expect(create(page)).toBeEnabled();
   await size.fill("1");
   await page.getByRole("button", { name: "Close settings" }).click();
   await expect(checkStatus(page, "Server check: passed.")).toBeVisible({ timeout: 15_000 });
 
-  // 폴더 /q(할당량 vCPU 1)를 폴더 칸에 끌어 놓으면 서버 확인이 할당량 오류를 VM 틀에 붙이고 만들기를 막는다.
-  await filter.fill("/q");
-  await drag(page, part(page, /^\/q/), slot(page, "Folder"));
-  await filter.fill("");
-  await expect(slot(page, "Folder")).toContainText("/q");
+  // 폴더 /q(할당량 vCPU 1)를 고르면 서버 확인이 할당량 오류를 VM 본체에 붙이고, 만들기를 누르면 그 까닭을 보인다.
+  await page.getByLabel("Folder", { exact: true }).selectOption({ label: "/q" });
   const whole = slot(page, /^VM, \d problems?$/);
   await expect(whole).toContainText("folder /q would use 2 of 1 vCPUs", { timeout: 15_000 });
   await expect(whole).toHaveAttribute("data-level", "error");
   await expect(checkStatus(page, "Server check: 1 problem.")).toBeVisible();
-  await expect(create(page)).toBeDisabled();
+  await create(page).click();
   await expect(
     page.getByRole("button", { name: "Cannot create yet: folder /q would use 2 of 1 vCPUs" }),
   ).toBeVisible();
-  // "작게"(1 vCPU)를 계산 칸에 놓으면 통과한다.
-  await drag(page, part(page, /^Small, 1 vCPU/), slot(page, "Compute"));
-  await expect(slot(page, "Compute")).toContainText("1 vCPU · 1 GiB");
+  // vCPU 1·메모리 1 GiB 칩을 누르면 통과한다.
+  await page.getByRole("button", { name: "vCPUs 1", exact: true }).click();
+  await page.getByRole("button", { name: "Memory (GiB) 1 GiB", exact: true }).click();
+  await expect(slot(page, /^CPU & memory/)).toContainText("1 vCPU · 1 GiB");
   await expect(checkStatus(page, "Server check: passed.")).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText(/^Machine (virt|q35)$/)).toBeVisible();
-  await expect(create(page)).toBeEnabled();
+  await expect(page.getByText(/Motherboard (virt|q35)/)).toBeVisible();
 
   // 보낼 요청 그대로: JSON(볼륨 먼저)과 CLI
+  await page.getByRole("button", { name: "View requests (JSON, CLI)" }).click();
   await page.getByRole("tab", { name: "JSON" }).click();
   const panel = page.getByRole("tabpanel");
   await expect(panel).toContainText("# POST /api/v1/volumes");
@@ -169,7 +171,7 @@ test("builds a VM by dragging with the mouse, with server problems on their slot
   await page.getByRole("tab", { name: "CLI" }).click();
   await expect(panel).toContainText(`orbivisorctl volume create b1-root --pool ${pool} --size 1G`);
   await expect(panel).toContainText("orbivisorctl vm create b1");
-  await page.getByRole("tab", { name: "Check" }).click();
+  await page.keyboard.press("Escape");
 
   await create(page).click();
   await created(page, "b1");
@@ -177,15 +179,17 @@ test("builds a VM by dragging with the mouse, with server problems on their slot
 
 test("builds a VM with the keyboard only", async ({ page }) => {
   await signIn(page);
-  // 주소로 바로 열면 폼의 초안 없이 빈 틀이다.
-  await page.goto("/vms/-new/builder");
+  // 주소로 바로 열면 그 용도의 그림이다.
+  await page.goto("/vms/-new?purpose=blank");
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
-  await expect(slot(page, "NICs")).toContainText("Drop a network here.");
+  await expect(slot(page, "NICs")).toContainText("Press + or drop a network here.");
   await page.getByLabel("Name", { exact: true }).fill("b2");
 
-  await keyDrop(page, part(page, /^Medium/), slot(page, "Compute"));
-  await expect(announcer(page)).toContainText("Dropped Medium on Compute.");
-  await expect(slot(page, "Compute")).toContainText("2 vCPU · 4 GiB");
+  // 메모리 칩 4 GiB(키보드로)
+  const four = page.getByRole("button", { name: "Memory (GiB) 4 GiB", exact: true });
+  await four.focus();
+  await page.keyboard.press("Space");
+  await expect(slot(page, /^CPU & memory/)).toContainText("2 vCPU · 4 GiB");
   await keyDrop(page, part(page, new RegExp(`^New disk in ${pool}`)), slot(page, "Disks"));
   // 놓으면 새 블록에 초점이 가고 개수를 읽는다.
   await expect(page.getByRole("button", { name: /^Disk 1 \(b2-disk0\) / })).toBeFocused();
@@ -219,25 +223,22 @@ test("builds a VM with the keyboard only", async ({ page }) => {
 test("builds a VM at phone width from the parts drawer", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page);
-  // 휴대폰 폭의 사이드바는 메뉴 단추 뒤에 있다 — 빌더 주소로 바로 간다(빈 틀).
-  await page.goto("/vms/-new/builder");
-  await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
+  // 휴대폰 폭의 사이드바는 메뉴 단추 뒤에 있다 — 만들기 주소로 바로 가서 용도 카드를 누른다.
+  await page.goto("/vms/-new");
+  await page.getByRole("button", { name: /^Blank VM/ }).click();
   await page.getByLabel("Name", { exact: true }).fill("b3");
+  await page.getByRole("button", { name: "Memory (GiB) 4 GiB", exact: true }).click();
 
-  // 서랍을 열고 부품을 누르면(들기) 서랍이 닫히고 놓을 수 있는 칸에 "여기에 놓기"가 나온다.
-  async function tapDrop(name: RegExp, to: string) {
+  // 서랍을 열고 부품을 누르면 그 부품을 받는 첫 칸에 붙고 서랍이 닫힌다.
+  async function tap(name: RegExp) {
     await page.getByRole("button", { name: "Add parts" }).click();
     const drawer = page.getByRole("dialog", { name: "Parts" });
     await drawer.getByRole("button", { name }).click();
     await expect(drawer).toBeHidden();
-    const target = slot(page, to);
-    await target.getByText("Drop here", { exact: true }).click();
   }
-  await tapDrop(/^Medium/, "Compute");
-  await expect(slot(page, "Compute")).toContainText("2 vCPU · 4 GiB");
-  await tapDrop(new RegExp(`^New disk in ${pool}`), "Disks");
+  await tap(new RegExp(`^New disk in ${pool}`));
   await expect(page.getByRole("button", { name: /^Disk 1 \(b3-disk0\) / })).toBeVisible();
-  await tapDrop(/^user/, "NICs");
+  await tap(/^user/);
   await expect(page.getByRole("button", { name: /^NIC 1 \(user\) / })).toBeVisible();
 
   expect(
@@ -260,7 +261,7 @@ test("opens the VMware and export views at phone width", async ({ page }) => {
   await signIn(page);
   for (const [path, heading] of [
     ["/vmware-migrations", "VMware migrations"],
-    ["/vmware-sources", "VMware sources"],
+    ["/vmware-sources", "Connected vCenter & ESXi"],
     ["/vm-exports", "Exports"],
     ["/vmware-migrations/-new", "New VMware migration"],
   ] as const) {

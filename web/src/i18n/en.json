@@ -2144,9 +2144,6 @@
   "vmForm": {
     "createTitle": "Create a virtual machine",
     "editTitle": "Edit {{name}}",
-    "view": "View",
-    "viewForm": "Form",
-    "viewBuilder": "Builder",
     "runningNote": "The VM is running: its node, disks, and the number, order and MAC addresses of its interfaces cannot change, and if an interface has security groups, only the groups of the interfaces can change. Security groups apply right away; other changes apply from the next start.",
     "general": "General",
     "cores": "vCPU cores",
@@ -2230,7 +2227,6 @@
         "user": "The user network (QEMU NAT) has no rate limit."
       }
     },
-    "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
     "scheduleNote": "Takes snapshots automatically and keeps only the newest scheduled ones (manual snapshots stay). All disks must be qcow2 files or all on one pool type (LVM-thin, ZFS, Ceph RBD).",
     "scheduleEvery": "Take snapshots",
@@ -2338,7 +2334,6 @@
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "Runs together with the generated user-data, for packages and runcmd.",
     "ciUserDataWarning": "The user-data replaces the generated user-data; user, password and SSH keys are not used.",
-    "windows11Hint": "Filled in for Windows 11: UEFI, Secure Boot, TPM 2.0, guest agent, 2 cores, 4096 MiB, a SATA disk and the compatible network device (e1000e) — the Windows installer has no drivers for the fast VirtIO devices. After installing the VirtIO drivers, switch to virtio for speed.",
     "security": "Security",
     "securityLive": "TPM changes apply at the next restart. Secure Boot can only change while the VM is stopped.",
     "tpm": "TPM 2.0",
@@ -2382,19 +2377,6 @@
       "cpu": "CPU",
       "cpuValue": "{{sockets}} × {{cores}} cores",
       "firmware": "Firmware"
-    },
-    "preset": {
-      "title": "Start from a preset",
-      "blank": "Blank VM",
-      "blankHint": "Default values; set everything yourself.",
-      "linux": "Linux server",
-      "linuxHint": "2 cores, 2048 MiB, guest agent and first-boot setup on.",
-      "windows": "Windows 11",
-      "windowsHint": "UEFI with Secure Boot, TPM 2.0, SATA disk, compatible network device (e1000e).",
-      "template": "From a template",
-      "templateHint": "Deploy a copy of a template.",
-      "noTemplates": "There are no templates yet. Convert a VM on the Templates page.",
-      "deploy": "Deploy {{name}}…"
     },
     "machineAuto": "Automatic (cluster default)",
     "coresPerSocket": "Cores per socket",
@@ -3533,9 +3515,7 @@
     "notTarget": "Cannot move to {{node}}",
     "create": "Create: {{what}}",
     "theme": "Theme: {{theme}}",
-    "density": "Density: {{density}}",
-    "openBuilder": "Open the VM builder",
-    "builderKeywords": "builder, drag, compose"
+    "density": "Density: {{density}}"
   },
   "shortcuts": {
     "title": "Keyboard shortcuts",

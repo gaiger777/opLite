@@ -1,24 +1,9 @@
 import type { QueryClient } from "@tanstack/react-query";
 
 import { ApiError, api, call } from "@/api/client";
-import type { components } from "@/api/schema";
 import type { Vm } from "@/api/types";
 import { trackTask, waitForTask } from "@/tasks/tasks";
-import { type DiskRow, toSpec, type VmFormValues, volumeRequest } from "@/vms/form";
-
-/**
- * 새 빈 볼륨을 `format`(풀 종류의 기본 형식)으로 만들고 그 Task가 끝날 때까지 기다린다. `label`은
- * 진행 알림 문구다.
- */
-export async function createVolume(
-  queryClient: QueryClient,
-  disk: DiskRow,
-  format: components["schemas"]["ImageFormat"],
-  label: string,
-  signal: AbortSignal,
-): Promise<void> {
-  await postVolume(queryClient, volumeRequest(disk, format), label, signal);
-}
+import { toSpec, type VmFormValues, volumeRequest } from "@/vms/form";
 
 /** `POST /volumes` 본문 그대로 볼륨을 만들고 Task를 기다린다(VM 빌더의 `requests()` 본문 — 폼도 이 길로 보낸다). */
 export async function postVolume(
@@ -30,15 +15,6 @@ export async function postVolume(
   const task = await call(api.POST("/volumes", { body }));
   trackTask(task, label);
   await waitForTask(queryClient, task.id, signal);
-}
-
-/** VM을 만든다. `values.start`면 켜진 상태로 만든다. */
-export async function createVm(values: VmFormValues, sdn: readonly boolean[] = []): Promise<void> {
-  await call(
-    api.POST("/vms", {
-      body: { name: values.name, spec: toSpec(values, values.start ? "running" : "stopped", sdn) },
-    }),
-  );
 }
 
 /** 실행 중인 VM의 하드웨어 변경을 적용하는 핫플러그 Task의 id를 주는 응답 헤더(서버의 `revision::TASK`) */

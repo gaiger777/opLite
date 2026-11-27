@@ -1004,6 +1004,11 @@
         "how": "Only the configured number of scheduled snapshots is kept, the oldest deleted first. Manual snapshots are untouched.",
         "when": "When you want quick restore points against updates or mistakes. Snapshots live on the same disk, so they don't replace backups.",
         "diagram": "backupChain"
+      },
+      "placement": {
+        "what": "Decides the node the VM runs on.",
+        "how": "Automatic: when it starts, the server picks a node by free memory, CPU and placement rules. Node: keeps it on that node (pinned, HA and the balancer do not move it either). Failure zone: only nodes in that zone (the zone label).",
+        "when": "Usually automatic. Pick only for a node or zone with a particular device or license."
       }
     },
     "cpu": {
