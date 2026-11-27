@@ -339,6 +339,20 @@ pub enum AlertCondition {
     /// [`crate::physical::bond_faults`]). 본딩이 통째로 끊기면 새로 내지 않고(`node_link_down`이 본딩 이름으로 냄), 이미
     /// 울린 경보는 풀지 않고 끊긴 동안 그대로 둔다(문구 `bond0 down on …`). 다시 저하로 돌아오면 `node_link_down`만 풀린다.
     BondDegraded,
+    /// 복구 계획의 VM 가운데 복구 지점이 없거나 RPO 목표보다 오래된 것이 있음(계획 76, 리더가 계획 `status.protection`으로
+    /// 평가, 대상 복구 계획 — 계획마다 경보 하나). `plans`가 비면 모든 계획
+    DrRpoExceeded {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        plans: Vec<String>,
+    },
+    /// DR 실행(시험·장애 조치·뒷정리)이 `failed`·`partial`로 끝남(이벤트, 계획 76, 리더, 대상 복구 계획). `plans`가 비면
+    /// 모든 계획
+    DrRunFailed {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        plans: Vec<String>,
+    },
 }
 
 fn default_expiring_days() -> u16 {
@@ -385,6 +399,8 @@ impl AlertCondition {
             Self::ApplySetDrift => "apply_set_drift",
             Self::NodeLinkDown { .. } => "node_link_down",
             Self::BondDegraded => "bond_degraded",
+            Self::DrRpoExceeded { .. } => "dr_rpo_exceeded",
+            Self::DrRunFailed { .. } => "dr_run_failed",
         }
     }
 
@@ -396,6 +412,7 @@ impl AlertCondition {
                 | Self::HaRecovery
                 | Self::BackupJobFailed
                 | Self::SdnGatewayFailover
+                | Self::DrRunFailed { .. }
         )
     }
 
@@ -440,11 +457,30 @@ impl AlertCondition {
         matches!(self, Self::NodeLinkDown { .. } | Self::BondDegraded)
     }
 
+    /// DR 조건(계획 76 — 기능 `dr-plans`)인지
+    pub fn is_dr(&self) -> bool {
+        matches!(self, Self::DrRpoExceeded { .. } | Self::DrRunFailed { .. })
+    }
+
+    /// DR 조건의 계획 거르기. 다른 조건은 `None`
+    pub fn plans(&self) -> Option<&[String]> {
+        match self {
+            Self::DrRpoExceeded { plans } | Self::DrRunFailed { plans } => Some(plans),
+            _ => None,
+        }
+    }
+
+    /// 계획 `name`에 걸리는지(DR 조건이 아니면 거짓, `plans`가 비면 모두)
+    pub fn applies_to_plan(&self, name: &str) -> bool {
+        self.plans()
+            .is_some_and(|p| p.is_empty() || p.iter().any(|n| n == name))
+    }
+
     pub fn evaluator(&self) -> Evaluator {
         match self {
             Self::NodeOffline | Self::BackupJobFailed => Evaluator::Leader,
             Self::CertificateRenewFailed { .. } | Self::ApplySetDrift => Evaluator::Leader,
-            c if c.is_sdn() || c.is_backup_store() || c.is_link() => Evaluator::Leader,
+            c if c.is_sdn() || c.is_backup_store() || c.is_link() || c.is_dr() => Evaluator::Leader,
             _ => Evaluator::Node,
         }
     }
@@ -471,6 +507,7 @@ impl AlertCondition {
             Self::BackupStoreUnavailable => SubjectKind::BackupStore,
             Self::CertificateRenewFailed { .. } => SubjectKind::Certificate,
             Self::ApplySetDrift => SubjectKind::ApplySet,
+            Self::DrRpoExceeded { .. } | Self::DrRunFailed { .. } => SubjectKind::RecoveryPlan,
         }
     }
 
@@ -619,6 +656,14 @@ impl AlertRuleSpec {
             } if !crate::physical::valid_port_glob(ports) => {
                 return Err(AlertRuleError::Ports(ports.clone()));
             }
+            AlertCondition::DrRpoExceeded { plans } | AlertCondition::DrRunFailed { plans } => {
+                if plans.len() > MAX_RULE_SUBJECTS {
+                    return Err(AlertRuleError::TooManySubjects);
+                }
+                for p in plans {
+                    validate_name(p).map_err(AlertRuleError::SubjectName)?;
+                }
+            }
             _ => {}
         }
         if !self.vms.is_empty() && !c.about_vms() {
@@ -629,6 +674,7 @@ impl AlertRuleSpec {
             && (matches!(c, AlertCondition::BackupJobFailed)
                 || c.is_backup_store()
                 || c.is_declarative()
+                || c.is_dr()
                 || matches!(c, AlertCondition::CertificateRenewFailed { .. })
                 || (c.is_sdn() && c.subject_kind() != SubjectKind::Node))
         {
@@ -688,6 +734,8 @@ pub enum SubjectKind {
     Certificate,
     /// 적용 묶음(계획 73)
     ApplySet,
+    /// DR 복구 계획(계획 76)
+    RecoveryPlan,
 }
 
 impl SubjectKind {
@@ -705,6 +753,7 @@ impl SubjectKind {
             Self::BackupStore => "backup_store",
             Self::Certificate => "certificate",
             Self::ApplySet => "apply_set",
+            Self::RecoveryPlan => "recovery_plan",
         }
     }
 }
@@ -1907,6 +1956,76 @@ mod tests {
                 json!({ "kind": "node_link_down", "role": "trunk" })
             )
             .is_err()
+        );
+    }
+
+    /// 계획 76: DR 조건 둘. 리더가 계획 상태·실행으로 평가하고(대상 복구 계획), `plans`로 거른다. 실행 실패는 이벤트다.
+    #[test]
+    fn dr_conditions() {
+        let cases = [
+            (
+                json!({ "kind": "dr_rpo_exceeded" }),
+                AlertCondition::DrRpoExceeded { plans: vec![] },
+                false,
+            ),
+            (
+                json!({ "kind": "dr_run_failed", "plans": ["web-tier"] }),
+                AlertCondition::DrRunFailed {
+                    plans: vec!["web-tier".into()],
+                },
+                true,
+            ),
+        ];
+        for (j, c, event) in cases {
+            assert_eq!(
+                serde_json::from_value::<AlertCondition>(j.clone()).unwrap(),
+                c
+            );
+            assert_eq!(serde_json::to_value(&c).unwrap(), j);
+            assert_eq!(c.evaluator(), Evaluator::Leader);
+            assert_eq!(c.subject_kind(), SubjectKind::RecoveryPlan);
+            assert!(c.is_dr());
+            assert_eq!(c.is_event(), event);
+            assert!(!c.is_sdn() && !c.is_link() && !c.is_backup_store() && !c.is_acme());
+            let mut r = rule(c.clone());
+            assert_eq!(r.validate(), Ok(()));
+            r.nodes = vec!["n1".into()];
+            assert_eq!(r.validate(), Err(AlertRuleError::NodesFilter(c.kind())));
+            r.nodes.clear();
+            r.vms = vec!["web".into()];
+            assert_eq!(r.validate(), Err(AlertRuleError::VmsFilter(c.kind())));
+        }
+        assert_eq!(
+            AlertCondition::DrRpoExceeded { plans: vec![] }.kind(),
+            "dr_rpo_exceeded"
+        );
+        assert_eq!(
+            AlertCondition::DrRunFailed { plans: vec![] }.kind(),
+            "dr_run_failed"
+        );
+        let all = AlertCondition::DrRpoExceeded { plans: vec![] };
+        assert!(all.applies_to_plan("any"));
+        let one = AlertCondition::DrRunFailed {
+            plans: vec!["web-tier".into()],
+        };
+        assert!(one.applies_to_plan("web-tier") && !one.applies_to_plan("db"));
+        assert!(!AlertCondition::NodeOffline.applies_to_plan("web-tier"));
+        assert_eq!(AlertCondition::NodeOffline.plans(), None);
+        let r = rule(AlertCondition::DrRpoExceeded {
+            plans: vec!["Bad".into()],
+        });
+        assert!(matches!(r.validate(), Err(AlertRuleError::SubjectName(_))));
+        let r = rule(AlertCondition::DrRpoExceeded {
+            plans: (0..=MAX_RULE_SUBJECTS).map(|i| format!("p{i}")).collect(),
+        });
+        assert_eq!(r.validate(), Err(AlertRuleError::TooManySubjects));
+        let mut r = rule(AlertCondition::DrRunFailed { plans: vec![] });
+        r.for_secs = 30;
+        assert_eq!(r.validate(), Err(AlertRuleError::EventFor("dr_run_failed")));
+        assert_eq!(SubjectKind::RecoveryPlan.as_str(), "recovery_plan");
+        assert_eq!(
+            serde_json::to_value(SubjectKind::RecoveryPlan).unwrap(),
+            "recovery_plan"
         );
     }
 

@@ -3152,7 +3152,9 @@
       "backup_store_unavailable": "Backup store unreachable",
       "node_link_down": "Uplink or service port link down",
       "node_link_down_any": "LAN port link down",
-      "bond_degraded": "Bond degraded"
+      "bond_degraded": "Bond degraded",
+      "dr_rpo_exceeded": "DR recovery point over RPO",
+      "dr_run_failed": "DR run failed"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3186,7 +3188,9 @@
       "backup_verify_failed": "Backup verification failed",
       "backup_store_unavailable": "Backup store unreachable",
       "node_link_down": "LAN port link down",
-      "bond_degraded": "Bond degraded"
+      "bond_degraded": "Bond degraded",
+      "dr_rpo_exceeded": "DR recovery point over RPO",
+      "dr_run_failed": "DR run failed"
     },
     "rules": {
       "create": "Create rule",

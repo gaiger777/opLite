@@ -77,6 +77,10 @@ fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     if spec.condition.is_link() {
         require_feature(&state.cluster, orbivisor_types::node::LINK_ALERTS)?;
     }
+    // DR 조건(계획 76 §3.4)도 옛 노드가 풀지 못한다.
+    if spec.condition.is_dr() {
+        require_feature(&state.cluster, orbivisor_types::node::DR_PLANS)?;
+    }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for t in &spec.targets {
@@ -827,7 +831,8 @@ fn subject_owner(
         | SubjectKind::Sdn
         | SubjectKind::BackupStore
         | SubjectKind::Certificate
-        | SubjectKind::ApplySet => None,
+        | SubjectKind::ApplySet
+        | SubjectKind::RecoveryPlan => None,
     };
     crate::authz::Owned {
         target: target.unwrap_or(AuthzTarget::Root),

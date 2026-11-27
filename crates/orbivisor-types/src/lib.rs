@@ -17,6 +17,7 @@ pub mod cloud_init;
 pub mod cluster;
 pub mod cpu;
 pub mod crypt;
+pub mod dr;
 pub mod fence;
 pub mod file_restore;
 pub mod firmware;

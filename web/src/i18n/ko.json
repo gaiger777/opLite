@@ -3152,7 +3152,9 @@
       "backup_store_unavailable": "백업 저장소에 닿지 않음",
       "node_link_down": "업링크·서비스 포트 링크 끊김",
       "node_link_down_any": "랜 포트 링크 끊김",
-      "bond_degraded": "본딩 저하"
+      "bond_degraded": "본딩 저하",
+      "dr_rpo_exceeded": "DR 복구 지점이 RPO를 넘음",
+      "dr_run_failed": "DR 실행 실패"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3186,7 +3188,9 @@
       "backup_verify_failed": "백업 검증 실패",
       "backup_store_unavailable": "백업 저장소에 닿지 않음",
       "node_link_down": "랜 포트 링크 끊김",
-      "bond_degraded": "본딩 저하"
+      "bond_degraded": "본딩 저하",
+      "dr_rpo_exceeded": "DR 복구 지점이 RPO를 넘음",
+      "dr_run_failed": "DR 실행 실패"
     },
     "rules": {
       "create": "규칙 만들기",

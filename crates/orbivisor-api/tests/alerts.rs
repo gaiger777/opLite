@@ -2003,6 +2003,26 @@ async fn a_port_that_vanishes_while_pending_still_fires() {
     engine.shutdown().await;
 }
 
+/// 계획 76: DR 조건은 모든 노드가 `dr-plans`를 알 때만 받는다. 1단계에는 아무 노드도 알리지 않으므로 늘 409다.
+#[tokio::test]
+async fn dr_rules_wait_for_dr_plans() {
+    let rig = Rig::start().await;
+    let admin = rig.env.admin().await;
+    rig.target("ops", "json").await;
+    for condition in [
+        json!({"kind": "dr_rpo_exceeded"}),
+        json!({"kind": "dr_run_failed", "plans": ["web-tier"]}),
+    ] {
+        let got = admin
+            .post(
+                "/alert-rules",
+                json!({"name": "dr", "spec": {"condition": condition, "severity": "warning", "targets": ["ops"]}}),
+            )
+            .await;
+        assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    }
+}
+
 /// 링크 조건은 모든 노드가 `link-alerts`를 알 때만 받는다(409 `cluster_upgrading`). "링크 경보 켜기"(`link-defaults`)도
 /// 그동안 409이고, SDN 묶음은 링크 규칙 없이 여덟 그대로다. 모두 알면 묶음이 둘을 만들고 다시 부르면 그대로 둔다.
 #[tokio::test]

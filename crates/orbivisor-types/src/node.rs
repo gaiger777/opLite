@@ -498,6 +498,15 @@ pub const OPERATOR_DASHBOARD: &str = "operator-dashboard";
 /// `deny_unknown_fields`·태그) 모든 노드가 알릴 때만 쓴다.
 pub const LINK_ALERTS: &str = "link-alerts";
 
+/// DR 오케스트레이션(계획 76): 종류 `RecoveryPlan`·`DrRun`, `/dr-plans`·`/dr-runs` 경로, 경보 조건 `dr_rpo_exceeded`·
+/// `dr_run_failed`. 옛 노드는 새 종류·조건을 풀지 못하므로 모든 노드가 알릴 때만 쓴다. API·엔진이 다 되는 단계에서
+/// [`FEATURES`]에 넣는다(그 전에는 아무 노드도 알리지 않아 쓰기가 409 `cluster_upgrading`이다).
+pub const DR_PLANS: &str = "dr-plans";
+
+/// 복원 맵(계획 76 §3.3): 복원 요청의 `networks`·`security_groups`·`cloud_init_networks`·`cloud_init_dns`. 옛 노드의 복원
+/// Task는 맵을 모르므로 모든 노드가 알릴 때만 받는다. 복원 Task가 맵을 쓰는 단계에서 [`FEATURES`]에 넣는다.
+pub const RESTORE_REMAP: &str = "restore-remap";
+
 /// 디렉터리 배치 이름 바꾸기(계획 74): 이 노드에는 `/etc/orbivisor` 등 새 이름의 디렉터리가 있다(옛 이름은 링크).
 /// 다른 노드가 여는 경로(RBD 풀의 관리 conf)를 새 이름으로 적고 ACME 훅 경로에 새 디렉터리를 받는 것은 모든 노드가
 /// 알릴 때만이다(그 전에는 옛 이름 — [`crate::layout::to_legacy`]).
@@ -1391,6 +1400,15 @@ mod tests {
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
         assert_eq!(FEATURES.last(), Some(&LINK_ALERTS));
+    }
+
+    /// 계획 76 1단계: DR 기능 이름은 상수뿐이고 아직 알리지 않는다(API가 없는 기능을 알리지 않게).
+    #[test]
+    fn dr_features_are_not_announced_yet() {
+        assert_eq!(DR_PLANS, "dr-plans");
+        assert_eq!(RESTORE_REMAP, "restore-remap");
+        assert!(!FEATURES.contains(&DR_PLANS));
+        assert!(!FEATURES.contains(&RESTORE_REMAP));
     }
 
     /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

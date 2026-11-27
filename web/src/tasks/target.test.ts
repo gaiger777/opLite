@@ -73,6 +73,8 @@ it("links alert subjects", () => {
   // 계획 73: 인증서는 설정 › 보안 › 인증서, 적용 묶음은 그 묶음의 상세
   expect(alertHref({ ...s, kind: "certificate" })).toBe("/settings/certificates");
   expect(alertHref({ ...s, kind: "apply_set" })).toBe("/apply-sets/a%20b");
+  // 계획 76: 복구 계획은 DR 화면이 생기기 전까지 백업 목록
+  expect(alertHref({ ...s, kind: "recovery_plan" })).toBe("/backups");
 });
 
 it("links declarative apply and ACME order tasks (plan 73)", () => {

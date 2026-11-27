@@ -94,11 +94,15 @@ pub enum Kind {
     AcmeDns,
     /// ACME로 받는 공개 인증서(계획 73)
     Certificate,
+    /// DR 복구 계획(계획 76)
+    RecoveryPlan,
+    /// DR 실행 기록 — 시험·장애 조치·뒷정리(계획 76)
+    DrRun,
 }
 
 impl Kind {
     /// 모든 종류(선언 순서). 종류마다 도는 시험과 권한 표가 쓴다.
-    pub const ALL: [Kind; 47] = [
+    pub const ALL: [Kind; 49] = [
         Kind::Vm,
         Kind::StoragePool,
         Kind::Volume,
@@ -146,6 +150,8 @@ impl Kind {
         Kind::AcmeAccount,
         Kind::AcmeDns,
         Kind::Certificate,
+        Kind::RecoveryPlan,
+        Kind::DrRun,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -197,6 +203,8 @@ impl Kind {
             Kind::AcmeAccount => "acme-account",
             Kind::AcmeDns => "acme-dns",
             Kind::Certificate => "certificate",
+            Kind::RecoveryPlan => "recovery-plan",
+            Kind::DrRun => "dr-run",
         }
     }
 
@@ -233,6 +241,7 @@ impl Kind {
             | Kind::AcmeAccount
             | Kind::AcmeDns
             | Kind::Certificate
+            | Kind::RecoveryPlan
             | Kind::User => true,
             Kind::Node
             | Kind::Task
@@ -251,7 +260,8 @@ impl Kind {
             | Kind::NetworkMigration
             | Kind::VmwareMigration
             | Kind::VmwareVm
-            | Kind::VmExport => false,
+            | Kind::VmExport
+            | Kind::DrRun => false,
         }
     }
 
@@ -329,7 +339,7 @@ mod tests {
         assert_eq!(set.len(), Kind::ALL.len());
         assert_eq!(
             Kind::ALL.last().map(|k| k.as_str()),
-            Some("certificate"),
+            Some("dr-run"),
             "새 종류는 ALL 끝에도 더한다"
         );
         assert_eq!(Kind::parse("apply-set"), Some(Kind::ApplySet));
@@ -345,7 +355,7 @@ mod tests {
             .filter(|k| k.history_tracked())
             .map(Kind::as_str)
             .collect();
-        assert_eq!(tracked.len(), 29, "{tracked:?}");
+        assert_eq!(tracked.len(), 30, "{tracked:?}");
         for k in [
             "task",
             "session",
@@ -354,10 +364,18 @@ mod tests {
             "api-token",
             "two-factor",
             "snapshot",
+            "dr-run",
         ] {
             assert!(!tracked.contains(&k), "{k}");
         }
-        for k in ["vm", "user", "apply-set", "certificate", "settings"] {
+        for k in [
+            "vm",
+            "user",
+            "apply-set",
+            "certificate",
+            "settings",
+            "recovery-plan",
+        ] {
             assert!(tracked.contains(&k), "{k}");
         }
     }

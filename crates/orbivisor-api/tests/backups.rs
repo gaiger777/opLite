@@ -1269,3 +1269,37 @@ async fn viewers_read_backups_and_operators_manage_them() {
     let (status, body) = operator.delete(&format!("/backups/{id}")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
+
+/// 계획 76 §3.3: 복원 맵(`networks`·`security_groups`·`cloud_init_networks`·`cloud_init_dns`)은 모든 노드가 `restore-remap`을
+/// 알아야 받는다(409 `cluster_upgrading`). 1단계에는 아무 노드도 알리지 않으므로 늘 409이고, 맵이 없는 복원은 그대로다.
+#[tokio::test]
+async fn restore_maps_wait_for_restore_remap() {
+    let env = env().await;
+    let admin = env.admin().await;
+    ready_backup(&env, &admin).await;
+    for extra in [
+        json!({ "networks": { "lan": "dr-lan" } }),
+        json!({ "security_groups": { "web": "dr-web" } }),
+        json!({ "cloud_init_networks": [ { "ipv4": { "mode": "static", "address": "10.0.0.5/24" } } ] }),
+        json!({ "cloud_init_dns": { "servers": ["10.0.0.1"] } }),
+    ] {
+        let mut body = json!({ "name": "web-2", "pool": "local" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let got = restore(&admin, "b1", body).await;
+        assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+        assert!(
+            got.1["message"].as_str().unwrap().contains("restore remap"),
+            "{}",
+            got.1
+        );
+    }
+    let (status, task) = restore(
+        &admin,
+        "b1",
+        json!({ "name": "web-2", "pool": "local", "networks": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+}

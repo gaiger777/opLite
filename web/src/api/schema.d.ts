@@ -5455,6 +5455,14 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "bond_degraded";
+        } | {
+            /** @enum {string} */
+            kind: "dr_rpo_exceeded";
+            plans?: string[];
+        } | {
+            /** @enum {string} */
+            kind: "dr_run_failed";
+            plans?: string[];
         };
         /**
          * @description 비교
@@ -9602,7 +9610,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store" | "vmware-source" | "vmware-migration" | "vmware-vm" | "vm-export" | "apply-set" | "acme-account" | "acme-dns" | "certificate";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store" | "vmware-source" | "vmware-migration" | "vmware-vm" | "vm-export" | "apply-set" | "acme-account" | "acme-dns" | "certificate" | "recovery-plan" | "dr-run";
         /**
          * @description 노드가 기억하는 포트 하나(`NodeStatus.known_ports`, 계획 75 리뷰 2). 역할이 업링크·underlay·service였던 이더넷·그 밖·
          *     VLAN·본딩을 이름으로 기억한다. 장애 순간 주소가 떨어지거나(NetworkManager·networkd가 carrier를 잃은 장치의 주소를 뗌)
@@ -16355,6 +16363,12 @@ export interface components {
             time: string;
         };
         RestoreRequest: {
+            cloud_init_dns?: components["schemas"]["CloudInitDns"] | null;
+            /**
+             * @description NIC마다의 cloud-init 주소 설정(계획 76 §3.3). 주면 새 VM의 cloud-init `networks`를 이것으로 바꾸고 cloud-init이 없던
+             *     백업이면 새로 붙인다.
+             */
+            cloud_init_networks?: components["schemas"]["CloudInitNet"][] | null;
             /**
              * Format: uuid
              * @description 새 VM을 둘 폴더 id(계획 62). 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트다.
@@ -16364,10 +16378,21 @@ export interface components {
             live?: boolean;
             /** @description 새 VM의 이름 */
             name: string;
+            /**
+             * @description 백업의 네트워크 이름 → 이 클러스터의 네트워크 이름(계획 76 §3.3). 맵에 없는 이름은 같은 이름이어야 한다. 모든 노드가
+             *     `restore-remap`을 알아야 한다(409 `cluster_upgrading`).
+             */
+            networks?: {
+                [key: string]: string;
+            };
             /** @description 복원을 실행할 노드(이름이나 id). 없으면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다. */
             node?: string | null;
             /** @description 새 디스크를 둘 풀 */
             pool: string;
+            /** @description 백업의 보안 그룹 이름 → 이 클러스터의 보안 그룹 이름(계획 76 §3.3, `networks`와 같은 규칙) */
+            security_groups?: {
+                [key: string]: string;
+            };
         };
         /** @description 시점 되돌리기의 범위(하나 이상 — 모두 맞아야 한다) */
         RestoreScope: {
@@ -17447,7 +17472,7 @@ export interface components {
          * @description 경보 대상의 종류
          * @enum {string}
          */
-        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer" | "backup" | "backup_store" | "certificate" | "apply_set";
+        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer" | "backup" | "backup_store" | "certificate" | "apply_set" | "recovery_plan";
         /** @description SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다. */
         Subnet: {
             /**

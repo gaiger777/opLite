@@ -2,7 +2,7 @@
 //! 만들기는 VM 쓰기, 지우기·복원·복제는 백업 쓰기 권한이다. 실제 작업은 Task 실행기가 한다: 백업은
 //! VM의 노드, 지우기·복원·복제는 백업 풀을 쓸 수 있는 노드(공유가 아닌 풀의 백업은 파일을 쓴 노드).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -10,8 +10,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use orbivisor_types::backup::{Backup, BackupPhase, BackupSpec, BackupStatus, default_backup_name};
 use orbivisor_types::backup_store::{BackupStore, BackupStoreSpec, StoreBackend, StorePhase};
+use orbivisor_types::cloud_init::{CloudInitDns, CloudInitNet};
 use orbivisor_types::network::{NetworkSpec, USER_NETWORK};
-use orbivisor_types::node::{GUEST_AGENT, Node, NodeSpec, VTPM};
+use orbivisor_types::node::{GUEST_AGENT, Node, NodeSpec, RESTORE_REMAP, VTPM};
 use orbivisor_types::remote::RemoteSpec;
 use orbivisor_types::resource::Resource;
 use orbivisor_types::storage::{
@@ -72,6 +73,30 @@ pub struct RestoreRequest {
     /// 라이브 복원(계획 68 §11): 디스크를 다 받기 전에 새 VM을 켜고 뒤에서 옮긴다. 새 폴더의 `vm.power`도 든다.
     #[serde(default)]
     pub live: bool,
+    /// 백업의 네트워크 이름 → 이 클러스터의 네트워크 이름(계획 76 §3.3). 맵에 없는 이름은 같은 이름이어야 한다. 모든 노드가
+    /// `restore-remap`을 알아야 한다(409 `cluster_upgrading`).
+    #[serde(default)]
+    pub networks: BTreeMap<String, String>,
+    /// 백업의 보안 그룹 이름 → 이 클러스터의 보안 그룹 이름(계획 76 §3.3, `networks`와 같은 규칙)
+    #[serde(default)]
+    pub security_groups: BTreeMap<String, String>,
+    /// NIC마다의 cloud-init 주소 설정(계획 76 §3.3). 주면 새 VM의 cloud-init `networks`를 이것으로 바꾸고 cloud-init이 없던
+    /// 백업이면 새로 붙인다.
+    #[serde(default)]
+    pub cloud_init_networks: Option<Vec<CloudInitNet>>,
+    /// cloud-init DNS(계획 76 §3.3 — 복구 계획 IP 규칙의 `dns`). 주면 새 VM의 cloud-init `dns`를 이것으로 바꾼다.
+    #[serde(default)]
+    pub cloud_init_dns: Option<CloudInitDns>,
+}
+
+impl RestoreRequest {
+    /// 복원 맵(계획 76 §3.3 — 기능 `restore-remap`)을 쓰는지
+    fn remaps(&self) -> bool {
+        !self.networks.is_empty()
+            || !self.security_groups.is_empty()
+            || self.cloud_init_networks.is_some()
+            || self.cloud_init_dns.is_some()
+    }
 }
 
 /// 옮기기·복사의 대상 저장소
@@ -803,6 +828,9 @@ pub async fn restore_backup(
     }
     if req.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
+    }
+    if req.remaps() {
+        require_feature(&state.cluster, RESTORE_REMAP)?;
     }
     check_name(&req.name)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
