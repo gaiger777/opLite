@@ -11933,7 +11933,8 @@ export interface components {
                     progress?: components["schemas"]["TaskProgress"];
                     /**
                      * Format: int64
-                     * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+                     * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+                     *     (기록 Task는 끝 시각과 같다).
                      */
                     started_at?: number;
                     /** @default pending */
@@ -17020,7 +17021,8 @@ export interface components {
                 progress?: components["schemas"]["TaskProgress"];
                 /**
                  * Format: int64
-                 * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+                 * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+                 *     (기록 Task는 끝 시각과 같다).
                  */
                 started_at?: number;
                 /** @default pending */
@@ -19185,7 +19187,8 @@ export interface components {
             progress?: components["schemas"]["TaskProgress"];
             /**
              * Format: int64
-             * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+             * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+             *     (기록 Task는 끝 시각과 같다).
              */
             started_at?: number;
             /** @default pending */
