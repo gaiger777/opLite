@@ -96,6 +96,7 @@ fn run_spec(kind: DrRunKind, plan_spec: RecoveryPlanSpec) -> DrRunSpec {
         max_parallel: DEFAULT_MAX_PARALLEL,
         cleanup: None,
         allow_missing: false,
+        skip_vms: Vec::new(),
         point_in_time: None,
     }
 }
@@ -1303,28 +1304,38 @@ fn planned_failover_prepares_the_source_first() {
     let (s, a) = w.tick(&spec, &s);
     assert_eq!(s.steps[0].phase, DrPhase::Failed);
     assert!(s.steps[0].error.as_deref().unwrap().contains("disk full"));
-    assert_eq!(s.prepare_secs, Some(w.obs.now - now));
     assert_eq!(s.steps[1].backup_id, Some(c.id));
-    // 준비가 끝나 db 그룹(실패)을 지나 web 그룹을 복원한다. 이 실행이 끄고 되살리지 못하는 db1은 운영 쪽에서 다시 켠다.
-    assert!(
-        matches!(&a[..], [DrAction::StartSource { step: 0, vm }, DrAction::Restore { name, backup, .. }]
-            if vm == "db1" && name == "web1" && *backup == c.id),
-        "{a:?}"
+    // 준비는 전부 아니면 전무(리뷰 2): db1이 실패했으니 web1도 복원하지 않고, 이 실행이 끈 둘을 운영 쪽에서 다시 켠다.
+    assert_eq!(s.prepare_secs, None);
+    assert!(s.stopping);
+    assert!(s.error.as_deref().unwrap().contains("all VMs or none"));
+    assert_eq!(s.steps[1].phase, DrPhase::Skipped);
+    assert_eq!(
+        a,
+        vec![
+            DrAction::StartSource {
+                step: 0,
+                vm: "db1".into()
+            },
+            DrAction::StartSource {
+                step: 1,
+                vm: "web1".into()
+            },
+        ]
     );
-    assert!(s.steps[0].prepare.as_ref().unwrap().restarted);
-    assert!(
-        s.steps[0].notes[0].starts_with("restarted the source VM db1"),
-        "{:?}",
-        s.steps[0].notes
-    );
-    let mut s = s;
-    for _ in 0..3 {
-        w.finish_tasks(&[]);
-        w.obs.now += 5;
-        s = w.tick(&spec, &s).0;
+    for st in &s.steps {
+        assert!(st.prepare.as_ref().unwrap().restarted);
+        assert!(
+            st.notes[0].starts_with("restarted the source VM"),
+            "{:?}",
+            st.notes
+        );
     }
-    assert_eq!(s.state, DrRunState::Partial, "{:?}", phases(&s));
-    assert!(s.rto_secs.unwrap() >= s.prepare_secs.unwrap());
+    w.obs.now += 5;
+    let (s, a) = w.tick(&spec, &s);
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(s.state, DrRunState::Failed, "{:?}", phases(&s));
+    assert_eq!(w.issued.get("restore"), None);
 }
 
 /// 뒷정리: VM을 지운 뒤 거품 네트워크를 지운다(이미 없는 것은 건너뜀).
@@ -1641,7 +1652,9 @@ fn live_restores_count_when_the_vm_runs() {
     let (s, _) = w.tick(&spec, &s);
     assert_eq!(s.steps[0].copy_task, None);
     assert!(s.steps[0].notes[0].contains("mirror broke"));
-    assert_eq!(s.state, DrRunState::Succeeded);
+    assert_eq!(s.steps[0].copy_error.as_deref(), Some("mirror broke"));
+    // 디스크를 다 받지 못한 VM이 있으면 `partial`(리뷰 2)
+    assert_eq!(s.state, DrRunState::Partial);
     assert_eq!(s.rto_secs, Some(ready_at - now));
 }
 
@@ -1870,4 +1883,387 @@ fn a_cancelled_planned_failover_restarts_once() {
     assert!(a.is_empty());
     assert_eq!(s.state, DrRunState::Cancelled);
     assert!(s.steps[0].notes[0].contains("could not restart"));
+}
+
+// ---- 리뷰 2 ----
+
+/// 계획된 이전 하나를 준비 중간(db1을 끔)까지 데려간다.
+fn planned_with_db1_stopped(now: u64) -> (DrRunSpec, DrRunStatus, World) {
+    let spec = run_spec(
+        DrRunKind::FailoverPlanned,
+        plan(vec![group("db", &["db1"])]),
+    );
+    let s0 = DrRunStatus::start(&spec, &[], Some(CA), now);
+    let mut w = World::new(now);
+    let mut src = SourceObservation::default();
+    src.vms.insert("db1".into(), false);
+    w.obs.source = Some(src);
+    let (s, _) = w.tick(&spec, &s0);
+    assert!(s.steps[0].prepare.as_ref().unwrap().stopped);
+    (spec, s, w)
+}
+
+/// 운영 VM 다시 켜기(리뷰 2): 일시 오류면 물러서며 다시 하고 실행은 그동안 끝나지 않는다. 409 `vm_busy`(Busy)는 취소한
+/// 실행도 다시 한다. 상한이 지나면 영구 실패로 적는다.
+#[test]
+fn source_restarts_retry_until_done_or_given_up() {
+    let now = 10_000;
+    let (spec, mut s, mut w) = planned_with_db1_stopped(now);
+    // 꺼지지 않아 상한 뒤 실패 → 다시 켬
+    w.obs.now += PREPARE_STOP_LIMIT_SECS;
+    let (next, a) = advance(&spec, &s, &w.obs);
+    s = next;
+    assert!(matches!(&a[..], [DrAction::StartSource { .. }]), "{a:?}");
+    s.record(&a[0], DrResult::Retry("timed out".into()), w.obs.now);
+    assert!(!s.steps[0].prepare.as_ref().unwrap().restarted);
+    // 다음 걸음: 아직 쉼 — 할 일은 없지만 끝나지 않는다.
+    w.obs.now += 5;
+    let (next, a) = advance(&spec, &s, &w.obs);
+    s = next;
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(s.state, DrRunState::Running);
+    // 1분 뒤 다시
+    w.obs.now += RETRY_SECS;
+    let (next, a) = advance(&spec, &s, &w.obs);
+    s = next;
+    assert!(matches!(&a[..], [DrAction::StartSource { .. }]), "{a:?}");
+    s.record(&a[0], DrResult::Busy("vm_busy".into()), w.obs.now);
+    // 취소해도 Busy는 다시 한다.
+    s.cancel_requested = true;
+    w.obs.now += RESTART_MAX_BACKOFF_SECS;
+    let (next, a) = advance(&spec, &s, &w.obs);
+    s = next;
+    assert!(matches!(&a[..], [DrAction::StartSource { .. }]), "{a:?}");
+    s.record(&a[0], DrResult::Busy("vm_busy".into()), w.obs.now);
+    assert_eq!(s.state, DrRunState::Running);
+    // 상한이 지나면 포기하고 그 까닭을 적는다.
+    w.obs.now += RESTART_LIMIT_SECS;
+    let (s, a) = advance(&spec, &s, &w.obs);
+    assert!(a.is_empty(), "{a:?}");
+    let p = s.steps[0].prepare.as_ref().unwrap();
+    assert!(p.restarted);
+    assert!(
+        p.restart_error.as_deref().unwrap().contains("gave up"),
+        "{p:?}"
+    );
+    assert_eq!(s.state, DrRunState::Cancelled);
+    // 끝까지 켰으면 restart_error는 없다.
+    let (spec, s, mut w) = planned_with_db1_stopped(now);
+    w.obs.now += PREPARE_STOP_LIMIT_SECS;
+    let (mut s, a) = advance(&spec, &s, &w.obs);
+    s.record(&a[0], DrResult::Done, w.obs.now);
+    assert_eq!(s.steps[0].prepare.as_ref().unwrap().restart_error, None);
+    // 영구 실패(4xx)면 적고 끝난다.
+    let (spec, s, mut w) = planned_with_db1_stopped(now);
+    w.obs.now += PREPARE_STOP_LIMIT_SECS;
+    let (mut s, a) = advance(&spec, &s, &w.obs);
+    s.record(&a[0], DrResult::Failed("HTTP 403".into()), w.obs.now);
+    let (s, _) = advance(&spec, &s, &w.obs);
+    assert_eq!(
+        s.steps[0]
+            .prepare
+            .as_ref()
+            .unwrap()
+            .restart_error
+            .as_deref(),
+        Some("HTTP 403")
+    );
+    assert_eq!(s.state, DrRunState::Failed);
+}
+
+/// 운영 쪽 읽기가 거절되면(401·403) 준비 중인 VM은 모두 실패다(끝없이 기다리지 않는다).
+#[test]
+fn a_denied_source_read_fails_the_preparation() {
+    let now = 10_000;
+    let (spec, s, mut w) = planned_with_db1_stopped(now);
+    w.obs.source = None;
+    w.obs.source_error = Some("HTTP 401: token expired".into());
+    w.obs.source_denied = true;
+    w.obs.now += 5;
+    let (s, a) = advance(&spec, &s, &w.obs);
+    assert_eq!(s.steps[0].phase, DrPhase::Failed);
+    assert!(s.steps[0].error.as_deref().unwrap().contains("401"));
+    assert!(matches!(&a[..], [DrAction::StartSource { .. }]), "{a:?}");
+}
+
+/// 일시 오류면 같은 사본으로 한 번 더, 데이터 오류면 다른 바탕의 더 오래된 사본으로 — 잃은 시간을 적고 실행은 `partial`
+#[test]
+fn older_points_are_visible_and_skip_the_broken_base() {
+    let now = 100_000;
+    let spec = run_spec(
+        DrRunKind::FailoverDisaster,
+        plan(vec![group("db", &["db1"])]),
+    );
+    let full = copy("db1-full", "db1", CA, now - 7200);
+    let mut inc = copy("db1-inc", "db1", CA, now - 600);
+    inc.status.parent = Some(full.id);
+    let other = copy("db1-old", "db1", CA, now - 86_400);
+    let backups = vec![other.clone(), full.clone(), inc.clone()];
+    let s0 = DrRunStatus::start(&spec, &backups, Some(CA), now);
+    assert_eq!(s0.steps[0].backup.as_deref(), Some("db1-inc"));
+    let mut w = World::new(now);
+    w.obs.backups = backups;
+    let (mut s, _) = w.tick(&spec, &s0);
+    let fail_with = |w: &mut World, e: &str| {
+        let t = *w.tasks.keys().last().unwrap();
+        w.obs.tasks.insert(t, TaskOutcome::Failed(e.into()));
+    };
+    // 자리 없음: 같은 사본으로 다시
+    fail_with(&mut w, "no space left on device");
+    w.obs.now += 5;
+    s = w.tick(&spec, &s).0;
+    assert_eq!(s.steps[0].backup.as_deref(), Some("db1-inc"));
+    assert_eq!(s.steps[0].lost_secs, None);
+    // 깨진 청크: 같은 바탕(db1-full)의 사슬은 빼고 db1-old로
+    fail_with(&mut w, "chunk checksum mismatch");
+    w.obs.now += 5;
+    s = w.tick(&spec, &s).0;
+    assert_eq!(s.steps[0].backup.as_deref(), Some("db1-old"));
+    assert_eq!(s.steps[0].lost_secs, Some(86_400 - 600));
+    assert_eq!(s.steps[0].tried, ["db1-inc", "db1-inc"]);
+    for _ in 0..3 {
+        w.finish_tasks(&[]);
+        w.obs.now += 5;
+        s = w.tick(&spec, &s).0;
+    }
+    assert_eq!(s.steps[0].phase, DrPhase::Ready);
+    assert_eq!(s.state, DrRunState::Partial, "오래된 사본으로 되살림");
+}
+
+/// 실패한 라이브 복원이 VM을 남겼으면 그 VM(id로)을 지운 뒤 다시 복원한다.
+#[test]
+fn a_failed_live_restore_vm_is_discarded_before_retrying() {
+    let now = 10_000;
+    let mut p = plan(vec![group("web", &["web1"])]);
+    p.groups[0].vms[0].live = true;
+    let spec = run_spec(DrRunKind::Test, p);
+    let backups = vec![
+        copy("web1-a", "web1", CA, now - 900),
+        copy("web1-b", "web1", CA, now - 60),
+    ];
+    let s0 = DrRunStatus::start(&spec, &backups, Some(CA), now);
+    let mut w = World::new(now);
+    w.obs.backups = backups;
+    let (s, _) = w.tick(&spec, &s0);
+    let (mut s, _) = w.tick(&spec, &s);
+    let first_vm = s.steps[0].vm_id.unwrap();
+    let task = s.steps[0].task.unwrap();
+    // VM은 생겼고(꺼짐) Task는 실패
+    w.obs.vms.insert(
+        "web1-drt".into(),
+        VmObservation {
+            id: Some(first_vm),
+            labelled: true,
+            ..Default::default()
+        },
+    );
+    w.obs
+        .tasks
+        .insert(task, TaskOutcome::Failed("bad chunk".into()));
+    w.obs.now += 5;
+    let (next, a) = w.tick(&spec, &s);
+    s = next;
+    assert_eq!(
+        a,
+        vec![DrAction::DiscardVm {
+            step: 0,
+            vm: "web1-drt".into(),
+            id: first_vm
+        }]
+    );
+    assert_eq!(s.steps[0].backup.as_deref(), Some("web1-a"));
+    assert_eq!(s.steps[0].vm_id, None);
+    // 아직 있으면 또 지운다, 없어지면 다시 복원
+    w.obs.now += 5;
+    let (next, a) = w.tick(&spec, &s);
+    s = next;
+    assert!(matches!(&a[..], [DrAction::DiscardVm { .. }]), "{a:?}");
+    w.obs.vms.remove("web1-drt");
+    w.obs.now += 5;
+    let (s, a) = w.tick(&spec, &s);
+    assert!(
+        matches!(&a[..], [DrAction::Restore { name, .. }] if name == "web1-drt"),
+        "{a:?}"
+    );
+    assert_ne!(s.steps[0].vm_id, Some(first_vm));
+    assert_eq!(s.steps[0].discard_vm, None);
+}
+
+/// 다시 돌린 장애 조치: 지난번에 `ready`였던 VM은 건너뛰되 되살린 것으로 세고, 복원만 된 VM은 이어 받아 켠다.
+#[test]
+fn a_rerun_takes_over_vms_that_never_started() {
+    let now = 10_000;
+    let spec = run_spec(
+        DrRunKind::FailoverDisaster,
+        plan(vec![group("db", &["db1", "db2"])]),
+    );
+    let s0 = DrRunStatus::start(&spec, &copies(&["db1", "db2"], now), Some(CA), now);
+    let w = World::new(now);
+    let (mut s, a) = advance(&spec, &s0, &w.obs);
+    let old1 = Uuid::now_v7();
+    let old2 = Uuid::now_v7();
+    s.record(
+        &a[0],
+        DrResult::Existing {
+            vm: old1,
+            ready_before: true,
+        },
+        now,
+    );
+    s.record(
+        &a[1],
+        DrResult::Existing {
+            vm: old2,
+            ready_before: false,
+        },
+        now,
+    );
+    assert_eq!(s.steps[0].phase, DrPhase::Skipped);
+    assert_eq!(s.steps[0].vm_id, Some(old1));
+    assert_eq!(s.steps[1].phase, DrPhase::Starting);
+    let mut w = World::new(now);
+    for (name, id) in [("db1", old1), ("db2", old2)] {
+        w.obs.vms.insert(
+            name.into(),
+            VmObservation {
+                id: Some(id),
+                labelled: true,
+                running: name == "db1",
+                ..Default::default()
+            },
+        );
+    }
+    let (s, a) = w.tick(&spec, &s);
+    assert_eq!(
+        a,
+        vec![DrAction::Start {
+            step: 1,
+            vm: "db2".into()
+        }]
+    );
+    let mut s = s;
+    for _ in 0..2 {
+        w.finish_tasks(&[]);
+        w.obs.now += 5;
+        s = w.tick(&spec, &s).0;
+    }
+    assert_eq!(s.steps[1].phase, DrPhase::Ready);
+    assert_eq!(s.state, DrRunState::Succeeded, "{:?}", phases(&s));
+}
+
+/// 도는 Task·상한 있는 기다림은 멈춤이 아니다(분마다 `progress_at`을 올림). 일시 오류를 다시 하는 중이면 올리지 않는다.
+#[test]
+fn running_tasks_and_bounded_waits_count_as_progress() {
+    let now = 10_000;
+    let spec = run_spec(
+        DrRunKind::FailoverDisaster,
+        plan(vec![group("db", &["db1"])]),
+    );
+    let s0 = DrRunStatus::start(&spec, &copies(&["db1"], now), Some(CA), now);
+    let mut w = World::new(now);
+    let (s, _) = w.tick(&spec, &s0);
+    let task = s.steps[0].task.unwrap();
+    // 줄만 선 Task: 나아감 아님
+    w.obs.now += 3600;
+    let (q, _) = advance(&spec, &s, &w.obs);
+    assert_eq!(q.progress_at, now);
+    // 도는 Task: 나아감
+    w.obs.running_tasks.insert(task);
+    let (r, _) = advance(&spec, &s, &w.obs);
+    assert_eq!(r.progress_at, w.obs.now);
+    // 1분 안에는 다시 쓰지 않는다.
+    w.obs.now += 5;
+    let (r2, _) = advance(&spec, &r, &w.obs);
+    assert_eq!(r2, r);
+}
+
+/// 라이브 복원의 디스크 옮기기도 동시성에 든다.
+#[test]
+fn live_copies_count_against_concurrency() {
+    let now = 10_000;
+    let mut p = plan(vec![group("web", &["web1", "web2"])]);
+    for v in &mut p.groups[0].vms {
+        v.live = true;
+    }
+    let mut spec = run_spec(DrRunKind::FailoverDisaster, p);
+    spec.max_parallel = 1;
+    let s0 = DrRunStatus::start(&spec, &copies(&["web1", "web2"], now), Some(CA), now);
+    let mut w = World::new(now);
+    let (s, _) = w.tick(&spec, &s0);
+    w.obs.vms.insert(
+        "web1".into(),
+        VmObservation {
+            running: true,
+            id: s.steps[0].vm_id,
+            labelled: true,
+            ..Default::default()
+        },
+    );
+    w.obs.now += 5;
+    let (s, a) = w.tick(&spec, &s);
+    assert_eq!(s.steps[0].phase, DrPhase::Ready);
+    assert!(s.steps[0].copy_task.is_some());
+    assert!(a.is_empty(), "web2는 web1의 복사가 끝나야: {a:?}");
+}
+
+/// `skip_vms`의 VM만 복구 지점이 없어도 건너뛴다.
+#[test]
+fn skip_vms_skips_only_the_named_vms() {
+    let now = 10_000;
+    let mut spec = run_spec(
+        DrRunKind::FailoverDisaster,
+        plan(vec![group("db", &["db1", "db2", "db3"])]),
+    );
+    spec.skip_vms = vec!["db2".into()];
+    let s = DrRunStatus::start(&spec, &copies(&["db1"], now), Some(CA), now);
+    assert_eq!(
+        phases(&s),
+        [
+            ("db1".to_string(), DrPhase::Pending),
+            ("db2".to_string(), DrPhase::Skipped),
+            ("db3".to_string(), DrPhase::Failed),
+        ]
+    );
+}
+
+/// `source_fence_pending`은 옛 모양(이름)과 새 모양을 함께 읽는다.
+#[test]
+fn fence_pending_reads_old_names() {
+    let id = Uuid::now_v7();
+    let st: RecoveryPlanStatus = serde_json::from_value(json!({
+        "source_fence_pending": ["db1", { "vm": "web1", "source_id": id, "ca_fingerprint": CA }]
+    }))
+    .unwrap();
+    assert_eq!(st.source_fence_pending[0].vm, "db1");
+    assert_eq!(st.source_fence_pending[0].source_id, None);
+    assert_eq!(st.source_fence_pending[1].source_id, Some(id));
+    let back = serde_json::to_value(&st).unwrap();
+    assert_eq!(back["source_fence_pending"][0], json!({ "vm": "db1" }));
+    assert_eq!(
+        serde_json::from_value::<RecoveryPlanStatus>(back).unwrap(),
+        st
+    );
+}
+
+/// 계획된 이전의 준비 검사: 운영 쪽 VM의 지금 NIC로 맵·보안 그룹·풀을 보고 복구 지점은 보지 않는다.
+#[test]
+fn planned_readiness_uses_the_source_nics() {
+    let mut p = plan(vec![group("web", &["web1", "web2"])]);
+    p.networks.insert("lan".into(), "dr-lan".into());
+    let here = DrInventory {
+        networks: ["dr-lan".to_string()].into(),
+        pools: ["local".to_string()].into(),
+        ..Default::default()
+    };
+    let r = planned_readiness(&p, &here, |vm| {
+        (vm == "web1").then(|| vm_spec(&["lan", "storage"]).nics)
+    });
+    assert_eq!(
+        r[0].issues,
+        [ReadinessIssue {
+            kind: ReadinessKind::Network,
+            name: "storage".into()
+        }]
+    );
+    assert!(r[1].ok, "운영 쪽에 없는 VM은 사전 검사가 따로 본다");
 }

@@ -418,6 +418,11 @@ pub struct RestoreRemap {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cloud_init_dns: Option<CloudInitDns>,
+    /// 새 VM에 처음부터 달 라벨(계획 76 리뷰 2 — DR 엔진의 계획·실행 라벨: VM이 생기는 때부터 라벨이 있어 틈이 없다).
+    /// 복원 API 요청에는 없다(엔진만 쓴다).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl RestoreRemap {
