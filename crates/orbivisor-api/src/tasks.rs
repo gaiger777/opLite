@@ -101,8 +101,14 @@ const TARGET_KINDS: [Kind; 24] = [
     Kind::Sdn,
 ];
 
-/// 요청자 이름·대상 이름 레이블을 단다(계획 77). 레이블이라 옛 노드도 그대로 읽고, 실행기가 status를 다시 써도 남는다.
+/// 요청자(id [`REQUESTED_BY`]·이름)와 대상 이름 레이블을 단다(계획 77). 레이블이라 옛 노드도 그대로 읽고, 실행기가
+/// status를 다시 써도 남는다. Task를 저장하기 바로 전에(대상이 정해진 뒤) 부른다.
 pub(crate) fn label_task(cluster: &Cluster, task: &mut Task) {
+    // 요청한 사용자(리뷰 2 N7). 레이블이라 옛 노드도 그대로 읽는다(`TaskSpec`은 모르는 칸을 거절한다).
+    if let Some(user) = crate::audit::requester() {
+        task.labels
+            .insert(REQUESTED_BY.to_string(), user.to_string());
+    }
     if let Some(p) = crate::audit::principal() {
         task.labels.insert(REQUESTED_BY_NAME.to_string(), p.name);
     }
@@ -170,11 +176,6 @@ pub(crate) async fn create_task_with_id(
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.id = id;
     task.name = task.id.to_string();
-    // 요청한 사용자(리뷰 2 N7). 레이블이라 옛 노드도 그대로 읽는다(`TaskSpec`은 모르는 칸을 거절한다).
-    if let Some(user) = crate::audit::requester() {
-        task.labels
-            .insert(REQUESTED_BY.to_string(), user.to_string());
-    }
     label_task(cluster, &mut task);
     task.revision = cluster.create(&task).await?;
     Ok(task)

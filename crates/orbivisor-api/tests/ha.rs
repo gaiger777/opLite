@@ -346,7 +346,7 @@ async fn recovers_ha_vms_of_a_failed_node_in_name_order() {
     // 기록 Task: 대상 VM, 받은 노드, 처음부터 Succeeded
     let mut records: Vec<(Uuid, Uuid, TaskOp, TaskStatus)> = recover_tasks(&env)
         .into_iter()
-        .map(|t| (t.spec.target, t.spec.node, t.spec.op, finished(t.status)))
+        .map(|t| (t.spec.target, t.spec.node, t.spec.op, recorded(t.status)))
         .collect();
     records.sort_by_key(|r| (r.0 != a.id, r.0));
     let done = TaskStatus {
@@ -2302,13 +2302,7 @@ fn power_off_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
         .filter(|t| matches!(t.spec.op, TaskOp::NodePowerOff { .. }))
         .map(|t| {
             assert_eq!(t.spec.node, t.spec.target);
-            // 기록 Task는 끝난 시각을 적는다(계획 77). 비교에서는 뺀다.
-            assert!(t.status.finished_at.is_some());
-            let status = TaskStatus {
-                finished_at: None,
-                ..t.status
-            };
-            (t.spec.target, t.spec.op, status)
+            (t.spec.target, t.spec.op, recorded(t.status))
         })
         .collect()
 }
@@ -2673,13 +2667,7 @@ fn check_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
         .filter(|t| matches!(t.spec.op, TaskOp::HaCheck { .. }))
         .map(|t| {
             assert_eq!(t.spec.node, t.spec.target);
-            // 기록 Task는 끝난 시각을 적는다(계획 77). 비교에서는 뺀다.
-            assert!(t.status.finished_at.is_some());
-            let status = TaskStatus {
-                finished_at: None,
-                ..t.status
-            };
-            (t.spec.target, t.spec.op, status)
+            (t.spec.target, t.spec.op, recorded(t.status))
         })
         .collect()
 }
@@ -2688,6 +2676,17 @@ fn check_tasks(env: &Env) -> Vec<(Uuid, TaskOp, TaskStatus)> {
 fn finished(status: TaskStatus) -> TaskStatus {
     assert!(status.finished_at.is_some(), "{status:?}");
     TaskStatus {
+        finished_at: None,
+        ..status
+    }
+}
+
+/// 기록 Task의 status(시작·끝 시각이 같은 값으로 적혔는지 보고 비교에서 뺀다 — 계획 77-1 리뷰 I1)
+fn recorded(status: TaskStatus) -> TaskStatus {
+    assert!(status.finished_at.is_some(), "{status:?}");
+    assert_eq!(status.started_at, status.finished_at, "{status:?}");
+    TaskStatus {
+        started_at: None,
         finished_at: None,
         ..status
     }

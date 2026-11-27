@@ -448,11 +448,6 @@ async fn create_exclusive(
         },
     );
     task.name = task.id.to_string();
-    if let Some(user) = crate::audit::requester() {
-        task.labels
-            .insert(crate::tasks::REQUESTED_BY.to_string(), user.to_string());
-    }
-    crate::tasks::label_task(&state.cluster, &mut task);
     let pending = SdnPending {
         op: op.clone(),
         node,
@@ -495,6 +490,7 @@ async fn create_exclusive(
             Err(e) => return Err(e.into()),
         }
     }
+    crate::tasks::label_task(&state.cluster, &mut task);
     match state.cluster.create(&task).await {
         Ok(revision) => {
             task.revision = revision;

@@ -519,7 +519,8 @@ pub struct TaskStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub progress: Option<TaskProgress>,
-    /// 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+    /// 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+    /// (기록 Task는 끝 시각과 같다).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub started_at: Option<u64>,
@@ -538,6 +539,19 @@ impl TaskStatus {
             progress: None,
             started_at: prev.and_then(|p| p.started_at),
             finished_at: Some(now_ms()),
+        }
+    }
+
+    /// 기록 Task(처음부터 끝난 채 만드는 Task — HA 복구·노드 끄기·검사·CPU 기준)의 상태: 시작과 끝이 지금이다.
+    /// 시작 시각이 없으면 웹이 시작하지 않은 Task나 옛 노드의 Task로 읽는다(계획 77-1 리뷰 I1).
+    pub fn record(state: TaskState, error: Option<String>) -> Self {
+        let now = now_ms();
+        Self {
+            state,
+            error,
+            progress: None,
+            started_at: Some(now),
+            finished_at: Some(now),
         }
     }
 
@@ -1077,6 +1091,10 @@ mod tests {
         let old = TaskStatus::finished(TaskState::Succeeded, None, Some(&TaskStatus::default()));
         assert_eq!(old.started_at, None);
         assert!(old.finished_at.is_some());
+        // 기록 Task는 시작과 끝이 같다.
+        let rec = TaskStatus::record(TaskState::Succeeded, None);
+        assert!(rec.started_at.is_some());
+        assert_eq!(rec.started_at, rec.finished_at);
     }
 
     #[test]

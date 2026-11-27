@@ -251,6 +251,7 @@ async fn create_exclusive(
             Err(e) => return Err(e.into()),
         }
     }
+    crate::tasks::label_task(&state.cluster, &mut task);
     match state.cluster.create(&task).await {
         Ok(revision) => {
             task.revision = revision;
@@ -683,6 +684,7 @@ pub async fn init_ceph(
         "ceph init on {} (public {public_network})",
         node.name
     ));
+    crate::tasks::label_task(&state.cluster, &mut task);
     match state.cluster.create(&task).await {
         Ok(revision) => task.revision = revision,
         Err(e) => {

@@ -286,6 +286,20 @@ fn message(body: &Value) -> &str {
     body["message"].as_str().unwrap_or_default()
 }
 
+/// Ceph Task에 요청자(관리자) id·이름과 대상(`Ceph` 리소스) 이름·종류 레이블이 있다.
+fn assert_labelled(t: &Task, ceph: &Resource<CephSpec, CephStatus>) {
+    let label = |k: &str| t.labels.get(k).map(String::as_str);
+    assert!(label("requested-by").is_some(), "{:?}", t.labels);
+    assert_eq!(label("requested-by-name"), Some("admin"), "{:?}", t.labels);
+    assert_eq!(
+        label("target-name"),
+        Some(ceph.name.as_str()),
+        "{:?}",
+        t.labels
+    );
+    assert_eq!(label("target-kind"), Some("ceph"), "{:?}", t.labels);
+}
+
 /// 부트스트랩: 키 넷과 fsid를 만들어 `bootstrapping` 리소스와 `ceph-init` Task를 만든다. 키는 응답·watch 어디에도
 /// 나가지 않는다. 같은 노드로 다시 부르면 끝난 Task 뒤에 새 Task만 만들고, 다른 노드면 거절한다.
 #[tokio::test]
@@ -307,6 +321,8 @@ async fn init_creates_the_cluster_and_keeps_the_keys_out_of_responses() {
     );
     assert_eq!(ceph.status.phase, CephPhase::Bootstrapping);
     assert_eq!(ceph.status.init_node, Some(c.env.node));
+    // 계획 77-1 리뷰 I3: 요청자와 대상 이름 레이블(Task 목록·서랍의 "요청자"가 "자동"이 아니다).
+    assert_labelled(&first, &ceph);
     assert_eq!(ceph.spec.public_network.to_string(), "127.0.0.0/8");
     let keys = &ceph.spec.keys;
     let all = [&keys.mon, &keys.admin, &keys.bootstrap_osd, &keys.client];
@@ -517,6 +533,7 @@ async fn adding_monitors_and_managers() {
         (t.spec.op.clone(), t.spec.target, t.spec.node),
         (TaskOp::CephMonAdd, id, node2)
     );
+    assert_labelled(&t, &c.ceph().unwrap());
     assert_eq!(
         c.ceph().unwrap().status.pending,
         Some(orbivisor_types::ceph::CephPending {

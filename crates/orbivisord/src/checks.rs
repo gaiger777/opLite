@@ -687,7 +687,7 @@ impl State {
         );
         record.name = record.id.to_string();
         // 실행기는 끝난 Task를 실행하지 않는다.
-        record.status = TaskStatus::finished(TaskState::Succeeded, None, None);
+        record.status = TaskStatus::record(TaskState::Succeeded, None);
         if let Err(e) = self.cluster.create(&record).await {
             tracing::warn!(error = %e, "cannot record the bond task");
         }

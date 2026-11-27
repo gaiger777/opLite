@@ -304,7 +304,7 @@ async fn try_record(state: &AppState) -> Result<(), ClusterError> {
         );
         task.name = task.id.to_string();
         // 실행기는 끝난 Task를 실행하지 않는다.
-        task.status = TaskStatus::finished(TaskState::Succeeded, None, None);
+        task.status = TaskStatus::record(TaskState::Succeeded, None);
         if let Err(e) = cluster.create(&task).await {
             tracing::warn!(error = %e, "cannot record the CPU baseline task");
         }

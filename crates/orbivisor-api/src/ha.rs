@@ -1024,7 +1024,7 @@ async fn record_power_off(
     );
     record.name = record.id.to_string();
     // 실행기는 끝난 Task를 실행하지 않는다.
-    record.status = TaskStatus::finished(state, error, None);
+    record.status = TaskStatus::record(state, error);
     if let Err(e) = create(ctx, &record).await {
         tracing::warn!(node = %node, error = %e, "cannot record the node power-off task");
     }
@@ -2019,7 +2019,7 @@ async fn finish(ctx: Ctx<'_>, vm: &Vm, failed: &Node, target: Uuid) {
     );
     record.name = record.id.to_string();
     // 실행기는 끝난 Task를 실행하지 않는다.
-    record.status = TaskStatus::finished(TaskState::Succeeded, None, None);
+    record.status = TaskStatus::record(TaskState::Succeeded, None);
     if let Err(e) = create(ctx, &record).await {
         tracing::warn!(vm = %vm.name, error = %e, "cannot record HA recovery task");
     }
@@ -2027,15 +2027,20 @@ async fn finish(ctx: Ctx<'_>, vm: &Vm, failed: &Node, target: Uuid) {
 
 /// Task를 실패로 끝낸다. 그사이 바뀌었으면 다시 읽어 끝나지 않았을 때만 다시 쓴다.
 async fn fail_task(ctx: Ctx<'_>, task: &Task, error: &str) {
-    let status = TaskStatus::finished(TaskState::Failed, Some(error.into()), Some(&task.status));
+    let mut prev = task.status.clone();
     let mut revision = task.revision;
     for _ in 0..TASK_FAIL_ATTEMPTS {
+        // 다시 읽은 사이에 시작했으면 그 시작 시각을 잇는다(리뷰 S5).
+        let status = TaskStatus::finished(TaskState::Failed, Some(error.into()), Some(&prev));
         match update_status_checked::<TaskSpec>(ctx, task.id, revision, &status).await {
             Ok(_) => return,
             Err(e) => {
                 tracing::info!(task = %task.id, error = %e, "cannot fail task of a failed node");
                 match ctx.cluster.get::<TaskSpec>(task.id) {
-                    Ok(Some(t)) if !t.status.state.is_finished() => revision = t.revision,
+                    Ok(Some(t)) if !t.status.state.is_finished() => {
+                        revision = t.revision;
+                        prev = t.status;
+                    }
                     _ => return,
                 }
             }
