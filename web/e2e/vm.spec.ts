@@ -1,4 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
+import { openItem, openPageTab } from "./nav";
 
 const user = process.env.ORBIVISOR_USER ?? "admin";
 const password = process.env.ORBIVISOR_PASSWORD ?? "";
@@ -20,21 +21,6 @@ async function signIn(page: Page) {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
-}
-
-/**
- * 왼쪽 사이드바의 영역을 누른 뒤 본문 위 영역 탭을 누른다. 사이드바에는 영역만 있고 하위 화면은 영역 탭이다
- * (설계 §4). 이동 경로에도 같은 이름의 링크가 있으므로 내비게이션 안에서 찾는다.
- */
-async function openTab(page: Page, area: string, tab: string) {
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: area, exact: true })
-    .click();
-  await page
-    .getByRole("navigation", { name: `${area} menu` })
-    .getByRole("link", { name: tab, exact: true })
-    .click();
 }
 
 /** VM 상세 머리의 케밥 메뉴("Actions for {vm}")에서 항목을 고른다. 주 동작(시작·정지·콘솔·옮기기) 밖은 메뉴에 있다. */
@@ -81,9 +67,7 @@ async function scheduledSnapshots(page: Page) {
  * 끝에 보기 "노드"로 돌아가 인프라를 다시 누르면 기억한 보기로 온다.
  */
 async function clusterMap(page: Page, vm: string) {
-  await openTab(page, "Infrastructure", "Nodes");
-  const views = page.getByRole("navigation", { name: "Nodes views" });
-  await views.getByRole("link", { name: "Map", exact: true }).click();
+  await openItem(page, "Overview", "Infrastructure map");
   await expect(page).toHaveURL(/\/cluster\/map$/);
   const picture = page.getByRole("group", { name: "Cluster map" });
   const node = picture.getByRole("button", { name: /^Node node1, .*\bonline\b/ });
@@ -185,13 +169,8 @@ async function clusterMap(page: Page, vm: string) {
   ).toBe(true);
   await page.setViewportSize(wide);
 
-  // 보기 "노드"로 돌아가면 영역이 그 보기를 기억한다.
-  await views.getByRole("link", { name: "Nodes", exact: true }).click();
-  await expect(page).toHaveURL(/\/nodes$/);
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: "Infrastructure", exact: true })
-    .click();
+  // 클러스터·가용성 › 노드로 간다.
+  await openItem(page, "Cluster & availability", "Nodes");
   await expect(page).toHaveURL(/\/nodes$/);
 }
 
@@ -204,7 +183,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByRole("status").filter({ hasText: "Live" })).toBeVisible();
 
   // 풀을 만들고 이미지를 올린다. 볼륨은 가져오기 Task가 끝나면 준비된다(watch).
-  await openTab(page, "Infrastructure", "Storage pools");
+  await openItem(page, "Storage", "Storage pools");
   // 머리줄의 "+ 만들기"(Create new)와 겹치지 않게 정확히 찾는다.
   await page.getByRole("button", { name: "Create", exact: true }).click();
   let dialog = page.getByRole("dialog", { name: "Create a storage pool" });
@@ -215,7 +194,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   // 풀 이름 칸에는 즐겨찾기 ★도 있다.
   await expect(page.getByRole("button", { name: "Favorite local", exact: true })).toBeVisible();
 
-  await openTab(page, "Infrastructure", "Volumes");
+  await openItem(page, "Storage", "Disks (volumes)");
   await page.getByRole("button", { name: "Upload image" }).click();
   dialog = page.getByRole("dialog", { name: "Upload a disk image" });
   await dialog.getByLabel("Image file").setInputFiles(image);
@@ -231,7 +210,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   // raw 파일을 기본 형식 qcow2로 바꿔 가져왔다.
   await expect(root.getByRole("cell", { name: "qcow2", exact: true })).toBeVisible();
 
-  await openTab(page, "Virtual machines", "VMs");
+  await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("link", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   await page.getByLabel("Name", { exact: true }).fill("web");
@@ -248,7 +227,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
 
   // 계획 70: 켜진 VM을 클러스터 지도에서 본 뒤 VM 화면으로 돌아온다.
   await clusterMap(page, "web");
-  await openTab(page, "Virtual machines", "VMs");
+  await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("link", { name: "web", exact: true }).click();
   await expect(page.getByRole("heading", { name: "web" })).toBeVisible();
 
@@ -288,7 +267,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("Clone web to copy: done")).toBeVisible({ timeout: 60_000 });
 
   // 복제한 VM은 꺼진 채로 생기고, 새 볼륨으로 시작한다.
-  await openTab(page, "Virtual machines", "VMs");
+  await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("link", { name: "copy", exact: true }).click();
   await expect(page.getByRole("heading", { name: "copy" })).toBeVisible();
   await expect(page.getByTestId("vm-phase")).toHaveText("Stopped");
@@ -298,7 +277,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByTestId("vm-phase")).toHaveText("Running", { timeout: 60_000 });
 
   // 목록에서 골라 일괄로 끈다(설계 §5.3). 강제 정지는 고른 수를 입력해야 하고, VM마다 Task 결과를 보인다.
-  await openTab(page, "Virtual machines", "VMs");
+  await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("checkbox", { name: "Select copy", exact: true }).check();
   await page
     .getByRole("region", { name: "Bulk actions" })
@@ -331,7 +310,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("No snapshots.")).toBeVisible({ timeout: 60_000 });
 
   // 실행 중인 VM의 볼륨을 1 GiB로 늘린다.
-  await openTab(page, "Infrastructure", "Volumes");
+  await openItem(page, "Storage", "Disks (volumes)");
   await page.getByRole("button", { name: "Resize root" }).click();
   dialog = page.getByRole("dialog", { name: "Resize volume root" });
   await expect(dialog.getByText("Current size: 16 MiB")).toBeVisible();
@@ -455,7 +434,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   });
 
   // 볼륨과 풀을 지운다. 볼륨은 삭제 Task가 끝나야 목록에서 사라진다.
-  await openTab(page, "Infrastructure", "Volumes");
+  await openItem(page, "Storage", "Disks (volumes)");
   await page.getByRole("button", { name: "Delete root" }).click();
   confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type root to confirm").fill("root");
@@ -471,7 +450,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
     timeout: 60_000,
   });
 
-  await openTab(page, "Infrastructure", "Storage pools");
+  await openItem(page, "Storage", "Storage pools");
   await page.getByRole("button", { name: "Delete local" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
   await expect(page.getByText("No storage pools.")).toBeVisible();
@@ -500,18 +479,11 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
 // SDN(계획 65): 설정 전에는 네트워크 탭의 SDN 보기가 빈 상태이고, 네트워크 만들기의 SDN 종류는 막혀 있다.
 test("SDN is not set up: the empty state and the blocked SDN type", async ({ page }) => {
   await signIn(page);
-  await openTab(page, "Infrastructure", "Networks");
-  await page
-    .getByRole("navigation", { name: "Networks views" })
-    .getByRole("link", { name: "SDN", exact: true })
-    .click();
+  await openItem(page, "Networking", "SDN (virtual networks)");
   await expect(page).toHaveURL(/\/sdn$/);
   await expect(page.getByText("SDN is not set up")).toBeVisible();
   await expect(page.getByRole("button", { name: "Start the SDN setup" })).toBeVisible();
-  await page
-    .getByRole("navigation", { name: "Networks views" })
-    .getByRole("link", { name: "Networks", exact: true })
-    .click();
+  await openItem(page, "Networking", "Networks");
   // 머리줄의 전역 "Create" 메뉴가 아니라 목록의 만들기 단추
   await page.getByRole("main").getByRole("button", { name: "Create", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Create a network" });
@@ -521,16 +493,16 @@ test("SDN is not set up: the empty state and the blocked SDN type", async ({ pag
 // 라우터·유동 IP(계획 66): 네트워크 탭의 보기이고, SDN 설정 전에는 빈 상태와 막힌 만들기다.
 test("routers and floating IPs before SDN is set up", async ({ page }) => {
   await signIn(page);
-  await openTab(page, "Infrastructure", "Networks");
-  const views = page.getByRole("navigation", { name: "Networks views" });
-  await views.getByRole("link", { name: "Routers", exact: true }).click();
+  await openItem(page, "Networking", "Routers & public IPs");
   await expect(page).toHaveURL(/\/routers$/);
   await expect(page.getByText("No routers")).toBeVisible();
   await expect(
-    page.getByText("Routers and floating IPs need SDN (OVN) set up first, under Networks › SDN."),
+    page.getByText(
+      "Routers and floating IPs need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+    ),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a router" })).toBeDisabled();
-  await views.getByRole("link", { name: "Floating IPs", exact: true }).click();
+  await openPageTab(page, "Routers & public IPs", "Floating IPs");
   await expect(page).toHaveURL(/\/floating-ips$/);
   await expect(page.getByText("No floating IPs")).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a floating IP" })).toBeDisabled();
@@ -540,7 +512,7 @@ test("routers and floating IPs before SDN is set up", async ({ page }) => {
 // 바뀐다. 부하 분산은 SDN 설정 전에 빈 상태와 막힌 만들기다.
 test("network topology and load balancers before SDN is set up", async ({ page }) => {
   await signIn(page);
-  await openTab(page, "Infrastructure", "Networks");
+  await openItem(page, "Networking", "Networks");
   await page.getByRole("main").getByRole("button", { name: "Create", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Create a network" });
   await dialog.getByLabel("Name").fill("e2e-lan");
@@ -548,8 +520,7 @@ test("network topology and load balancers before SDN is set up", async ({ page }
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(page.getByRole("cell", { name: "e2e-lan", exact: true })).toBeVisible();
 
-  const views = page.getByRole("navigation", { name: "Networks views" });
-  await views.getByRole("link", { name: "Topology", exact: true }).click();
+  await openItem(page, "Networking", "Topology diagram");
   await expect(page).toHaveURL(/\/networks\/topology$/);
   const picture = page.getByRole("group", { name: "Network topology" });
   await expect(
@@ -561,15 +532,17 @@ test("network topology and load balancers before SDN is set up", async ({ page }
   // 다음에 열 때를 위해 그림으로 되돌린다(브라우저에 기억한다).
   await page.getByRole("radio", { name: "Picture" }).click();
 
-  await views.getByRole("link", { name: "Load balancers", exact: true }).click();
+  await openItem(page, "Networking", "Load balancers");
   await expect(page).toHaveURL(/\/load-balancers$/);
   await expect(page.getByText("No load balancers")).toBeVisible();
   await expect(
-    page.getByText("Load balancers need SDN (OVN) set up first, under Networks › SDN."),
+    page.getByText(
+      "Load balancers need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+    ),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a load balancer" })).toBeDisabled();
 
-  await views.getByRole("link", { name: "Networks", exact: true }).click();
+  await openItem(page, "Networking", "Networks");
   await page.getByRole("button", { name: "Delete e2e-lan" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "e2e-lan", exact: true })).toHaveCount(0);
@@ -579,7 +552,7 @@ test("network topology and load balancers before SDN is set up", async ({ page }
 // 준비된다. 저장소 리소스를 지우고 풀도 지운다(저장소 데이터는 풀 디렉터리에 남는다 — Rust 테스트가 본다).
 test("create a local backup store and see it in the list", async ({ page }) => {
   await signIn(page);
-  await openTab(page, "Infrastructure", "Storage pools");
+  await openItem(page, "Storage", "Storage pools");
   await page.getByRole("button", { name: "Create", exact: true }).click();
   const poolDialog = page.getByRole("dialog", { name: "Create a storage pool" });
   await poolDialog.getByLabel("Name").fill("e2e-bk");
@@ -588,7 +561,7 @@ test("create a local backup store and see it in the list", async ({ page }) => {
   await poolDialog.getByRole("button", { name: "Create" }).click();
   await expect(poolDialog).toBeHidden();
 
-  await openTab(page, "Protection", "Backup stores");
+  await openItem(page, "Backup & recovery", "Backup stores");
   await expect(page).toHaveURL(/\/backup-stores$/);
   await expect(page.getByText("No backup stores")).toBeVisible();
   await page.getByRole("button", { name: "Create a backup store" }).click();
@@ -613,7 +586,7 @@ test("create a local backup store and see it in the list", async ({ page }) => {
   await confirm.getByRole("button", { name: "Delete" }).click();
   await expect(page.getByText("No backup stores")).toBeVisible();
 
-  await openTab(page, "Infrastructure", "Storage pools");
+  await openItem(page, "Storage", "Storage pools");
   await page.getByRole("button", { name: "Delete e2e-bk" }).click();
   confirm = page.getByRole("alertdialog");
   await confirm.getByRole("button", { name: "Delete" }).click();
