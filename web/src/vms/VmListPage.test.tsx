@@ -11,6 +11,7 @@ import { expectNoAxeViolations } from "@/test/axe";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { resetTasks } from "@/tasks/tasks";
 import { apiUrl, server } from "@/test/server";
+import { guestKey } from "@/vms/guest";
 import { VmListPage } from "@/vms/VmListPage";
 
 const web = vm("web", "running");
@@ -708,4 +709,23 @@ it("splits a long list into pages of 50 and shows each VM's address (plan 77-6)"
   expect(await screen.findByRole("link", { name: "vm-050" })).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "vm-000" })).not.toBeInTheDocument();
   await expectNoAxeViolations(container);
+});
+
+it("shows only the guest address cached for the VM's current node and state (plan 77-6)", async () => {
+  const off = vm("off", "stopped");
+  mockLists({ vm: [web, off], node: [NODE] });
+  const { queryClient } = renderPage(<VmListPage />);
+  const answered = (ip: string) => ({
+    state: "answered" as const,
+    info: { collected_at: 1, interfaces: [{ name: "eth0", addresses: [{ ip, prefix: 24 }] }] },
+  });
+  // web의 지금 키와, 예전에 다른 노드에 있던 때의 키
+  queryClient.setQueryData(guestKey(web), answered("10.0.0.7"));
+  queryClient.setQueryData(["guest", web.id, "n-old", "running"], answered("10.9.9.9"));
+  // 꺼진 VM에 남은 예전 실행 때의 키
+  queryClient.setQueryData(["guest", off.id, "n1", "running"], answered("10.0.0.8"));
+  await screen.findByRole("link", { name: "web" });
+  expect(within(rowOf("web")).getByText("10.0.0.7")).toBeInTheDocument();
+  expect(rowOf("web")).not.toHaveTextContent("10.9.9.9");
+  expect(rowOf("off")).not.toHaveTextContent("10.0.0.8");
 });

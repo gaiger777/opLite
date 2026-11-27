@@ -24,7 +24,7 @@ import { formatMib } from "@/lib/format";
 import { isTemplate } from "@/templates/templates";
 import { type BulkAction, BULK_ACTIONS, BULK_PRIVILEGE, bulkReason, snapshotVms } from "@/vms/bulk";
 import { haEnabled } from "@/vms/ha";
-import { type GuestInfoResponse, guestAddresses } from "@/vms/guest";
+import { type GuestInfoResponse, guestAddresses, guestKey } from "@/vms/guest";
 import { VmBulkDialog } from "@/vms/VmBulkDialog";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPeek } from "@/vms/VmPeek";
@@ -63,22 +63,23 @@ export function VmListPage() {
   const create = perms.anywhere("vm.create");
   const phone = useIsPhone();
 
-  // 게스트 에이전트가 알린 주소는 이미 읽은 것만(VM 상세·팔레트가 읽어 둔 캐시) — 행마다 묻지 않는다.
+  // 게스트 에이전트가 알린 주소는 이미 읽은 것만(VM 상세·팔레트가 읽어 둔 캐시) — 행마다 묻지 않는다. 지금 노드·상태의
+  // 키 하나만 읽는다(꺼지거나 옮겨진 뒤 남은 옛 키의 주소를 보이지 않게). 캐시를 구독하지 않으므로 상세에서 막 읽은 주소는
+  // 목록이 다시 그려질 때(실시간 목록이 바뀔 때) 보인다 — 일부러 그렇다.
   const queryClient = useQueryClient();
-  const guestIps = new Map<string, string[]>();
-  for (const [key, data] of queryClient.getQueriesData<GuestInfoResponse>({
-    queryKey: ["guest"],
-  })) {
-    if (data?.info && typeof key[1] === "string") {
-      guestIps.set(key[1], guestAddresses(data.info));
+  const guestIps = (vm: Vm): string[] => {
+    if (vm.status.phase !== "running") {
+      return [];
     }
-  }
+    const info = queryClient.getQueryData<GuestInfoResponse>(guestKey(vm))?.info;
+    return info ? guestAddresses(info) : [];
+  };
   const addresses = (vm: Vm): string[] => {
     const statics = (vm.spec.cloud_init?.networks ?? []).flatMap((net) =>
       [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
     );
     return [
-      ...new Set([...statics, ...(guestIps.get(vm.id) ?? [])].map((a) => a.split("/")[0] ?? a)),
+      ...new Set([...statics, ...guestIps(vm)].map((a) => a.split("/")[0] ?? a)),
     ];
   };
 
