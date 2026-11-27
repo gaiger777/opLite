@@ -343,7 +343,7 @@ it("goes to every item, page tab and folder view", async () => {
     }),
   );
   await waitFor(() => expect(router.state.location.pathname).toBe("/cluster"));
-  const second = await search("floating", "Networking › Routers & public IPs › Floating IPs");
+  const second = await search("public ips", "Networking › Routers & public IPs › Public IPs");
   await second.user.keyboard("{Escape}");
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   await search("vm folders", "Virtual machines › All VMs › VM folders");

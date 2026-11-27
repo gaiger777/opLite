@@ -2,7 +2,7 @@
   "clusterMap": {
     "label": {
       "node": "노드 {{name}}",
-      "witness": "증인 노드 {{name}}",
+      "witness": "투표 전용 노드 {{name}}",
       "slab": "판 {{name}}",
       "noGroup": "영역 없음",
       "online": "온라인",
@@ -125,7 +125,7 @@
       "uplinkUp": "업링크 정상",
       "uplinkDegraded": "업링크 일부 끊김",
       "uplinkDown": "업링크 없음",
-      "noFencing": "펜싱 없음(HA VM을 돌리지 않음)",
+      "noFencing": "강제 차단 장치 없음(HA VM을 돌리지 않음)",
       "haVm": "HA VM",
       "recommendation": "추천 옮기기",
       "portUp": "포트 연결됨",
@@ -170,11 +170,11 @@
       "applyDescription": "{{vm}}을(를) {{from}}에서 {{to}}(으)로 라이브 마이그레이션합니다(최적 배치 화면의 적용과 같음)."
     },
     "tagAlloc": "할당 {{pct}}%",
-    "tagFence": "펜스 확인 실패",
+    "tagFence": "강제 차단 장치 확인 실패",
     "drag": {
       "here": "VM이 이미 여기 있습니다",
       "hereTag": "여기서",
-      "witness": "{{node}}는 위트니스 노드입니다",
+      "witness": "{{node}}는 투표 전용 노드입니다(VM을 돌리지 않음)",
       "offline": "{{node}}는 오프라인입니다",
       "frozen": "{{node}}는 종료 뒤 얼어 있습니다",
       "maintenance": "{{node}}는 유지보수 중입니다",

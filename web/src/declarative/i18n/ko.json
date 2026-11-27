@@ -29,9 +29,8 @@
     },
     "sets": {
       "title": "선언 묶음",
-      "pageHint": "선언 묶음은 orbivisorctl apply가 마지막에 선언한 것을 기억하고 클러스터와 견줍니다. 드리프트는 그 뒤 누가 무엇을 바꿨는지 보입니다.",
       "empty": "선언 묶음이 없습니다.",
-      "emptyHint": "orbivisorctl apply --set 이름 -f 디렉터리가 만듭니다.",
+      "emptyHint": "시작하기: ① 지금 설정을 YAML로 내보내기(설정 화면의 ⋯ 메뉴) ② 그 파일을 Git에 두기 ③ orbivisorctl apply --set 이름 -f 폴더.",
       "objects": "객체",
       "lastApplied": "마지막 적용",
       "appliedBy": "{{time}} · {{user}}",
@@ -40,7 +39,8 @@
       "drifted_other": "{{count}}개 다름",
       "inSync": "같음",
       "unchecked": "아직 견주지 않음",
-      "failed": "마지막 적용 실패"
+      "failed": "마지막 적용 실패",
+      "intro": "설정을 YAML 파일로 적어 orbivisorctl apply로 한 번에 적용하는 방식입니다. 적용한 묶음을 기억해, 그 뒤 화면에서 누가 바꾸면 '파일과 달라짐'으로 알려 줍니다. 화면만 쓴다면 필요 없습니다."
     },
     "set": {
       "history": "설정 기록",

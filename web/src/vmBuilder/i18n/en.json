@@ -21,7 +21,7 @@
       "hardRule": "Placement rules keep this VM off {{name}}: {{rules}}",
       "templateFixed": "A template deployment keeps the template's disks, NICs and CD drives. Change them after creating.",
       "templateHa": "A template deployment does not set HA. Turn it on after creating.",
-      "sataPorts": "No free SATA port: q35 has {{max}} shared by SATA disks, CD drives and cloud-init.",
+      "sataPorts": "No free SATA port: the virtual motherboard (q35) has {{max}} shared by SATA disks, CD drives and the first-boot setup drive.",
       "maxCdroms": "A VM can have at most {{max}} CD drives.",
       "maxNics": "A VM can have at most {{max}} NICs.",
       "maxSgs": "A NIC can have at most {{max}} security groups.",
@@ -56,7 +56,7 @@
       }
     },
     "json": {
-      "masked": "The cloud-init password is masked as ********. Put the real password in before sending."
+      "masked": "The first-boot setup (cloud-init) password is masked as ********. Put the real password in before sending."
     },
     "page": {
       "parts": "Parts",
@@ -67,10 +67,10 @@
       "more": "Ways to add {{name}}",
       "noTarget": "Nothing takes this part now.",
       "addTo": "Add to {{slot}}",
-      "inspect": "Inspect",
+      "inspect": "Edit",
       "dropHere": "Drop here",
-      "baseBlank": "Base: empty VM",
-      "baseTemplate": "Base: template {{name}} (deployed as a copy)",
+      "baseBlank": "Starting point: empty VM",
+      "baseTemplate": "Starting point: template {{name}} (deployed as a copy)",
       "start": "Drag parts onto the VM, or press a part and then a place.",
       "quickStart": "Start with a medium Linux server",
       "compute": "{{vcpus}} vCPU · {{memory}} · CPU {{model}}",
@@ -111,7 +111,7 @@
       "media": "Install media",
       "template": "Templates",
       "network": "Networks",
-      "cloudInit": "cloud-init",
+      "cloudInit": "First-boot setup",
       "placement": "Placement",
       "protection": "Protection",
       "folder": "Folder"
@@ -163,14 +163,14 @@
     },
     "slot": {
       "vm": "VM",
-      "compute": "Compute",
+      "compute": "CPU & memory",
       "disks": "Disks (top boots first)",
       "disk": "Disk {{n}} ({{name}})",
       "cdroms": "CD drives",
       "cdrom": "CD drive {{n}} ({{name}})",
       "nics": "NICs",
       "nic": "NIC {{n}} ({{name}})",
-      "cloudInit": "cloud-init",
+      "cloudInit": "First-boot setup",
       "placement": "Placement",
       "protection": "Protection",
       "folder": "Folder",
@@ -182,7 +182,7 @@
       "disks": "Drop a pool or a volume here.",
       "cdroms": "Drop an ISO here.",
       "nics": "Drop a network here.",
-      "cloudInit": "Drop a cloud-init snippet here.",
+      "cloudInit": "Drop a first-boot setup snippet here.",
       "protection": "Drop HA here.",
       "trash": "Drop a block here to remove it."
     },
@@ -248,7 +248,7 @@
       "stale": "Values changed; checking again.",
       "node": "Runs on {{node}}",
       "cpu": "CPU model {{model}}",
-      "machine": "Machine {{machine}}",
+      "machine": "Motherboard {{machine}}",
       "ips": "NIC {{n}} gets {{ips}}",
       "none": "No problems.",
       "template": "The server checks a template deployment when you create it.",
@@ -257,6 +257,9 @@
       "warn": "Warning",
       "copyJson": "Copy the JSON requests",
       "copyCli": "Copy the commands"
+    },
+    "help": {
+      "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or -. It can't be changed later."
     }
   }
 }

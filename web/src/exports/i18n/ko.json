@@ -1,8 +1,6 @@
 {
   "vmExports": {
-    "pageHint": "풀에 쓴 OVF 패키지입니다. vSphere·Workstation·VirtualBox용 OVA 하나로 내려받습니다. 내보내기는 꺼진 VM의 메뉴에서 시작합니다.",
     "empty": "내보내기가 없습니다",
-    "emptyHint": "꺼진 VM의 메뉴에서 \"OVA로 내보내기…\"를 고르세요.",
     "vm": "VM",
     "vmGone": "지워짐",
     "pool": "풀",
@@ -22,19 +20,19 @@
     "deleteDescription": "풀에서 OVF 파일을 지웁니다. VM은 남습니다.",
     "dialog": {
       "title": "{{name}}을(를) OVA로 내보내기",
-      "description": "디스크를 streamOptimized VMDK로, OVF 서술자와 SHA-256 매니페스트를 함께 씁니다. 다 쓸 때까지 VM은 꺼진 채여야 합니다.",
+      "description": "VM 디스크를 VMware가 읽는 형식(VMDK)으로 바꿔 풀에 OVA 꾸러미로 씁니다. 다 쓸 때까지 VM은 꺼진 채여야 합니다.",
       "submit": "내보내기",
       "pool": "풀",
-      "poolHint": "디스크가 들어갈 자리가 있는 디렉터리·NFS 풀.",
+      "poolHint": "OVA 파일을 쓸 디렉터리·NFS 풀입니다. VM 디스크만큼 빈 공간이 있어야 합니다.",
       "noPool": "디렉터리·NFS 풀이 없음",
       "name": "이름",
-      "nameHint": "비우면 VM 이름과 시각입니다.",
+      "nameHint": "이 내보내기와 내려받을 파일의 이름입니다. 비우면 VM 이름과 시각으로 짓습니다.",
       "guestOs": "VMware 게스트 OS",
-      "guestOsHint": "VMware guestId. 비우면 가져온 VM의 원본 값, 없으면 otherGuest64입니다.",
+      "guestOsHint": "받는 VMware가 OS를 알아보는 값(guestId, 예: ubuntu64Guest)입니다. 비우면 가져온 VM의 원본 값, 없으면 otherGuest64.",
       "hwVersion": "하드웨어 버전",
-      "hwVersionHint": "vmx-7부터 vmx-21까지. 14는 ESXi 6.7 이상에서 돕니다.",
+      "hwVersionHint": "받는 VMware가 열 수 있는 가상 하드웨어 버전(7–21)입니다. 14는 ESXi 6.7 이상에서 열립니다.",
       "keepMacs": "MAC 주소 그대로",
-      "keepMacsHint": "끄면 받는 제품이 새 MAC을 정합니다.",
+      "keepMacsHint": "켜 두면 네트워크 카드의 MAC 주소를 그대로 씁니다. 끄면 받는 제품이 새 MAC을 정합니다.",
       "started": "{{name}}을(를) 내보냅니다.",
       "errors": {
         "pool": "풀을 고르세요.",
@@ -49,6 +47,11 @@
       "export_busy": "다른 Task가 이 내보내기를 다루는 중입니다.",
       "export_not_ready": "내보내기가 아직 끝나지 않았습니다.",
       "link_expired": "내려받기 링크가 지났습니다. 다시 해 보세요."
+    },
+    "help": {
+      "intro": "VM을 VMware·VirtualBox에서 열 수 있는 OVA 파일로 만든 목록입니다. 내보내기는 꺼진 VM의 메뉴에서 시작하고, 다 되면 여기서 내려받습니다.",
+      "emptyHint": "꺼진 VM의 메뉴에서 'OVA로 내보내기…'를 고르면 여기에 생기고, 다 쓰면 내려받을 수 있습니다.",
+      "openVms": "VM 목록 열기"
     }
   }
 }

@@ -181,9 +181,9 @@ it("opens the group of a page in another group and marks its item", async () => 
   const tabs = screen.getByRole("navigation", { name: "Routers & public IPs pages" });
   expect(links(tabs)).toEqual([
     ["Routers", "/routers"],
-    ["Floating IPs", "/floating-ips"],
+    ["Public IPs", "/floating-ips"],
   ]);
-  expect(within(tabs).getByRole("link", { name: "Floating IPs" })).toHaveAttribute(
+  expect(within(tabs).getByRole("link", { name: "Public IPs" })).toHaveAttribute(
     "aria-current",
     "page",
   );
@@ -195,7 +195,7 @@ it("opens the group of a page in another group and marks its item", async () => 
     "href",
     "/routers",
   );
-  expect(within(crumbs).getByText("Floating IPs")).toHaveAttribute("aria-current", "page");
+  expect(within(crumbs).getByText("Public IPs")).toHaveAttribute("aria-current", "page");
   wide.mockRestore();
 });
 

@@ -21,7 +21,7 @@
       "hardRule": "배치 규칙이 이 VM을 {{name}}에 두지 않습니다: {{rules}}",
       "templateFixed": "템플릿 배포는 템플릿의 디스크·NIC·CD 드라이브를 그대로 씁니다. 만든 뒤 고치기에서 바꿉니다.",
       "templateHa": "템플릿 배포는 HA를 정하지 않습니다. 만든 뒤 켭니다.",
-      "sataPorts": "빈 SATA 포트가 없습니다: q35의 포트 {{max}}개를 SATA 디스크·CD 드라이브·cloud-init이 나눠 씁니다.",
+      "sataPorts": "빈 SATA 포트가 없습니다: 가상 메인보드(q35)의 포트 {{max}}개를 SATA 디스크·CD 드라이브·첫 부팅 설정 드라이브가 나눠 씁니다.",
       "maxCdroms": "VM의 CD 드라이브는 {{max}}개까지입니다.",
       "maxNics": "VM의 NIC는 {{max}}개까지입니다.",
       "maxSgs": "NIC 하나에 보안 그룹은 {{max}}개까지입니다.",
@@ -56,7 +56,7 @@
       }
     },
     "json": {
-      "masked": "cloud-init 비밀번호를 ********로 가렸습니다. 보내기 전에 진짜 비밀번호로 바꾸세요."
+      "masked": "첫 부팅 설정(cloud-init) 비밀번호를 ********로 가렸습니다. 보내기 전에 진짜 비밀번호로 바꾸세요."
     },
     "page": {
       "parts": "부품",
@@ -67,10 +67,10 @@
       "more": "{{name}} 더하는 곳",
       "noTarget": "지금 이 부품을 받을 칸이 없습니다.",
       "addTo": "{{slot}}에 더하기",
-      "inspect": "살피기",
+      "inspect": "고치기",
       "dropHere": "여기에 놓기",
-      "baseBlank": "바탕: 빈 VM",
-      "baseTemplate": "바탕: 템플릿 {{name}}(복사해 배포)",
+      "baseBlank": "시작점: 빈 VM",
+      "baseTemplate": "시작점: 템플릿 {{name}}(복사해 배포)",
       "start": "부품을 VM에 끌어 놓거나, 부품을 누른 뒤 놓을 곳을 누르세요.",
       "quickStart": "보통 크기 Linux 서버로 시작",
       "compute": "vCPU {{vcpus}}개 · {{memory}} · CPU {{model}}",
@@ -111,7 +111,7 @@
       "media": "설치 매체",
       "template": "템플릿",
       "network": "네트워크",
-      "cloudInit": "cloud-init",
+      "cloudInit": "첫 부팅 자동 설정",
       "placement": "배치",
       "protection": "보호",
       "folder": "폴더"
@@ -163,14 +163,14 @@
     },
     "slot": {
       "vm": "VM",
-      "compute": "계산",
+      "compute": "CPU·메모리",
       "disks": "디스크(위가 먼저 부팅)",
       "disk": "디스크 {{n}}({{name}})",
       "cdroms": "CD 드라이브",
       "cdrom": "CD 드라이브 {{n}}({{name}})",
       "nics": "NIC",
       "nic": "NIC {{n}}({{name}})",
-      "cloudInit": "cloud-init",
+      "cloudInit": "첫 부팅 자동 설정",
       "placement": "배치",
       "protection": "보호",
       "folder": "폴더",
@@ -182,7 +182,7 @@
       "disks": "여기에 풀이나 볼륨을 놓으세요.",
       "cdroms": "여기에 ISO를 놓으세요.",
       "nics": "여기에 네트워크를 놓으세요.",
-      "cloudInit": "여기에 cloud-init 조각을 놓으세요.",
+      "cloudInit": "여기에 첫 부팅 자동 설정 조각을 놓으세요.",
       "protection": "여기에 HA를 놓으세요.",
       "trash": "뺄 블록을 여기에 놓으세요."
     },
@@ -248,7 +248,7 @@
       "stale": "값이 바뀌어 다시 확인합니다.",
       "node": "{{node}}에서 돕니다",
       "cpu": "CPU 모델 {{model}}",
-      "machine": "머신 {{machine}}",
+      "machine": "가상 메인보드 {{machine}}",
       "ips": "NIC {{n}} 주소 {{ips}}",
       "none": "문제가 없습니다.",
       "template": "템플릿 배포는 만들 때 서버가 확인합니다.",
@@ -257,6 +257,9 @@
       "warn": "경고",
       "copyJson": "JSON 요청 복사",
       "copyCli": "명령 복사"
+    },
+    "help": {
+      "name": "목록과 화면에서 부를 VM 이름입니다. 소문자·숫자·-로 1~63자이고, 만든 뒤에는 바꿀 수 없습니다."
     }
   }
 }

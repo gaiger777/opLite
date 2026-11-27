@@ -146,7 +146,7 @@ export const GROUPS: NavGroup[] = [
         key: "nav.item.routing",
         pages: [
           { to: "/routers", key: "nav.routers" },
-          { to: "/floating-ips", key: "nav.floatingIps" },
+          { to: "/floating-ips", key: "nav.floatingIps", keywords: "nav.floatingIpsKeywords" },
         ],
       },
       one("lb", "nav.loadBalancers", { to: "/load-balancers" }),

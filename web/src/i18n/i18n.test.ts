@@ -188,7 +188,7 @@ it("translates API error codes and falls back to the server message", async () =
     'The backup is not ready. Only finished backups can be restored or copied. Details: backup "b" is not ready',
   );
   expect(errorMessage(t, new ApiError(409, "job_disabled", 'backup job "n" is disabled'))).toBe(
-    'The backup job is off. Turn on "Run on schedule" first. Details: backup job "n" is disabled',
+    'The backup schedule is off. Turn on "Run on schedule" first. Details: backup job "n" is disabled',
   );
   expect(errorMessage(t, new ApiError(400, "invalid_ova", "the OVA has no .ovf file"))).toBe(
     "The file is not a usable OVA: the OVA has no .ovf file",

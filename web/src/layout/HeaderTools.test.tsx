@@ -47,7 +47,7 @@ describe("create menu", () => {
       "VM import",
       "Storage pool",
       "Network",
-      "Backup job",
+      "Backup schedule",
       "ISO upload",
     ]);
     await user.click(within(menu).getByRole("menuitem", { name: "Storage pool" }));
@@ -62,7 +62,7 @@ describe("create menu", () => {
       within(await screen.findByRole("menu"))
         .getAllByRole("menuitem")
         .map((i) => i.textContent),
-    ).toEqual(["Virtual machine", "VM import", "Backup job", "ISO upload"]);
+    ).toEqual(["Virtual machine", "VM import", "Backup schedule", "ISO upload"]);
     unmount();
     shell("/", VIEWER);
     await screen.findByRole("button", { name: "Account (viewer)" });

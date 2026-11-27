@@ -107,6 +107,7 @@
       "preview": "Show the plan",
       "submit": "Restore",
       "taskTarget": "point-in-time restore"
-    }
+    },
+    "intro": "Every change to the settings is recorded: who changed it, when, and from where (UI, command line, YAML apply, Terraform, automatic tasks). Open a row to compare before and after and restore an earlier value."
   }
 }
