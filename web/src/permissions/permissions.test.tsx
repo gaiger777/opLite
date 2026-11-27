@@ -124,11 +124,24 @@ it("lets a folder delegator who cannot list users add a grant by id", async () =
 });
 
 it("creates a custom role from the privilege checklist", async () => {
-  const posts: unknown[] = [];
+  const posts: { name: string; privileges: string[]; description: string }[] = [];
   server.use(
-    http.get(apiUrl("/access-roles"), () => HttpResponse.json(ROLES)),
+    http.get(apiUrl("/access-roles"), () =>
+      HttpResponse.json({
+        ...ROLES,
+        items: [
+          ...ROLES.items,
+          ...posts.map((p) => ({
+            ...p,
+            id: "00000000-0000-0000-0000-0000000000d2",
+            builtin: false,
+            revision: 1,
+          })),
+        ],
+      }),
+    ),
     http.post(apiUrl("/access-roles"), async ({ request }) => {
-      posts.push(await request.json());
+      posts.push((await request.json()) as (typeof posts)[number]);
       return HttpResponse.json({}, { status: 201 });
     }),
   );
@@ -136,6 +149,7 @@ it("creates a custom role from the privilege checklist", async () => {
   const { container } = renderPage(<RolesPage />, { as: ADMIN });
   // 역할을 고르면 그 권한이 묶음별 체크 트리로 보인다(계획 77-6). 처음엔 첫 역할이다.
   await user.click(await screen.findByRole("button", { name: /^vm-user/ }));
+  expect(screen.getByRole("button", { name: /^vm-user/ })).toHaveAttribute("aria-pressed", "true");
   const detail = screen.getByRole("region", { name: "vm-user" });
   expect(within(detail).getByRole("list", { name: "vm" })).toHaveTextContent("vm.power(granted)");
   expect(within(detail).getByRole("list", { name: "vm" })).toHaveTextContent(
@@ -162,6 +176,9 @@ it("creates a custom role from the privilege checklist", async () => {
       { name: "snapper", privileges: ["system.read", "vm.snapshot"], description: "" },
     ]),
   );
+  // 새로 만든 역할을 골라 보인다.
+  expect(await screen.findByRole("region", { name: "snapper" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /^snapper/ })).toHaveAttribute("aria-pressed", "true");
 });
 
 it("keeps privileges this web build does not know when saving a role", async () => {

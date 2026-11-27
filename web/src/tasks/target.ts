@@ -103,6 +103,15 @@ function vmTab(task: Task): string | undefined {
   return undefined;
 }
 
+/** 노드 상세에서 그 Task를 볼 탭(계획 77-6 노드 탭): CPU 다시 읽기는 하드웨어, SDN 작업은 네트워크 */
+function nodeTab(task: Task): string | undefined {
+  const kind = task.spec.op.kind;
+  if (kind === "node-cpu-probe") {
+    return "hardware";
+  }
+  return kind.startsWith("sdn-") ? "network" : undefined;
+}
+
 /**
  * Task 대상의 이름과 화면 경로(`?tab=`까지). VM은 상세의 알맞은 탭, 노드는 노드 상세, 볼륨·백업은 목록 검색,
  * 가져오기는 가져오기 상세, Ceph Task는 Ceph 화면이다. 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)을 이름으로 한다.
@@ -143,7 +152,8 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
   // 노드 업데이트 확인·업그레이드·비우기·끄기, HA 검사의 대상은 노드다.
   const node = lookup.node.get(task.spec.target);
   if (node) {
-    return { name: node.name, href: `/nodes/${enc(node.name)}` };
+    const tab = nodeTab(task);
+    return { name: node.name, href: `/nodes/${enc(node.name)}${tab ? `?tab=${tab}` : ""}` };
   }
   // 그 밖의 종류(이미 받은 목록)
   const named = lookup.named?.get(task.spec.target);

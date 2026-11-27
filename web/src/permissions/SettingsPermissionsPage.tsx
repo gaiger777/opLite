@@ -361,9 +361,9 @@ export function RolesPage() {
                 <button
                   key={key}
                   type="button"
-                  aria-current={current?.name === role.name ? "true" : undefined}
+                  aria-pressed={current?.name === role.name}
                   onClick={() => setPicked(role.name)}
-                  className="flex items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm hover:bg-muted aria-[current]:bg-muted aria-[current]:font-medium"
+                  className="flex items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm hover:bg-muted aria-pressed:bg-muted aria-pressed:font-medium"
                 >
                   <span className="min-w-0 truncate">{roleName(role)}</span>
                   <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
@@ -424,7 +424,11 @@ export function RolesPage() {
         <RoleDialog
           role={editing === "new" ? null : editing}
           onClose={() => setEditing(null)}
-          onDone={changed}
+          onDone={async (saved) => {
+            // 새로 만든(고친) 역할을 골라 둔다.
+            setPicked(saved);
+            await changed();
+          }}
         />
       )}
       <ConfirmDialog
@@ -452,7 +456,7 @@ function RoleDialog({
 }: {
   role: AccessRole | null;
   onClose(): void;
-  onDone(): Promise<unknown>;
+  onDone(saved: string): Promise<unknown>;
 }) {
   const { t } = useTranslation();
   const [name, setName] = useState(role?.name ?? "");
@@ -498,7 +502,7 @@ function RoleDialog({
       await call(api.POST("/access-roles", { body: { name, privileges, description } }));
     }
     toast.success(t("roleEditor.saved", { name }));
-    await onDone();
+    await onDone(name);
   }
 
   return (
