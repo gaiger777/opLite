@@ -420,7 +420,7 @@ export function FenceDialog({
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const pending = plan.status.source_fence_pending ?? [];
+  const pending = (plan.status.source_fence_pending ?? []).map((f) => f.vm);
   return (
     <ConfirmDialog
       open

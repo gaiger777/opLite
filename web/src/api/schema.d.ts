@@ -1661,6 +1661,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dr-plans/{key}/actions/clear-fence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 두 벌 막기 목록(`source_fence_pending`)을 비운다(리뷰 2): 운영자가 운영 쪽 옛 VM이 멈췄거나 없음을 스스로 확인했을 때
+         *     (되돌리기 앞에 옛 VM을 지움, 원격을 새 클러스터로 바꿈 등). 운영 쪽에는 아무것도 하지 않는다. 경보
+         *     `dr_source_returned`는 다음 평가에서 풀린다. 감사 기록에 비운 VM을 적는다. 목록이 비어 있어도 200.
+         */
+        post: operations["clear_fence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dr-plans/{key}/actions/failover": {
         parameters: {
             query?: never;
@@ -1697,8 +1718,10 @@ export interface paths {
         put?: never;
         /**
          * 재해 장애 조치 뒤 돌아온 운영 쪽을 막는다(리뷰 1, split-brain): 계획 `status.source_fence_pending`의 VM(이곳에 되살린
-         *     것)을 운영 쪽에서 강제로 끄고 원하는 상태를 `stopped`로 둔다(`POST /vms/{vm}/actions/stop?mode=force` — 노드가 돌아와도
-         *     다시 켜지 않는다). 멈춘 VM(운영 쪽에 없는 것 포함)은 목록에서 뺀다. 자동으로는 하지 않는다(경보 `dr_source_returned`).
+         *     것)을 운영 쪽에서 강제로 끄고 원하는 상태를 `stopped`로 둔다(`POST /vms/{id}/actions/stop?mode=force` — 노드가 돌아와도
+         *     다시 켜지 않는다). 리뷰 2: 기록한 운영 쪽 VM id가 맞는 VM만 끈다 — 같은 이름의 다른 VM(되돌리기로 새로 만든 운영 VM 등)은
+         *     건너뛰고(`different_vm`) 목록에서 뺀다. 원격의 CA 지문이 장애 조치 때와 다르면 끄지 않고 목록에 둔다
+         *     (`different_cluster`). 멈춘 VM·운영 쪽에 없는 VM도 뺀다. 자동으로는 하지 않는다(경보 `dr_source_returned`).
          *     사전 검사: 목록이 비면 409 `dr_nothing_to_fence`, 운영 쪽에 닿지 않으면 409 `dr_source_unreachable`, 토큰이 VM을 끌 수
          *     없으면(viewer) 409 `dr_fence_preflight`.
          */
@@ -1763,8 +1786,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 계획의 RPO/RTO 보고: VM별 보호 상태(복구 지점·나이·RPO 목표 — 지금 다시 셈), 최근 시험 셋의 RTO·결과·실패 VM,
-         *     지난 장애 조치, 도는 실행.
+         * 계획의 RPO/RTO 보고: VM별 보호 상태(복구 지점·나이·RPO 목표 — 지금 다시 셈, `point_in_time`이면 그 시각 이하의 사본으로),
+         *     최근 시험 셋의 RTO·결과·실패 VM, 지난 장애 조치, 도는 실행.
          */
         get: operations["plan_report"];
         put?: never;
@@ -8186,6 +8209,8 @@ export interface components {
              * @description 운영 쪽 VM을 다시 켜는 부름을 처음 보낸 시각
              */
             restart_at?: number;
+            /** @description 다시 켜지 못함(영구 실패·상한·취소한 실행에서 닿지 않음): 운영 VM이 꺼진 채 남았다(리뷰 2) */
+            restart_error?: string;
             /** @description 다시 켜기가 끝남(켬·포기) */
             restarted?: boolean;
             /** @description 운영 쪽에 뜬 마지막 백업 */
@@ -8217,6 +8242,11 @@ export interface components {
             plan: string;
             /** Format: uuid */
             plan_id: string;
+            /**
+             * Format: int64
+             * @description 보호 상태·장애 조치 준비를 센 기준 시각(요청의 `point_in_time` — 없으면 가장 새 사본)
+             */
+            point_in_time?: number;
             protected: number;
             /** @description VM마다의 복구 지점(그룹 차례, 지금 다시 셈) */
             protection: components["schemas"]["VmProtection"][];
@@ -8227,7 +8257,7 @@ export interface components {
             /** @description 운영 클러스터(원격 이름) */
             source: string;
             /** @description 재해 장애 조치 뒤 운영 쪽에서 아직 멈추지 않은 VM(계획 `status.source_fence_pending`) */
-            source_fence_pending?: string[];
+            source_fence_pending?: components["schemas"]["FencePending"][];
             /** @description 원격이 등록돼 있는지(없으면 모든 VM이 복구 지점 없음) */
             source_registered: boolean;
             /** @description 최근 끝난 시험(새것부터 셋까지) */
@@ -8239,7 +8269,7 @@ export interface components {
         DrRunKind: "test" | "failover-planned" | "failover-disaster" | "cleanup";
         /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
         DrRunSpec: {
-            /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`) */
+            /** @description 복구 지점이 없는 VM을 모두 `skipped`로 두고 진행(요청의 옛 `allow_missing`) */
             allow_missing?: boolean;
             /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
             cleanup?: components["schemas"]["DrCleanupTarget"];
@@ -8264,6 +8294,8 @@ export interface components {
              * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
              */
             point_in_time?: number;
+            /** @description 복구 지점이 없으면 `skipped`로 둘 VM(원본 이름 — 요청의 `skip_vms`, 리뷰 2). 여기 없는 VM은 복구 지점이 없으면 `failed`다. */
+            skip_vms?: string[];
         };
         /** @enum {string} */
         DrRunState: "running" | "succeeded" | "partial" | "failed" | "cancelled";
@@ -8292,6 +8324,11 @@ export interface components {
             group?: number;
             /** @description 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤) */
             preempted?: boolean;
+            /**
+             * Format: uuid
+             * @description 시험 실행: 이 시험을 끊은 장애 조치 실행 id(`preempted`)
+             */
+            preempted_by?: string;
             /**
              * Format: uuid
              * @description 장애 조치 실행: 시작하며 끊은 시험 실행
@@ -8354,11 +8391,18 @@ export interface components {
             backup?: string;
             /** Format: uuid */
             backup_id?: string;
+            /** @description 라이브 복원이 VM을 켠 뒤 디스크 옮기기에 실패함(리뷰 2): VM은 디스크를 다 받지 못했다. 있으면 실행은 `partial`이다. */
+            copy_error?: string;
             /**
              * Format: uuid
              * @description 라이브 복원: VM이 켜진 뒤에도 디스크를 옮기는 복원 Task(끝나면 비움 — 실패하면 `notes`에 경고)
              */
             copy_task?: string;
+            /**
+             * Format: uuid
+             * @description 다시 복원하기 전에 지울, 실패한 라이브 복원이 만든 VM의 id(리뷰 2). 지워지면 비운다.
+             */
+            discard_vm?: string;
             error?: string;
             /** @description `failed`·`timed_out`이면 그때 있던 단계(`preparing`·`restoring`·`starting`·`waiting` — 처음부터 실패면 없음) */
             failed_in?: components["schemas"]["DrPhase"];
@@ -8366,6 +8410,12 @@ export interface components {
             group?: string;
             /** @description 다시 해 보는 중인 마지막 일시 오류(운영 쪽에 닿지 않음 등). 나아가면 비운다. */
             last_error?: string;
+            /**
+             * Format: int64
+             * @description 더 오래된 복구 지점으로 되살림(리뷰 2): 처음 고른 지점과 쓴 지점의 시각 차(초) — 그만큼 데이터를 더 잃었다. 있으면
+             *     실행은 `partial`이다.
+             */
+            lost_secs?: number;
             /** @description 되살린(뒷정리는 지울) VM 이름 */
             new_vm?: string;
             /** @description 복원·시작하는 노드(계획의 `node`, 없으면 되살린 VM의 노드를 보고 앎) */
@@ -8618,16 +8668,19 @@ export interface components {
         FailoverMode: "planned" | "disaster";
         /** @description `POST /dr-plans/{key}/actions/failover` 본문 */
         FailoverRequest: {
-            /** @description 재해: 복구 지점이 없는 VM을 `skipped`로 두고 진행(없으면 400 `dr_missing_recovery_points`) */
+            /** @description 재해: 복구 지점이 없는 VM을 모두 `skipped`로 두고 진행(옛 칸 — `skip_vms`를 쓴다). 계획된 이전에 주면 400. */
             allow_missing?: boolean;
             /** @description 계획 이름(실수로 누르지 않게 그대로 다시 친다) */
             confirm: string;
             mode: components["schemas"]["FailoverMode"];
             /**
              * Format: int64
-             * @description 재해: 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로(랜섬웨어·논리 손상이 복제된 경우)
+             * @description 재해: 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로(랜섬웨어·논리 손상이 복제된 경우). 계획된 이전에 주면 400
+             *     (계획된 이전은 막 뜬 사본을 쓴다).
              */
             point_in_time?: number;
+            /** @description 재해: 복구 지점이 없으면 건너뛸 VM(원본 이름 — 사용자가 본 목록, 리뷰 2). 계획된 이전에 주면 400. */
+            skip_vms?: string[];
         };
         /**
          * @description 장애의 무게
@@ -8680,17 +8733,35 @@ export interface components {
             /** @enum {string} */
             kind: "command";
         });
+        /** @description 운영 쪽에서 아직 멈추지 않은, 이곳에 되살린 VM 하나(리뷰 2 — fence는 이름이 아니라 id로 맞춘다) */
+        FencePending: {
+            /** @description 장애 조치 때 운영 클러스터(원격)의 CA 지문. 원격이 다른 클러스터를 가리키게 바뀌었으면 fence는 그 VM을 끄지 않는다. */
+            ca_fingerprint?: string;
+            /**
+             * Format: uuid
+             * @description 운영 쪽 VM id(복구 지점 백업의 `spec.vm`). 옛 기록이면 없다(이름으로만 맞춘다).
+             */
+            source_id?: string;
+            /** @description 원본 VM 이름 */
+            vm: string;
+        };
         /** @description `POST /dr-plans/{key}/actions/fence-source` 응답 */
         FenceResponse: {
             /** @description 아직 멈추지 못한 VM(계획 `status.source_fence_pending`) */
-            pending: string[];
+            pending: components["schemas"]["FencePending"][];
             results: components["schemas"]["FenceResult"][];
         };
         /** @description fence-source 결과(VM 하나) */
         FenceResult: {
             error?: string;
-            /** @description 멈춤(강제 stop을 받았거나 운영 쪽에 없음) */
+            /** @description 목록에서 뺌(멈춤·운영 쪽에 없음·같은 이름의 다른 VM) */
             ok: boolean;
+            /**
+             * @description `stopped`(강제 stop을 받음·이미 꺼짐), `not_found`(운영 쪽에 없음), `different_vm`(같은 이름이지만 장애 조치 때의
+             *     VM이 아님 — 되돌리기로 새로 만든 운영 VM 등, 끄지 않음), `different_cluster`(원격이 다른 클러스터를 가리킴 — 끄지 않고
+             *     목록에 둠: 확인한 뒤 `clear-fence`), `failed`(끄지 못함)
+             */
+            result: string;
             /** @description 운영 쪽 VM 이름 */
             vm: string;
         };
@@ -11093,7 +11164,7 @@ export interface components {
                 revision: number;
                 /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
                 spec: {
-                    /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`) */
+                    /** @description 복구 지점이 없는 VM을 모두 `skipped`로 두고 진행(요청의 옛 `allow_missing`) */
                     allow_missing?: boolean;
                     /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
                     cleanup?: components["schemas"]["DrCleanupTarget"];
@@ -11118,6 +11189,8 @@ export interface components {
                      * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
                      */
                     point_in_time?: number;
+                    /** @description 복구 지점이 없으면 `skipped`로 둘 VM(원본 이름 — 요청의 `skip_vms`, 리뷰 2). 여기 없는 VM은 복구 지점이 없으면 `failed`다. */
+                    skip_vms?: string[];
                 };
                 status: {
                     bubbles?: components["schemas"]["DrBubble"][];
@@ -11144,6 +11217,11 @@ export interface components {
                     group?: number;
                     /** @description 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤) */
                     preempted?: boolean;
+                    /**
+                     * Format: uuid
+                     * @description 시험 실행: 이 시험을 끊은 장애 조치 실행 id(`preempted`)
+                     */
+                    preempted_by?: string;
                     /**
                      * Format: uuid
                      * @description 장애 조치 실행: 시작하며 끊은 시험 실행
@@ -11667,10 +11745,11 @@ export interface components {
                      */
                     run?: string;
                     /**
-                     * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
-                     *     `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+                     * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름과 운영 쪽 VM id). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+                     *     `dr_source_returned`. `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM(id가 맞는 것만)을 멈추면 빼고,
+                     *     `clear-fence`가 운영자의 확인으로 비운다. 옛 기록(이름만)도 읽는다.
                      */
-                    source_fence_pending?: string[];
+                    source_fence_pending?: components["schemas"]["FencePending"][];
                 };
             }[];
             /** Format: int64 */
@@ -14768,6 +14847,19 @@ export interface components {
          * @enum {string}
          */
         PreflightLevel: "ok" | "warn" | "blocked";
+        /** @description 계획된 이전의 사전 검사 문제 하나(409 `dr_planned_preflight`의 `details.problems`) */
+        PreflightProblem: {
+            /**
+             * @description `token_role`(원격 토큰이 admin이 아님 — 운영 쪽 복제는 루트 `cluster.admin`), `no_remote_here`(운영 쪽에 이 클러스터의
+             *     원격이 없음), `vm_missing`(운영 쪽에 그 VM이 없음), `no_backup_pool`(운영 쪽 지난 백업도 `source_backup_pool`도 없음),
+             *     `no_receiving_pool`(이 클러스터에 사본을 받을 백업 풀이 없음), `unreadable`(운영 쪽 목록을 읽지 못함),
+             *     `dr_readiness`(이 클러스터에 복원할 네트워크 맵 대상·보안 그룹·풀·노드가 없음 — 운영 쪽 VM의 지금 NIC로 셈),
+             *     `dr_name_taken`(이 클러스터에 그 이름의, 이 계획이 되살리지 않은 VM이 있음)
+             */
+            code: string;
+            message: string;
+            vm?: string;
+        };
         /** @description 미리 확인할 VM(없으면 계획의 모든 VM) */
         PreflightRequest: {
             /** @description 노드 캐시(60초)를 쓰지 않고 인벤토리를 다시 읽는다. */
@@ -15074,10 +15166,11 @@ export interface components {
              */
             run?: string;
             /**
-             * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
-             *     `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+             * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름과 운영 쪽 VM id). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+             *     `dr_source_returned`. `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM(id가 맞는 것만)을 멈추면 빼고,
+             *     `clear-fence`가 운영자의 확인으로 비운다. 옛 기록(이름만)도 읽는다.
              */
-            source_fence_pending?: string[];
+            source_fence_pending?: components["schemas"]["FencePending"][];
         };
         /** @description Redfish BMC. Basic 인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`로 확인한다. */
         RedfishFence: {
@@ -15949,7 +16042,7 @@ export interface components {
             revision: number;
             /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
             spec: {
-                /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`) */
+                /** @description 복구 지점이 없는 VM을 모두 `skipped`로 두고 진행(요청의 옛 `allow_missing`) */
                 allow_missing?: boolean;
                 /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
                 cleanup?: components["schemas"]["DrCleanupTarget"];
@@ -15974,6 +16067,8 @@ export interface components {
                  * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
                  */
                 point_in_time?: number;
+                /** @description 복구 지점이 없으면 `skipped`로 둘 VM(원본 이름 — 요청의 `skip_vms`, 리뷰 2). 여기 없는 VM은 복구 지점이 없으면 `failed`다. */
+                skip_vms?: string[];
             };
             status: {
                 bubbles?: components["schemas"]["DrBubble"][];
@@ -16000,6 +16095,11 @@ export interface components {
                 group?: number;
                 /** @description 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤) */
                 preempted?: boolean;
+                /**
+                 * Format: uuid
+                 * @description 시험 실행: 이 시험을 끊은 장애 조치 실행 id(`preempted`)
+                 */
+                preempted_by?: string;
                 /**
                  * Format: uuid
                  * @description 장애 조치 실행: 시작하며 끊은 시험 실행
@@ -16625,10 +16725,11 @@ export interface components {
                  */
                 run?: string;
                 /**
-                 * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
-                 *     `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+                 * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름과 운영 쪽 VM id). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+                 *     `dr_source_returned`. `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM(id가 맞는 것만)을 멈추면 빼고,
+                 *     `clear-fence`가 운영자의 확인으로 비운다. 옛 기록(이름만)도 읽는다.
                  */
-                source_fence_pending?: string[];
+                source_fence_pending?: components["schemas"]["FencePending"][];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -17451,6 +17552,13 @@ export interface components {
             cloud_init_dns?: components["schemas"]["CloudInitDns"];
             /** @description 주면 새 VM의 cloud-init `networks`를 이것으로 바꾼다(cloud-init이 없던 백업이면 새로 붙인다). */
             cloud_init_networks?: components["schemas"]["CloudInitNet"][];
+            /**
+             * @description 새 VM에 처음부터 달 라벨(계획 76 리뷰 2 — DR 엔진의 계획·실행 라벨: VM이 생기는 때부터 라벨이 있어 틈이 없다).
+             *     복원 API 요청에는 없다(엔진만 쓴다).
+             */
+            labels?: {
+                [key: string]: string;
+            };
             /** @description 백업의 네트워크 이름 → 새 VM의 네트워크 이름. 맵에 없는 이름은 그대로다. */
             networks?: {
                 [key: string]: string;
@@ -19184,7 +19292,7 @@ export interface components {
         };
         /** @description `POST /dr-plans/{key}/actions/test` 본문(없어도 된다) */
         TestRequest: {
-            /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(없으면 400 `dr_missing_recovery_points`) */
+            /** @description 복구 지점이 없는 VM을 모두 `skipped`로 두고 진행(옛 칸 — `skip_vms`를 쓴다) */
             allow_missing?: boolean;
             /**
              * @description `test_networks`가 라우터·업링크가 있는(밖과 닿을 수 있는) 네트워크를 가리켜도 진행(없으면 400
@@ -19196,6 +19304,11 @@ export interface components {
              * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로
              */
             point_in_time?: number;
+            /**
+             * @description 복구 지점이 없으면 건너뛸 VM(원본 이름 — 사용자가 본 목록, 리뷰 2). 여기 없는 VM에 복구 지점이 없으면 400
+             *     `dr_missing_recovery_points`(`details.vms`)
+             */
+            skip_vms?: string[];
         };
         /**
          * @description 전용 VM의 SMT 형제 스레드 정책(OpenStack `hw:cpu_thread_policy`)
@@ -24485,6 +24598,36 @@ export interface operations {
             };
         };
     };
+    clear_fence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_RecoveryPlanSpec_RecoveryPlanStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     failover_plan: {
         parameters: {
             query?: never;
@@ -24627,7 +24770,13 @@ export interface operations {
     };
     plan_report: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description 이 시각(유닉스 초) 이하의 사본으로 보호 상태·장애 조치 준비를 센다(시험·장애 조치의 `point_in_time` 대화상자 — 리뷰 2).
+                 *     나이는 그래도 지금에서 잰다.
+                 */
+                point_in_time?: number;
+            };
             header?: never;
             path: {
                 /** @description id or name */

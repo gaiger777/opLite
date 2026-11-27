@@ -106,7 +106,7 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
   const nothingToClean = report.data !== undefined && leftovers.length === 0;
   // 장애 조치는 도는 시험을 끊고 시작한다(서버). 다른 실행(장애 조치·뒷정리)이 돌면 막는다.
   const preemptsTest = !!running && runningKind === "test";
-  const fencePending = plan.status.source_fence_pending ?? [];
+  const fencePending = (plan.status.source_fence_pending ?? []).map((f) => f.vm);
   const openRun = (run: DrRun) => void navigate(`/dr-runs/${run.id}`);
 
   const actions = operate && (
@@ -369,7 +369,7 @@ function FenceResult({ result, onClose }: { result: FenceResponse; onClose(): vo
       </ul>
       {result.pending.length > 0 && (
         <p className="text-danger-fg">
-          {t("dr.fence.stillPending", { vms: result.pending.join(", ") })}
+          {t("dr.fence.stillPending", { vms: result.pending.map((f) => f.vm).join(", ") })}
         </p>
       )}
     </section>

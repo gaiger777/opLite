@@ -674,15 +674,17 @@ it("warns about unfenced source VMs and fences them with the plan name", async (
   setup();
   server.use(
     http.get(apiUrl("/dr-plans/web-tier"), () =>
-      HttpResponse.json(plan("web-tier", { status: { source_fence_pending: ["db1", "web1"] } })),
+      HttpResponse.json(
+        plan("web-tier", { status: { source_fence_pending: [{ vm: "db1" }, { vm: "web1" }] } }),
+      ),
     ),
     http.post(apiUrl(`/dr-plans/${PLAN_ID}/actions/fence-source`), () =>
       HttpResponse.json({
         results: [
-          { vm: "db1", ok: true },
-          { vm: "web1", ok: false, error: "source said 500" },
+          { vm: "db1", ok: true, result: "stopped" },
+          { vm: "web1", ok: false, result: "failed", error: "source said 500" },
         ],
-        pending: ["web1"],
+        pending: [{ vm: "web1" }],
       }),
     ),
   );
@@ -712,7 +714,7 @@ it("tells why fencing could not start", async () => {
   setup();
   server.use(
     http.get(apiUrl("/dr-plans/web-tier"), () =>
-      HttpResponse.json(plan("web-tier", { status: { source_fence_pending: ["db1"] } })),
+      HttpResponse.json(plan("web-tier", { status: { source_fence_pending: [{ vm: "db1" }] } })),
     ),
     http.post(apiUrl(`/dr-plans/${PLAN_ID}/actions/fence-source`), () =>
       HttpResponse.json(
