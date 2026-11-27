@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { Link, useParams } from "react-router";
+import { Link, useParams, useSearchParams } from "react-router";
 
 import { useList } from "@/api/live";
 import type { Node, Vm } from "@/api/types";
@@ -11,6 +11,7 @@ import { ListPending } from "@/components/ListPending";
 import { NodeCpuSection } from "@/cpu/NodeCpuSection";
 import { NodeTopologySection } from "@/numa/NodeTopologySection";
 import { TableMessage } from "@/components/TableMessage";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
   TableBody,
@@ -26,8 +27,8 @@ import { vcpus } from "@/vms/VmListPage";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
 /**
- * 노드 상세(`/nodes/:name`): 머리, 지표 차트 넷(범위 고르기), CPU(계획 63), NUMA 토폴로지(계획 64), SDN physnet·게이트웨이
- * (계획 66), 그 노드의 VM
+ * 노드 상세(`/nodes/:name`): 머리 아래 탭 — 지표 차트 넷(범위 고르기), 하드웨어(CPU 계획 63·NUMA 토폴로지 계획 64),
+ * 네트워크(SDN physnet·게이트웨이 계획 66), 그 노드의 VM
  */
 export function NodeDetailPage() {
   const { t } = useTranslation();
@@ -49,14 +50,54 @@ export function NodeDetailPage() {
     );
   }
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-4">
       <NodeHeader node={node} vms={vms.data ? vmsOn(node, vms.data).length : undefined} />
-      <NodeMetrics node={node} />
-      <NodeCpuSection node={node} />
-      <NodeTopologySection node={node} />
-      <NodeSdnSection node={node} />
-      <NodeVms node={node} />
+      <NodeTabs node={node} />
     </div>
+  );
+}
+
+const TABS = ["metrics", "hardware", "network", "vms"] as const;
+
+/** 지표·하드웨어(CPU·NUMA)·네트워크(SDN)·VM을 탭으로(계획 77-6 — 한 쪽이 2000~3500px로 길던 것). 탭은 주소 `?tab=`에 둔다. */
+function NodeTabs({ node }: { node: Node }) {
+  const { t } = useTranslation();
+  const [params, setParams] = useSearchParams();
+  const tab = TABS.find((id) => id === params.get("tab")) ?? "metrics";
+  return (
+    <Tabs
+      value={tab}
+      onValueChange={(value) =>
+        setParams(
+          (p) => {
+            p.set("tab", value);
+            return p;
+          },
+          { replace: true },
+        )
+      }
+    >
+      <TabsList>
+        {TABS.map((id) => (
+          <TabsTrigger key={id} value={id}>
+            {t(`nodes.tab.${id}`)}
+          </TabsTrigger>
+        ))}
+      </TabsList>
+      <TabsContent value="metrics">
+        <NodeMetrics node={node} />
+      </TabsContent>
+      <TabsContent value="hardware" className="flex flex-col gap-6">
+        <NodeCpuSection node={node} />
+        <NodeTopologySection node={node} />
+      </TabsContent>
+      <TabsContent value="network">
+        <NodeSdnSection node={node} />
+      </TabsContent>
+      <TabsContent value="vms">
+        <NodeVms node={node} />
+      </TabsContent>
+    </Tabs>
   );
 }
 

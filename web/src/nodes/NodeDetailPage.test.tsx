@@ -36,8 +36,15 @@ it("shows the node's charts with AVG, MAX, MIN and exact percentiles", async () 
   );
   expect(screen.getByRole("table", { name: "Memory summary" })).toHaveTextContent("Used");
   expect(screen.getByRole("table", { name: "Network summary" })).toHaveTextContent("Received");
-  // 그 노드의 VM만
-  const vms = screen.getByRole("table", { name: "Virtual machines" });
+  // 그 노드의 VM만(VM 탭, 계획 77-6). 하드웨어·네트워크는 다른 탭이다.
+  expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+    "Metrics",
+    "Hardware",
+    "Network",
+    "VMs",
+  ]);
+  await userEvent.click(screen.getByRole("tab", { name: "VMs" }));
+  const vms = await screen.findByRole("table", { name: "Virtual machines" });
   expect(within(vms).getByRole("link", { name: "web" })).toHaveAttribute("href", "/vms/web");
   expect(within(vms).queryByText("far")).not.toBeInTheDocument();
   expect(ranges[0]).toBe("hour");

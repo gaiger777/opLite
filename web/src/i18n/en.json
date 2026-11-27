@@ -1880,7 +1880,13 @@
     "noVms": "No VMs on this node.",
     "sdn": "SDN",
     "sdnCentral": "{{name}} is an OVN central. Remove it from the SDN first; if it is offline, another central kicks it out of the OVN databases.",
-    "sdnCentralRemove": "Remove it from the SDN"
+    "sdnCentralRemove": "Remove it from the SDN",
+    "tab": {
+      "metrics": "Metrics",
+      "hardware": "Hardware",
+      "network": "Network",
+      "vms": "VMs"
+    }
   },
   "accounts": {
     "currentPassword": "Current password",

@@ -1880,7 +1880,13 @@
     "noVms": "이 노드에 VM이 없습니다.",
     "sdn": "SDN",
     "sdnCentral": "{{name}}은(는) OVN 중앙입니다. 먼저 SDN에서 빼세요. 오프라인이면 다른 중앙이 OVN 데이터베이스에서 내쫓습니다.",
-    "sdnCentralRemove": "SDN에서 빼기"
+    "sdnCentralRemove": "SDN에서 빼기",
+    "tab": {
+      "metrics": "지표",
+      "hardware": "하드웨어",
+      "network": "네트워크",
+      "vms": "VM"
+    }
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
