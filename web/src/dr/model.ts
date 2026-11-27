@@ -359,8 +359,8 @@ export type TestNetIssue = "failover" | "routed" | "provider" | "physical";
 
 /**
  * 시험 네트워크 맵의 줄마다 격리가 깨질 수 있는 까닭(리뷰 1 웹 9): 대상이 장애 조치가 쓰는 네트워크(`networks` 맵의 대상,
- * 또는 맵에 없는 원본과 같은 이름), 라우터 인터페이스, 공급자(업링크) 네트워크, SDN이 아닌 브리지(물리 L2)이면. 모르는
- * 네트워크는 보지 않는다.
+ * 또는 맵에 없는 원본과 같은 이름), 라우터 인터페이스, 공급자(업링크) 네트워크, 브리지 네트워크(`bridge` — 물리 L2)이면.
+ * VXLAN 네트워크는 브리지가 아니다(서버 `dr_test_network_not_isolated`와 같은 판단 — 리뷰 2 웹 4). 모르는 네트워크는 보지 않는다.
  */
 export function testNetworkIssues(
   draft: Draft,
@@ -389,7 +389,7 @@ export function testNetworkIssues(
     }
     if (net.spec.sdn?.provider) {
       out[i] = "provider";
-    } else if (!net.spec.sdn) {
+    } else if (net.spec.bridge) {
       out[i] = "physical";
     } else if (routed.has(to)) {
       out[i] = "routed";
@@ -623,15 +623,19 @@ export function rtoClock(
 /** 실행이 나아가지 않으면 "멈춤"으로 보는 시간(서버 경보 `dr_run_failed`의 stalled와 같은 30분) */
 export const STALL_SECS = 30 * 60;
 
-/** 도는 실행이 `progress_at`부터 [`STALL_SECS`]보다 오래 나아가지 않았으면 그 초(아니면 undefined) */
+/**
+ * 도는 실행이 [`STALL_SECS`]보다 오래 나아가지 않았으면 그 초(아니면 undefined). 서버 경보와 같은 기준이다(리뷰 2 웹 2·5): 서버는
+ * 도는 Task·상한이 있는 기다림(그룹의 `wait`·`delay_secs`·일시 오류 없는 계획된 이전 준비) 동안 `progress_at`을 분마다
+ * 올리므로 `progress_at`만 보면 되고, 없으면(0이라 빠짐) 시작 시각에서 잰다.
+ */
 export function stalledFor(
-  status: { state: DrRunState; progress_at?: number },
+  status: { state: DrRunState; started_at: number; progress_at?: number },
   nowSecs: number,
 ): number | undefined {
-  if (status.state !== "running" || status.progress_at === undefined) {
+  if (status.state !== "running") {
     return undefined;
   }
-  const idle = nowSecs - status.progress_at;
+  const idle = nowSecs - Math.max(status.progress_at ?? 0, status.started_at);
   return idle > STALL_SECS ? idle : undefined;
 }
 
@@ -639,6 +643,7 @@ export function stalledFor(
 const STEP_NOTES: Record<string, string> = {
   "no recovery point": "dr.step.noPoint",
   "already recovered by this plan": "dr.step.alreadyRecovered",
+  "stopped for a failover": "dr.step.preempted",
 };
 
 export function stepNoteKey(error: string | undefined): string | undefined {

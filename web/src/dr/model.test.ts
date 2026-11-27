@@ -232,6 +232,7 @@ it("warns about test networks that can reach production", () => {
       { from: "c", to: "br0" },
       { from: "d", to: "iso" },
       { from: "e", to: "unknown" },
+      { from: "f", to: "vx" },
     ],
   };
   const networks = [
@@ -239,6 +240,8 @@ it("warns about test networks that can reach production", () => {
     providerNetwork("ext", "physnet1"),
     { ...sdnNetwork("br0"), spec: { bridge: "br0" } } as Network,
     sdnNetwork("iso"),
+    // VXLAN은 SDN이 아니어도 브리지가 아니다(서버도 막지 않음 — 리뷰 2 웹 4)
+    { ...sdnNetwork("vx"), spec: { vxlan: { vni: 100 } } } as Network,
   ];
   expect(testNetworkIssues(draft, networks, new Set(["routed"]))).toEqual({
     0: "failover",
@@ -279,16 +282,19 @@ it("round-trips and checks the source backup pool of a plan and its VMs", () => 
 });
 
 it("calls a running run stalled after 30 minutes without progress", () => {
-  const status = { state: "running" as const, progress_at: 1000 };
+  const status = { state: "running" as const, started_at: 500, progress_at: 1000 };
   expect(stalledFor(status, 1000 + STALL_SECS)).toBeUndefined();
   expect(stalledFor(status, 1001 + STALL_SECS)).toBe(STALL_SECS + 1);
   expect(stalledFor({ ...status, state: "failed" }, 99_999)).toBeUndefined();
-  expect(stalledFor({ state: "running" }, 99_999)).toBeUndefined();
+  // `progress_at`이 없으면(옛 실행) 시작 시각에서 잰다(서버 경보와 같음 — 리뷰 2 웹 5)
+  expect(stalledFor({ state: "running", started_at: 500 }, 500 + STALL_SECS)).toBeUndefined();
+  expect(stalledFor({ state: "running", started_at: 500 }, 501 + STALL_SECS)).toBe(STALL_SECS + 1);
 });
 
 it("knows the skip reasons the server writes and reads local times", () => {
   expect(stepNoteKey("already recovered by this plan")).toBe("dr.step.alreadyRecovered");
   expect(stepNoteKey("no recovery point")).toBe("dr.step.noPoint");
+  expect(stepNoteKey("stopped for a failover")).toBe("dr.step.preempted");
   expect(stepNoteKey("restore failed")).toBeUndefined();
   expect(stepNoteKey(undefined)).toBeUndefined();
   expect(localToSecs("")).toBeUndefined();

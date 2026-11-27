@@ -9,16 +9,19 @@ import { type DotState, isFailover, PHASE_TONE, phaseDots, rpoCounts, RUN_TONE }
 
 /**
  * 취소 확인의 설명: 실행 종류마다 취소 뒤 일(리뷰 1 웹 4) — 시험은 끝나면 뒷정리가 저절로 시작되고, 장애 조치가 만든 VM은
- * 남으며, 뒷정리는 남은 것을 다음 뒷정리로 지운다. 종류를 모르면 앞 문장만.
+ * 남으며(계획된 이전은 운영 쪽에서 끈 VM을 다시 켠다 — 리뷰 2 웹 6), 뒷정리는 남은 것을 다음 뒷정리로 지운다. 종류를 모르면
+ * 앞 문장만.
  */
 export function cancelText(t: TFunction, kind: DrRunKind | undefined): string {
   const after = !kind
     ? ""
     : kind === "test"
       ? t("dr.cancel.afterTest")
-      : isFailover(kind)
-        ? t("dr.cancel.afterFailover")
-        : t("dr.cancel.afterCleanup");
+      : kind === "failover-planned"
+        ? `${t("dr.cancel.afterFailover")} ${t("dr.cancel.afterPlanned")}`
+        : isFailover(kind)
+          ? t("dr.cancel.afterFailover")
+          : t("dr.cancel.afterCleanup");
   return after ? `${t("dr.cancel.description")} ${after}` : t("dr.cancel.description");
 }
 

@@ -6,6 +6,7 @@ import {
   PowerOff,
   ShieldAlert,
   ShieldCheck,
+  ShieldOff,
   Trash2,
 } from "lucide-react";
 import { useState } from "react";
@@ -38,12 +39,15 @@ import {
   type FenceResponse,
   localized,
   oldNodes,
+  otherPlan,
   type RecoveryPlan,
   refreshDr,
+  reportKey,
   usePlan,
   usePlanRuns,
   useReport,
 } from "@/dr/api";
+import { type Edit, planEdits } from "@/dr/edits";
 import { FailoverDialog, FenceDialog, ReprotectDialog, TestDialog } from "@/dr/dialogs";
 import {
   type Draft,
@@ -63,7 +67,8 @@ import { useRemotes } from "@/remotes/remotes";
 const TABS = ["overview", "plan", "runs"] as const;
 type Tab = (typeof TABS)[number];
 
-type Dialog = "test" | "failover" | "fence" | "cleanup" | "cancel" | "delete" | "reprotect";
+type Dialog =
+  "test" | "failover" | "fence" | "clearFence" | "cleanup" | "cancel" | "delete" | "reprotect";
 
 function useTime() {
   const { i18n } = useTranslation();
@@ -119,7 +124,11 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
         variant="outline"
         disabled={!!running || nothingToClean}
         title={nothingToClean ? t("dr.cleanup.nothing") : undefined}
-        onClick={() => setDialog("cleanup")}
+        onClick={() => {
+          // 남은 시험 VM·네트워크를 손으로 지웠을 수 있다: 영향 목록을 다시 센다(리뷰 2 웹 7 — 사건은 보고를 다시 읽지 않음).
+          void queryClient.invalidateQueries({ queryKey: reportKey(plan.name), exact: true });
+          setDialog("cleanup");
+        }}
       >
         <Eraser />
         {t("dr.action.cleanup")}
@@ -165,10 +174,16 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
             {t("dr.fence.band", { source: plan.spec.source, vms: fencePending.join(", ") })}
           </span>
           {operate && (
-            <Button variant="destructive" size="sm" onClick={() => setDialog("fence")}>
-              <PowerOff />
-              {t("dr.fence.button")}
-            </Button>
+            <span className="flex flex-wrap gap-2">
+              <Button variant="destructive" size="sm" onClick={() => setDialog("fence")}>
+                <PowerOff />
+                {t("dr.fence.button")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setDialog("clearFence")}>
+                <ShieldOff />
+                {t("dr.fence.clear")}
+              </Button>
+            </span>
           )}
         </div>
       )}
@@ -264,6 +279,29 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
       )}
       {dialog === "reprotect" && <ReprotectDialog plan={plan} onClose={() => setDialog(null)} />}
       <ConfirmDialog
+        open={dialog === "clearFence"}
+        onOpenChange={(open) => !open && setDialog(null)}
+        title={t("dr.fence.clearTitle", { name: plan.name })}
+        description={t("dr.fence.clearDescription", { source: plan.spec.source })}
+        confirmLabel={t("dr.fence.clear")}
+        impact={[t("dr.fence.clearImpact", { vms: fencePending.join(", ") })]}
+        onConfirm={async () => {
+          try {
+            await call(
+              api.POST("/dr-plans/{key}/actions/clear-fence", {
+                params: { path: { key: plan.id } },
+              }),
+            );
+            toast.success(t("dr.fence.cleared"));
+            setFenced(null);
+          } catch (err) {
+            throw localized(t, err);
+          } finally {
+            await refreshDr(queryClient);
+          }
+        }}
+      />
+      <ConfirmDialog
         open={dialog === "cleanup"}
         onOpenChange={(open) => !open && setDialog(null)}
         title={t("dr.cleanup.title", { name: plan.name })}
@@ -342,9 +380,9 @@ function PlanView({ plan }: { plan: RecoveryPlan }) {
   );
 }
 
-/** fence-source 결과: VM마다 멈춤·실패와 아직 남은 VM */
+/** fence-source 결과: VM마다 결과(`result` 다섯 값 — 모르는 값은 ok로 어림)와 아직 남은 VM */
 function FenceResult({ result, onClose }: { result: FenceResponse; onClose(): void }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   return (
     <section
       aria-label={t("dr.fence.result")}
@@ -361,7 +399,9 @@ function FenceResult({ result, onClose }: { result: FenceResponse; onClose(): vo
           <li key={r.vm} className="flex flex-wrap gap-x-2">
             <span className="font-medium">{r.vm}</span>
             <span className={r.ok ? "text-success-fg" : "text-danger-fg"}>
-              {t(r.ok ? "dr.fence.stopped" : "dr.fence.failed")}
+              {i18n.exists(`dr.fence.outcome.${r.result}`)
+                ? t(`dr.fence.outcome.${r.result}`)
+                : t(r.ok ? "dr.fence.stopped" : "dr.fence.failed")}
             </span>
             {r.error && <span className="text-muted-foreground">{r.error}</span>}
           </li>
@@ -469,9 +509,15 @@ function Overview({
         <h2 id="dr-tests" className="text-base font-semibold">
           {t("dr.report.tests")}
         </h2>
+        {/* 그 시험 실행이 본 문제다(위 표는 지금 센 것 — 리뷰 2 웹 9): 그 실행으로 잇는다. */}
         {lastTest?.readiness_issues ? (
           <p className="text-sm text-warning-fg">
-            {t("dr.readiness.lastTest", { count: lastTest.readiness_issues })}
+            {t("dr.readiness.lastTest", { count: lastTest.readiness_issues })}{" "}
+            {lastTest.run && (
+              <Link to={`/dr-runs/${lastTest.run}`} className="underline-offset-4 hover:underline">
+                {t("dr.readiness.openLastTest")}
+              </Link>
+            )}
           </p>
         ) : null}
         {report.tests.length === 0 ? (
@@ -547,19 +593,6 @@ function RunsTable({
   );
 }
 
-/** 고치는 중인 초안: 편집을 시작한 때의 계획(`base`)과 그 판. 계획 탭을 떠났다 와도 같은 세션이면 남는다(리뷰 1 웹 7). */
-interface Edit {
-  draft: Draft;
-  base: RecoveryPlan["spec"];
-  revision: number;
-}
-const edits = new Map<string, Edit>();
-
-/** 시험이 서로의 초안을 보지 않게 */
-export function forgetPlanEdits() {
-  edits.clear();
-}
-
 /**
  * 계획 탭: 편집과 저장(PUT 통째, `If-Match`). 계획의 판은 status 쓰기(보호 상태·실행)로도 오르므로, 409이면 계획을 다시 읽어
  * spec이 편집을 시작한 때와 같으면 새 판으로 한 번 더 저장한다. spec이 바뀌었으면 그때만 알리고 "내 것으로 덮기"와 "다시 읽기
@@ -578,17 +611,21 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
   if (fresh.key !== specKey) {
     setFresh({ key: specKey, draft: toDraft(plan.name, plan.spec) });
   }
-  const [stored, setStored] = useState(() => edits.get(plan.id));
+  const [stored, setStored] = useState(() => planEdits.get(plan.id));
   const edit: Edit = stored ?? { draft: fresh.draft, base: plan.spec, revision: plan.revision };
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [failure, setFailure] = useState<{ message: string; latest?: RecoveryPlan } | null>(null);
+  const [failure, setFailure] = useState<{
+    message: string;
+    latest?: RecoveryPlan;
+    other?: string;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
 
   function keep(next: Edit | undefined) {
     if (next) {
-      edits.set(plan.id, next);
+      planEdits.set(plan.id, next);
     } else {
-      edits.delete(plan.id);
+      planEdits.delete(plan.id);
     }
     setStored(next);
   }
@@ -638,7 +675,7 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
       await refreshDr(queryClient);
       keep(undefined);
     } catch (err) {
-      setFailure({ message: drErrorText(t, err) });
+      setFailure({ message: drErrorText(t, err), other: otherPlan(err) });
     } finally {
       setBusy(false);
     }
@@ -657,6 +694,7 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
       {failure && (
         <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
           <span>{failure.message}</span>
+          {failure.other && <OtherPlanLink plan={failure.other} />}
           {failure.latest && (
             <>
               <Button
@@ -702,6 +740,16 @@ function EditPlan({ plan, readOnly }: { plan: RecoveryPlan; readOnly: boolean })
   );
 }
 
+/** 409 `dr_vm_in_other_plan`: 그 VM이 든 다른 계획으로 가는 길 */
+function OtherPlanLink({ plan }: { plan: string }) {
+  const { t } = useTranslation();
+  return (
+    <Link to={`/dr-plans/${encodeURIComponent(plan)}`} className="underline underline-offset-4">
+      {t("dr.edit.openOtherPlan", { name: plan })}
+    </Link>
+  );
+}
+
 /** 새 계획(`/dr-plans/-new`): 같은 편집으로 만든다(`POST /dr-plans`). */
 export function NewPlanPage() {
   const { t } = useTranslation();
@@ -713,7 +761,7 @@ export function NewPlanPage() {
   const old = oldNodes(nodes.data);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [failure, setFailure] = useState<string | null>(null);
+  const [failure, setFailure] = useState<{ message: string; other?: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const allowed = perms.can("write", "recovery-plan");
 
@@ -733,7 +781,7 @@ export function NewPlanPage() {
       await refreshDr(queryClient);
       void navigate(`/dr-plans/${encodeURIComponent(plan.name)}`);
     } catch (err) {
-      setFailure(drErrorText(t, err));
+      setFailure({ message: drErrorText(t, err), other: otherPlan(err) });
     } finally {
       setBusy(false);
     }
@@ -758,8 +806,9 @@ export function NewPlanPage() {
             remotes={remotes.data ?? []}
           />
           {failure && (
-            <p role="alert" className="text-sm text-destructive">
-              {failure}
+            <p role="alert" className="flex flex-wrap gap-2 text-sm text-destructive">
+              <span>{failure.message}</span>
+              {failure.other && <OtherPlanLink plan={failure.other} />}
             </p>
           )}
           {Object.keys(errors).length > 0 && (

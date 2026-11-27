@@ -20,7 +20,6 @@ import {
   localized,
   oldNodes,
   refreshDr,
-  usePlan,
   usePlanRuns,
   useRun,
 } from "@/dr/api";
@@ -34,7 +33,7 @@ import {
   stepNoteKey,
 } from "@/dr/model";
 import { UpgradeNotice } from "@/dr/PlansPage";
-import { cancelText, PhaseChip, PhaseDots, RunStateChip, useNow } from "@/dr/parts";
+import { cancelText, PhaseChip, PhaseDots, ReadinessCell, RunStateChip, useNow } from "@/dr/parts";
 import { formatTime } from "@/lib/format";
 import { TaskStateBadge } from "@/tasks/TasksPage";
 
@@ -85,20 +84,39 @@ function RunView({ run }: { run: DrRun }) {
   const [cancelling, setCancelling] = useState(false);
   const status = run.status;
   const cleanup = run.spec.kind === "cleanup";
-  // 취소한 시험이 끝나면 서버가 뒷정리를 저절로 시작한다: 계획의 지금 실행으로 가는 길(리뷰 1 웹 4). 장애 조치가 끊은
-  // 시험(`preempted`)의 뒷정리는 장애 조치 뒤이고 그때 계획의 지금 실행은 장애 조치다 — 그 장애 조치를 실행 기록에서 찾는다.
+  // 취소한 시험이 끝나면 서버가 뒷정리를 저절로 시작한다(리뷰 1 웹 4): 이 시험이 끝난 뒤 시작한 첫 뒷정리 실행으로 가는
+  // 길(리뷰 2 웹 3 — 계획의 지금 실행은 그 뒤의 새 시험·장애 조치일 수 있다). 장애 조치가 끊은 시험(`preempted`)은 끊은
+  // 장애 조치(`preempted_by`, 옛 실행은 실행 기록에서 찾음)로 간다.
   const preempted = run.spec.kind === "test" && !!status.preempted;
-  const plan = usePlan(
-    run.spec.kind === "test" && status.state === "cancelled" && !preempted
-      ? run.spec.plan
-      : undefined,
-  );
-  const autoCleanup = plan.data?.status.run !== run.id ? plan.data?.status.run : undefined;
-  const planRuns = usePlanRuns(preempted ? run.spec.plan : undefined);
-  const preemptedBy = planRuns.data?.find((r) => r.status.preempted_test === run.id);
+  const cancelledTest = run.spec.kind === "test" && status.state === "cancelled";
+  const planRuns = usePlanRuns(cancelledTest ? run.spec.plan : undefined);
+  const autoCleanup = preempted
+    ? undefined
+    : planRuns.data
+        ?.filter(
+          (r) =>
+            r.spec.kind === "cleanup" && r.status.started_at >= (status.finished_at ?? Infinity),
+        )
+        .at(-1)?.id;
+  const preemptedBy =
+    status.preempted_by ?? planRuns.data?.find((r) => r.status.preempted_test === run.id)?.id;
   const live = status.state === "running";
   const now = useNow(live);
   const stalled = stalledFor(status, now);
+  // 일시 오류를 다시 하는 단계가 있는 계획된 이전만 "취소하고 재해 방식으로"를 권한다(리뷰 2 웹 2).
+  const retrying = (status.steps ?? []).some(
+    (s) => s.retrying_since !== undefined || !!s.last_error,
+  );
+  // 계획된 이전이 운영 VM을 다시 켜지 못함(위험 — 운영 VM이 꺼진 채 남음)
+  const leftStopped = (status.steps ?? []).filter((s) => s.prepare?.restart_error);
+  // 계획된 이전 준비가 실패해 아무것도 되살리지 않음(전부 아니면 전무)
+  const allOrNone =
+    run.spec.kind === "failover-planned" &&
+    status.state === "failed" &&
+    !!status.error?.includes("all VMs or none");
+  // 시험이 본 실제 장애 조치 준비 문제(개요의 "마지막 시험" 문구가 이리로 온다 — 리뷰 2 웹 9)
+  const notReady =
+    run.spec.kind === "test" ? (status.failover_readiness ?? []).filter((r) => !r.ok) : [];
   const rto = rtoClock(status, now);
   const time = (s: number) => formatTime(new Date(s * 1000), i18n.language);
   const taskOf = (id: string | undefined) => tasks.data?.find((task) => task.id === id);
@@ -141,13 +159,34 @@ function RunView({ run }: { run: DrRun }) {
           className="rounded-md border border-warning px-3 py-2 text-sm text-warning-fg"
         >
           {t("dr.run.stalled", { time: formatDuration(stalled) })}
+          {run.spec.kind === "failover-planned" && retrying && ` ${t("dr.run.stalledPlanned")}`}
         </p>
+      )}
+      {leftStopped.length > 0 && (
+        <div
+          role="alert"
+          className="flex flex-col gap-1 rounded-md border border-danger bg-danger-soft px-3 py-2 text-sm text-danger-fg"
+        >
+          <p className="font-medium">
+            {t("dr.run.leftStopped", {
+              source: run.spec.plan_spec.source,
+              vms: leftStopped.map((s) => s.vm).join(", "),
+            })}
+          </p>
+          <ul className="list-disc pl-5 text-xs">
+            {leftStopped.map((s) => (
+              <li key={s.vm}>
+                {s.vm}: {s.prepare!.restart_error}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
       {preempted && (
         <p role="status" className="rounded-md border px-3 py-2 text-sm">
           {t("dr.run.preempted")}{" "}
           {preemptedBy && (
-            <Link to={`/dr-runs/${preemptedBy.id}`} className="underline-offset-4 hover:underline">
+            <Link to={`/dr-runs/${preemptedBy}`} className="underline-offset-4 hover:underline">
               {t("dr.run.openPreemptedBy")}
             </Link>
           )}
@@ -215,8 +254,25 @@ function RunView({ run }: { run: DrRun }) {
       )}
       {status.error && (
         <p role="alert" className="text-sm text-destructive">
+          {allOrNone && <span className="block font-medium">{t("dr.run.allOrNone")}</span>}
           {status.error}
         </p>
+      )}
+      {notReady.length > 0 && (
+        <section aria-labelledby="dr-run-readiness" className="flex flex-col gap-1">
+          <h2 id="dr-run-readiness" className="text-base font-semibold">
+            {t("dr.run.readiness")}
+          </h2>
+          <p className="text-xs text-muted-foreground">{t("dr.run.readinessHint")}</p>
+          <ul className="flex flex-col gap-1 text-sm">
+            {notReady.map((r) => (
+              <li key={r.vm} className="flex flex-wrap gap-x-2">
+                <span className="min-w-28 font-medium">{r.vm}</span>
+                <ReadinessCell readiness={r} />
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
       {(status.bubbles ?? []).length > 0 && (
         <section aria-labelledby="dr-bubbles" className="flex flex-col gap-1">
@@ -322,6 +378,16 @@ function RunView({ run }: { run: DrRun }) {
                             {t("dr.run.copyTask")}
                             {copy && <TaskStateBadge task={copy} />}
                           </Link>
+                        )}
+                        {s.lost_secs !== undefined && (
+                          <span className="basis-full text-xs text-warning-fg">
+                            {t("dr.run.lost", { time: formatDuration(s.lost_secs) })}
+                          </span>
+                        )}
+                        {s.copy_error && (
+                          <span className="basis-full text-xs text-destructive">
+                            {t("dr.run.copyError", { error: s.copy_error })}
+                          </span>
                         )}
                         {(s.tried ?? []).length > 0 && (
                           <span className="text-xs text-muted-foreground">

@@ -30,16 +30,12 @@ export type OnTimeout = Schemas["OnTimeout"];
 export type TestRequest = Schemas["TestRequest"];
 export type FenceResponse = Schemas["FenceResponse"];
 export type VmReadiness = Schemas["VmReadiness"];
-
+export type FenceResult = Schemas["FenceResult"];
 /**
- * 409 `dr_planned_preflight`의 `details.problems` 하나(서버 `PreflightProblem` — 오류 본문이라 스키마에 없다). `code`는
- * `token_role`·`no_remote_here`·`vm_missing`·`no_backup_pool`·`no_receiving_pool`·`unreadable`.
+ * 409 `dr_planned_preflight`의 `details.problems` 하나. `code`는 `token_role`·`no_remote_here`·`vm_missing`·
+ * `no_backup_pool`·`no_receiving_pool`·`unreadable`·`dr_readiness`·`dr_name_taken`.
  */
-export interface PreflightProblem {
-  code: string;
-  vm?: string;
-  message: string;
-}
+export type PreflightProblem = Schemas["PreflightProblem"];
 
 export const PLANS_KEY = ["dr-plans"] as const;
 export const RUNS_KEY = ["dr-runs"] as const;
@@ -78,11 +74,23 @@ export function usePlan(key: string | undefined) {
   });
 }
 
-/** 보고(보호 상태 나이는 지금 다시 셈) */
-export function useReport(key: string | undefined) {
+/**
+ * 보고(보호 상태 나이는 지금 다시 셈). `pointInTime`(유닉스 초)이면 그 시각 이하의 사본으로 센 보호 상태(시험·장애 조치
+ * 대화상자의 복구 지점 시각 — 리뷰 2).
+ */
+export function useReport(key: string | undefined, pointInTime?: number) {
   return useQuery({
-    queryKey: reportKey(key ?? ""),
-    queryFn: () => call(api.GET("/dr-plans/{key}/report", { params: { path: { key: key! } } })),
+    queryKey:
+      pointInTime === undefined ? reportKey(key ?? "") : [...reportKey(key ?? ""), pointInTime],
+    queryFn: () =>
+      call(
+        api.GET("/dr-plans/{key}/report", {
+          params: {
+            path: { key: key! },
+            ...(pointInTime !== undefined && { query: { point_in_time: pointInTime } }),
+          },
+        }),
+      ),
     enabled: !!key,
     retry: false,
   });
@@ -135,6 +143,15 @@ export function detailNames(err: unknown, key: "vms" | "networks"): string[] {
   return Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : [];
 }
 
+/** 409 `dr_vm_in_other_plan`의 다른 계획 이름(`details.plan` — 아니면 undefined) */
+export function otherPlan(err: unknown): string | undefined {
+  if (!(err instanceof ApiError) || err.code !== "dr_vm_in_other_plan") {
+    return undefined;
+  }
+  const plan = (err.details as { plan?: unknown } | undefined)?.plan;
+  return typeof plan === "string" ? plan : undefined;
+}
+
 function preflightProblems(err: ApiError): PreflightProblem[] {
   const list = (err.details as { problems?: unknown } | undefined)?.problems;
   return Array.isArray(list)
@@ -165,6 +182,13 @@ export function drErrorText(t: TFunction, err: unknown, scope?: string): string 
     const names = detailNames(err, key);
     if (names.length > 0) {
       return t(`dr.errors.${err.code}`, { [key]: names.join(", ") });
+    }
+    return err.message;
+  }
+  if (err.code === "dr_vm_in_other_plan") {
+    const d = (err.details ?? {}) as { vm?: unknown; plan?: unknown };
+    if (typeof d.vm === "string" && typeof d.plan === "string") {
+      return t("dr.errors.dr_vm_in_other_plan", { vm: d.vm, plan: d.plan });
     }
     return err.message;
   }

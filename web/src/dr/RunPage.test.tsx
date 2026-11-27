@@ -233,9 +233,26 @@ it("tells that a cancelled test cleans up by itself and links that cleanup", asy
   const user = userEvent.setup();
   const next = setup();
   const CLEANUP = "019a0f3c-0000-7000-8076-0000000000b2";
+  const LATER = "019a0f3c-0000-7000-8076-0000000000b3";
+  const OLD = "019a0f3c-0000-7000-8076-0000000000b4";
+  const at = (id: string, kind: DrRun["spec"]["kind"], started_at: number) => ({
+    ...run({ spec: { kind }, status: { started_at } }),
+    id,
+  });
   server.use(
+    // 계획의 지금 실행은 뒷정리 뒤의 새 시험이다 — 그리로 잇지 않는다(리뷰 2 웹 3)
     http.get(apiUrl(`/dr-plans/${PLAN_ID}`), () =>
-      HttpResponse.json(plan("web-tier", { status: { run: CLEANUP } })),
+      HttpResponse.json(plan("web-tier", { status: { run: LATER } })),
+    ),
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}/runs`), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [
+          at(LATER, "test", NOW + 600),
+          at(CLEANUP, "cleanup", NOW),
+          at(OLD, "cleanup", NOW - 3600),
+        ],
+      }),
     ),
   );
   const { queryClient } = open();
@@ -248,6 +265,16 @@ it("tells that a cancelled test cleans up by itself and links that cleanup", asy
   expect(
     await screen.findByRole("link", { name: "Open the cleanup that started after the cancel" }),
   ).toHaveAttribute("href", `/dr-runs/${CLEANUP}`);
+});
+
+it("tells that cancelling a planned migration starts the stopped source VMs again", async () => {
+  const user = userEvent.setup();
+  setup(run({ spec: { kind: "failover-planned" } }));
+  open();
+  await user.click(await screen.findByRole("button", { name: "Cancel run" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Cancel the run of web-tier" });
+  expect(dialog).toHaveTextContent("VMs the failover already made stay");
+  expect(dialog).toHaveTextContent("Source VMs it stopped are started again");
 });
 
 it("shows the server's failed phase, notes, tried copies, retries and the disk copy", async () => {
@@ -306,7 +333,112 @@ it("shows the server's failed phase, notes, tried copies, retries and the disk c
 it("warns when a running run made no progress for 30 minutes", async () => {
   setup(run({ status: { progress_at: Math.floor(Date.now() / 1000) - 3600 } }));
   open();
-  expect(await screen.findByRole("alert")).toHaveTextContent(/No progress for 1h 0m/);
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(/No progress for 1h 0m/);
+  // 계획된 이전에 다시 하는 오류가 없으면 취소를 권하지 않는다(리뷰 2 웹 2)
+  expect(alert).not.toHaveTextContent(/cancel/);
+});
+
+it("advises cancelling a stalled planned failover only while a step retries", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  setup(
+    run({
+      spec: { kind: "failover-planned" },
+      status: {
+        progress_at: now - 3600,
+        steps: [
+          {
+            group: "db",
+            vm: "db1",
+            phase: "preparing",
+            at: NOW,
+            retrying_since: now - 3600,
+            last_error: "cannot read the source cluster: timed out",
+          },
+        ],
+      },
+    }),
+  );
+  open();
+  expect(await screen.findByText(/No progress for 1h 0m/)).toHaveTextContent(
+    /cancel and fail over in disaster mode/,
+  );
+});
+
+it("shows source VMs left stopped, older recovery points, a failed disk copy and all-or-none", async () => {
+  setup(
+    run({
+      spec: { kind: "failover-planned" },
+      status: {
+        state: "failed",
+        finished_at: NOW,
+        error:
+          "preparing web1 on the source cluster failed; a planned failover recovers all VMs or none, so nothing is recovered here and the source VMs this run stopped are started again",
+        steps: [
+          {
+            group: "db",
+            vm: "db1",
+            phase: "skipped",
+            at: NOW,
+            prepare: { stage: "done", stopped: true, restart_error: "source said 500" },
+          },
+          { group: "web", vm: "web1", phase: "ready", at: NOW, lost_secs: 7200 },
+          { group: "web", vm: "web2", phase: "ready", at: NOW, copy_error: "disk sda: io error" },
+        ],
+      },
+    }),
+  );
+  open();
+  const band = await screen.findByText(/were left stopped/);
+  expect(band.closest("[role=alert]")).toHaveTextContent("db1: source said 500");
+  expect(screen.getByText(/moves all VMs or none/)).toBeInTheDocument();
+  expect(screen.getByRole("listitem", { name: "web1" })).toHaveTextContent(
+    "Recovered from an older recovery point — 2h 0m more data lost.",
+  );
+  expect(screen.getByRole("listitem", { name: "web2" })).toHaveTextContent(
+    "could not finish copying the disks (the VM did not get all of them): disk sda: io error",
+  );
+});
+
+it("shows the failover readiness problems a test saw", async () => {
+  setup(
+    run({
+      status: {
+        state: "succeeded",
+        finished_at: NOW,
+        failover_readiness: [
+          { vm: "db1", ok: true },
+          { vm: "web1", ok: false, issues: [{ kind: "network", name: "lan" }] },
+        ],
+      },
+    }),
+  );
+  open();
+  const section = await screen.findByRole("region", {
+    name: "Failover readiness problems (seen by this test)",
+  });
+  expect(section).toHaveTextContent("web1");
+  expect(section).toHaveTextContent("network lan missing");
+  expect(section).not.toHaveTextContent("db1");
+});
+
+it("tells a test step a failover stopped is skipped, not failed", async () => {
+  setup(
+    run({
+      status: {
+        state: "cancelled",
+        preempted: true,
+        finished_at: NOW,
+        steps: [
+          { group: "db", vm: "db1", phase: "skipped", at: NOW, error: "stopped for a failover" },
+        ],
+      },
+    }),
+  );
+  open();
+  expect(await screen.findByRole("listitem", { name: "db1" })).toHaveTextContent(
+    "A failover stopped the test — skipped.",
+  );
 });
 
 it("tells a skipped VM was already recovered by this plan, not failed", async () => {
@@ -366,6 +498,25 @@ it("links a test a failover cancelled and the failover back to it", async () => 
   expect(
     screen.queryByRole("link", { name: "Open the cleanup that started after the cancel" }),
   ).not.toBeInTheDocument();
+});
+
+it("links the failover that cancelled a test by its id", async () => {
+  const FAILOVER = "019a0f3c-0000-7000-8076-0000000000c5";
+  setup(
+    run({
+      status: { state: "cancelled", preempted: true, preempted_by: FAILOVER, finished_at: NOW },
+    }),
+  );
+  server.use(
+    http.get(apiUrl(`/dr-plans/${PLAN_ID}/runs`), () =>
+      HttpResponse.json({ revision: 1, items: [] }),
+    ),
+  );
+  open();
+  expect(await screen.findByRole("link", { name: "Open the failover" })).toHaveAttribute(
+    "href",
+    `/dr-runs/${FAILOVER}`,
+  );
 });
 
 it("links the test a failover cancelled", async () => {

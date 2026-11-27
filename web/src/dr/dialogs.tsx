@@ -28,6 +28,7 @@ import {
   type RecoveryPlan,
   refreshDr,
   type TestRequest,
+  useReport,
 } from "@/dr/api";
 import {
   formatDuration,
@@ -118,42 +119,75 @@ function PointInTime({
   );
 }
 
-/** 복구 지점이 없는 VM과 "건너뛰고 진행"(`allow_missing`) — 목록이 있을 때만 */
-function MissingPoints({
-  id,
-  vms,
-  allow,
-  onChange,
-}: {
-  id: string;
-  vms: readonly string[];
-  allow: boolean;
-  onChange(v: boolean): void;
-}) {
+/** 복구 지점이 없는 VM과 VM마다 "건너뛰기"(`skip_vms`) — 목록이 있을 때만. 그 시각의 보고를 받는 중이면 그렇다고. */
+function MissingPoints({ id, missing }: { id: string; missing: ReturnType<typeof useMissing> }) {
   const { t } = useTranslation();
-  if (vms.length === 0) {
+  if (missing.loading) {
+    return (
+      <p role="status" className="text-sm text-muted-foreground">
+        {t("dr.runOptions.counting")}
+      </p>
+    );
+  }
+  if (missing.list.length === 0) {
     return null;
   }
   return (
-    <div className="flex flex-col gap-2 rounded-md border border-warning px-3 py-2">
-      <p className="text-sm">{t("dr.runOptions.missing", { vms: names(t, vms) })}</p>
-      <Check id={id} checked={allow} onChange={onChange}>
-        {t("dr.runOptions.allowMissing")}
-      </Check>
-    </div>
+    <fieldset className="flex flex-col gap-2 rounded-md border border-warning px-3 py-2">
+      <legend className="px-1 text-sm">
+        {t("dr.runOptions.missing", { count: missing.list.length })}
+      </legend>
+      <p className="text-xs text-muted-foreground">{t("dr.runOptions.skipHint")}</p>
+      <div className="flex max-h-48 flex-col gap-1.5 overflow-y-auto">
+        {missing.list.map((vm, i) => (
+          <Check
+            key={vm}
+            id={`${id}-${i}`}
+            checked={missing.skip.includes(vm)}
+            onChange={(on) => missing.toggle(vm, on)}
+          >
+            {t("dr.runOptions.skipVm", { vm })}
+          </Check>
+        ))}
+      </div>
+    </fieldset>
   );
 }
 
-/** 보호 상태(보고)에서 복구 지점이 없는 VM과 서버가 400으로 알려 준 VM을 합친다(서버 것이 늘 맞다). */
-function useMissing(report: DrReport | undefined) {
-  const [fromServer, setFromServer] = useState<string[] | null>(null);
-  const list = fromServer ?? protectionGaps(report?.protection).missing;
-  return { list, setFromServer };
+/**
+ * 복구 지점이 없는 VM과 건너뛸 VM(리뷰 2 웹 1). 목록은 고른 복구 지점 시각(`point` — 없으면 가장 새 사본)의 보고에서
+ * 오고(`GET /report?point_in_time=`), 서버가 400 `dr_missing_recovery_points`로 알려 준 VM이 있으면 그 시각의 것으로 더한다
+ * (서버 것이 늘 맞다). 시각이 바뀌면 고른 것과 서버 목록은 버린다 — 다른 시점의 목록은 동의 근거가 아니다. 서버는
+ * `skip_vms`에 든 VM만 건너뛰므로 사용자가 보지 못한 VM은 건너뛰지 않는다(400으로 목록에 더해진다).
+ */
+function useMissing(plan: RecoveryPlan, report: DrReport | undefined, point: number | undefined) {
+  const atPoint = useReport(point !== undefined ? plan.name : undefined, point);
+  const [fromServer, setFromServer] = useState<{ point?: number; vms: string[] } | null>(null);
+  const [picked, setPicked] = useState<{ point?: number; vms: string[] }>({ vms: [] });
+  const base = point === undefined ? report : atPoint.data;
+  const server = fromServer && fromServer.point === point ? fromServer.vms : [];
+  const list = [...new Set([...protectionGaps(base?.protection).missing, ...server])].sort();
+  const skip = picked.point === point ? picked.vms.filter((vm) => list.includes(vm)) : [];
+  return {
+    list,
+    skip,
+    /** 그 시각의 보고를 받는 중(서버 목록도 아직 없음) */
+    loading: point !== undefined && !atPoint.data && !atPoint.error && server.length === 0,
+    /** 그 시각 기준 보호 상태(장애 조치 확인의 RPO·검증 실패 줄) */
+    protection: base?.protection,
+    toggle(vm: string, on: boolean) {
+      setPicked({ point, vms: on ? [...skip, vm] : skip.filter((v) => v !== vm) });
+    },
+    /** 400의 `details.vms`(보낸 `skip_vms`는 빼고 온다 — 고른 것도 목록에 남긴다) */
+    fromError(vms: string[]) {
+      setFromServer({ point, vms: [...new Set([...vms, ...skip])] });
+    },
+  };
 }
 
 /**
- * 시험 장애 조치(설계 §3.2, 리뷰 1): 운영 쪽을 건드리지 않고 격리망에서 되살린다. 복구 지점이 없는 VM이 있으면 목록과 "건너뛰고
- * 진행"(`allow_missing`), 시험망이 밖과 닿을 수 있으면(브리지·업링크·라우터 — 서버 `dr_test_network_not_isolated`와 같은 판단,
+ * 시험 장애 조치(설계 §3.2, 리뷰 1): 운영 쪽을 건드리지 않고 격리망에서 되살린다. 복구 지점이 없는 VM이 있으면 VM마다
+ * "건너뛰기"(`skip_vms` — 리뷰 2, 고른 복구 지점 시각 기준의 목록), 시험망이 밖과 닿을 수 있으면(브리지·업링크·라우터 — 서버 `dr_test_network_not_isolated`와 같은 판단,
  * 또는 서버가 알려 준 네트워크) "알고 진행"(`allow_routed_test_networks`), 고급으로 복구 지점 시각(`point_in_time`).
  */
 export function TestDialog({
@@ -172,12 +206,11 @@ export function TestDialog({
   const id = useId();
   const networks = useList("network");
   const routed = useRouted();
-  const missing = useMissing(report);
-  const [allowMissing, setAllowMissing] = useState(false);
-  const [serverRouted, setServerRouted] = useState<string[] | null>(null);
-  const [allowRouted, setAllowRouted] = useState(false);
   const [when, setWhen] = useState("");
   const [whenError, setWhenError] = useState<string | undefined>();
+  const missing = useMissing(plan, report, localToSecs(when));
+  const [serverRouted, setServerRouted] = useState<string[] | null>(null);
+  const [allowRouted, setAllowRouted] = useState(false);
   const draft = toDraft(plan.name, plan.spec);
   const issues = testNetworkIssues(
     draft,
@@ -207,7 +240,7 @@ export function TestDialog({
         }
         setWhenError(undefined);
         const body: TestRequest = {
-          ...(allowMissing && missing.list.length > 0 && { allow_missing: true }),
+          ...(missing.skip.length > 0 && { skip_vms: missing.skip }),
           ...(allowRouted && notIsolated.length > 0 && { allow_routed_test_networks: true }),
           ...(point !== undefined && { point_in_time: point }),
         };
@@ -222,7 +255,7 @@ export function TestDialog({
           onStarted(run);
         } catch (err) {
           if (err instanceof ApiError && err.code === "dr_missing_recovery_points") {
-            missing.setFromServer(detailNames(err, "vms"));
+            missing.fromError(detailNames(err, "vms"));
           }
           if (err instanceof ApiError && err.code === "dr_test_network_not_isolated") {
             setServerRouted(detailNames(err, "networks"));
@@ -233,12 +266,7 @@ export function TestDialog({
         }
       }}
     >
-      <MissingPoints
-        id={`${id}-missing`}
-        vms={missing.list}
-        allow={allowMissing}
-        onChange={setAllowMissing}
-      />
+      <MissingPoints id={`${id}-missing`} missing={missing} />
       {notIsolated.length > 0 && (
         <div className="flex flex-col gap-2 rounded-md border border-warning px-3 py-2">
           <p className="text-sm">{t("dr.test.notIsolated", { networks: names(t, notIsolated) })}</p>
@@ -255,8 +283,9 @@ export function TestDialog({
 /**
  * 장애 조치 확인(설계 §3.2·§4): 모드(planned — 운영 쪽을 끄고 마지막 백업을 떠 온 뒤, disaster — 지금 있는 가장 새 사본으로
  * 곧장)를 기본값 없이 고르고 계획 이름을 그대로 쳐야 진행한다. 영향 목록은 VM·그룹 수, disaster면 이미 받은 보고의 복구 지점
- * 없는 VM·RPO를 넘은 VM(나이)·검증 실패로 앞 사본을 쓸 VM, planned면 운영 쪽에서 끌 VM이다(리뷰 1 웹 10). disaster는 데이터를
- * 잃을 수 있다는 경고와 "복구 지점 없는 VM은 건너뛰고 진행"(`allow_missing`), 고급으로 복구 지점 시각(`point_in_time`)을 준다.
+ * 없는 VM·RPO를 넘은 VM(나이)·검증 실패로 앞 사본을 쓸 VM(고른 복구 지점 시각의 보고로), planned면 운영 쪽에서 끌 VM이다
+ * (리뷰 1 웹 10). disaster는 데이터를 잃을 수 있다는 경고와 VM마다 "건너뛰기"(`skip_vms`), 고급으로 복구 지점 시각
+ * (`point_in_time`)을 준다.
  * 도는 시험이 있으면 그 시험을 끊고 시작한다고 알린다(`preemptsTest` — 서버가 끊는다).
  */
 export function FailoverDialog({
@@ -276,12 +305,12 @@ export function FailoverDialog({
   const queryClient = useQueryClient();
   const id = useId();
   const [mode, setMode] = useState<FailoverMode | null>(null);
-  const missing = useMissing(report);
-  const [allowMissing, setAllowMissing] = useState(false);
   const [when, setWhen] = useState("");
   const [whenError, setWhenError] = useState<string | undefined>();
+  // 복구 지점 시각은 disaster만 받는다(planned는 막 뜬 사본을 쓴다).
+  const missing = useMissing(plan, report, mode === "disaster" ? localToSecs(when) : undefined);
   const vms = plan.spec.groups.flatMap((g) => g.vms.map((v) => v.vm));
-  const gaps = protectionGaps(report?.protection);
+  const gaps = protectionGaps(missing.protection);
   // planned는 운영 쪽에서 새 백업을 떠 오므로 지금 사본의 빈 곳은 상관없다.
   const fromCopies = mode !== "planned";
   const impact = [
@@ -330,9 +359,7 @@ export function FailoverDialog({
               body: {
                 mode: mode!,
                 confirm: plan.name,
-                ...(mode === "disaster" &&
-                  allowMissing &&
-                  missing.list.length > 0 && { allow_missing: true }),
+                ...(mode === "disaster" && missing.skip.length > 0 && { skip_vms: missing.skip }),
                 ...(point !== undefined && { point_in_time: point }),
               },
             }),
@@ -341,7 +368,7 @@ export function FailoverDialog({
           onStarted(run);
         } catch (err) {
           if (err instanceof ApiError && err.code === "dr_missing_recovery_points") {
-            missing.setFromServer(detailNames(err, "vms"));
+            missing.fromError(detailNames(err, "vms"));
           }
           throw localized(t, err);
         } finally {
@@ -391,12 +418,7 @@ export function FailoverDialog({
           >
             {t("dr.failover.disasterWarning")}
           </p>
-          <MissingPoints
-            id={`${id}-missing`}
-            vms={missing.list}
-            allow={allowMissing}
-            onChange={setAllowMissing}
-          />
+          <MissingPoints id={`${id}-missing`} missing={missing} />
           <PointInTime id={`${id}-when`} value={when} error={whenError} onChange={setWhen} />
         </>
       )}

@@ -52,7 +52,7 @@
         "disaster": "재해"
       },
       "modeHint": {
-        "planned": "운영 쪽에 닿아야 합니다: 그 VM을 그룹 역순으로 끄고(5분 안에 꺼지지 않으면 강제로 끔 — 그러면 crash 수준의 일관성) 마지막 백업을 떠 이곳으로 복제한 뒤 넘깁니다. 끈 뒤 준비가 실패한 VM은 운영 쪽에서 다시 켭니다.",
+        "planned": "운영 쪽에 닿아야 합니다: 그 VM을 그룹 역순으로 끄고(5분 안에 꺼지지 않으면 강제로 끔 — 그러면 crash 수준의 일관성) 마지막 백업을 떠 이곳으로 복제한 뒤 넘깁니다. 모든 VM을 넘기거나 하나도 넘기지 않습니다 — 한 VM이라도 준비가 실패하면 아무것도 되살리지 않고 끈 VM을 운영 쪽에서 다시 켭니다.",
         "disaster": "이 클러스터에 이미 있는 가장 새 복구 지점으로 곧장 넘깁니다. 운영 쪽에 묻지 않습니다."
       },
       "disasterWarning": "운영 쪽의 마지막 복제 백업 뒤에 쓴 것은 잃습니다. 운영 쪽이 아직 돌고 있으면 두 벌이 함께 돕니다 — 먼저 끄세요. 운영 쪽이 돌아오면 그 VM이 스스로 켜질 수 있으니 다시 잇기 전에 격리하세요.",
@@ -80,7 +80,8 @@
       "done": "{{name}} 실행을 취소하는 중입니다.",
       "afterTest": "시험이 끝나면 뒷정리가 저절로 시작됩니다.",
       "afterFailover": "장애 조치가 이미 만든 VM은 남습니다(지우지 않음).",
-      "afterCleanup": "아직 지우지 못한 것은 다음 뒷정리에 남습니다."
+      "afterCleanup": "아직 지우지 못한 것은 다음 뒷정리에 남습니다.",
+      "afterPlanned": "운영 쪽에서 끈 VM은 다시 켭니다(운영 쪽에 닿지 않으면 꺼진 채 남음)."
     },
     "delete": {
       "button": "계획 지우기",
@@ -164,7 +165,8 @@
       "planSourceBackupPool": "계획의 것",
       "ipHelpLabel": "IP 규칙과 cloud-init",
       "ipHelpInstance": "되살린 VM은 cloud-init instance-id가 새것이라 cloud-init이 첫 부팅 모듈을 다시 돕니다: SSH 호스트 키를 새로 만들고 user-data(사용자·비밀번호·runcmd)를 다시 돕니다.",
-      "ipHelpNoCloudInit": "게스트에 cloud-init이 없으면 IP는 그대로입니다(규칙이 바꾸지 못함)."
+      "ipHelpNoCloudInit": "게스트에 cloud-init이 없으면 IP는 그대로입니다(규칙이 바꾸지 못함).",
+      "openOtherPlan": "계획 {{name}} 열기"
     },
     "pick": {
       "title": "{{group}}에 VM 더하기",
@@ -246,7 +248,7 @@
       "elapsed": "걸린 시간",
       "openCleanup": "취소 뒤 시작한 뒷정리 열기",
       "sourceBackup": "백업 {{backup}}",
-      "stalled": "{{time}} 동안 나아가지 않았습니다. 아래 오류를 보세요. 계획된 이전 중에 운영 쪽이 죽었으면 취소하고 재해 방식으로 장애 조치하세요.",
+      "stalled": "{{time}} 동안 나아가지 않았습니다(도는 Task도, 정해진 기다림도 없음). 아래 단계와 Task를 확인하세요.",
       "preempted": "이 계획의 장애 조치가 이 시험을 끊었습니다. 뒷정리는 장애 조치가 끝난 뒤 시작합니다.",
       "openPreemptedBy": "그 장애 조치 열기",
       "preemptedTest": "이 장애 조치가 돌던 시험을 끊었습니다.",
@@ -254,7 +256,14 @@
       "copyTask": "디스크 옮기기",
       "tried": "써 본 사본 {{backups}}",
       "retrying": "{{time}}째 다시 하는 중: {{error}}",
-      "notes": "기록"
+      "notes": "기록",
+      "stalledPlanned": "단계가 오류를 다시 하고 있습니다. 계획된 이전 중에 운영 쪽이 죽었으면 취소하고 재해 방식으로 장애 조치하세요.",
+      "leftStopped": "{{source}}의 운영 VM이 꺼진 채 남았습니다(다시 켜지 못함): {{vms}}. 운영 쪽에서 확인하고 손으로 켜세요.",
+      "allOrNone": "계획된 이전은 모든 VM을 넘기거나 하나도 넘기지 않습니다: 준비가 실패해 아무것도 되살리지 않았고, 이 실행이 끈 운영 VM은 다시 켭니다.",
+      "readiness": "장애 조치 준비 문제(이 시험이 봄)",
+      "readinessHint": "시험은 시험망으로 되살리므로 성공해도, 실제 장애 조치는 이 VM에서 실패할 수 있습니다.",
+      "lost": "더 오래된 복구 지점으로 되살림 — {{time}} 데이터를 더 잃었습니다.",
+      "copyError": "라이브 복원의 디스크 옮기기 실패(VM이 디스크를 다 받지 못함): {{error}}"
     },
     "kind": {
       "test": "시험 장애 조치",
@@ -308,9 +317,10 @@
       "dr_no_active_run": "도는 실행이 없습니다.",
       "dr_nothing_to_clean": "지난 시험이 남긴 것이 없습니다.",
       "dr_no_recovered_vms": "이 계획의 장애 조치로 되살린 VM이 아직 없습니다.",
-      "dr_missing_recovery_points": "복구 지점이 없는 VM: {{vms}}. \"이 VM은 건너뛰고 진행\"을 고르거나 사본이 이곳에 올 때까지 기다리세요.",
+      "dr_missing_recovery_points": "복구 지점이 없는 VM: {{vms}}. 건너뛸 VM으로 고르거나 사본이 이곳에 올 때까지 기다리세요.",
       "dr_test_network_not_isolated": "시험 네트워크 {{networks}}는 밖과 닿을 수 있습니다(브리지·업링크·라우터). 계획의 시험 네트워크 맵에 격리된 네트워크를 정하거나 \"알고 진행\"을 고르세요.",
-      "dr_planned_preflight": "계획된 이전을 시작할 수 없습니다. 아무것도 끄지 않았습니다."
+      "dr_planned_preflight": "계획된 이전을 시작할 수 없습니다. 아무것도 끄지 않았습니다.",
+      "dr_vm_in_other_plan": "VM {{vm}}은(는) 이미 계획 {{plan}}에 있습니다. 한 VM은 복구 계획 하나에만 넣을 수 있습니다."
     },
     "prepare": {
       "shutdown": "운영 쪽에서 끄는 중",
@@ -323,8 +333,11 @@
       "advanced": "고급",
       "pointInTime": "이 시각 이전의 복구 지점(지역 시각)",
       "pointInTimeHint": "비우면 가장 새 복구 지점입니다. 랜섬웨어·손상이 사본에 닿기 전 시각을 고르세요.",
-      "missing": "복구 지점 없음: {{vms}}.",
-      "allowMissing": "이 VM은 건너뛰고 진행(되살리지 않음 — 실행은 partial로 끝남)"
+      "missing_one": "복구 지점 없는 VM {{count}}개 — 건너뛸 VM을 고르세요.",
+      "missing_other": "복구 지점 없는 VM {{count}}개 — 건너뛸 VM을 고르세요.",
+      "skipHint": "고른 VM은 되살리지 않습니다(실행은 partial로 끝남). 고르지 않은 VM이 있으면 시작하지 않습니다.",
+      "skipVm": "{{vm}} 건너뛰기",
+      "counting": "그 시각의 복구 지점을 세는 중…"
     },
     "fence": {
       "band": "이 클러스터에 되살렸지만 {{source}}에서 멈추지 않은 VM: {{vms}}. {{source}}가 돌아오면 그 VM이 거기서도 켜져 같은 IP로 두 벌이 돕니다 — 격리하세요.",
@@ -345,22 +358,35 @@
         "dr_nothing_to_fence": "격리를 기다리는 되살린 VM이 없습니다.",
         "dr_source_unreachable": "운영 클러스터에 닿지 않습니다. 돌아오면(네트워크를 다시 잇기 전에) 격리하거나 거기서 손으로 VM을 멈추세요.",
         "dr_fence_preflight": "운영 쪽 원격의 토큰이 viewer입니다. 이곳에 운영 쪽을 operator나 admin 토큰으로 다시 등록하고(원격) 다시 하세요."
-      }
+      },
+      "outcome": {
+        "stopped": "멈춤",
+        "not_found": "운영 쪽에 없음",
+        "different_vm": "같은 이름의 다른 VM — 끄지 않고 목록에서 뺌",
+        "different_cluster": "원격이 다른 클러스터를 가리킴 — 끄지 않음(확인한 뒤 격리 해제)",
+        "failed": "멈추지 못함"
+      },
+      "clear": "격리 해제",
+      "clearTitle": "{{name}} 격리 목록 비우기",
+      "clearDescription": "{{source}}에는 아무것도 하지 않고 격리할 VM 목록만 비웁니다(경보 dr_source_returned가 풀림). 되돌리기를 마쳤거나 운영 쪽의 옛 VM을 손으로 멈추거나 지운 것을 확인했을 때만 쓰세요.",
+      "clearImpact": "목록에서 뺄 VM: {{vms}}",
+      "cleared": "격리 목록을 비웠습니다."
     },
     "readiness": {
       "column": "장애 조치 준비",
       "ok": "준비됨",
       "badge_one": "장애 조치 준비 안 된 VM {{count}}개",
       "badge_other": "장애 조치 준비 안 된 VM {{count}}개",
-      "lastTest_one": "마지막 시험이 실제 장애 조치에 준비되지 않은 VM {{count}}개를 찾았습니다(위 \"장애 조치 준비\").",
-      "lastTest_other": "마지막 시험이 실제 장애 조치에 준비되지 않은 VM {{count}}개를 찾았습니다(위 \"장애 조치 준비\").",
+      "lastTest_one": "마지막 시험이 실제 장애 조치에 준비되지 않은 VM {{count}}개를 찾았습니다.",
+      "lastTest_other": "마지막 시험이 실제 장애 조치에 준비되지 않은 VM {{count}}개를 찾았습니다.",
       "issue": {
         "recovery-point": "복구 지점 없음",
         "network": "네트워크 {{name}} 없음",
         "security-group": "보안 그룹 {{name}} 없음",
         "pool": "풀 {{name}} 없음",
         "node": "노드 {{name}} 없음"
-      }
+      },
+      "openLastTest": "그 시험 열기"
     },
     "preflight": {
       "token_role": "운영 쪽 원격의 토큰이 admin이 아닙니다 — 이곳에 운영 쪽을 admin 토큰으로 다시 등록하세요(원격).",
@@ -368,11 +394,14 @@
       "vm_missing": "{{vm}}이(가) 운영 쪽에 없습니다 — 계획에서 빼거나 재해 방식을 쓰세요.",
       "no_backup_pool": "{{vm}}의 백업이 운영 쪽에 없습니다 — 계획에 운영 쪽 백업 풀을 정하세요.",
       "no_receiving_pool": "이 클러스터에 사본을 받을 백업 풀이 없습니다 — 하나 만드세요(스토리지).",
-      "unreadable": "운영 쪽을 읽지 못했습니다: {{message}}"
+      "unreadable": "운영 쪽을 읽지 못했습니다: {{message}}",
+      "dr_readiness": "이 클러스터에 복원할 곳(네트워크 맵 대상·보안 그룹·풀·노드)이 없습니다 — 계획의 맵을 고치거나 그것을 만드세요: {{message}}",
+      "dr_name_taken": "이 클러스터에 이 계획이 되살리지 않은 {{vm}} VM이 있습니다 — 그 VM의 이름을 바꾸거나 지우세요."
     },
     "step": {
       "noPoint": "복구 지점 없음 — 건너뜀.",
-      "alreadyRecovered": "이 계획이 이미 되살림 — 건너뜀."
+      "alreadyRecovered": "이 계획이 이미 되살림 — 건너뜀.",
+      "preempted": "장애 조치가 시험을 끊음 — 건너뜀."
     }
   }
 }

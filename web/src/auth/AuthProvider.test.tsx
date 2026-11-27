@@ -9,6 +9,9 @@ import { createQueryClient } from "@/api/queryClient";
 import type { Task } from "@/api/types";
 import { AuthProvider, useAuth } from "@/auth/AuthProvider";
 import { Toaster } from "@/components/ui/sonner";
+import { planEdits } from "@/dr/edits";
+import { emptyDraft } from "@/dr/model";
+import { planSpec } from "@/test/dr";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
 import { resetUploads, startUpload } from "@/storage/upload";
@@ -159,6 +162,20 @@ it("stays signed out explicitly when requests get 401 during sign out", async ()
   answer();
   await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
   expect(screen.getByText("explicit")).toBeInTheDocument();
+});
+
+it("forgets unsaved DR plan drafts when signing out", async () => {
+  server.use(
+    http.get(apiUrl("/auth/whoami"), () => HttpResponse.json(ADMIN)),
+    http.post(apiUrl("/auth/logout"), () => new HttpResponse(null, { status: 204 })),
+  );
+  renderAuth();
+  expect(await screen.findByText("admin")).toBeInTheDocument();
+  // 다음 사용자가 앞 사람의 초안을 보지 않게(계획 76 리뷰 2 웹 8)
+  planEdits.set("plan-1", { draft: emptyDraft(), base: planSpec(), revision: 1 });
+  await userEvent.click(screen.getByRole("button", { name: "logout" }));
+  expect(await screen.findByText("signed out")).toBeInTheDocument();
+  expect(planEdits.size).toBe(0);
 });
 
 it("stops uploads when signing out", async () => {
