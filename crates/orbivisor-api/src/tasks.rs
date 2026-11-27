@@ -1240,7 +1240,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::VolumeImport {
             source,
             source_format,
-        } => import_volume(ctx, id, source, *source_format).await,
+        } => import_volume(ctx, task.id, id, source, *source_format).await,
         TaskOp::VolumeDelete => delete_volume(ctx, id).await,
         // 게스트 에이전트가 파일 시스템을 얼리지 못했으면 경고로 남긴다(계획 59 §9).
         TaskOp::SnapshotCreate { snapshot } => return snapshot::create(ctx, id, *snapshot).await,
@@ -1691,13 +1691,45 @@ async fn create_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     Ok(())
 }
 
+/// 가져오기 Task의 진행 단계(계획 77-8): 원본 확인 → 변환 → 마무리(크기를 읽어 ready). 바로 쓴 조각 업로드는 변환이 없다.
+pub(crate) const IMPORT_CHECKING: &str = "checking";
+pub(crate) const IMPORT_CONVERTING: &str = "converting";
+pub(crate) const IMPORT_FINISHING: &str = "finishing";
+/// 변환 진행을 Task에 쓰는 간격
+const CONVERT_PROGRESS_EVERY: Duration = Duration::from_secs(2);
+
 async fn import_volume(
     ctx: &Ctx,
+    task: Uuid,
     id: Uuid,
     source: &Path,
     source_format: SourceFormat,
 ) -> Result<(), String> {
     let (volume, pool) = volume_and_pool(ctx, id)?;
+    let total = tokio::fs::metadata(source).await.map_or(0, |m| m.len());
+    let stage = |name: &'static str, done: u64| {
+        migrate::write_progress(
+            ctx,
+            task,
+            name,
+            orbivisor_driver::migration::MirrorProgress {
+                done_bytes: done,
+                total_bytes: total,
+            },
+        )
+    };
+    // 조각 업로드가 풀에 바로 쓴 raw(계획 77-8): 원본이 곧 볼륨 파일이다 — 확인만 하고 변환하지 않는다.
+    let in_place = source_format == SourceFormat::Raw
+        && volume.spec.format == ImageFormat::Raw
+        && orbivisor_driver::check_pool_root(&pool, &ctx.config.mount_root).is_ok()
+        && source
+            == orbivisor_driver::DirStorage::volume_path(
+                &pool,
+                &ctx.config.mount_root,
+                id,
+                volume.spec.format,
+            );
+    stage(IMPORT_CHECKING, 0).await;
     if !volume.spec.content.is_disk() {
         check_iso_source(source).await?;
     }
@@ -1712,18 +1744,48 @@ async fn import_volume(
             }
             e => e.to_string(),
         })?;
-    // 풀에 쓰다 공간이 바닥나면 그 풀로 안내한다(리뷰 I2 — 원문만으로는 어느 디스크인지 모른다).
-    ctx.storage
-        .import_volume(&pool, id, source, source_format, volume.spec.format)
-        .await
-        .map_err(|e| {
+    if !in_place {
+        stage(IMPORT_CONVERTING, 0).await;
+        // `qemu-img convert -p`의 퍼센트(× 100)를 받아 `CONVERT_PROGRESS_EVERY`마다 바뀌었으면 쓴다.
+        let percent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let report: orbivisor_driver::ConvertProgress = {
+            let percent = percent.clone();
+            Arc::new(move |p: f64| {
+                percent.store((p * 100.0) as u64, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let work = orbivisor_driver::with_convert_progress(
+            report,
+            ctx.storage
+                .import_volume(&pool, id, source, source_format, volume.spec.format),
+        );
+        tokio::pin!(work);
+        let mut tick = tokio::time::interval(CONVERT_PROGRESS_EVERY);
+        tick.tick().await;
+        let mut written = 0;
+        let imported = loop {
+            tokio::select! {
+                r = &mut work => break r,
+                _ = tick.tick() => {
+                    let now = percent.load(std::sync::atomic::Ordering::Relaxed);
+                    if now != written {
+                        written = now;
+                        stage(IMPORT_CONVERTING, total.saturating_mul(now.min(10_000)) / 10_000).await;
+                    }
+                }
+            }
+        };
+        // 풀에 쓰다 공간이 바닥나면 그 풀로 안내한다(리뷰 I2 — 원문만으로는 어느 디스크인지 모른다).
+        imported.map_err(|e| {
             failure::if_no_space(e.to_string(), || {
                 TaskFailure::new(code::POOL_OUT_OF_SPACE)
                     .param("pool", &pool.name)
                     .param("node", failure::node_name(&ctx.cluster, ctx.config.node))
             })
         })?;
-    let _ = tokio::fs::remove_file(source).await;
+        let _ = tokio::fs::remove_file(source).await;
+    }
+    stage(IMPORT_FINISHING, total).await;
     mark_ready(ctx, &volume, &pool).await;
     Ok(())
 }
@@ -2150,6 +2212,8 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
         return unmounted;
     };
     crate::vm_imports::sweep(&ctx.cluster, ctx.config.node, dir, revision, tasks).await;
+    // 버려진 조각 업로드(계획 77-8 — 하위 디렉터리 `sessions`)
+    crate::uploads::sweep(dir, orbivisor_types::task::now_ms());
     let Ok(entries) = std::fs::read_dir(dir) else {
         return unmounted;
     };

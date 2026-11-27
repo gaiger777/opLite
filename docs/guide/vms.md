@@ -378,6 +378,16 @@ orbivisorctl volume download noble --pool nas --source-format qcow2 \
 - **업로드 사전 확인.** 웹과 `orbivisorctl volume import`는 파일을 보내기 전에 받을 수 있는지 먼저 묻는다
   (`POST /api/v1/volumes/import/check`): 권한, 이름, 풀이 있는지, 풀이 접속한 노드에서 준비됐는지, 같은 이름의 볼륨이
   있는지, 파일 크기 + 1 GiB의 빈 공간이 있는지. 거절되면 파일을 보내지 않고 이유를 보인다.
+- **조각 업로드·이어 올리기(계획 77-8).** 접속한 노드가 기능 `chunked-uploads`를 알리면 웹은 파일을 조각(16 MiB)으로
+  보낸다: `POST /api/v1/uploads {name, pool, format?, source_format, content?, size}`(확인은 사전 확인과 같다 — 공간은 받을
+  자리에서) → `PUT /uploads/{id}?offset=`(받은 데와 다르면 409 `upload_offset_mismatch`, `details.offset`이 받은 데) →
+  `POST /uploads/{id}/complete`가 볼륨과 가져오기 Task(202)를 돌려준다. 끊기면 `GET /uploads/{id}`의 `offset`부터 잇고,
+  탭을 닫았다 와도 같은 파일을 고르면 잇는다(`GET /uploads` — 연 사람의 것만). raw를 raw로 두는 디렉터리·NFS 풀(ISO 포함)은
+  풀 안에 바로 써 끝내면 그 파일이 볼륨이 된다(변환·사본 없음). 그 밖은 업로드 디렉터리에 받아 Task가 변환하며, 진행은
+  Task 진행 `checking` → `converting`(qemu-img `-p`, 바이트) → `finishing`이다. 24시간 조각이 오지 않은 업로드는 지운다.
+  웹은 업로드 창과 작업·알림 센터에 단계(올리는 중 → 변환 → 확인 → 끝)·올린 양·속도·남은 시간·일시정지·취소를 보이고,
+  끝나면 "이 이미지로 VM 만들기"(`/vms/-new?purpose=image&disk=` — ISO는 `?purpose=iso&iso=`)로 간다. 기능이 없는 노드에
+  접속했으면 옛 한 번 올리기(`POST /volumes/import`)를 쓴다.
 - **처리 대기.** 웹에서 파일을 다 보낸 뒤 서버가 2분 동안 응답하지 않으면 "처리 중" 알림이 "<이름>: 서버
   응답이 없습니다. 볼륨 목록에서 결과를 확인하세요."로 바뀌고 닫을 수 있다. 업로드는 끊지 않고 서버에서 계속된다.
   나중에 응답이 오면 평소처럼 결과를 알린다.

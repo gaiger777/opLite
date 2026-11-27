@@ -489,6 +489,7 @@ pub const FEATURES: &[&str] = &[
     LINK_ALERTS,
     RESTORE_REMAP,
     DR_PLANS,
+    CHUNKED_UPLOADS,
 ];
 
 /// 운영자 대시보드(계획 75): `GET /topology/physical`·`GET /capacity`, `NodeInterface`의 `mtu`·`parent`·`vlan_id`·
@@ -504,6 +505,10 @@ pub const LINK_ALERTS: &str = "link-alerts";
 /// `dr_run_failed`, 설정 `dr_max_parallel`. 옛 노드는 새 종류·조건을 풀지 못하므로 모든 노드가 알릴 때만 쓴다(4단계
 /// 엔진으로 다 되어 알린다).
 pub const DR_PLANS: &str = "dr-plans";
+
+/// 조각 업로드(계획 77-8): `/uploads` 경로(만들기·조각 쓰기·이어 올리기·끝내기). 업로드와 그 가져오기 Task는 요청을 받은
+/// 노드의 것이라 클러스터 전체가 아니라 **접속한 노드**가 알리면 웹이 쓴다(아니면 옛 한 번 올리기 `/volumes/import`).
+pub const CHUNKED_UPLOADS: &str = "chunked-uploads";
 
 /// 복원 맵(계획 76 §3.3): 복원 요청의 `networks`·`security_groups`·`cloud_init_networks`·`cloud_init_dns`. 옛 노드의 복원
 /// Task는 맵을 모르므로 모든 노드가 알릴 때만 받는다.
@@ -1184,7 +1189,8 @@ mod tests {
                 "operator-dashboard",
                 "link-alerts",
                 "restore-remap",
-                "dr-plans"
+                "dr-plans",
+                "chunked-uploads"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1403,7 +1409,14 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&DR_PLANS));
+        assert_eq!(FEATURES.last(), Some(&CHUNKED_UPLOADS));
+    }
+
+    /// 계획 77-8: 조각 업로드를 알린다.
+    #[test]
+    fn chunked_uploads_are_announced() {
+        assert_eq!(CHUNKED_UPLOADS, "chunked-uploads");
+        assert!(FEATURES.contains(&CHUNKED_UPLOADS));
     }
 
     /// 계획 76: 복원 맵(2단계)과 복구 계획(4단계 — API·엔진)을 알린다.

@@ -4035,6 +4035,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 부른 사람이 이 노드에 연 업로드(연 차례). 탭을 닫았다 와도 같은 파일(이름·크기)을 고르면 잇는 데 쓴다. */
+        get: operations["list_uploads"];
+        put?: never;
+        /**
+         * 업로드를 연다(201). 확인은 옛 업로드(`/volumes/import/check`)와 같고, 공간은 받을 자리(바로 쓰면 풀, 아니면 업로드
+         *     디렉터리)에서 본다. 같은 이름의 업로드가 이미 열려 있으면 409 `name_taken`.
+         */
+        post: operations["create_upload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/uploads/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 업로드와 받은 바이트(`offset` — 끊긴 뒤 여기서 잇는다) */
+        get: operations["get_upload"];
+        /**
+         * 조각 하나를 받은 데(`offset`)에 이어 쓴다(200, 새 `offset`). `offset`이 받은 데와 다르면(순서가 어긋남·같은 조각을
+         *     다시 보냄) 409 `upload_offset_mismatch`(`details.offset` = 받은 데). 크기를 넘으면 400, 조각이
+         *     [`MAX_CHUNK`]보다 크면 413, 공간이 모자라면 507. 중간에 끊기면 그때까지 받은 것은 남는다(`GET`의 `offset`).
+         */
+        put: operations["put_upload_chunk"];
+        post?: never;
+        /** 업로드를 버린다(204, 받은 것도 지운다). */
+        delete: operations["delete_upload"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/uploads/{id}/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 다 받은 업로드로 볼륨을 만들고 가져오기 Task를 돌려준다(202). 바로 쓴 업로드는 받은 파일을 볼륨 파일 이름으로
+         *     바꾸고(Task는 확인만), 아니면 Task가 변환한다. 덜 받았으면 409 `upload_incomplete`. 권한·이름·풀은 다시 본다.
+         */
+        post: operations["complete_upload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users": {
         parameters: {
             query?: never;
@@ -19931,6 +19995,67 @@ export interface components {
             password?: string | null;
             role?: components["schemas"]["Role"] | null;
         };
+        /** @description 진행 중인 업로드 */
+        Upload: {
+            /**
+             * Format: int64
+             * @description 권하는 조각 크기(바이트). 한 조각은 [`MAX_CHUNK`]까지 받는다.
+             */
+            chunk_size: number;
+            content: components["schemas"]["VolumeContent"];
+            /**
+             * Format: int64
+             * @description 연 시각·마지막 조각 시각(유닉스 ms)
+             */
+            created_at: number;
+            /** @description 대상 풀에 바로 쓰는지(raw·ISO를 파일 풀에 — 끝낸 뒤 변환하지 않는다) */
+            direct: boolean;
+            /**
+             * Format: int64
+             * @description 조각이 더 오지 않으면 버리는 시각(유닉스 ms)
+             */
+            expires_at: number;
+            /** @description 만들 볼륨의 형식(정해진 것) */
+            format: components["schemas"]["ImageFormat"];
+            /** Format: uuid */
+            id: string;
+            /** @description 만들 볼륨 이름 */
+            name: string;
+            /**
+             * Format: int64
+             * @description 받은 바이트 — 다음 조각은 여기서부터
+             */
+            offset: number;
+            pool: string;
+            /**
+             * Format: int64
+             * @description 올릴 파일 크기(바이트)
+             */
+            size: number;
+            source_format: components["schemas"]["SourceFormat"];
+            /** Format: int64 */
+            updated_at: number;
+        };
+        /** @description 업로드 목록(`GET /uploads`) */
+        UploadList: {
+            items: components["schemas"]["Upload"][];
+        };
+        /** @description `POST /uploads` */
+        UploadRequest: {
+            /** @description 내용 종류(기본 disk). iso는 dir·nfs 풀에 raw로 둔다. */
+            content?: components["schemas"]["VolumeContent"];
+            /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2. ISO는 늘 raw) */
+            format?: components["schemas"]["ImageFormat"];
+            /** @description 만들 볼륨 이름 */
+            name: string;
+            pool: string;
+            /**
+             * Format: int64
+             * @description 올릴 파일 크기(바이트)
+             */
+            size: number;
+            source_format: components["schemas"]["SourceFormat"];
+        };
         Usage: {
             /**
              * Format: int64
@@ -30183,6 +30308,185 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TopologyUsage"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_uploads: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadList"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_upload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UploadRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Upload"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_upload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Upload"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_upload_chunk: {
+        parameters: {
+            query: {
+                /** @description 이 조각이 시작하는 바이트(지금 받은 데와 같아야 한다) */
+                offset: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": components["schemas"]["ImageFile"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Upload"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_upload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    complete_upload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
             };
             "4XX": {

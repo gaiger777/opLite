@@ -303,6 +303,18 @@ pub async fn check_import(
     q: &ImportQuery,
     size: u64,
 ) -> Result<(StoragePool, ImageFormat), ApiError> {
+    let (pool, format) = check_import_target(state, principal, q)?;
+    check_upload_space(state, size).await?;
+    Ok((pool, format))
+}
+
+/// [`check_import`]에서 공간을 뺀 확인(권한·이름·풀·형식). 조각 업로드(계획 77-8)는 받을 자리(업로드 디렉터리나
+/// 풀)의 공간을 따로 본다.
+pub(crate) fn check_import_target(
+    state: &AppState,
+    principal: &Principal,
+    q: &ImportQuery,
+) -> Result<(StoragePool, ImageFormat), ApiError> {
     let iso = !q.content.is_disk();
     if iso {
         require_feature(&state.cluster, INSTALL_MEDIA)?;
@@ -331,16 +343,20 @@ pub async fn check_import(
             format!("volume {:?} already exists", q.name),
         ));
     }
-    check_upload_space(state, size).await?;
     Ok((pool, format))
 }
 
 /// 업로드 디렉터리에 `size`바이트를 받고도 [`UPLOAD_RESERVE_BYTES`]가 남는지 본다. 아니면 507.
 pub(crate) async fn check_upload_space(state: &AppState, size: u64) -> Result<(), ApiError> {
-    tokio::fs::create_dir_all(&state.upload_dir)
+    check_space(&state.upload_dir, size).await
+}
+
+/// 디렉터리 `dir`(없으면 만든다)에 `size`바이트를 받고도 [`UPLOAD_RESERVE_BYTES`]가 남는지 본다. 아니면 507.
+pub(crate) async fn check_space(dir: &FsPath, size: u64) -> Result<(), ApiError> {
+    tokio::fs::create_dir_all(dir)
         .await
         .map_err(ApiError::internal)?;
-    let available = fs4::available_space(&state.upload_dir).map_err(ApiError::internal)?;
+    let available = fs4::available_space(dir).map_err(ApiError::internal)?;
     if size.saturating_add(UPLOAD_RESERVE_BYTES) > available {
         return Err(ApiError::new(
             StatusCode::INSUFFICIENT_STORAGE,
@@ -664,11 +680,11 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
 }
 
 /// 업로드를 끝내지 못한 볼륨과 파일을 지운다. 정상 경로에서는 `armed`를 내린다.
-struct UploadGuard {
-    state: Arc<AppState>,
-    volume: Uuid,
-    source: PathBuf,
-    armed: bool,
+pub(crate) struct UploadGuard {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) volume: Uuid,
+    pub(crate) source: PathBuf,
+    pub(crate) armed: bool,
 }
 
 impl Drop for UploadGuard {
