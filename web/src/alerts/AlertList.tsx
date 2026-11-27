@@ -5,6 +5,7 @@ import { alertPhase, subjectText, type AlertView } from "@/alerts/alerts";
 import { severityTone, type Severity } from "@/alerts/severity";
 import { StatusChip } from "@/components/StatusChip";
 import { formatTime } from "@/lib/format";
+import { useFailureStrings } from "@/tasks/failures/strings";
 
 /** 심각도 칩 */
 export function SeverityBadge({ severity }: { severity: Severity }) {
@@ -35,6 +36,8 @@ export function AlertList({
   subjectHref?: (subject: AlertView["subject"]) => string;
 }) {
   const { t, i18n } = useTranslation();
+  // 경보 조건별 원인·해결(계획 77-2 — 짧은 사전, 실패 원인 사전과 같은 조각). 짧은 목록에는 보이지 않는다.
+  const runbook = useFailureStrings(!compact && alerts.length > 0) && !compact;
   if (alerts.length === 0) {
     return <p className="text-sm text-muted-foreground">{t("alerts.none")}</p>;
   }
@@ -73,6 +76,18 @@ export function AlertList({
             <span className="ml-auto text-xs text-muted-foreground">
               {t("alerts.since", { time: formatTime(new Date(alert.since), i18n.language) })}
             </span>
+            {runbook && i18n.exists(`alertRunbook.${alert.condition}.cause`) && (
+              <details className="basis-full text-xs">
+                <summary
+                  className="cursor-pointer text-muted-foreground"
+                  aria-label={t("failureUi.runbookOf", { name: alert.rule_name })}
+                >
+                  {t("failureUi.runbook")}
+                </summary>
+                <p className="mt-1 break-words">{t(`alertRunbook.${alert.condition}.cause`)}</p>
+                <p className="mt-0.5 break-words">{t(`alertRunbook.${alert.condition}.fix`)}</p>
+              </details>
+            )}
           </li>
         );
       })}
