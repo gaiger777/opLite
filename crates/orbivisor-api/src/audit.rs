@@ -542,10 +542,12 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditNote {
 
 /// 적지 않는 바꾸지 않는 POST(계획 71 VM 만들기 미리 확인)
 const QUIET_CHECK: &str = "/vm-checks";
+/// 적지 않는 조각 업로드의 조각(계획 77-8 리뷰 I9 — 100 GiB면 6,400줄). 열기·끝내기·버리기는 적는다.
+const QUIET_CHUNK: (Method, &str) = (Method::PUT, "/uploads/{id}");
 
 /// 라우트가 맞은 요청 가운데 바꾸는 것(GET·HEAD·OPTIONS가 아닌 것)과 콘솔 열기, OIDC 로그인 콜백을 적는다. VM 만들기
 /// 미리 확인(`POST /vm-checks`, 계획 71 §9)은 아무것도 바꾸지 않고 빌더가 입력마다 부르므로 적지 않는다 — 주체 자리는
-/// 그대로 두어 검사(SDN 주소 규칙 등)가 만들기와 같은 주체를 본다.
+/// 그대로 두어 검사(SDN 주소 규칙 등)가 만들기와 같은 주체를 본다. 조각 업로드의 조각(`PUT /uploads/{id}`)도 적지 않는다.
 pub(crate) async fn layer(
     State(state): State<Arc<AppState>>,
     ClientIp(ip): ClientIp,
@@ -579,7 +581,7 @@ pub(crate) async fn layer(
     let response = REQUEST
         .scope(slot.clone(), change.scope(next.run(req)))
         .await;
-    if template == QUIET_CHECK {
+    if template == QUIET_CHECK || (method == QUIET_CHUNK.0 && template == QUIET_CHUNK.1) {
         return response;
     }
     let data = std::mem::take(&mut *slot.0.lock().unwrap());

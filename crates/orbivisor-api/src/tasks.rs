@@ -2213,7 +2213,16 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
     };
     crate::vm_imports::sweep(&ctx.cluster, ctx.config.node, dir, revision, tasks).await;
     // 버려진 조각 업로드(계획 77-8 — 하위 디렉터리 `sessions`)
-    crate::uploads::sweep(dir, orbivisor_types::task::now_ms());
+    if let Some(pools) = crate::uploads::pool_roots(&ctx.cluster, &ctx.config.mount_root) {
+        crate::uploads::sweep(
+            dir,
+            ctx.config.node,
+            &pools,
+            &|_| false,
+            orbivisor_types::task::now_ms(),
+        )
+        .await;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return unmounted;
     };

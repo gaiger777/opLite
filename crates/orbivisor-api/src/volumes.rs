@@ -351,12 +351,16 @@ pub(crate) async fn check_upload_space(state: &AppState, size: u64) -> Result<()
     check_space(&state.upload_dir, size).await
 }
 
-/// 디렉터리 `dir`(없으면 만든다)에 `size`바이트를 받고도 [`UPLOAD_RESERVE_BYTES`]가 남는지 본다. 아니면 507.
+/// 디렉터리 `dir`(없으면 만든다)에 `size`바이트를 받고도 [`UPLOAD_RESERVE_BYTES`]가 남는지 본다. 아니면 507. 풀 루트(NFS)일
+/// 수 있어 blocking 스레드에서 제한 시간 안에 본다(리뷰 77-8 I4 — 멈춘 NFS가 tokio 워커를 붙잡지 않게).
 pub(crate) async fn check_space(dir: &FsPath, size: u64) -> Result<(), ApiError> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(ApiError::internal)?;
-    let available = fs4::available_space(dir).map_err(ApiError::internal)?;
+    let path = dir.to_path_buf();
+    let available = crate::uploads::on_fs(move || {
+        std::fs::create_dir_all(&path)?;
+        fs4::available_space(&path)
+    })
+    .await
+    .map_err(crate::uploads::fs_error)?;
     if size.saturating_add(UPLOAD_RESERVE_BYTES) > available {
         return Err(ApiError::new(
             StatusCode::INSUFFICIENT_STORAGE,
@@ -426,6 +430,7 @@ pub async fn import_volume(
         state: state.clone(),
         volume: volume.id,
         source: state.upload_dir.join(format!("{}.upload", volume.id)),
+        restore: None,
         armed: true,
     };
     receive(&guard.source, body, length).await?;
@@ -679,12 +684,50 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
         })
 }
 
-/// 업로드를 끝내지 못한 볼륨과 파일을 지운다. 정상 경로에서는 `armed`를 내린다.
+/// 업로드를 끝내지 못한 볼륨과 파일을 지운다. 정상 경로에서는 `armed`를 내린다. `restore`가 있으면(조각 업로드 끝내기 —
+/// 리뷰 77-8 I8) 파일을 지우지 않고 그 자리(받은 자리)로 되돌린다 — 다시 끝낼 수 있게.
 pub(crate) struct UploadGuard {
     pub(crate) state: Arc<AppState>,
     pub(crate) volume: Uuid,
     pub(crate) source: PathBuf,
+    pub(crate) restore: Option<PathBuf>,
     pub(crate) armed: bool,
+}
+
+impl UploadGuard {
+    /// 실패한 경로: 기다려서 정리한다(되돌린 파일로 바로 다시 끝낼 수 있게 — 볼륨 이름도 비운다).
+    pub(crate) async fn abandon(mut self) {
+        self.armed = false;
+        undo_upload(
+            self.state.clone(),
+            self.volume,
+            self.source.clone(),
+            self.restore.take(),
+        )
+        .await;
+    }
+}
+
+async fn undo_upload(
+    state: Arc<AppState>,
+    volume: Uuid,
+    source: PathBuf,
+    restore: Option<PathBuf>,
+) {
+    match restore {
+        Some(back) => {
+            let from = source.clone();
+            if let Err(e) = crate::uploads::on_fs(move || std::fs::rename(from, back)).await {
+                tracing::warn!(path = %source.display(), error = %e, "cannot put a finished upload back");
+            }
+        }
+        None => {
+            let _ = tokio::fs::remove_file(&source).await;
+        }
+    }
+    if let Err(e) = state.cluster.delete::<VolumeSpec>(volume, None).await {
+        tracing::warn!(%volume, error = %e, "cannot remove volume of a failed upload");
+    }
 }
 
 impl Drop for UploadGuard {
@@ -692,13 +735,12 @@ impl Drop for UploadGuard {
         if !self.armed {
             return;
         }
-        let (state, volume, source) = (self.state.clone(), self.volume, self.source.clone());
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(&source).await;
-            if let Err(e) = state.cluster.delete::<VolumeSpec>(volume, None).await {
-                tracing::warn!(%volume, error = %e, "cannot remove volume of a failed upload");
-            }
-        });
+        tokio::spawn(undo_upload(
+            self.state.clone(),
+            self.volume,
+            self.source.clone(),
+            self.restore.take(),
+        ));
     }
 }
 

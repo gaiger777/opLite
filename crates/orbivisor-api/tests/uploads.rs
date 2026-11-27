@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common::{Client, Env, FakeStorage};
+use orbivisor_types::audit::AuditQuery;
 use orbivisor_types::resource::Resource;
 use orbivisor_types::runtime::ImageFormat;
 use orbivisor_types::storage::{PoolBackend, StoragePoolSpec, VolumeSpec};
@@ -238,8 +239,13 @@ async fn raw_uploads_write_straight_into_the_pool() {
     assert_eq!(up["direct"], true);
     let id = up["id"].as_str().unwrap();
     assert_eq!(put(&admin, id, 0, b"rawraw").await.0, StatusCode::OK);
-    // 받는 중에는 풀 안 임시 이름이다(업로드 디렉터리에는 기록만).
-    assert_eq!(files(&dir), [format!(".upload-{id}.raw.part")]);
+    // 받는 중에는 풀 안 임시 이름(노드 id를 넣음)이다(업로드 디렉터리에는 기록만).
+    let part = files(&dir);
+    assert_eq!(part.len(), 1);
+    assert!(
+        part[0].starts_with(".upload-") && part[0].ends_with(&format!(".{id}.raw.part")),
+        "{part:?}"
+    );
     assert_eq!(sessions(&env), [format!("{id}.json")]);
 
     let (status, task) = admin
@@ -455,4 +461,272 @@ async fn conversion_progress_shows_on_the_task() {
     let task = admin.wait_task(&task).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
     assert!(task["status"].get("progress").is_none(), "{task}");
+}
+
+/// 조각 `bytes`의 앞 `first`바이트를 보내고 `go`가 올 때까지 기다렸다 나머지를 보내는 PUT(백그라운드)
+fn slow_put(
+    client: &Client,
+    id: &str,
+    bytes: &'static [u8],
+    first: usize,
+    go: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let chunks = futures_util::stream::unfold((0, Some(go)), move |(step, go)| async move {
+        match step {
+            0 => Some((Ok::<_, std::io::Error>(bytes[..first].to_vec()), (1, go))),
+            1 => {
+                let _ = go.unwrap().await;
+                Some((Ok(bytes[first..].to_vec()), (2, None)))
+            }
+            _ => None,
+        }
+    });
+    let r = client
+        .http
+        .put(format!("{}/api/v1/uploads/{id}?offset=0", client.base))
+        .bearer_auth(client.token.as_ref().unwrap())
+        .header("content-length", bytes.len().to_string())
+        .body(reqwest::Body::wrap_stream(chunks));
+    let client = client.clone();
+    tokio::spawn(async move { client.send(r).await })
+}
+
+/// 받은 데가 `want`가 될 때까지(서버가 조각 앞부분을 쓸 때까지)
+async fn wait_offset(client: &Client, id: &str, want: u64) {
+    for _ in 0..200 {
+        let (_, got) = client.get(&format!("/uploads/{id}")).await;
+        if got["offset"].as_u64() == Some(want) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the upload never reached {want} bytes");
+}
+
+/// 조각을 받는 중에 버리면(웹의 취소) 거절하지 않는다: 이름은 바로 풀리고, 그 조각이 끝나면 받은 것을 지운다.
+#[tokio::test]
+async fn discarding_while_a_chunk_arrives_removes_it_after_the_chunk() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let dir = pool(&env).await;
+    let (_, up) = open(
+        &admin,
+        json!({ "name": "plain", "pool": "local", "format": "raw", "source_format": "raw", "size": 8 }),
+    )
+    .await;
+    let id = up["id"].as_str().unwrap().to_string();
+    let (go, wait) = tokio::sync::oneshot::channel();
+    let put = slow_put(&admin, &id, b"abcdefgh", 3, wait);
+    wait_offset(&admin, &id, 3).await;
+
+    assert_eq!(
+        admin.delete(&format!("/uploads/{id}")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        admin.get(&format!("/uploads/{id}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // 이름이 바로 풀린다.
+    let (status, again) = open(
+        &admin,
+        json!({ "name": "plain", "pool": "local", "format": "raw", "source_format": "raw", "size": 8 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{again}");
+    let again = again["id"].as_str().unwrap().to_string();
+
+    go.send(()).unwrap();
+    let (status, body) = put.await.unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    // 버린 업로드의 받는 파일·기록은 없고 새 업로드만 남는다.
+    let part = files(&dir);
+    assert_eq!(part.len(), 1, "{part:?}");
+    assert!(part[0].ends_with(&format!(".{again}.raw.part")), "{part:?}");
+    assert_eq!(sessions(&env), [format!("{again}.json")]);
+}
+
+/// 같은 풀에 바로 쓰는 업로드는 남은 양을 더해 공간을 본다 — 둘이 각각 통과해 풀을 채우지 않는다. 버리면 예약이 풀린다.
+#[tokio::test]
+async fn open_uploads_reserve_their_space_on_the_pool() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let dir = pool(&env).await;
+    const GIB: u64 = 1 << 30;
+    let available = fs4::available_space(&dir).unwrap();
+    if available < 4 * GIB {
+        eprintln!("skipping: only {available} bytes free");
+        return;
+    }
+    // 처음 것은 혼자면 들어가고(여유 1 GiB + 512 MiB), 둘째(1 GiB)는 혼자면 들어가지만 함께는 안 된다.
+    let big = available - GIB - GIB / 2;
+    let raw = |name: &str, size: u64| json!({ "name": name, "pool": "local", "format": "raw", "source_format": "raw", "size": size });
+    let (status, first) = open(&admin, raw("first", big)).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, body) = open(&admin, raw("second", GIB)).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Some("insufficient_storage")
+        ),
+        "{body}"
+    );
+    // 업로드 디렉터리에 받는 것은 다른 자리라 예약에 들지 않는다.
+    let (status, body) = open(
+        &admin,
+        json!({ "name": "elsewhere", "pool": "local", "source_format": "qcow2", "size": GIB }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = first["id"].as_str().unwrap();
+    assert_eq!(
+        admin.delete(&format!("/uploads/{first}")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = open(&admin, raw("second", GIB)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// 끝낼 때 웹이 보낸 SHA-256이 받은 것과 다르면 400 `upload_checksum_mismatch`이고 업로드를 버린다. 같으면 끝낸다(끊긴
+/// 조각 뒤 이어 받아도 받으며 센 해시가 맞다).
+#[tokio::test]
+async fn completing_checks_the_sha256() {
+    let mut env = Env::start().await;
+    fake(&mut env).await;
+    let admin = env.admin().await;
+    pool(&env).await;
+    let (_, up) = open(
+        &admin,
+        json!({ "name": "disk", "pool": "local", "source_format": "qcow2", "size": 4 }),
+    )
+    .await;
+    let id = up["id"].as_str().unwrap();
+    put(&admin, id, 0, b"abcd").await;
+    let (status, body) = admin
+        .post(
+            &format!("/uploads/{id}/complete"),
+            json!({ "sha256": sha256(b"abce") }),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("upload_checksum_mismatch")),
+        "{body}"
+    );
+    assert_eq!(
+        admin.get(&format!("/uploads/{id}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(sessions(&env).is_empty(), "{:?}", sessions(&env));
+    assert_eq!(admin.get("/volumes/disk").await.0, StatusCode::NOT_FOUND);
+
+    // 끊긴 조각(3바이트가 닿음) 뒤 이어 보낸 것도 맞게 센다.
+    let (_, up) = open(
+        &admin,
+        json!({ "name": "disk", "pool": "local", "source_format": "qcow2", "size": 8 }),
+    )
+    .await;
+    let id = up["id"].as_str().unwrap().to_string();
+    let (go, wait) = tokio::sync::oneshot::channel::<()>();
+    let cut = slow_put(&admin, &id, b"abcdefgh", 3, wait);
+    wait_offset(&admin, &id, 3).await;
+    cut.abort();
+    drop(go);
+    let mut got = put(&admin, &id, 3, b"defgh").await;
+    for _ in 0..100 {
+        if got.1["code"] != "upload_busy" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        got = put(&admin, &id, 3, b"defgh").await;
+    }
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let (status, task) = admin
+        .post(
+            &format!("/uploads/{id}/complete"),
+            json!({ "sha256": sha256(b"abcdefgh").to_uppercase() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+}
+
+/// 열 때 낸 파일 지문을 목록·GET이 알린다(다른 브라우저에서 이어 올릴 파일을 맞춰 보게). 빈 파일·틀린 지문은 받지 않는다.
+/// 감사 기록에는 열기·끝내기·버리기만 적고 조각은 적지 않는다.
+#[tokio::test]
+async fn uploads_keep_the_fingerprint_and_audit_only_open_complete_discard() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env).await;
+    let fingerprint = json!({
+        "file_name": "disk.qcow2", "last_modified": 1_700_000_000_000_i64, "head_sha256": sha256(b"ab")
+    });
+    let (status, up) = open(
+        &admin,
+        json!({
+            "name": "disk", "pool": "local", "source_format": "qcow2", "size": 4,
+            "fingerprint": fingerprint
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{up}");
+    assert_eq!(up["fingerprint"], fingerprint);
+    assert_eq!(up["node"], env.node.to_string());
+    let id = up["id"].as_str().unwrap();
+    let (_, list) = admin.get("/uploads").await;
+    assert_eq!(list["items"][0]["fingerprint"], fingerprint);
+    for body in [
+        json!({ "name": "empty", "pool": "local", "source_format": "raw", "size": 0 }),
+        json!({
+            "name": "bad", "pool": "local", "source_format": "raw", "size": 1,
+            "fingerprint": { "file_name": "x", "last_modified": 0, "head_sha256": "zz" }
+        }),
+    ] {
+        let (status, got) = open(&admin, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} {got}");
+    }
+    assert_eq!(put(&admin, id, 0, b"ab").await.0, StatusCode::OK);
+    assert_eq!(put(&admin, id, 2, b"cd").await.0, StatusCode::OK);
+    assert_eq!(
+        admin.delete(&format!("/uploads/{id}")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let actions = |entries: Vec<orbivisor_types::audit::AuditEntry>| -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|e| e.action)
+            .filter(|a| a.contains("/uploads"))
+            .collect()
+    };
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        let entries = env
+            .state
+            .audit
+            .read(AuditQuery {
+                since: 0,
+                until: u64::MAX,
+                user: None,
+                action: None,
+                limit: 1000,
+            })
+            .await
+            .unwrap();
+        seen = actions(entries);
+        if seen.iter().any(|a| a.starts_with("DELETE")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(seen.iter().all(|a| !a.starts_with("PUT")), "{seen:?}");
+    assert!(seen.contains(&"POST /uploads".to_string()), "{seen:?}");
+    assert!(
+        seen.contains(&"DELETE /uploads/{id}".to_string()),
+        "{seen:?}"
+    );
 }
