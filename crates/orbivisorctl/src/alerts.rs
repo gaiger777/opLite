@@ -161,8 +161,8 @@ pub(crate) enum RuleCmd {
         #[arg(long = "target", value_name = "NAME", required = true)]
         targets: Vec<String>,
     },
-    /// 권하는 DR 경보 규칙 둘(`dr-rpo-exceeded`·`dr-run-failed`, 계획 76)을 한 번에 만든다. 같은 이름의 규칙은 그대로
-    /// 둔다.
+    /// 권하는 DR 경보 규칙 셋(`dr-rpo-exceeded`·`dr-run-failed` warning, `dr-source-returned` critical, 계획 76)을 한 번에
+    /// 만든다. 같은 이름의 규칙은 그대로 둔다.
     AddDrDefaults {
         /// 알림 대상 이름(여러 번 줄 수 있다)
         #[arg(long = "target", value_name = "NAME", required = true)]

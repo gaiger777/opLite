@@ -34,6 +34,11 @@ pub(crate) enum DrCmd {
         /// 실행이 끝날 때까지 기다린다(단계가 바뀔 때마다 stderr에 한 줄, 끝에 실행 표).
         #[arg(long)]
         wait: bool,
+        #[command(flatten)]
+        points: PointArgs,
+        /// 시험망이 라우터·업링크가 있는(밖과 닿을 수 있는) 네트워크여도 진행한다(시험 VM은 운영 주소·이름으로 뜬다).
+        #[arg(long)]
+        allow_routed_test_networks: bool,
     },
     /// 실제 장애 조치: 원본 이름으로 VM을 되살린다. `planned`는 운영 쪽 VM을 끄고 마지막 백업을 받아 넘기고, `disaster`는
     /// 지금 있는 가장 새 사본으로 곧장 한다.
@@ -46,6 +51,9 @@ pub(crate) enum DrCmd {
         confirm: String,
         #[arg(long)]
         wait: bool,
+        /// (disaster만)
+        #[command(flatten)]
+        points: PointArgs,
     },
     /// 지난 시험이 남긴 시험 VM(끄고 지움)과 거품 네트워크를 지운다. 장애 조치로 만든 VM은 건드리지 않는다.
     Cleanup {
@@ -69,6 +77,31 @@ pub(crate) enum DrCmd {
     /// 되돌리기 준비: 장애 조치로 되살린 VM에 원격(되살아난 운영 클러스터)으로 복제하는 백업 작업
     /// `dr-reprotect-<plan>`을 만들거나 바꾼다.
     Reprotect(ReprotectArgs),
+    /// 재해 장애 조치 뒤 돌아온 운영 쪽에서 이곳에 되살린 VM을 강제로 끄고 원하는 상태를 stopped로 둔다(두 벌 막기). 계획의
+    /// `source_fence_pending` 목록을 비운다.
+    FenceSource { plan: String },
+}
+
+/// 복구 지점 고르기(시험·재해 장애 조치)
+#[derive(Args)]
+pub(crate) struct PointArgs {
+    /// 복구 지점이 없는 VM은 건너뛰고 진행한다(없으면 그런 VM이 있을 때 거절).
+    #[arg(long)]
+    allow_missing: bool,
+    /// 이 시각(RFC 3339) 이전의 가장 새 복구 지점으로(랜섬웨어·논리 손상이 복제된 경우)
+    #[arg(long, value_name = "TIME", value_parser = crate::vmware::parse_time)]
+    point_in_time: Option<u64>,
+}
+
+impl PointArgs {
+    fn fill(&self, body: &mut Value) {
+        if self.allow_missing {
+            body["allow_missing"] = json!(true);
+        }
+        if let Some(t) = self.point_in_time {
+            body["point_in_time"] = json!(t);
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -130,12 +163,12 @@ pub(crate) struct ReprotectArgs {
     /// 그 원격의 백업 풀
     #[arg(long)]
     pool: String,
-    /// 이 클러스터에서 백업을 쓸 백업 풀(없으면 계획의 `pool`)
+    /// 이 클러스터에서 백업을 쓸 백업 풀(없으면 이미 있는 작업의 풀, 그것도 없으면 계획의 `pool`)
     #[arg(long)]
     backup_pool: Option<String>,
-    /// 실행 시각(UTC)
+    /// 실행 시각(UTC). 작업이 이미 있으면 생략해도 된다(그대로) — 보존 규칙도 주지 않으면 그대로다.
     #[arg(long, value_name = "HH:MM")]
-    at: String,
+    at: Option<String>,
     /// 실행할 요일(쉼표로 나눔). 생략하면 매일.
     #[arg(long, value_enum, value_delimiter = ',', value_name = "mon,tue,...")]
     days: Vec<Day>,
@@ -410,10 +443,19 @@ fn run_row(r: &Value) -> Vec<String> {
         cell(&r["spec"]["kind"]),
         cell(&st["state"]),
         time_cell(&st["started_at"]),
-        dur_cell(&st["rto_secs"]),
+        rto_cell(st),
         format!("{done}/{}", steps.len()),
         st["error"].as_str().unwrap_or("").to_string(),
     ]
+}
+
+/// RTO: 성공하지 않은 실행은 되살린 VM만으로 센 값이라 실제보다 짧다(`>=`).
+fn rto_cell(st: &Value) -> String {
+    match (st["rto_secs"].is_null(), st["state"].as_str()) {
+        (true, _) => "-".into(),
+        (false, Some("succeeded" | "running")) => dur_cell(&st["rto_secs"]),
+        (false, _) => format!(">={}", dur_cell(&st["rto_secs"])),
+    }
 }
 
 const STEP_HEADERS: &[&str] = &[
@@ -456,7 +498,7 @@ fn run_view(out: &mut dyn Write, r: &Value) -> std::io::Result<()> {
         head.push_str(&format!(", finished {}", time_cell(&st["finished_at"])));
     }
     if !st["rto_secs"].is_null() {
-        head.push_str(&format!(", RTO {}", dur_cell(&st["rto_secs"])));
+        head.push_str(&format!(", RTO {}", rto_cell(st)));
     }
     if !st["prepare_secs"].is_null() {
         head.push_str(&format!(", prepare {}", dur_cell(&st["prepare_secs"])));
@@ -467,6 +509,15 @@ fn run_view(out: &mut dyn Write, r: &Value) -> std::io::Result<()> {
     }
     if st["cancel_requested"] == json!(true) && !finished(r) {
         writeln!(out, "cancel requested")?;
+    }
+    if st["preempted"] == json!(true) {
+        writeln!(
+            out,
+            "stopped for a failover (its cleanup starts after that failover)"
+        )?;
+    }
+    if let Some(t) = st["preempted_test"].as_str() {
+        writeln!(out, "stopped the running test {t}")?;
     }
     for b in st["bubbles"].as_array().into_iter().flatten() {
         let mut line = format!("network {}", cell(&b["name"]));
@@ -485,7 +536,49 @@ fn run_view(out: &mut dyn Write, r: &Value) -> std::io::Result<()> {
         .flatten()
         .map(step_row)
         .collect();
-    table(out, STEP_HEADERS, &rows)
+    table(out, STEP_HEADERS, &rows)?;
+    // 단계마다 다시 해 보는 일시 오류와 기록(다른 복구 지점, 운영 쪽 VM 다시 켬, 라이브 복원 복사 실패)
+    for s in st["steps"].as_array().into_iter().flatten() {
+        if let Some(e) = s["last_error"].as_str() {
+            writeln!(
+                out,
+                "{}: retrying since {}: {e}",
+                cell(&s["vm"]),
+                time_cell(&s["retrying_since"])
+            )?;
+        }
+        for n in s["notes"].as_array().into_iter().flatten() {
+            writeln!(out, "{}: {}", cell(&s["vm"]), cell(n))?;
+        }
+    }
+    readiness_lines(out, &st["failover_readiness"])
+}
+
+/// 장애 조치 준비 문제(VM마다 한 줄)
+fn readiness_lines(out: &mut dyn Write, list: &Value) -> std::io::Result<()> {
+    for r in list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["ok"] != json!(true))
+    {
+        let issues: Vec<String> = r["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| match i["name"].as_str() {
+                Some(n) => format!("{} {n} missing", cell(&i["kind"])),
+                None => format!("no {}", cell(&i["kind"])),
+            })
+            .collect();
+        writeln!(
+            out,
+            "failover not ready: {}: {}",
+            cell(&r["vm"]),
+            issues.join(", ")
+        )?;
+    }
+    Ok(())
 }
 
 const PROTECTION_HEADERS: &[&str] = &["VM", "BACKUP", "POINT", "AGE", "STATUS"];
@@ -497,6 +590,7 @@ fn protection_row(p: &Value) -> Vec<String> {
         match p["issue"].as_str() {
             Some("no-recovery-point") => "no recovery point".into(),
             Some("over-rpo") => "over RPO".into(),
+            Some("verify-failed") => "newest copy failed verification".into(),
             Some(other) => other.to_string(),
             None => "not ok".into(),
         }
@@ -523,7 +617,11 @@ fn summary_row(s: &Value) -> Vec<String> {
         cell(&s["name"]),
         cell(&s["state"]),
         time_cell(&s["started_at"]),
-        dur_cell(&s["rto_secs"]),
+        match s["state"].as_str() {
+            Some("succeeded") | None => dur_cell(&s["rto_secs"]),
+            _ if s["rto_secs"].is_null() => "-".into(),
+            _ => format!(">={}", dur_cell(&s["rto_secs"])),
+        },
         if failed.is_empty() {
             "-".into()
         } else {
@@ -561,6 +659,21 @@ fn report_view(out: &mut dyn Write, r: &Value) -> std::io::Result<()> {
         .map(protection_row)
         .collect();
     table(out, PROTECTION_HEADERS, &rows)?;
+    readiness_lines(out, &r["failover_readiness"])?;
+    let pending: Vec<String> = r["source_fence_pending"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(cell)
+        .collect();
+    if !pending.is_empty() {
+        writeln!(
+            out,
+            "warning: recovered after a disaster and not yet stopped on the source cluster: {} — run `orbivisorctl dr fence-source {}` when it is back",
+            pending.join(", "),
+            cell(&r["plan"])
+        )?;
+    }
     let tests: Vec<Vec<String>> = r["tests"]
         .as_array()
         .into_iter()
@@ -772,11 +885,21 @@ async fn run_cmd(
     let plan_path = |p: &str| format!("/dr-plans/{}", seg(p));
     match cmd {
         DrCmd::Plan { cmd } => return plan(client, cmd, json_out, out).await,
-        DrCmd::Test { plan, wait } => {
+        DrCmd::Test {
+            plan,
+            wait,
+            points,
+            allow_routed_test_networks,
+        } => {
+            let mut body = json!({});
+            points.fill(&mut body);
+            if allow_routed_test_networks {
+                body["allow_routed_test_networks"] = json!(true);
+            }
             let a = Action {
                 plan: &plan,
                 name: "test",
-                body: json!({}),
+                body,
                 wait,
             };
             act(client, a, every, json_out, out, err).await?
@@ -786,12 +909,14 @@ async fn run_cmd(
             mode,
             confirm,
             wait,
+            points,
         } => {
             let mode = match mode {
                 FailoverMode::Planned => "planned",
                 FailoverMode::Disaster => "disaster",
             };
-            let body = json!({ "mode": mode, "confirm": confirm });
+            let mut body = json!({ "mode": mode, "confirm": confirm });
+            points.fill(&mut body);
             let a = Action {
                 plan: &plan,
                 name: "failover",
@@ -845,12 +970,13 @@ async fn run_cmd(
             }
         }
         DrCmd::Reprotect(a) => {
-            let mut body = json!({
-                "remote": a.remote,
-                "pool": a.pool,
-                "schedule": { "at": a.at, "days": days_value(&a.days) },
-                "keep": keep_value(&a.keep, &Value::Null),
-            });
+            let mut body = json!({ "remote": a.remote, "pool": a.pool });
+            if let Some(at) = &a.at {
+                body["schedule"] = json!({ "at": at, "days": days_value(&a.days) });
+            }
+            if a.keep.given() {
+                body["keep"] = keep_value(&a.keep, &Value::Null);
+            }
             if let Some(p) = &a.backup_pool {
                 body["backup_pool"] = json!(p);
             }
@@ -868,6 +994,35 @@ async fn run_cmd(
                 a.remote,
                 a.pool
             )?;
+        }
+        DrCmd::FenceSource { plan } => {
+            let r = client
+                .post(
+                    &format!("{}/actions/fence-source", plan_path(&plan)),
+                    &json!({}),
+                )
+                .await?;
+            if json_out {
+                return Ok(print_json(out, &r)?);
+            }
+            for v in r["results"].as_array().into_iter().flatten() {
+                let what = match (v["ok"] == json!(true), v["error"].as_str()) {
+                    (true, None) => "stopped".to_string(),
+                    (true, Some(e)) => e.to_string(),
+                    (false, e) => format!("not stopped: {}", e.unwrap_or("failed")),
+                };
+                writeln!(out, "{}: {what}", cell(&v["vm"]))?;
+            }
+            let pending: Vec<String> = r["pending"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(cell)
+                .collect();
+            if !pending.is_empty() {
+                writeln!(out, "still to fence: {}", pending.join(", "))?;
+                anyhow::bail!("some VMs are not stopped on the source cluster");
+            }
         }
     }
     Ok(())
@@ -1053,7 +1208,8 @@ mod tests {
             .is_ok()
         );
         // reprotect는 원격·풀·시각
-        assert!(parse(&["reprotect", "p", "--remote", "prod", "--pool", "b"]).is_err());
+        // 시각은 이미 있는 작업이면 생략해도 된다(서버가 그대로 둔다).
+        assert!(parse(&["reprotect", "p", "--remote", "prod", "--pool", "b"]).is_ok());
         assert!(
             parse(&[
                 "reprotect",
@@ -1379,7 +1535,26 @@ mod tests {
         let (r, out, _) = exec(&client, &["cancel", "web"], false).await;
         r.unwrap();
         assert_eq!(out, "dr-run web-test-1: cancel requested\n");
+        let args = [
+            "failover",
+            "web",
+            "--mode",
+            "disaster",
+            "--confirm",
+            "web",
+            "--allow-missing",
+            "--point-in-time",
+            "2026-11-01T00:00:00Z",
+        ];
+        exec(&client, &args, false).await.0.unwrap();
+        let args = ["test", "web", "--allow-routed-test-networks"];
+        exec(&client, &args, false).await.0.unwrap();
         let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[4].body,
+            json!({ "mode": "disaster", "confirm": "web", "allow_missing": true, "point_in_time": 1_793_491_200u64 })
+        );
+        assert_eq!(seen[5].body, json!({ "allow_routed_test_networks": true }));
         assert_eq!(
             seen[0].body,
             json!({ "mode": "disaster", "confirm": "web" })
@@ -1462,8 +1637,8 @@ mod tests {
              web3  -       -                     -    no recovery point\n\
              \n\
              tests:\n\
-             RUN         STATE    STARTED               RTO  FAILED\n\
-             web-test-1  partial  1970-01-01 00:00 UTC  5m   web3\n\
+             RUN         STATE    STARTED               RTO   FAILED\n\
+             web-test-1  partial  1970-01-01 00:00 UTC  >=5m  web3\n\
              last failover: web-failover-9 (failover-disaster) succeeded, RTO 66m\n"
         );
     }

@@ -2937,7 +2937,7 @@ pub(crate) struct KeepArgs {
 }
 
 impl KeepArgs {
-    fn given(&self) -> bool {
+    pub(crate) fn given(&self) -> bool {
         self.keep_last.is_some()
             || self.keep_daily.is_some()
             || self.keep_weekly.is_some()
@@ -4032,13 +4032,14 @@ enum SettingsCmd {
     /// `voters`(투표 멤버 상한 3|5|7, 위트니스도 센다), `shutdown_policy`(호스트가 꺼질 때 HA VM:
     /// conditional|freeze|failover|migrate), `ha_reserve`(HA 복구 자리로 비워 둘 용량:
     /// none|nodes:N|percent:P), `ha_start_concurrency`(HA 복구 때 대상 노드당 동시 시작 수 1~32, 기본 4),
+    /// `dr_max_parallel`(DR 실행 하나의 동시 복원·시작 수 1~32, 기본 4 — 새 실행부터),
     /// `cpu.baseline`(클러스터 CPU 기준 off|auto), `cpu.pinned`(아키텍처마다 고정 기준 `x86_64:Haswell-v4,-hle`, `;`로 여럿,
     /// 비우면 없음), `cpu.auto_flags`(true|false), `cpu.mask`(모든 VM에서 숨길 플래그, 쉼표로 여럿, 비우면 없음 — 다음 전원
     /// 껐다 켜기부터), `cpu.force=true`(고정 기준을 켤 수 없는 노드가 있어도)
     Set {
         /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`,
         /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`, `shutdown_policy=migrate`,
-        /// `ha_reserve=nodes:1`, `ha_start_concurrency=8`
+        /// `ha_reserve=nodes:1`, `ha_start_concurrency=8`, `dr_max_parallel=8`
         #[arg(required = true, value_name = "KEY=VALUE")]
         values: Vec<String>,
     },
@@ -4053,6 +4054,7 @@ const SETTING_KEYS: &[&str] = &[
     "shutdown_policy",
     "ha_reserve",
     "ha_start_concurrency",
+    "dr_max_parallel",
     "two_factor",
     "two_factor.roles",
     "two_factor.realms",
@@ -4141,6 +4143,12 @@ fn settings_set_body(values: &[String], current_two_factor: &Value) -> anyhow::R
                     anyhow::anyhow!("ha_start_concurrency must be a number 1-32 (got {v:?})")
                 })?;
                 body["ha_start_concurrency"] = json!(n);
+            }
+            "dr_max_parallel" => {
+                let n: u8 = v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("dr_max_parallel must be a number 1-32 (got {v:?})")
+                })?;
+                body["dr_max_parallel"] = json!(n);
             }
             "two_factor" => match v.trim() {
                 "off" => body["two_factor"] = json!({}),
@@ -17070,6 +17078,11 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             json!({ "voters": 3 })
         );
         assert_eq!(
+            settings_set_body(&["dr_max_parallel=8".into()], &Value::Null).unwrap(),
+            json!({ "dr_max_parallel": 8 })
+        );
+        assert!(settings_set_body(&["dr_max_parallel=many".into()], &Value::Null).is_err());
+        assert_eq!(
             settings_set_body(&["shutdown_policy=migrate".into()], &Value::Null).unwrap(),
             json!({ "shutdown_policy": "migrate" })
         );
@@ -17112,7 +17125,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         let err = settings_set_body(&["updates.mirror=x".into()], &Value::Null).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, two_factor, two_factor.roles, two_factor.realms, two_factor.rp_id, cpu.baseline, cpu.pinned, cpu.auto_flags, cpu.mask, cpu.force"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, dr_max_parallel, two_factor, two_factor.roles, two_factor.realms, two_factor.rp_id, cpu.baseline, cpu.pinned, cpu.auto_flags, cpu.mask, cpu.force"
         );
         let err = settings_set_body(&["updates.channel".into()], &Value::Null).unwrap_err();
         assert_eq!(

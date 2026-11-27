@@ -291,7 +291,7 @@ fn parse_minutes(s: &str) -> Result<u32, String> {
 }
 
 /// RFC 3339 → 유닉스 초
-fn parse_time(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_time(s: &str) -> Result<u64, String> {
     let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .map_err(|e| {
             format!("invalid time {s:?}: {e} (use RFC 3339, e.g. 2026-12-01T02:00:00Z)")
