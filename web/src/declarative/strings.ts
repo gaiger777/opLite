@@ -29,7 +29,7 @@ export async function loadDeclarativeStrings(): Promise<void> {
 
 /** 인증서 보기 문구(`certs.*`) */
 export async function loadCertStrings(): Promise<void> {
-  await add("certs.pageHint", () =>
+  await add("certs.certificates", () =>
     Promise.all([import("@/certs/i18n/en.json"), import("@/certs/i18n/ko.json")]),
   );
 }
