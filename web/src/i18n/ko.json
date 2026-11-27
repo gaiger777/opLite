@@ -950,7 +950,8 @@
     },
     "addresses": "주소",
     "createFirst": "첫 VM 만들기",
-    "fromTemplate": "템플릿에서 빠르게"
+    "fromTemplate": "템플릿에서 빠르게",
+    "createVm": "VM 만들기"
   },
   "snapshots": {
     "created": "만든 시각",

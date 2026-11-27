@@ -24,10 +24,10 @@ async function signIn(page: Page) {
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
 }
 
-/** 가상 머신 › 모든 VM의 "만들기" → 용도 카드 "빈 VM"(늦게 읽는 조각) */
+/** 가상 머신 › 모든 VM의 "VM 만들기" → 용도 카드 "빈 VM"(늦게 읽는 조각) */
 async function openCreate(page: Page) {
   await openItem(page, "Virtual machines", "All VMs");
-  await page.getByRole("link", { name: "Create", exact: true }).click();
+  await page.getByRole("link", { name: "Create VM", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "What will this VM run?" })).toBeVisible();
   await page.getByRole("button", { name: /^Blank VM/ }).click();

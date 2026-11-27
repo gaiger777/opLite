@@ -211,7 +211,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(root.getByRole("cell", { name: "qcow2", exact: true })).toBeVisible();
 
   await openItem(page, "Virtual machines", "All VMs");
-  await page.getByRole("link", { name: "Create", exact: true }).click();
+  await page.getByRole("link", { name: "Create VM", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   // VM 만들기 한 화면(계획 77-5): 용도 카드 "빈 VM" → 그림에 이름·메모리(살피기 칸)·올린 볼륨 root(부품을 누르면 디스크 칸에 붙음)
   await page.getByRole("button", { name: /^Blank VM/ }).click();

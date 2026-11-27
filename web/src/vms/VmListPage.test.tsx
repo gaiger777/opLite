@@ -342,7 +342,7 @@ it("hides changes from viewers", async () => {
   mockLists({ vm: [web], node: [NODE] });
   renderPage(<VmListPage />, { as: { user: "u", name: "v", role: "viewer" } });
   await screen.findByRole("link", { name: "web" });
-  expect(screen.queryByRole("link", { name: "Create" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Create VM" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Actions for web" })).not.toBeInTheDocument();
   expect(screen.queryByRole("checkbox", { name: "Select web" })).not.toBeInTheDocument();
 });
@@ -679,4 +679,33 @@ it("offers to create the first VM when there is none", async () => {
     "/templates",
   );
   expect(screen.getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});
+
+it("splits a long list into pages of 50 and shows each VM's address (plan 77-6)", async () => {
+  const many = Array.from({ length: 131 }, (_, i) =>
+    vm(`vm-${String(i).padStart(3, "0")}`, i % 2 ? "stopped" : "running"),
+  );
+  const fixed = {
+    ...many[0]!,
+    spec: {
+      ...many[0]!.spec,
+      cloud_init: {
+        networks: [{ ipv4: { mode: "static", address: "10.0.0.5/24" } }],
+      },
+    },
+  } as (typeof many)[number];
+  mockLists({ vm: [fixed, ...many.slice(1)], node: [NODE] });
+  const { container } = renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "vm-000" });
+  const table = screen.getByRole("table", { name: "Virtual machines" });
+  expect(within(table).getAllByRole("row")).toHaveLength(51);
+  expect(screen.getByRole("navigation", { name: "Pages" })).toHaveTextContent("1–50 of 131");
+  expect(within(rowOf("vm-000")).getByText("10.0.0.5")).toBeInTheDocument();
+  expect(screen.getByRole("columnheader", { name: /Addresses/ })).toBeInTheDocument();
+  // 머리줄의 "만들기 ▾"와 겹치지 않게 이 화면의 단추는 "VM 만들기"
+  expect(screen.getByRole("link", { name: "Create VM" })).toHaveAttribute("href", "/vms/-new");
+  await userEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(await screen.findByRole("link", { name: "vm-050" })).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "vm-000" })).not.toBeInTheDocument();
+  await expectNoAxeViolations(container);
 });

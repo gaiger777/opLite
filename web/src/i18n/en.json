@@ -950,7 +950,8 @@
     },
     "addresses": "Addresses",
     "createFirst": "Create your first VM",
-    "fromTemplate": "Quick start from a template"
+    "fromTemplate": "Quick start from a template",
+    "createVm": "Create VM"
   },
   "snapshots": {
     "created": "Created",

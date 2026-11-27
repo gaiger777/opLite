@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Monitor, Plus } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -24,6 +24,7 @@ import { formatMib } from "@/lib/format";
 import { isTemplate } from "@/templates/templates";
 import { type BulkAction, BULK_ACTIONS, BULK_PRIVILEGE, bulkReason, snapshotVms } from "@/vms/bulk";
 import { haEnabled } from "@/vms/ha";
+import { type GuestInfoResponse, guestAddresses } from "@/vms/guest";
 import { VmBulkDialog } from "@/vms/VmBulkDialog";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPeek } from "@/vms/VmPeek";
@@ -35,6 +36,8 @@ export function vcpus(vm: Vm): number {
 }
 
 const PHASES = ["running", "stopped", "failed", "starting", "stopping", "migrating"] as const;
+/** 한 쪽에 보일 VM 수(계획 77-6 — 131행을 한 쪽 5600px로 그리던 것) */
+const PAGE_SIZE = 50;
 /** 주소 쿼리의 거름 키 */
 const KEYS = ["phase", "node", "template", "folder", "cpu"];
 
@@ -58,8 +61,26 @@ export function VmListPage() {
   // VM마다 권한이 다르다(계획 62 폴더·객체 grant). 어딘가에 그 권한이 있으면 단추를 두고 VM마다 센다.
   const allowed = (vm: Vm, privilege: Privilege) => perms.has(privilege, objectTarget("vm", vm));
   const create = perms.anywhere("vm.create");
-  const templatesOnly = state.get("template") === "1";
   const phone = useIsPhone();
+
+  // 게스트 에이전트가 알린 주소는 이미 읽은 것만(VM 상세·팔레트가 읽어 둔 캐시) — 행마다 묻지 않는다.
+  const queryClient = useQueryClient();
+  const guestIps = new Map<string, string[]>();
+  for (const [key, data] of queryClient.getQueriesData<GuestInfoResponse>({
+    queryKey: ["guest"],
+  })) {
+    if (data?.info && typeof key[1] === "string") {
+      guestIps.set(key[1], guestAddresses(data.info));
+    }
+  }
+  const addresses = (vm: Vm): string[] => {
+    const statics = (vm.spec.cloud_init?.networks ?? []).flatMap((net) =>
+      [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
+    );
+    return [
+      ...new Set([...statics, ...(guestIps.get(vm.id) ?? [])].map((a) => a.split("/")[0] ?? a)),
+    ];
+  };
 
   const nodeName = useMemo(() => {
     const names = new Map(nodes.data?.map((n) => [n.id, n.name]));
@@ -120,6 +141,24 @@ export function VmListPage() {
       header: t("common.node"),
       value: (vm) => nodeName(vm.spec.node ?? vm.status.node),
       cell: (vm) => nodeName(vm.spec.node ?? vm.status.node),
+    },
+    // 운영자가 먼저 찾는 주소(진단 §2.2): cloud-init 고정 주소와 이미 읽은 게스트 정보(새로 묻지 않는다)
+    {
+      id: "ip",
+      header: t("vms.addresses"),
+      value: (vm) => addresses(vm)[0] ?? "",
+      cell: (vm) => {
+        const list = addresses(vm);
+        return list.length > 0 ? (
+          <span className="font-mono text-xs" title={list.join(", ")}>
+            {list[0]}
+            {list.length > 1 && ` +${list.length - 1}`}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        );
+      },
+      priority: 2,
     },
     { id: "cpu", header: t("vms.vcpus"), value: vcpus, cell: vcpus, priority: 2 },
     {
@@ -246,10 +285,11 @@ export function VmListPage() {
           <>
             <ViewToggle />
             {create && (
+              // 머리줄의 "만들기 ▾"(모든 것)와 겹치지 않게 이 화면 단추는 무엇을 만드는지 말한다(계획 77-6).
               <Button asChild>
                 <Link to="/vms/-new">
                   <Plus />
-                  {t("common.create")}
+                  {t("vms.createVm")}
                 </Link>
               </Button>
             )}
@@ -301,16 +341,7 @@ export function VmListPage() {
         rowHref={(vm) => `/vms/${encodeURIComponent(vm.name)}`}
         peek={(vm) => <VmPeek vm={vm} nodeName={nodeName} />}
         keys
-        toolbar={
-          <Button
-            variant={templatesOnly ? "secondary" : "outline"}
-            size="sm"
-            aria-pressed={templatesOnly}
-            onClick={() => state.set("template", templatesOnly ? "" : "1")}
-          >
-            {t("vms.templatesOnly")}
-          </Button>
-        }
+        pageSize={PAGE_SIZE}
       />
       {moving && (
         <MoveDialog
