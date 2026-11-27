@@ -1,7 +1,7 @@
 import type uPlot from "uplot";
 
 // 설정(`test/setup.ts`)은 차트를 가짜로 바꾸므로 진짜 모듈에서 풍선 플러그인만 꺼낸다.
-const { tooltipPlugin } =
+const { tooltipPlugin, timeAxisValues } =
   await vi.importActual<typeof import("@/charts/TimeChart")>("@/charts/TimeChart");
 
 /** 플러그인이 쓰는 만큼만 갖춘 uPlot */
@@ -69,4 +69,27 @@ it("hides when the cursor leaves the plot", () => {
   u.cursor.left = -10;
   move();
   expect(tip.style.display).toBe("none");
+});
+
+describe("time axis labels (plan 77-6)", () => {
+  // 2026-11-28 13:40, 13:50 (현지 시각)
+  const at = (h: number, m: number, d = 28) => new Date(2026, 10, d, h, m).getTime() / 1000;
+  const u = {} as uPlot;
+
+  it("uses the screen language's clock and adds the date on the first tick and day changes", () => {
+    const ko = timeAxisValues("ko")(u, [at(13, 40), at(13, 50), at(0, 0, 29)], 0, 50, 600);
+    expect(ko[0]).toMatch(/^오후 1:40\n11월 28일$/);
+    expect(ko[1]).toBe("오후 1:50");
+    expect(ko[2]).toMatch(/\n11월 29일$/);
+    const en = timeAxisValues("en")(u, [at(13, 40), at(13, 50)], 0, 50, 600);
+    expect(en[0]).toMatch(/^1:40\sPM\nNov 28$/);
+    expect(en[1]).toMatch(/^1:50\sPM$/);
+  });
+
+  it("shows only dates for day-long steps", () => {
+    expect(timeAxisValues("en")(u, [at(0, 0), at(0, 0, 29)], 0, 50, 86_400)).toEqual([
+      "Nov 28",
+      "Nov 29",
+    ]);
+  });
 });

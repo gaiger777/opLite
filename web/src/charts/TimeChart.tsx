@@ -58,9 +58,32 @@ function options(
     plugins: [tooltipPlugin(mains, unit)],
     scales: { y: { range: (_u, _min, max) => [0, max > 0 ? max * 1.1 : 1] } },
     axes: [
-      axis,
+      { ...axis, values: timeAxisValues(document.documentElement.lang || "en") },
       { ...axis, size: 72, values: (_u, splits) => splits.map((v) => formatValue(v, unit)) },
     ],
+  };
+}
+
+/**
+ * x축 눈금 글(계획 77-6): 화면 언어의 시각 형식(ko "오후 1:40", en "1:40 PM" — 12/24시간은 그 언어의 관례). uPlot 기본은 언어와
+ * 상관없이 "1:40pm"이다. 하루 넘는 간격이면 날짜만, 아니면 시각이고 첫 눈금과 날이 바뀐 눈금에는 날짜를 둘째 줄에 더한다.
+ * `splits`는 초다.
+ */
+export function timeAxisValues(language: string) {
+  const time = new Intl.DateTimeFormat(language, { hour: "numeric", minute: "2-digit" });
+  const day = new Intl.DateTimeFormat(language, { month: "short", day: "numeric" });
+  return (_u: uPlot, splits: number[], _axis: number, _space: number, incr: number): string[] => {
+    let prev: string | null = null;
+    return splits.map((split) => {
+      const date = new Date(split * 1000);
+      const today = day.format(date);
+      if (incr >= 86_400) {
+        return today;
+      }
+      const text = prev === today ? time.format(date) : `${time.format(date)}\n${today}`;
+      prev = today;
+      return text;
+    });
   };
 }
 

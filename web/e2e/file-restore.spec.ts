@@ -29,7 +29,9 @@ test("browses a backup, downloads a file and a folder, and closes the session", 
 }) => {
   await signIn(page);
   await openItem(page, "Backup & recovery", "Backups");
-  await page.getByRole("link", { name: `Browse files of ${backup}` }).click();
+  // 행 동작은 "복원" + ⋯ 메뉴(계획 77-6)
+  await page.getByRole("button", { name: `Actions for ${backup}` }).click();
+  await page.getByRole("menuitem", { name: `Browse files of ${backup}` }).click();
   await expect(page).toHaveURL(/\/backups\/[^/]+\/files$/);
   await expect(page.getByRole("heading", { name: `Files in ${backup}` })).toBeVisible();
   // 도우미 VM이 뜨면(TCG면 1분까지) 준비됨

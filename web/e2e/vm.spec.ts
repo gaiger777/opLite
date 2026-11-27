@@ -465,7 +465,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("No storage pools.")).toBeVisible();
 
   // 계획 63: 노드 상세의 CPU 모델(노드가 자기 QEMU에 물어 알린 것)과 설정 › 일반의 클러스터 CPU 기준
-  await page.goto("/nodes/node1");
+  await page.goto("/nodes/node1?tab=hardware");
   const cpu = page.getByRole("region", { name: "CPU models" });
   await expect(cpu.getByText("QEMU", { exact: true })).toBeVisible();
   await expect(cpu.getByRole("button", { name: "Re-read CPU models" })).toBeEnabled();
