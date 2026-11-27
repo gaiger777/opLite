@@ -73,6 +73,8 @@ export function report(extra: Partial<DrReport> = {}): DrReport {
     protected: 2,
     total: 3,
     protection: plan().status.protection!,
+    failover_readiness: [],
+    leftovers: { run: RUN_ID },
     tests: [
       {
         id: RUN_ID,

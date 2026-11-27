@@ -1611,8 +1611,9 @@ export interface paths {
         put: operations["update_plan"];
         post?: never;
         /**
-         * 계획과 그 실행 기록을 지운다. 도는 실행이 있으면 409 `dr_run_active`(취소하고 끝나기를 기다린다). 실행이 만든 VM·
-         *     네트워크는 그대로 둔다.
+         * 계획과 그 실행 기록을 지운다. 도는 실행이 있으면 409 `dr_run_active`(취소하고 끝나기를 기다린다), 지난 시험이 남긴 VM·
+         *     거품 네트워크가 있으면 409 `dr_cleanup_required`(먼저 `cleanup` — 기록을 지우면 다시 찾지 못한다). 장애 조치로 만든 VM은
+         *     그대로 둔다.
          */
         delete: operations["delete_plan"];
         options?: never;
@@ -1670,11 +1671,38 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 실제 장애 조치를 시작한다(설계 §3.2). `confirm`이 계획 이름과 다르면 400 `dr_confirm_mismatch`. `planned`는 운영 쪽에
-         *     닿아야 한다(409 `dr_source_unreachable`). 도는 실행이 있으면 409 `dr_run_active`, 원격이 없으면 409
-         *     `dr_source_missing`.
+         * 실제 장애 조치를 시작한다(설계 §3.2). `confirm`이 계획 이름과 다르면 400 `dr_confirm_mismatch`. 원격이 없으면 409
+         *     `dr_source_missing`. 도는 시험은 끊고(곧 `cancelled`, 그 뒷정리는 장애 조치가 끝난 뒤 — 실행의 `preempted_test`) 다른
+         *     실행이 돌면 409 `dr_run_active`.
+         *     - `planned`는 운영 쪽에 닿아야 하고(409 `dr_source_unreachable`) 사전 검사를 모두 지나야 한다(409
+         *       `dr_planned_preflight`, `details.problems` — 아무것도 끄지 않는다).
+         *     - `disaster`는 복구 지점이 없는 VM이 있으면 400 `dr_missing_recovery_points`(`allow_missing`이면 그 VM `skipped`),
+         *       `point_in_time`이면 그 시각 이전의 가장 새 복구 지점.
          */
         post: operations["failover_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dr-plans/{key}/actions/fence-source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 재해 장애 조치 뒤 돌아온 운영 쪽을 막는다(리뷰 1, split-brain): 계획 `status.source_fence_pending`의 VM(이곳에 되살린
+         *     것)을 운영 쪽에서 강제로 끄고 원하는 상태를 `stopped`로 둔다(`POST /vms/{vm}/actions/stop?mode=force` — 노드가 돌아와도
+         *     다시 켜지 않는다). 멈춘 VM(운영 쪽에 없는 것 포함)은 목록에서 뺀다. 자동으로는 하지 않는다(경보 `dr_source_returned`).
+         *     사전 검사: 목록이 비면 409 `dr_nothing_to_fence`, 운영 쪽에 닿지 않으면 409 `dr_source_unreachable`, 토큰이 VM을 끌 수
+         *     없으면(viewer) 409 `dr_fence_preflight`.
+         */
+        post: operations["fence_source"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1715,7 +1743,10 @@ export interface paths {
          * 시험 장애 조치를 시작한다(설계 §3.2): 운영 쪽을 건드리지 않고 시험 VM(`<vm>-drt`, 폴더 `dr-test/<plan>`)을 격리망
          *     (`test_networks` 맵, 없는 원본 네트워크는 거품 SDN 네트워크)에서 되살린다. 도는 실행이 있으면 409 `dr_run_active`,
          *     지난 시험의 VM·네트워크가 남았으면 409 `dr_cleanup_required`(먼저 `cleanup`), 원격이 없으면 409 `dr_source_missing`,
-         *     거품 네트워크가 필요한데 SDN이 세워지지 않았으면 400 `dr_test_network_required`.
+         *     거품 네트워크가 필요한데 SDN이 세워지지 않았으면 400 `dr_test_network_required`, 시험망이 밖과 닿을 수 있으면 400
+         *     `dr_test_network_not_isolated`(`allow_routed_test_networks`), 복구 지점이 없는 VM이 있으면 400
+         *     `dr_missing_recovery_points`(`allow_missing`). 실행의 `failover_readiness`에 장애 조치 준비(네트워크 맵·보안 그룹·풀·
+         *     노드·복구 지점)를 적는다.
          */
         post: operations["test_plan"];
         delete?: never;
@@ -5684,6 +5715,10 @@ export interface components {
             /** @enum {string} */
             kind: "dr_run_failed";
             plans?: string[];
+        } | {
+            /** @enum {string} */
+            kind: "dr_source_returned";
+            plans?: string[];
         };
         /**
          * @description 비교
@@ -7717,6 +7752,11 @@ export interface components {
                 };
                 /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
                 source: string;
+                /**
+                 * @description 계획된 이전: 운영 쪽에 그 VM의 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 백업 풀(VM마다 덮어씀). 지난 백업이
+                 *     있으면 그 백업의 풀·저장소를 쓴다.
+                 */
+                source_backup_pool?: string;
                 /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
                 test_networks?: {
                     [key: string]: string;
@@ -8095,6 +8135,8 @@ export interface components {
              * @description 시험 실행 id
              */
             run: string;
+            /** @description `vms`와 같은 차례의 VM id(시험 실행이 만든 VM — 뒷정리는 id와 시험 라벨이 둘 다 맞는 VM만 지운다) */
+            vm_ids?: string[];
             vms?: string[];
         };
         /** @description 부팅 그룹 하나. 그룹 안의 VM은 함께 되살리고, 모두 끝나면(`ready`·`failed`·`timed_out`) `delay_secs` 뒤 다음 그룹이다. */
@@ -8139,11 +8181,25 @@ export interface components {
              * @description 지금 단계의 원격 부름을 보낸 시각
              */
             requested_at?: number;
+            /**
+             * Format: int64
+             * @description 운영 쪽 VM을 다시 켜는 부름을 처음 보낸 시각
+             */
+            restart_at?: number;
+            /** @description 다시 켜기가 끝남(켬·포기) */
+            restarted?: boolean;
             /** @description 운영 쪽에 뜬 마지막 백업 */
             source_backup?: string;
             /** Format: uuid */
             source_backup_id?: string;
             stage: components["schemas"]["PrepareStage"];
+            /**
+             * Format: int64
+             * @description 지금 단계에 든 시각(shutdown을 처음 보낸 때, 백업을 시작한 때 — 단계 상한을 센다)
+             */
+            stage_at?: number;
+            /** @description 이 실행이 운영 쪽 VM에 shutdown·stop을 보냈다(되살리지 못하면 다시 켠다) */
+            stopped?: boolean;
         };
         /** @description `GET /dr-plans/{key}/report`(설계 §3.5) */
         DrReport: {
@@ -8152,8 +8208,12 @@ export interface components {
              * @description 보고를 센 시각(유닉스 초) — 아래 나이는 이때의 것이다.
              */
             at: number;
+            /** @description VM마다의 장애 조치 준비(지금 셈 — 네트워크 맵·보안 그룹 대상, 풀, 노드, 복구 지점이 이 클러스터에 있는지) */
+            failover_readiness: components["schemas"]["VmReadiness"][];
             /** @description 마지막으로 끝난 장애 조치 */
             last_failover?: components["schemas"]["DrRunSummary"];
+            /** @description 지난 시험이 남긴 것(뒷정리가 지울 시험 VM·거품 네트워크 — `cleanup`이 받는 것과 같다) */
+            leftovers: components["schemas"]["DrCleanupTarget"];
             plan: string;
             /** Format: uuid */
             plan_id: string;
@@ -8166,6 +8226,8 @@ export interface components {
             running?: components["schemas"]["DrRunSummary"];
             /** @description 운영 클러스터(원격 이름) */
             source: string;
+            /** @description 재해 장애 조치 뒤 운영 쪽에서 아직 멈추지 않은 VM(계획 `status.source_fence_pending`) */
+            source_fence_pending?: string[];
             /** @description 원격이 등록돼 있는지(없으면 모든 VM이 복구 지점 없음) */
             source_registered: boolean;
             /** @description 최근 끝난 시험(새것부터 셋까지) */
@@ -8177,6 +8239,8 @@ export interface components {
         DrRunKind: "test" | "failover-planned" | "failover-disaster" | "cleanup";
         /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
         DrRunSpec: {
+            /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`) */
+            allow_missing?: boolean;
             /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
             cleanup?: components["schemas"]["DrCleanupTarget"];
             kind: components["schemas"]["DrRunKind"];
@@ -8195,6 +8259,11 @@ export interface components {
             plan_name: string;
             /** @description 시작한 때의 계획(실행 중에 계획을 바꿔도 이 실행은 그대로 간다) */
             plan_spec: components["schemas"]["RecoveryPlanSpec"];
+            /**
+             * Format: int64
+             * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
+             */
+            point_in_time?: number;
         };
         /** @enum {string} */
         DrRunState: "running" | "succeeded" | "partial" | "failed" | "cancelled";
@@ -8209,6 +8278,11 @@ export interface components {
             delay_until?: number;
             /** @description 실행 전체의 실패 까닭(거품 네트워크 등) */
             error?: string;
+            /**
+             * @description 시험 실행: 시작할 때 본 장애 조치 준비(VM마다 — 시험은 거품·시험망으로 가므로 장애 조치의 네트워크 맵·보안 그룹·
+             *     풀·노드·복구 지점은 따로 본다). 문제가 있어도 시험 결과는 그대로다.
+             */
+            failover_readiness?: components["schemas"]["VmReadiness"][];
             /** Format: int64 */
             finished_at?: number;
             /**
@@ -8216,11 +8290,23 @@ export interface components {
              * @description 지금 그룹 순번
              */
             group?: number;
+            /** @description 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤) */
+            preempted?: boolean;
+            /**
+             * Format: uuid
+             * @description 장애 조치 실행: 시작하며 끊은 시험 실행
+             */
+            preempted_test?: string;
             /**
              * Format: int64
              * @description 계획된 이전: 시작부터 운영 쪽 정지·마지막 복제가 끝날 때까지(초, RTO에 든다)
              */
             prepare_secs?: number;
+            /**
+             * Format: int64
+             * @description 마지막으로 나아간 시각(단계·그룹·거품이 바뀐 때, 유닉스 초). [`STALL_SECS`] 넘게 그대로면 경보가 "stalled"로 알린다.
+             */
+            progress_at?: number;
             /**
              * Format: int64
              * @description 시작부터 마지막 `ready`까지(초). `ready`가 없으면 없다.
@@ -8268,23 +8354,46 @@ export interface components {
             backup?: string;
             /** Format: uuid */
             backup_id?: string;
+            /**
+             * Format: uuid
+             * @description 라이브 복원: VM이 켜진 뒤에도 디스크를 옮기는 복원 Task(끝나면 비움 — 실패하면 `notes`에 경고)
+             */
+            copy_task?: string;
             error?: string;
+            /** @description `failed`·`timed_out`이면 그때 있던 단계(`preparing`·`restoring`·`starting`·`waiting` — 처음부터 실패면 없음) */
+            failed_in?: components["schemas"]["DrPhase"];
             /** @description 그룹 이름(뒷정리는 비움) */
             group?: string;
+            /** @description 다시 해 보는 중인 마지막 일시 오류(운영 쪽에 닿지 않음 등). 나아가면 비운다. */
+            last_error?: string;
             /** @description 되살린(뒷정리는 지울) VM 이름 */
             new_vm?: string;
             /** @description 복원·시작하는 노드(계획의 `node`, 없으면 되살린 VM의 노드를 보고 앎) */
             node?: string;
+            /** @description 경고·되돌림 기록(다른 복구 지점으로 다시 함, 운영 쪽 VM을 다시 켬, 라이브 복원의 복사 실패 등) */
+            notes?: string[];
             phase: components["schemas"]["DrPhase"];
             /** @description 계획된 이전의 운영 쪽 준비 */
             prepare?: components["schemas"]["DrPrepare"];
+            /**
+             * Format: int64
+             * @description `last_error`가 처음 난 시각(유닉스 초)
+             */
+            retrying_since?: number;
             /**
              * Format: uuid
              * @description 지금 단계의 Task(복원·시작·지우기). 있으면 다시 내지 않는다.
              */
             task?: string;
+            /** @description 복원이 실패해 버린 복구 지점(사본 이름, 차례대로) */
+            tried?: string[];
             /** @description 원본 VM 이름(뒷정리는 지울 VM 이름) */
             vm: string;
+            /**
+             * Format: uuid
+             * @description 이 실행이 만든(만드는) VM의 id(복원 Task의 대상). 라벨·뒷정리는 이 id로 본다.
+             */
+            vm_id?: string;
         };
         /** @description 계획의 VM 하나(원본 VM 이름) */
         DrVm: {
@@ -8296,6 +8405,8 @@ export interface components {
             node?: string;
             /** @description 복원 풀. 없으면 계획의 `pool` */
             pool?: string;
+            /** @description 계획된 이전: 계획의 `source_backup_pool`을 이 VM만 덮어씀 */
+            source_backup_pool?: string;
             /** @description 원본 VM 이름(사본의 `vm_name`) */
             vm: string;
         };
@@ -8507,9 +8618,16 @@ export interface components {
         FailoverMode: "planned" | "disaster";
         /** @description `POST /dr-plans/{key}/actions/failover` 본문 */
         FailoverRequest: {
+            /** @description 재해: 복구 지점이 없는 VM을 `skipped`로 두고 진행(없으면 400 `dr_missing_recovery_points`) */
+            allow_missing?: boolean;
             /** @description 계획 이름(실수로 누르지 않게 그대로 다시 친다) */
             confirm: string;
             mode: components["schemas"]["FailoverMode"];
+            /**
+             * Format: int64
+             * @description 재해: 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로(랜섬웨어·논리 손상이 복제된 경우)
+             */
+            point_in_time?: number;
         };
         /**
          * @description 장애의 무게
@@ -8562,6 +8680,20 @@ export interface components {
             /** @enum {string} */
             kind: "command";
         });
+        /** @description `POST /dr-plans/{key}/actions/fence-source` 응답 */
+        FenceResponse: {
+            /** @description 아직 멈추지 못한 VM(계획 `status.source_fence_pending`) */
+            pending: string[];
+            results: components["schemas"]["FenceResult"][];
+        };
+        /** @description fence-source 결과(VM 하나) */
+        FenceResult: {
+            error?: string;
+            /** @description 멈춤(강제 stop을 받았거나 운영 쪽에 없음) */
+            ok: boolean;
+            /** @description 운영 쪽 VM 이름 */
+            vm: string;
+        };
         /** @description `fence-test`의 결과 */
         FenceTestResult: {
             /** @description 전원을 읽은 노드의 이름(시험하는 노드 자신이면 이웃) */
@@ -10142,6 +10274,12 @@ export interface components {
              * @description 끝난 시각(유닉스 초)
              */
             at: number;
+            /**
+             * Format: int32
+             * @description 그 시험이 본 장애 조치 준비 문제가 있는 VM 수(시험 실행의 `failover_readiness`) — 시험이 성공해도 실제 장애 조치는
+             *     그 VM에서 실패할 수 있다.
+             */
+            readiness_issues?: number;
             result: components["schemas"]["DrRunState"];
             /** Format: int64 */
             rto_secs?: number;
@@ -10955,6 +11093,8 @@ export interface components {
                 revision: number;
                 /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
                 spec: {
+                    /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`) */
+                    allow_missing?: boolean;
                     /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
                     cleanup?: components["schemas"]["DrCleanupTarget"];
                     kind: components["schemas"]["DrRunKind"];
@@ -10973,6 +11113,11 @@ export interface components {
                     plan_name: string;
                     /** @description 시작한 때의 계획(실행 중에 계획을 바꿔도 이 실행은 그대로 간다) */
                     plan_spec: components["schemas"]["RecoveryPlanSpec"];
+                    /**
+                     * Format: int64
+                     * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
+                     */
+                    point_in_time?: number;
                 };
                 status: {
                     bubbles?: components["schemas"]["DrBubble"][];
@@ -10985,6 +11130,11 @@ export interface components {
                     delay_until?: number;
                     /** @description 실행 전체의 실패 까닭(거품 네트워크 등) */
                     error?: string;
+                    /**
+                     * @description 시험 실행: 시작할 때 본 장애 조치 준비(VM마다 — 시험은 거품·시험망으로 가므로 장애 조치의 네트워크 맵·보안 그룹·
+                     *     풀·노드·복구 지점은 따로 본다). 문제가 있어도 시험 결과는 그대로다.
+                     */
+                    failover_readiness?: components["schemas"]["VmReadiness"][];
                     /** Format: int64 */
                     finished_at?: number;
                     /**
@@ -10992,11 +11142,23 @@ export interface components {
                      * @description 지금 그룹 순번
                      */
                     group?: number;
+                    /** @description 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤) */
+                    preempted?: boolean;
+                    /**
+                     * Format: uuid
+                     * @description 장애 조치 실행: 시작하며 끊은 시험 실행
+                     */
+                    preempted_test?: string;
                     /**
                      * Format: int64
                      * @description 계획된 이전: 시작부터 운영 쪽 정지·마지막 복제가 끝날 때까지(초, RTO에 든다)
                      */
                     prepare_secs?: number;
+                    /**
+                     * Format: int64
+                     * @description 마지막으로 나아간 시각(단계·그룹·거품이 바뀐 때, 유닉스 초). [`STALL_SECS`] 넘게 그대로면 경보가 "stalled"로 알린다.
+                     */
+                    progress_at?: number;
                     /**
                      * Format: int64
                      * @description 시작부터 마지막 `ready`까지(초). `ready`가 없으면 없다.
@@ -11479,6 +11641,11 @@ export interface components {
                     };
                     /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
                     source: string;
+                    /**
+                     * @description 계획된 이전: 운영 쪽에 그 VM의 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 백업 풀(VM마다 덮어씀). 지난 백업이
+                     *     있으면 그 백업의 풀·저장소를 쓴다.
+                     */
+                    source_backup_pool?: string;
                     /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
                     test_networks?: {
                         [key: string]: string;
@@ -11499,6 +11666,11 @@ export interface components {
                      * @description 지금 실행(`DrRun` id)
                      */
                     run?: string;
+                    /**
+                     * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+                     *     `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+                     */
+                    source_fence_pending?: string[];
                 };
             }[];
             /** Format: int64 */
@@ -14681,7 +14853,7 @@ export interface components {
         /** @enum {string} */
         PropagationCheck: "authoritative" | "skip";
         /** @enum {string} */
-        ProtectionIssue: "no-recovery-point" | "over-rpo";
+        ProtectionIssue: "no-recovery-point" | "over-rpo" | "verify-failed";
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         /** @description 공급자 네트워크가 붙는 물리 망(계획 66 §8) */
@@ -14724,6 +14896,13 @@ export interface components {
          * @enum {string}
          */
         RailState: "up" | "degraded" | "down" | "absent" | "unknown";
+        /** @description 장애 조치 준비 문제 하나: `kind`의 `name`이 이 클러스터에 없다(복구 지점은 `name` 없음). */
+        ReadinessIssue: {
+            kind: components["schemas"]["ReadinessKind"];
+            name?: string;
+        };
+        /** @enum {string} */
+        ReadinessKind: "recovery-point" | "network" | "security-group" | "pool" | "node";
         /** @description 영역이 사용자를 확인하는 방법 */
         RealmBackend: (components["schemas"]["LdapRealm"] & {
             /** @enum {string} */
@@ -14869,6 +15048,11 @@ export interface components {
             };
             /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
             source: string;
+            /**
+             * @description 계획된 이전: 운영 쪽에 그 VM의 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 백업 풀(VM마다 덮어씀). 지난 백업이
+             *     있으면 그 백업의 풀·저장소를 쓴다.
+             */
+            source_backup_pool?: string;
             /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
             test_networks?: {
                 [key: string]: string;
@@ -14889,6 +15073,11 @@ export interface components {
              * @description 지금 실행(`DrRun` id)
              */
             run?: string;
+            /**
+             * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+             *     `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+             */
+            source_fence_pending?: string[];
         };
         /** @description Redfish BMC. Basic 인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`로 확인한다. */
         RedfishFence: {
@@ -15149,14 +15338,16 @@ export interface components {
         };
         /** @description `POST /dr-plans/{key}/actions/reprotect` 본문(설계 §3.6) */
         ReprotectRequest: {
-            /** @description 이 클러스터에서 백업을 쓸 백업 풀. 없으면 계획의 `pool`(백업 풀이어야 한다) */
+            /** @description 이 클러스터에서 백업을 쓸 백업 풀. 없으면 이미 있는 작업의 풀, 그것도 없으면 계획의 `pool`(백업 풀이어야 한다) */
             backup_pool?: string;
+            /** @description 보존 규칙. 없으면 이미 있는 작업의 것 그대로(처음이면 모두 둠) */
             keep?: components["schemas"]["Keep"];
             /** @description 그 원격의 백업 풀 */
             pool: string;
             /** @description 복제를 받을 원격(보통 되살아난 운영 클러스터) */
             remote: string;
-            schedule: components["schemas"]["JobSchedule"];
+            /** @description 백업 시각. 작업이 이미 있으면 없어도 된다(그대로) — 처음 만들 때는 있어야 한다(400). */
+            schedule?: components["schemas"]["JobSchedule"];
         };
         /** @description `PublicKeyCredentialRequestOptions`(이진 값은 base64url) */
         RequestOptions: {
@@ -15758,6 +15949,8 @@ export interface components {
             revision: number;
             /** @description 실행 하나(Raft 리소스, 계획마다 최근 [`MAX_RUNS_PER_PLAN`]개). spec은 시작할 때 정하고 바꾸지 않는다. */
             spec: {
+                /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`) */
+                allow_missing?: boolean;
                 /** @description 뒷정리가 지울 것(`cleanup` 실행만) */
                 cleanup?: components["schemas"]["DrCleanupTarget"];
                 kind: components["schemas"]["DrRunKind"];
@@ -15776,6 +15969,11 @@ export interface components {
                 plan_name: string;
                 /** @description 시작한 때의 계획(실행 중에 계획을 바꿔도 이 실행은 그대로 간다) */
                 plan_spec: components["schemas"]["RecoveryPlanSpec"];
+                /**
+                 * Format: int64
+                 * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
+                 */
+                point_in_time?: number;
             };
             status: {
                 bubbles?: components["schemas"]["DrBubble"][];
@@ -15788,6 +15986,11 @@ export interface components {
                 delay_until?: number;
                 /** @description 실행 전체의 실패 까닭(거품 네트워크 등) */
                 error?: string;
+                /**
+                 * @description 시험 실행: 시작할 때 본 장애 조치 준비(VM마다 — 시험은 거품·시험망으로 가므로 장애 조치의 네트워크 맵·보안 그룹·
+                 *     풀·노드·복구 지점은 따로 본다). 문제가 있어도 시험 결과는 그대로다.
+                 */
+                failover_readiness?: components["schemas"]["VmReadiness"][];
                 /** Format: int64 */
                 finished_at?: number;
                 /**
@@ -15795,11 +15998,23 @@ export interface components {
                  * @description 지금 그룹 순번
                  */
                 group?: number;
+                /** @description 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤) */
+                preempted?: boolean;
+                /**
+                 * Format: uuid
+                 * @description 장애 조치 실행: 시작하며 끊은 시험 실행
+                 */
+                preempted_test?: string;
                 /**
                  * Format: int64
                  * @description 계획된 이전: 시작부터 운영 쪽 정지·마지막 복제가 끝날 때까지(초, RTO에 든다)
                  */
                 prepare_secs?: number;
+                /**
+                 * Format: int64
+                 * @description 마지막으로 나아간 시각(단계·그룹·거품이 바뀐 때, 유닉스 초). [`STALL_SECS`] 넘게 그대로면 경보가 "stalled"로 알린다.
+                 */
+                progress_at?: number;
                 /**
                  * Format: int64
                  * @description 시작부터 마지막 `ready`까지(초). `ready`가 없으면 없다.
@@ -16384,6 +16599,11 @@ export interface components {
                 };
                 /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
                 source: string;
+                /**
+                 * @description 계획된 이전: 운영 쪽에 그 VM의 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 백업 풀(VM마다 덮어씀). 지난 백업이
+                 *     있으면 그 백업의 풀·저장소를 쓴다.
+                 */
+                source_backup_pool?: string;
                 /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
                 test_networks?: {
                     [key: string]: string;
@@ -16404,6 +16624,11 @@ export interface components {
                  * @description 지금 실행(`DrRun` id)
                  */
                 run?: string;
+                /**
+                 * @description 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+                 *     `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+                 */
+                source_fence_pending?: string[];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -18957,6 +19182,21 @@ export interface components {
              */
             vcpus: number;
         };
+        /** @description `POST /dr-plans/{key}/actions/test` 본문(없어도 된다) */
+        TestRequest: {
+            /** @description 복구 지점이 없는 VM을 `skipped`로 두고 진행(없으면 400 `dr_missing_recovery_points`) */
+            allow_missing?: boolean;
+            /**
+             * @description `test_networks`가 라우터·업링크가 있는(밖과 닿을 수 있는) 네트워크를 가리켜도 진행(없으면 400
+             *     `dr_test_network_not_isolated`)
+             */
+            allow_routed_test_networks?: boolean;
+            /**
+             * Format: int64
+             * @description 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로
+             */
+            point_in_time?: number;
+        };
         /**
          * @description 전용 VM의 SMT 형제 스레드 정책(OpenStack `hw:cpu_thread_policy`)
          * @enum {string}
@@ -19416,6 +19656,11 @@ export interface components {
                 };
                 /** @description 운영 클러스터(원격 이름). 사본의 `origin`이 이 원격의 CA 지문인 것으로 VM을 맞춘다. */
                 source: string;
+                /**
+                 * @description 계획된 이전: 운영 쪽에 그 VM의 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 백업 풀(VM마다 덮어씀). 지난 백업이
+                 *     있으면 그 백업의 풀·저장소를 쓴다.
+                 */
+                source_backup_pool?: string;
                 /** @description 시험 때 원본 네트워크 → DR 네트워크. 없는 원본 네트워크는 시험 때 거품 SDN 네트워크(`drt-<plan>-<n>`)다. */
                 test_networks?: {
                     [key: string]: string;
@@ -19911,6 +20156,13 @@ export interface components {
              * @description 복구 지점의 시각(원본 백업을 만든 때, 유닉스 초)
              */
             point_at?: number;
+            /** @description 원본 VM 이름 */
+            vm: string;
+        };
+        /** @description 장애 조치 준비(VM 하나): 실제 장애 조치가 지금 그 VM을 되살릴 수 있는지 */
+        VmReadiness: {
+            issues?: components["schemas"]["ReadinessIssue"][];
+            ok: boolean;
             /** @description 원본 VM 이름 */
             vm: string;
         };
@@ -24267,6 +24519,36 @@ export interface operations {
             };
         };
     };
+    fence_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FenceResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     reprotect_plan: {
         parameters: {
             query?: never;
@@ -24319,7 +24601,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TestRequest"] | null;
+            };
+        };
         responses: {
             202: {
                 headers: {
