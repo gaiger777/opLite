@@ -1,12 +1,10 @@
-// 살피기(계획 71 설계 §8.2): 고른 칸의 값을 틀 아래에서 고친다. 계산은 밀대 + 숫자 칸(메모리는 256 MiB 단위·로그
-// 눈금), 디스크·CD·NIC는 그 줄의 칸, cloud-init은 폼의 `CloudInitSection` 그대로, 배치·보호·템플릿 바탕은 몇 칸.
-// 빌더에 없는 칸(스냅샷 예약·복제·NUMA·QoS·펌웨어 세부)은 "폼에서 고치기".
+// 그림 위 카드(계획 71 설계 §8.2 살피기, 계획 77-5): 고른 칸의 값을 그림 위에서 고친다. 계산은 밀대 + 숫자 칸(메모리는
+// 256 MiB 단위·로그 눈금), 디스크·CD·NIC는 그 줄의 칸, cloud-init은 폼의 `CloudInitSection` 그대로, 배치·보호·템플릿 바탕은
+// 몇 칸. 그림에 없는 칸(스냅샷 예약·복제·NUMA·QoS·펌웨어 세부)은 "고급 설정에서 더 고치기".
 import { X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNavigate } from "react-router";
 
-import { usePrincipal } from "@/auth/AuthProvider";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -15,7 +13,6 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { isSdnNetwork } from "@/sdn/ips";
 import { DeployDialog } from "@/templates/DeployDialog";
 import { useBuilder } from "@/vmBuilder/context";
-import { putDraft, writeMode } from "@/vmBuilder/draft";
 import { slotLabel } from "@/vmBuilder/labels";
 import { slotOf } from "@/vmBuilder/model/slots";
 import { renumber } from "@/vmBuilder/model/state";
@@ -122,8 +119,6 @@ function Check({
 export function Inspector() {
   const { t } = useTranslation();
   const b = useBuilder();
-  const navigate = useNavigate();
-  const { user } = usePrincipal();
   const id = b.selected!;
   const slot = slotOf(id);
   const s = b.s;
@@ -473,11 +468,7 @@ export function Inspector() {
           variant="link"
           size="sm"
           className="self-start px-0"
-          onClick={() => {
-            putDraft({ values: v });
-            writeMode(user, "form");
-            void navigate("/vms/-new");
-          }}
+          onClick={b.openAdvanced}
         >
           {i("editInForm")}
         </Button>

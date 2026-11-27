@@ -104,10 +104,9 @@ export const appRoutes: RouteObject[] = [
                 { path: `${path}/:id`, lazy: page(() => import("@/folders/FolderPages"), detail) },
               ]),
               // VM 이름은 `-`로 시작할 수 없으므로 "new"라는 VM과 겹치지 않는다.
-              { path: "vms/-new", lazy: page(() => import("@/vms/VmFormPage"), "VmCreatePage") },
               {
-                path: "vms/-new/builder",
-                // 빌더·끌기 틀 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다(계획 71 §12).
+                // VM 만들기 한 화면(계획 77-5 — 폼과 빌더를 합침). 빌더·끌기 틀 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다.
+                path: "vms/-new",
                 lazy: page(
                   () =>
                     Promise.all([

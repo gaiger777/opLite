@@ -275,16 +275,13 @@ it("opens an item from a rail flyout", async () => {
   await vi.waitFor(() => expect(where(router)).toBe("/volumes"));
 });
 
-it("opens the VM builder as a lazy view of the create page with its strings", async () => {
-  renderApp("/vms/-new/builder");
+it("opens the one create screen lazily with its strings, also from the old builder address", async () => {
+  const router = renderApp("/vms/-new/builder?folder=x");
   expect(
-    await screen.findByRole(
-      "button",
-      { name: "Start with a medium Linux server" },
-      { timeout: 3000 },
-    ),
+    await screen.findByRole("heading", { name: "What will this VM run?" }, { timeout: 3000 }),
   ).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Builder" })).toHaveAttribute("aria-current", "page");
+  expect(router.state.location.pathname).toBe("/vms/-new");
+  expect(router.state.location.search).toBe("?folder=x");
 });
 
 it("opens the cluster map lazily under Overview and keeps [ inside the map", async () => {

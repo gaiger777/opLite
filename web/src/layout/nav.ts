@@ -79,7 +79,7 @@ export const GROUPS: NavGroup[] = [
         folder: { to: "/vm-folders", key: "nav.vmFolders" },
       },
       one("templates", "nav.templates", { to: "/templates" }),
-      // `/vms/-new/builder`도 이 항목이다(가장 긴 접두사).
+      // 옛 `/vms/-new/builder`(지금은 넘김)도 이 항목이다(가장 긴 접두사).
       {
         ...one("create", "nav.item.createVm", { to: "/vms/-new", anywhere: "vm.create" }),
         leaf: true,
@@ -306,6 +306,8 @@ export const LEGACY_REDIRECTS: { from: string; to: string }[] = [
   { from: "/protect", to: "/backups" },
   { from: "/activity", to: "/tasks" },
   { from: "/settings/remotes", to: "/remotes/-manage" },
+  // 계획 71 빌더 보기는 계획 77-5에서 VM 만들기 한 화면이 되었다.
+  { from: "/vms/-new/builder", to: "/vms/-new" },
 ];
 
 /** 사이드바 없이 전체 폭으로 보이는 경로(콘솔) */

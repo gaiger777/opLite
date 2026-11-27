@@ -39,7 +39,7 @@ import { apiUrl, server } from "@/test/server";
 import { emptyForm, toSpec } from "@/vms/form";
 import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDetailPage } from "@/vms/VmDetailPage";
-import { VmCreatePage } from "@/vms/VmFormPage";
+import { BuilderPage } from "@/vmBuilder/BuilderPage";
 import { VmMigrateDialog } from "@/vms/VmMigrateDialog";
 import { pendingFieldLabel } from "@/vms/hotplug";
 
@@ -467,10 +467,12 @@ it("saves CPU placement and NUMA from the VM form and shows where it fits", asyn
       return HttpResponse.json(vm("db", "stopped"), { status: 201 });
     }),
   );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  // 만들기 화면(계획 77-5)의 고급 설정 서랍
+  renderPage(<BuilderPage />, { path: "/vms/-new", url: "/vms/-new?purpose=blank" });
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "db");
-  await user.click(screen.getByText("CPU placement and NUMA"));
+  await user.click(screen.getByRole("button", { name: "Advanced settings" }));
+  await user.click(await screen.findByText("CPU placement and NUMA"));
   // 소켓이 하나면 노드 수는 1뿐이고 그렇다고 말한다.
   expect(screen.getByText(/With one socket the guest has one NUMA node/)).toBeInTheDocument();
   // vCPU 2개를 나눌 수 있는 소켓 수만(리뷰 1 웹 I1)
@@ -490,6 +492,7 @@ it("saves CPU placement and NUMA from the VM form and shows where it fits", asyn
   expect(
     await screen.findByText("Room for this VM's dedicated CPUs and hugepages on: node-a"),
   ).toBeInTheDocument();
+  await user.keyboard("{Escape}");
   await user.click(screen.getByRole("button", { name: "Create" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toMatchObject({
@@ -515,7 +518,12 @@ it("keeps dedicated CPUs and hugepages out of reach without vm.dedicated", async
     ),
   );
   mockLists({ node: [X86] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new", as: { ...ADMIN, role: "operator" } });
+  renderPage(<BuilderPage />, {
+    path: "/vms/-new",
+    url: "/vms/-new?purpose=blank",
+    as: { ...ADMIN, role: "operator" },
+  });
+  await userEvent.click(await screen.findByRole("button", { name: "Advanced settings" }));
   await userEvent.click(await screen.findByText("CPU placement and NUMA"));
   await waitFor(() => expect(screen.getByRole("option", { name: "Dedicated" })).toBeDisabled());
   expect(screen.getByRole("option", { name: "2 MiB" })).toBeDisabled();

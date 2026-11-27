@@ -71,8 +71,6 @@
       "dropHere": "Drop here",
       "baseBlank": "Starting point: empty VM",
       "baseTemplate": "Starting point: template {{name}} (deployed as a copy)",
-      "start": "Drag parts onto the VM, or press a part and then a place.",
-      "quickStart": "Start with a medium Linux server",
       "compute": "{{vcpus}} vCPU · {{memory}} · CPU {{model}}",
       "ciOn": "On",
       "keys": "SSH keys",
@@ -86,11 +84,11 @@
       "undone": "Undone.",
       "created": "Already created: {{names}}. {{error}}",
       "ruleLeft": "Could not delete the placement rule {{name}} left by the last try: {{error}}",
-      "formOnly_one": "Changed in the form: {{count}} field ({{names}}). It is sent as set there.",
-      "formOnly_other": "Changed in the form: {{count}} fields ({{names}}). They are sent as set there.",
-      "formCleared_one": "Cleared {{count}} field changed in the form ({{names}}): a template deployment cannot carry it. Set it after creating.",
-      "formCleared_other": "Cleared {{count}} fields changed in the form ({{names}}): a template deployment cannot carry them. Set them after creating.",
-      "side": "Check and preview",
+      "formOnly_one": "Changed in advanced settings: {{count}} field ({{names}})",
+      "formOnly_other": "Changed in advanced settings: {{count}} fields ({{names}})",
+      "formCleared_one": "Cleared {{count}} field changed in advanced settings ({{names}}): a template deployment cannot carry it. Set it after creating.",
+      "formCleared_other": "Cleared {{count}} fields changed in advanced settings ({{names}}): a template deployment cannot carry them. Set them after creating.",
+      "side": "Summary and checks",
       "creating": "Creating…",
       "blocked": "Cannot create yet: {{reason}}",
       "count": {
@@ -101,7 +99,15 @@
         "nics_one": "{{count}} NIC.",
         "nics_other": "{{count}} NICs."
       },
-      "grip": "Pick up {{name}}"
+      "grip": "Pick up {{name}}",
+      "advanced": "Advanced settings",
+      "code": "View requests (JSON, CLI)",
+      "codeText": "The exact requests Create sends — use them to create the same VM from a script or the CLI.",
+      "partsHint": "Press a part to attach it to the VM, or drag it onto a slot.",
+      "fewer": "Show fewer",
+      "morePartsN_one": "{{count}} more",
+      "morePartsN_other": "{{count}} more",
+      "inspectSlot": "Edit {{slot}}"
     },
     "group": {
       "size": "Size",
@@ -179,11 +185,11 @@
       "problems_other": "{{name}}, {{count}} problems"
     },
     "empty": {
-      "disks": "Drop a pool or a volume here.",
-      "cdroms": "Drop an ISO here.",
-      "nics": "Drop a network here.",
-      "cloudInit": "Drop a first-boot setup snippet here.",
-      "protection": "Drop HA here.",
+      "disks": "Press + or drop a pool or volume here.",
+      "cdroms": "Press an ISO or drop it here.",
+      "nics": "Press + or drop a network here.",
+      "cloudInit": "Press a snippet such as the user and SSH keys to turn it on.",
+      "protection": "Press high availability (HA) to turn it on.",
       "trash": "Drop a block here to remove it."
     },
     "inspect": {
@@ -213,7 +219,7 @@
       "pool": "Pool for copies",
       "samePool": "Same as the template",
       "blank": "Back to an empty VM",
-      "editInForm": "Edit more in the form",
+      "editInForm": "Edit more in advanced settings",
       "deployDialog": "More deploy options…"
     },
     "carried": {
@@ -230,7 +236,6 @@
     },
     "check": {
       "tab": {
-        "check": "Check",
         "json": "JSON",
         "cli": "CLI"
       },
@@ -256,10 +261,102 @@
       "error": "Error",
       "warn": "Warning",
       "copyJson": "Copy the JSON requests",
-      "copyCli": "Copy the commands"
+      "copyCli": "Copy the commands",
+      "needName": "Enter a name and the server checks whether the VM can be created.",
+      "title": "Checks",
+      "more": "Show {{count}} more",
+      "fewer": "Show fewer"
     },
     "help": {
       "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or -. It can't be changed later."
+    },
+    "purpose": {
+      "question": "What will this VM run?",
+      "intro": "Pick a use and the VM picture fills with fitting CPU, memory, disks and network. You can change anything on the next screen.",
+      "chosen": "Use: {{name}}",
+      "change": "Change",
+      "size": "{{cores}} vCPU · {{memory}} · disk {{disks}}",
+      "pickTemplate": "Pick a template to deploy",
+      "noTemplates": "No templates yet — turn a VM into a template and it shows here.",
+      "linux": {
+        "title": "Linux server",
+        "text": "A general server such as Ubuntu or Rocky. First-boot setup and the guest agent are on."
+      },
+      "web": {
+        "title": "Web server",
+        "text": "A small web or API server. Like a Linux server, with one network."
+      },
+      "database": {
+        "title": "Database",
+        "text": "Plenty of memory, with separate OS and data disks."
+      },
+      "windows": {
+        "title": "Windows 11 or Server",
+        "text": "UEFI, Secure Boot and TPM on, with devices the Windows installer knows (SATA, e1000e)."
+      },
+      "iso": {
+        "title": "Install from ISO",
+        "text": "An empty disk and a CD drive that boots first. Put the installer ISO in the drive."
+      },
+      "template": {
+        "title": "From a template",
+        "text": "Copy a template you prepared and use it right away (disks are copied too)."
+      },
+      "image": {
+        "title": "Image library",
+        "text": "Download a cloud image such as Ubuntu or Debian as a template — then create from it with \"From a template\"."
+      },
+      "blank": {
+        "title": "Blank VM",
+        "text": "A VM with nothing attached. Add each part yourself (for experts)."
+      }
+    },
+    "pic": {
+      "title": "VM picture",
+      "cores": "vCPUs",
+      "memory": "Memory (GiB)",
+      "vcpu_one": "{{count}}",
+      "vcpu_other": "{{count}}",
+      "unnamed": "New VM (no name yet)",
+      "preset": {
+        "blank": "Custom",
+        "linux": "Linux",
+        "windows": "Windows 11"
+      },
+      "addDisk": "Add a new disk",
+      "addCdrom": "Add a CD drive",
+      "addNic": "Add a network (NIC)",
+      "bootOrder": "Boot order: {{order}}",
+      "boot": {
+        "disk": "Disk {{n}}",
+        "cdrom": "CD {{n}}"
+      },
+      "security": "Firmware and security",
+      "secureBoot": "Secure Boot",
+      "agent": "Guest agent",
+      "inAdvanced": "Change in advanced settings",
+      "fit": {
+        "fits": "Fits easily in the node's memory.",
+        "tight": "The node's memory is tight.",
+        "over": "Larger than the node's free memory — it may not start."
+      }
+    },
+    "room": {
+      "chosen": "Room on the chosen node {{node}}",
+      "server": "Room on {{node}}, where it would run (server estimate)",
+      "guess": "Room on {{node}}, where it would likely run",
+      "cpu": "vCPUs",
+      "memory": "Memory",
+      "disk": "Disk ({{pool}})",
+      "cpuText": "{{used}}/{{total}} (+{{add}})",
+      "text": "{{used}}/{{total}} (+{{add}})",
+      "overcommit": "Hands out more vCPUs than the node has threads ({{pct}}%) — it can slow down when all are busy (overcommit)."
+    },
+    "advanced": {
+      "title": "Advanced settings",
+      "text": "If unsure, leave these as they are — the defaults work well. Each field's ⓘ explains it.",
+      "template": "A template deployment cannot carry these settings (it uses the template's values). Change them after creating, in Edit VM.",
+      "cpu": "CPU, memory, firmware, placement and HA"
     }
   }
 }

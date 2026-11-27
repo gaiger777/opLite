@@ -2136,9 +2136,6 @@
   "vmForm": {
     "createTitle": "가상 머신 만들기",
     "editTitle": "{{name}} 편집",
-    "view": "보기",
-    "viewForm": "폼",
-    "viewBuilder": "빌더",
     "runningNote": "VM이 실행 중이라 노드·디스크와 인터페이스의 개수·순서·MAC은 바꿀 수 없고, 보안 그룹이 걸린 인터페이스가 있으면 인터페이스는 그룹만 바꿀 수 있습니다. 보안 그룹은 곧바로, 다른 변경은 다음 시작부터 적용됩니다.",
     "general": "일반",
     "cores": "vCPU 코어",
@@ -2222,7 +2219,6 @@
         "user": "user 네트워크(QEMU NAT)에는 속도 제한이 없습니다."
       }
     },
-    "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
     "scheduleNote": "주기마다 스냅샷을 자동으로 만들고, 예약으로 만든 것은 보관 개수만큼만 남깁니다(직접 만든 것은 그대로). 디스크가 모두 qcow2 파일이거나 모두 같은 종류(LVM-thin·ZFS·Ceph RBD)의 풀에 있어야 합니다.",
     "scheduleEvery": "스냅샷 주기",
@@ -2330,7 +2326,6 @@
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "만든 user-data와 함께 돕니다. 패키지·runcmd는 여기에.",
     "ciUserDataWarning": "user-data가 만든 user-data를 대신하므로 사용자·비밀번호·SSH 키는 쓰이지 않습니다.",
-    "windows11Hint": "Windows 11에 맞게 채웠습니다: UEFI·Secure Boot·TPM 2.0·게스트 에이전트·2코어·4096 MiB, SATA 디스크와 호환용 네트워크 장치(e1000e) — Windows 설치 프로그램에는 빠른 가상 장치(VirtIO) 드라이버가 없습니다. 설치 뒤 VirtIO 드라이버를 넣고 virtio로 바꾸면 더 빠릅니다.",
     "security": "보안",
     "securityLive": "TPM 변경은 다음 재시작 때 적용됩니다. Secure Boot는 VM이 정지돼 있을 때만 바꿀 수 있습니다.",
     "tpm": "TPM 2.0",
@@ -2374,19 +2369,6 @@
       "cpu": "CPU",
       "cpuValue": "{{sockets}} × 코어 {{cores}}",
       "firmware": "펌웨어"
-    },
-    "preset": {
-      "title": "프리셋에서 시작",
-      "blank": "빈 VM",
-      "blankHint": "기본값에서 직접 정합니다.",
-      "linux": "Linux 서버",
-      "linuxHint": "코어 2개, 2048 MiB, 게스트 에이전트와 첫 부팅 자동 설정 켬.",
-      "windows": "Windows 11",
-      "windowsHint": "UEFI·Secure Boot, TPM 2.0, SATA 디스크, 호환용 네트워크 장치(e1000e).",
-      "template": "템플릿에서",
-      "templateHint": "템플릿의 복사본을 배포합니다.",
-      "noTemplates": "아직 템플릿이 없습니다. 템플릿 화면에서 VM을 바꾸세요.",
-      "deploy": "{{name}} 배포…"
     },
     "machineAuto": "자동(클러스터 기본값)",
     "coresPerSocket": "소켓당 코어",
@@ -3525,9 +3507,7 @@
     "notTarget": "{{node}}(으)로 옮길 수 없습니다",
     "create": "만들기: {{what}}",
     "theme": "테마: {{theme}}",
-    "density": "밀도: {{density}}",
-    "openBuilder": "VM 빌더 열기",
-    "builderKeywords": "빌더, 끌어 놓기, 조립"
+    "density": "밀도: {{density}}"
   },
   "shortcuts": {
     "title": "단축키",

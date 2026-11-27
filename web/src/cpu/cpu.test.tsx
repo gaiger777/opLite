@@ -30,7 +30,7 @@ import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
 import { VmCloneDialog } from "@/vms/VmCloneDialog";
-import { VmCreatePage } from "@/vms/VmFormPage";
+import { BuilderPage } from "@/vmBuilder/BuilderPage";
 import { VmListPage } from "@/vms/VmListPage";
 import { VmMigrateDialog } from "@/vms/VmMigrateDialog";
 
@@ -38,6 +38,15 @@ afterEach(() => {
   toast.dismiss();
   resetTasks();
 });
+
+/** 만들기 화면(계획 77-5 — 빈 VM)과 고급 설정 서랍. CPU 모델·플래그·머신은 서랍에 있다. */
+function openCreate() {
+  renderPage(<BuilderPage />, { path: "/vms/-new", url: "/vms/-new?purpose=blank" });
+}
+async function advanced(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: "Advanced settings" }));
+  await screen.findByRole("dialog", { name: "Advanced settings" });
+}
 
 const VIEWER: Principal = {
   user: "00000000-0000-0000-0000-000000000003",
@@ -582,9 +591,10 @@ it("defaults a new VM to the cluster model and sends its CPU flags", async () =>
       return HttpResponse.json(vm("web", "stopped"), { status: 201 });
     }),
   );
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  openCreate();
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "web");
+  await advanced(user);
   // 클러스터 기준이 있으면 새 VM은 `cluster`로 시작한다.
   await waitFor(() => expect(screen.getByLabelText("CPU model")).toHaveValue("cluster"));
   expect(screen.getByText(/The cluster baseline is now Skylake-Server-v5/)).toBeInTheDocument();
@@ -593,6 +603,7 @@ it("defaults a new VM to the cluster model and sends its CPU flags", async () =>
     expect(document.querySelector('#vm-cpu-flags-names option[value="aes"]')).not.toBeNull(),
   );
   await user.type(flags, "avx512vbmi{Enter}");
+  await user.keyboard("{Escape}");
   await user.click(screen.getByRole("button", { name: "Create" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toMatchObject({
@@ -626,7 +637,8 @@ it("offers a power cycle for a pending CPU change and says a guest reboot does n
 it("keeps host for a new VM when the cluster has no baseline", async () => {
   // 기본 msw 응답은 서버 그대로다: 기준이 없으면 `cluster`에 `current`가 없다.
   mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  openCreate();
+  await advanced(userEvent.setup());
   const model = await screen.findByLabelText("CPU model");
   await screen.findByRole("option", { name: /^cluster/ });
   await new Promise((r) => setTimeout(r, 50));
@@ -789,8 +801,9 @@ it("re-reports a failed node CPU refresh only once", async () => {
 it("resets an x86 model and flags when the machine type switches the architecture", async () => {
   mockCpu();
   mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  openCreate();
   const user = userEvent.setup();
+  await advanced(user);
   const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   await user.selectOptions(machine, "q35");
   await screen.findAllByRole("option", { name: /Skylake-Server-v5/ });
@@ -1049,8 +1062,9 @@ it("resets an automatically chosen cluster model when the architecture changes",
     }),
   );
   mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
-  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  openCreate();
   const user = userEvent.setup();
+  await advanced(user);
   const machine = await screen.findByLabelText("Virtual motherboard (advanced)");
   await user.selectOptions(machine, "q35");
   await waitFor(() => expect(screen.getByLabelText("CPU model")).toHaveValue("cluster"));
