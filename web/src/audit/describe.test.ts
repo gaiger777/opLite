@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 
 import type { AuditEntry } from "@/api/types";
-import { describeAudit, routeParams } from "@/audit/describe";
+import { auditOutcome, auditTarget, describeAudit, routeParams } from "@/audit/describe";
 import i18n from "@/i18n";
 
 const BASE: AuditEntry = {
@@ -75,4 +75,77 @@ it("names every route that changes something (OpenAPI) and the console", () => {
   }
   expect(missing).toEqual([]);
   expect(i18n.exists("auditOps.route.GET /vms/{key}/console")).toBe(true);
+});
+
+/** 저장소의 Rust 소스(시험 밖)에서 노드가 스스로 남기는 감사 항목의 동작 이름을 모은다. */
+function systemActions(): string[] {
+  const found = new Set<string>();
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir, { withFileTypes: true })) {
+      const path = `${dir}/${name.name}`;
+      if (name.isDirectory()) {
+        walk(path);
+      } else if (name.name.endsWith(".rs")) {
+        const text = readFileSync(path, "utf8").split("#[cfg(test)]")[0]!;
+        if (!text.includes("system_entry(")) continue;
+        // 노드 항목의 동작은 "<무엇>.<일>"(소문자·-) — 파일 이름 같은 다른 글(audit.log)은 뺀다
+        for (const m of text.matchAll(/"([a-z]+(?:-[a-z]+)*\.[a-z]+(?:-[a-z]+)*)"/g)) {
+          if (m[1] !== "audit.log") found.add(m[1]!);
+        }
+        // 선언형 적용 단계(`format!("apply.{}", verb(...))`): verb가 돌려주는 낱말마다
+        if (text.includes('format!("apply.{}"')) {
+          const verbs = /fn verb\([^)]*\)[^{]*\{([\s\S]*?)\n\}/.exec(text)![1]!;
+          for (const v of verbs.matchAll(/=> "([a-z]+)"/g)) found.add(`apply.${v[1]}`);
+        }
+      }
+    }
+  };
+  for (const crate of readdirSync("../crates")) {
+    if (existsSync(`../crates/${crate}/src`)) walk(`../crates/${crate}/src`);
+  }
+  // write_dropped·suppressed_entry는 system_entry를 거치지 않는다
+  found.add("audit.dropped").add("audit.suppressed");
+  return [...found].sort();
+}
+
+it("names every entry the nodes write on their own (system_entry in the server)", () => {
+  const actions = systemActions();
+  // 모으기가 제대로 도는지(모두 빠지면 시험이 헛돈다)
+  expect(actions).toEqual(
+    expect.arrayContaining(["apply.update", "acme.order", "vmware-vm.cutover", "node.bond-down"]),
+  );
+  const missing = actions.flatMap((a) =>
+    ["ko", "en"]
+      .filter((lng) => !i18n.exists(`auditOps.system.${a}`, { lng }))
+      .map((l) => `${l} ${a}`),
+  );
+  expect(missing).toEqual([]);
+});
+
+it("tells results apart: preview, started, failed SSO and plain success", () => {
+  const t = i18n.getFixedT("ko");
+  const outcome = (extra: Partial<AuditEntry>) => auditOutcome({ ...BASE, ...extra }, t)?.text;
+  expect(outcome({ action: "POST /apply", status: 200 })).toBe("미리 보기(바꾼 것 없음)");
+  expect(outcome({ action: "POST /vms", status: 200, outcome: "dry_run" })).toBe(
+    "미리 보기(바꾼 것 없음)",
+  );
+  expect(outcome({ action: "POST /apply", status: 202 })).toBe("시작함");
+  expect(auditOutcome({ ...BASE, status: 202, task: "t1" }, t)?.task).toBe("t1");
+  const sso = { action: "GET /auth/oidc/callback", status: 302 };
+  expect(outcome({ ...sso, detail: "realm=okta error=no_role" })).toBe(
+    "실패(로그인 화면으로 돌려보냄)",
+  );
+  expect(outcome({ ...sso, detail: "realm=okta username=a", outcome: "failed" })).toBe(
+    "실패(로그인 화면으로 돌려보냄)",
+  );
+  expect(outcome({ ...sso, detail: "realm=okta username=a" })).toBe("성공");
+  expect(outcome({ status: 0 })).toBeUndefined();
+});
+
+it("shows the target only when the action's name does not already say it", () => {
+  const e = { ...BASE, target: { kind: "folders", key: "f1" } };
+  expect(auditTarget(e, "폴더 지우기")).toBe("folders/f1");
+  expect(auditTarget(e, "폴더 지우기", new Map([["f1", "prod"]]))).toBe("folders/prod");
+  expect(auditTarget({ ...e, target: { kind: "vms", key: "web" } }, "VM web 켜기")).toBeNull();
+  expect(auditTarget({ ...BASE, target: null }, null)).toBeNull();
 });

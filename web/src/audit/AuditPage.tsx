@@ -2,11 +2,12 @@ import { useQuery } from "@tanstack/react-query";
 import { FileSearch, RefreshCw } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
-import type { AuditEntry } from "@/api/types";
-import { auditOutcome, describeAudit } from "@/audit/describe";
+import type { AuditEntry, Task } from "@/api/types";
+import { auditOutcome, auditTarget, describeAudit } from "@/audit/describe";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { CopyButton } from "@/components/CopyButton";
 import { focusBack } from "@/components/focusBack";
@@ -26,6 +27,7 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
+import { useTaskHref } from "@/tasks/taskLink";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -36,18 +38,70 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   );
 }
 
-/** 항목 하나를 사람 말로: 결과·누가·언제·어디서·걸린 시간·자세히, 요청 원문(복사) */
-function EntrySummary({ entry }: { entry: AuditEntry }) {
+/**
+ * 결과 칸: 성공·실패·미리 보기, 202는 "시작함"과 그 작업(서랍 링크 — 지금 상태: 진행 중·성공·실패). 작업 목록에서 이미 지워진
+ * 작업은 "작업 보기"(서랍이 없다고 알린다).
+ */
+function OutcomeText({ entry, tasks }: { entry: AuditEntry; tasks: ReadonlyMap<string, Task> }) {
+  const { t } = useTranslation();
+  const taskHref = useTaskHref();
+  const outcome = auditOutcome(entry, t);
+  if (!outcome) {
+    return <>—</>;
+  }
+  const task = outcome.task ? tasks.get(outcome.task) : undefined;
+  return (
+    <span className={outcome.failed ? "font-medium text-destructive" : undefined}>
+      {outcome.text}
+      {outcome.task && (
+        <>
+          {" · "}
+          <Link
+            to={taskHref(outcome.task)}
+            className="underline underline-offset-4"
+            // 줄을 누르면 항목 창이 열린다 — 링크는 작업 서랍만
+            onClick={(e) => e.stopPropagation()}
+          >
+            {task
+              ? t("auditOps.ui.taskState", { state: t(`tasks.state.${task.status.state}`) })
+              : t("auditOps.ui.taskOpen")}
+          </Link>
+        </>
+      )}
+    </span>
+  );
+}
+
+/** 항목 하나를 사람 말로: 결과·대상·누가·언제·어디서·걸린 시간·자세히, 요청 원문(복사) */
+function EntrySummary({
+  entry,
+  tasks,
+  names,
+}: {
+  entry: AuditEntry;
+  tasks: ReadonlyMap<string, Task>;
+  names: ReadonlyMap<string, string>;
+}) {
   const { t, i18n } = useTranslation();
-  const outcome = auditOutcome(entry.status, t);
+  const outcome = auditOutcome(entry, t);
   const raw = entry.method ? `${entry.method} /api/v1${entry.path}` : entry.action;
+  const target =
+    entry.target && `${entry.target.kind}/${names.get(entry.target.key) ?? entry.target.key}`;
   return (
     <dl className="flex flex-col gap-1">
       {outcome && (
         <Row label={t("auditOps.ui.result")}>
-          <span className={outcome.failed ? "font-medium text-destructive" : undefined}>
-            {outcome.text}
-          </span>
+          <OutcomeText entry={entry} tasks={tasks} />
+          {outcome.started && (
+            <span className="block text-xs text-muted-foreground">
+              {t("auditOps.ui.startedHint")}
+            </span>
+          )}
+        </Row>
+      )}
+      {target && (
+        <Row label={t("auditOps.ui.target")}>
+          <code className="font-mono text-xs break-all">{target}</code>
         </Row>
       )}
       <Row label={t("auditOps.ui.who")}>
@@ -98,9 +152,23 @@ export function AuditPage() {
   const [filter, setFilter] = useState({ user: "", action: "" });
   const [opened, setOpened] = useState<AuditEntry | null>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
-  // id로 부른 VM(콘솔 열기 등)을 이름으로 — 이미 받는 VM 목록
+  // id로 부른 VM(콘솔 열기 등)·폴더(저장 이름이 id — 화면 이름은 spec.name)를 이름으로
   const vms = useList("vm");
-  const names = useMemo(() => new Map((vms.data ?? []).map((vm) => [vm.id, vm.name])), [vms.data]);
+  const folders = useList("folder");
+  const names = useMemo(
+    () =>
+      new Map([
+        ...(vms.data ?? []).map((vm) => [vm.id, vm.name] as const),
+        ...(folders.data ?? []).map((f) => [f.id, f.spec.name] as const),
+      ]),
+    [vms.data, folders.data],
+  );
+  // 202가 시작한 작업의 지금 상태(이미 받는 작업 목록)
+  const taskList = useList("task");
+  const tasks = useMemo(
+    () => new Map((taskList.data ?? []).map((task) => [task.id, task])),
+    [taskList.data],
+  );
   const audit = useQuery({
     queryKey: ["audit", range, filter],
     queryFn: () =>
@@ -174,10 +242,17 @@ export function AuditPage() {
       },
     },
     {
+      // 무엇에 한 일인가: 동작 이름에 대상이 없을 때만(폴더 지우기, 권한 거두기, 표에 없는 동작)
+      id: "target",
+      header: t("auditOps.ui.target"),
+      className: "font-mono text-xs break-all",
+      priority: 2,
+      cell: (entry) => auditTarget(entry, describeAudit(entry, t, names), names) ?? "",
+    },
+    {
       id: "status",
       header: t("auditOps.ui.result"),
-      className: (entry) => (entry.status >= 400 ? "font-medium text-destructive" : undefined),
-      cell: (entry) => auditOutcome(entry.status, t)?.text ?? "—",
+      cell: (entry) => <OutcomeText entry={entry} tasks={tasks} />,
     },
     { id: "node", header: t("common.node"), priority: 2, cell: (entry) => entry.node },
     {
@@ -313,7 +388,7 @@ export function AuditPage() {
                 {describeAudit(opened, t, names) ?? t("audit.entryTitle")}
               </DialogTitle>
             </DialogHeader>
-            <EntrySummary entry={opened} />
+            <EntrySummary entry={opened} tasks={tasks} names={names} />
             <details>
               <summary className="cursor-pointer text-sm">{t("auditOps.ui.rawJson")}</summary>
               <pre className="mt-2 max-h-80 overflow-auto rounded-md bg-muted p-2 font-mono text-xs">

@@ -235,19 +235,35 @@
     },
     "system": {
       "placement": {
-        "move": "Automatic move by the balancer"
+        "move": "Automatic move by the balancer — VM {{key}}"
       },
       "cpu": {
-        "baseline": "Cluster CPU baseline changed"
+        "baseline": "Cluster CPU baseline changed ({{key}})"
       },
       "node": {
-        "bond-degraded": "A bonded port of the node went down",
-        "bond-down": "All bonded ports of the node went down",
-        "bond-recovered": "Node bonding recovered"
+        "bond-degraded": "Node {{key}}: a bonded port went down",
+        "bond-down": "Node {{key}}: all bonded ports went down",
+        "bond-recovered": "Node {{key}}: bonding recovered"
       },
       "audit": {
         "dropped": "Audit entries dropped (writer backlog)",
         "suppressed": "Unauthenticated requests summarized"
+      },
+      "apply": {
+        "create": "YAML apply: create {{kind}} {{key}}",
+        "update": "YAML apply: change {{kind}} {{key}}",
+        "delete": "YAML apply: delete {{kind}} {{key}}",
+        "keep": "YAML apply: keep {{kind}} {{key}}",
+        "blocked": "YAML apply: {{kind}} {{key}} blocked (not applied)"
+      },
+      "acme": {
+        "order": "Issue certificate {{key}} (ACME order)"
+      },
+      "vmware-vm": {
+        "cutover": "Cut over VMware VM {{key}}",
+        "rollback": "Roll back the cutover of VMware VM {{key}}",
+        "revert": "Revert VMware VM {{key}}",
+        "source-power-on": "Source VM of VMware VM {{key}} powered on again"
       }
     },
     "ui": {
@@ -287,7 +303,15 @@
       "rawJson": "Whole entry (JSON)",
       "copyRaw": "Copy the raw request",
       "actionPlaceholder": "e.g. /vms/web-01, login",
-      "actionHint": "Matches part of the address (e.g. /vms/web-01 — everything done to that VM)."
+      "actionHint": "Matches part of the address (e.g. /vms/web-01 — everything done to that VM).",
+      "preview": "Preview (nothing changed)",
+      "started": "Started",
+      "startedHint": "Work started — its result is kept on the task.",
+      "task": "Task",
+      "taskOpen": "View task",
+      "taskState": "Task {{state}}",
+      "failedRedirect": "Failed (sent back to the sign-in page)",
+      "target": "Target"
     }
   }
 }

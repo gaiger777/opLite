@@ -102,7 +102,7 @@
       "PUT /ha-groups/{key}": "HA 그룹 {{key}} 바꾸기",
       "DELETE /ha-groups/{key}": "HA 그룹 {{key}} 지우기",
       "POST /history/restore": "한 시점으로 되돌리기",
-      "POST /history/{kind}/{key}/restore": "설정 기록에서 {{key}} 되돌리기",
+      "POST /history/{kind}/{key}/restore": "변경 기록에서 {{key}} 되돌리기",
       "POST /image-catalog": "이미지 목록에 더하기",
       "DELETE /image-catalog/{id}": "이미지 목록에서 지우기",
       "POST /image-catalog/{id}/download": "목록의 이미지 내려받기",
@@ -235,19 +235,35 @@
     },
     "system": {
       "placement": {
-        "move": "균형 조정기의 자동 옮기기"
+        "move": "균형 조정기의 자동 옮기기 — VM {{key}}"
       },
       "cpu": {
-        "baseline": "클러스터 CPU 기준 바뀜"
+        "baseline": "클러스터 CPU 기준 바뀜({{key}})"
       },
       "node": {
-        "bond-degraded": "노드 본딩 포트 하나 끊김",
-        "bond-down": "노드 본딩 모두 끊김",
-        "bond-recovered": "노드 본딩 되살아남"
+        "bond-degraded": "노드 {{key}}: 본딩 포트 하나 끊김",
+        "bond-down": "노드 {{key}}: 본딩 모두 끊김",
+        "bond-recovered": "노드 {{key}}: 본딩 되살아남"
       },
       "audit": {
         "dropped": "감사 항목 버림(쓰기 밀림)",
         "suppressed": "인증 없는 요청 줄여 적음"
+      },
+      "apply": {
+        "create": "YAML 적용: {{kind}} {{key}} 만들기",
+        "update": "YAML 적용: {{kind}} {{key}} 바꾸기",
+        "delete": "YAML 적용: {{kind}} {{key}} 지우기",
+        "keep": "YAML 적용: {{kind}} {{key}} 그대로 둠",
+        "blocked": "YAML 적용: {{kind}} {{key}} 막힘(적용 안 함)"
+      },
+      "acme": {
+        "order": "인증서 {{key}} 발급(ACME 주문)"
+      },
+      "vmware-vm": {
+        "cutover": "VMware VM {{key}} 전환(컷오버)",
+        "rollback": "VMware VM {{key}} 전환 되돌림(롤백)",
+        "revert": "VMware VM {{key}} 되돌리기",
+        "source-power-on": "VMware VM {{key}}의 원본 VM 다시 켬"
       }
     },
     "ui": {
@@ -287,7 +303,15 @@
       "rawJson": "항목 전체(JSON)",
       "copyRaw": "요청 원문 복사",
       "actionPlaceholder": "예: /vms/web-01, login",
-      "actionHint": "주소의 일부로 거릅니다(예: /vms/web-01 — 그 VM의 모든 동작)."
+      "actionHint": "주소의 일부로 거릅니다(예: /vms/web-01 — 그 VM의 모든 동작).",
+      "preview": "미리 보기(바꾼 것 없음)",
+      "started": "시작함",
+      "startedHint": "작업을 시작했습니다 — 일의 결과는 작업에 남습니다.",
+      "task": "작업",
+      "taskOpen": "작업 보기",
+      "taskState": "작업 {{state}}",
+      "failedRedirect": "실패(로그인 화면으로 돌려보냄)",
+      "target": "대상"
     }
   }
 }
