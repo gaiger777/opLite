@@ -19,6 +19,10 @@ const RECORD = "019a0f3c-8a10-7000-8000-000000000003";
 const DROPPED = "019a0f3c-8a10-7000-8000-000000000004";
 const WAITING = "019a0f3c-8a10-7000-8000-000000000005";
 const SKEWED = "019a0f3c-8a10-7000-8000-000000000006";
+const CODED = "019a0f3c-8a10-7000-8000-000000000008";
+const FIXFIRST = "019a0f3c-8a10-7000-8000-000000000007";
+const NOT_ENOUGH =
+  'not enough space in storage pool "local" on node "svc02": need 21474836480, available 3221225472';
 const LONG =
   "QMP command failed: GenericError: TLS credentials support requires the migration to be configured with tls-creds; " +
   "the object 'migrate-tls' was not found on node svc02 while setting up the outgoing connection (see journalctl -u orbivisord)";
@@ -93,6 +97,39 @@ const TASKS = [
       error: "x",
       started_at: 1_761_192_230_000,
       finished_at: 1_761_192_229_000,
+    },
+  },
+  {
+    // 원인 코드가 있는 실패(계획 77-2): 다시 할 수 있는 시작(이 VM의 가장 새 전원 Task)
+    id: CODED,
+    name: CODED,
+    revision: 3,
+    spec: { op: { kind: "vm-start" }, target: web.id, node: NODE.id },
+    status: {
+      state: "failed",
+      error: NOT_ENOUGH,
+      failure: {
+        code: "pool_full",
+        params: {
+          node: "svc02",
+          pool: "local",
+          need_bytes: "21474836480",
+          free_bytes: "3221225472",
+        },
+        retryable: true,
+      },
+    },
+  },
+  {
+    // 먼저 고쳐야 하는 실패: 다시 하기가 없다.
+    id: FIXFIRST,
+    name: FIXFIRST,
+    revision: 3,
+    spec: { op: { kind: "vm-stop" }, target: web.id, node: NODE.id },
+    status: {
+      state: "failed",
+      error: "QMP command failed: GenericError: TLS credentials support requires GNUTLS",
+      failure: { code: "migration_tls_missing" },
     },
   },
 ] as Task[];
@@ -256,4 +293,45 @@ it("keeps the error in the phone cards", async () => {
   } finally {
     window.matchMedia = original;
   }
+});
+
+it("explains a coded failure: what, why, what to do, related pages and the raw text folded", async () => {
+  const { drawer } = await drawerOf(CODED);
+  const explain = within(drawer).getByRole("region", { name: "What went wrong" });
+  expect(explain).toHaveTextContent("Storage pool local on node svc02 is too full.");
+  expect(explain).toHaveTextContent("The task needs 20 GiB but only 3 GiB is free.");
+  expect(explain).toHaveTextContent("What to do");
+  // 원인 값의 화면
+  expect(within(explain).getByRole("link", { name: "storage pool local" })).toHaveAttribute(
+    "href",
+    "/storage-pools?q=local",
+  );
+  expect(within(explain).getByRole("link", { name: "node svc02" })).toHaveAttribute(
+    "href",
+    "/nodes/svc02",
+  );
+  // 다시 할 수 있는 시작은 단추가 있다.
+  expect(within(explain).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  // 원문은 "자세히(원문)"에 접혀 있고 코드와 복사가 함께 있다.
+  const raw = within(drawer).getByText("Details (raw message)").closest("details")!;
+  expect(raw).not.toHaveAttribute("open");
+  expect(raw).toHaveTextContent(NOT_ENOUGH);
+  expect(raw).toHaveTextContent("Error code pool_full");
+  await expectNoAxeViolations(drawer, { disable: ["region"] });
+});
+
+it("has no retry when the cause must be fixed first, and lists the summary above the raw text", async () => {
+  const { drawer, unmount } = await drawerOf(FIXFIRST);
+  const explain = within(drawer).getByRole("region", { name: "What went wrong" });
+  expect(explain).toHaveTextContent("The move cannot be encrypted (TLS).");
+  expect(within(explain).queryByRole("button", { name: "Retry" })).toBeNull();
+  unmount();
+  // 목록: 사전의 제목 한 줄 + 원문
+  page();
+  const rows = (await screen.findAllByRole("link", { name: "Start web" })).map((link) =>
+    link.closest("tr")!,
+  );
+  const row = rows.find((r) => r.textContent?.includes(NOT_ENOUGH))!;
+  expect(row).toHaveTextContent("Storage pool local on node svc02 is too full.");
+  expect(row).toHaveTextContent(NOT_ENOUGH);
 });

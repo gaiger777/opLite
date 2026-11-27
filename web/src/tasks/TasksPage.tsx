@@ -14,6 +14,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Pager, usePage } from "@/components/Pager";
 import { Label } from "@/components/ui/label";
 import { formatTime, uuidTime } from "@/lib/format";
+import { failureTitle } from "@/tasks/failures/failure";
+import { useFailureStrings } from "@/tasks/failures/strings";
 import { TaskErrorText } from "@/tasks/TaskErrorText";
 import { requesterName, useTaskHref } from "@/tasks/taskLink";
 import { type Named, type TargetLookup, taskTarget } from "@/tasks/target";
@@ -144,6 +146,8 @@ export function TaskTable({
   const taskHref = useTaskHref();
   const nodes = useList("node");
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
+  // 실패 원인 사전(계획 77-2): 원인 코드가 있는 실패가 보일 때만 받는다.
+  useFailureStrings(tasks.some((task) => task.status.failure));
   const timeOf = (task: Task) => {
     const time = uuidTime(task.id);
     return <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>;
@@ -177,6 +181,7 @@ export function TaskTable({
             {error && (
               <TaskErrorText
                 text={error}
+                summary={failureTitle(task, t)}
                 warning={task.status.state === "succeeded"}
                 subject={label}
                 className="mt-0.5"

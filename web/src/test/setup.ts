@@ -29,6 +29,8 @@ import drEn from "@/dr/i18n/en.json";
 import drKo from "@/dr/i18n/ko.json";
 import helpEn from "@/help/i18n/en.json";
 import helpKo from "@/help/i18n/ko.json";
+import failuresEn from "@/tasks/failures/i18n/en.json";
+import failuresKo from "@/tasks/failures/i18n/ko.json";
 
 // 늦게 받는 문구(첫 화면 묶음도 언어마다 늦게 받는다 — `i18n/index.ts`, 클러스터 지도 — `clusterMap/strings.ts`, 끌기 틀 — `dnd/strings.ts`, VM 빌더 —
 // `vmBuilder/strings.ts`, VMware 이전 — `vmware/strings.ts`, VM 내보내기 — `exports/strings.ts`, 설정 기록·선언 묶음·인증서 —
@@ -46,6 +48,7 @@ for (const [en, ko] of [
   [physicalEn, physicalKo],
   [drEn, drKo],
   [helpEn, helpKo],
+  [failuresEn, failuresKo],
 ] as const) {
   i18n.addResourceBundle("en", "translation", en, false, false);
   i18n.addResourceBundle("ko", "translation", ko, false, false);

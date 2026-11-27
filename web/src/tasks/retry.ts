@@ -57,6 +57,10 @@ export function retryOf(task: Task, ctx: RetryContext): Retry | null {
   if (task.status.state !== "failed") {
     return null;
   }
+  // 서버가 원인을 알고 다시 해도 같다고 했으면(권한·설정을 먼저 고쳐야 함) 다시 하지 않는다(계획 77-2).
+  if (task.status.failure && !task.status.failure.retryable) {
+    return null;
+  }
   // 그 뒤에 같은 대상에 다른 시도(성공한 시작, 일부러 한 정지 등)가 있으면 옛 실패를 다시 하지 않는다.
   const group = retryGroup(task);
   const newest = group && ctx.latest?.get(group);

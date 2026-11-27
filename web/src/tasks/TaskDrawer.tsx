@@ -13,6 +13,9 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/
 import { serverSkew } from "@/fileRestore/fileRestore";
 import { formatTime, uuidTime } from "@/lib/format";
 import { CENTER_BUTTON, setTaskOpener, TASK_PARAM } from "@/tasks/center";
+import { failureText } from "@/tasks/failures/failure";
+import { FailureExplain } from "@/tasks/failures/FailureExplain";
+import { useFailureStrings } from "@/tasks/failures/strings";
 import { requesterName } from "@/tasks/taskLink";
 import { relatedLinks, taskTarget, TASK_LABELS } from "@/tasks/target";
 import { bytePercent, describeDetail, describeProgress, describeTask } from "@/tasks/tasks";
@@ -132,6 +135,24 @@ export function TaskDetail({ task }: { task: Task }) {
   const p = task.status.progress;
   const pct = p && p.total_bytes > 0 ? bytePercent(p.done_bytes, p.total_bytes) : null;
   const kindName = task.labels?.[TASK_LABELS.targetKind];
+  // 원인 코드가 있으면 사전을 받아 "무엇이 / 왜 / 이렇게 하세요"를 보이고 원문은 접는다(계획 77-2). 없으면 원문 그대로.
+  const stringsReady = useFailureStrings(!!task.status.failure);
+  const explain = stringsReady ? failureText(task, t) : null;
+  const raw = error && (
+    <>
+      <pre
+        className={
+          "max-h-80 overflow-y-auto rounded-md border bg-muted p-2 font-mono text-xs break-words whitespace-pre-wrap " +
+          (state === "succeeded" ? "text-warning-fg" : "text-danger-fg")
+        }
+      >
+        {error}
+      </pre>
+      {state === "failed" && (
+        <p className="text-xs text-muted-foreground">{t("tasks.drawer.rawHint")}</p>
+      )}
+    </>
+  );
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
@@ -141,7 +162,22 @@ export function TaskDetail({ task }: { task: Task }) {
           · {t("tasks.drawer.requestedBy", { name: requesterName(task, t, lookup.named) })}
         </span>
       </div>
-      {error && (
+      {explain && <FailureExplain task={task} text={explain} />}
+      {error && explain && (
+        <details className="flex flex-col gap-1.5 text-sm">
+          <summary className="cursor-pointer text-sm font-medium">{t("failureUi.raw")}</summary>
+          <div className="mt-1.5 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">
+                {t("failureUi.code")} <code>{explain.code}</code>
+              </span>
+              <CopyButton text={error} label={t("tasks.drawer.copyError")} />
+            </div>
+            {raw}
+          </div>
+        </details>
+      )}
+      {error && !explain && (
         <section aria-labelledby="task-error" className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between gap-2">
             <h3 id="task-error" className="text-sm font-medium">
@@ -149,17 +185,7 @@ export function TaskDetail({ task }: { task: Task }) {
             </h3>
             <CopyButton text={error} label={t("tasks.drawer.copyError")} />
           </div>
-          <pre
-            className={
-              "max-h-80 overflow-y-auto rounded-md border bg-muted p-2 font-mono text-xs break-words whitespace-pre-wrap " +
-              (state === "succeeded" ? "text-warning-fg" : "text-danger-fg")
-            }
-          >
-            {error}
-          </pre>
-          {state === "failed" && (
-            <p className="text-xs text-muted-foreground">{t("tasks.drawer.rawHint")}</p>
-          )}
+          {raw}
         </section>
       )}
       <dl className="flex flex-col gap-1.5">

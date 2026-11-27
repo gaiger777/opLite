@@ -528,7 +528,7 @@
     "errorLessOf": "Show less: {{name}}",
     "drawer": {
       "title": "Task",
-      "description": "What was done, by whom and when, and how it ended. Errors are shown exactly as the server recorded them.",
+      "description": "What was done, by whom and when, and how it ended. A failure shows its cause and fix; the server's raw message is under \"Details\".",
       "gone": "This task no longer exists. Old tasks are cleaned up.",
       "requestedBy": "requested by {{name}}",
       "copyError": "Copy the error text",
