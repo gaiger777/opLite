@@ -228,6 +228,7 @@
     "new": "새로 만들기",
     "main": "주 메뉴",
     "breadcrumb": "이동 경로",
+    "backTo": "{{name}} 화면으로 돌아가기",
     "skipToContent": "본문으로 건너뛰기",
     "openMenu": "메뉴 열기",
     "collapse": "사이드바 접기",

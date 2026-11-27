@@ -228,6 +228,7 @@
     "new": "New",
     "main": "Main",
     "breadcrumb": "Breadcrumb",
+    "backTo": "Back to {{name}}",
     "skipToContent": "Skip to content",
     "openMenu": "Open menu",
     "collapse": "Collapse sidebar",

@@ -67,6 +67,8 @@ it("shows the CA and the members", async () => {
   ).toHaveAttribute("href", "/settings/certificates");
   const table = screen.getByRole("table", { name: "Members" });
   expect(within(table).getByText("node-a").closest("tr")).toHaveTextContent("Leader");
+  // 행 몇 개의 표라 "열" 메뉴는 없다.
+  expect(screen.queryByRole("button", { name: "Columns" })).not.toBeInTheDocument();
   expect(within(table).getByText("node-b").closest("tr")).toHaveTextContent("(this node)");
   const joining = within(table).getByText("n3").closest("tr")!;
   expect(joining).toHaveTextContent("Joining");

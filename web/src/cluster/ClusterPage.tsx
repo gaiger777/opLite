@@ -121,6 +121,8 @@ export function ClusterPage() {
           rowName={(m) => m.name ?? m.id.slice(-8)}
           labelledBy="cluster-members"
           empty="—"
+          // 멤버는 몇 개뿐이라 열 메뉴는 군더더기다(정렬도 없다 — `state`를 주지 않음).
+          columnMenu={false}
           columns={[
             {
               id: "name",

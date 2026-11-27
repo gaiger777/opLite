@@ -207,6 +207,10 @@ it("keeps the item of a detail page and names the resource", async () => {
   expect(within(crumbs).getByRole("link", { name: "All VMs" })).toHaveAttribute("href", "/vms");
   expect(within(crumbs).getByText("web")).toHaveAttribute("aria-current", "page");
   expect(screen.queryByRole("navigation", { name: / pages$/ })).not.toBeInTheDocument();
+  // 휴대폰은 지금 화면 이름 하나만 보이므로 위 단계(목록)로 가는 단추를 둔다(넓은 화면에서는 숨김).
+  const back = within(crumbs).getByRole("link", { name: "Back to All VMs" });
+  expect(back).toHaveAttribute("href", "/vms");
+  expect(back).toHaveClass("md:hidden");
 });
 
 it("puts the create page and the builder under Create VM", async () => {

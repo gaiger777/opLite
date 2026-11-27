@@ -35,9 +35,7 @@ it("links other targets to their screens", () => {
     href: "/nodes/node-a",
   });
   // 노드 상세의 알맞은 탭(계획 77-6)
-  expect(taskTarget(op("node-cpu-probe", NODE.id), lookup).href).toBe(
-    "/nodes/node-a?tab=hardware",
-  );
+  expect(taskTarget(op("node-cpu-probe", NODE.id), lookup).href).toBe("/nodes/node-a?tab=hardware");
   expect(taskTarget(op("sdn-chassis-install", NODE.id), lookup).href).toBe(
     "/nodes/node-a?tab=network",
   );

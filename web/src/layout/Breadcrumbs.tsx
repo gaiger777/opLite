@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "cn";
-import { ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
@@ -9,7 +9,10 @@ import { useNavUser } from "@/auth/usePermissions";
 import { FOLDER_PATHS } from "@/folders/folders";
 import { crumbsOf } from "@/layout/nav";
 
-/** 머리줄 왼쪽의 `묶음 › 항목 › 리소스`. 묶음 이름은 링크가 아니다. 768px 아래에서는 마지막 둘만 보인다. */
+/**
+ * 머리줄 왼쪽의 `묶음 › 항목 › 리소스`. 묶음 이름은 링크가 아니다. 768px 아래에서는 지금 화면 이름 하나와, 위 단계가 링크면 그리로
+ * 가는 "‹" 단추만 보인다.
+ */
 export function Breadcrumbs() {
   const { t } = useTranslation();
   const me = useNavUser();
@@ -36,8 +39,22 @@ export function Breadcrumbs() {
   if (crumbs.length === 0) {
     return null;
   }
+  // 휴대폰에서 숨긴 위 단계 가운데 가장 가까운 링크(상세 → 목록)
+  const up = crumbs
+    .slice(0, -1)
+    .reverse()
+    .find((c) => c.to);
   return (
-    <nav aria-label={t("nav.breadcrumb")} className="min-w-0">
+    <nav aria-label={t("nav.breadcrumb")} className="flex min-w-0 items-center gap-1">
+      {up?.to && (
+        <Link
+          to={up.to}
+          aria-label={t("nav.backTo", { name: up.label })}
+          className="-ml-1 shrink-0 rounded-md p-1 text-muted-foreground hover:text-foreground md:hidden"
+        >
+          <ChevronLeft className="size-4" aria-hidden />
+        </Link>
+      )}
       <ol className="flex min-w-0 items-center gap-1 text-sm">
         {crumbs.map((crumb, i) => (
           <li

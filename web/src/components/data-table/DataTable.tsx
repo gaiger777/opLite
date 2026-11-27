@@ -127,6 +127,8 @@ interface Props<T> {
   toolbar?: ReactNode;
   /** 주면 이만큼씩 페이지를 나눈다(계획 77-6 — 긴 목록을 한 쪽에 다 그리지 않게). 단축키·고르기는 지금 페이지 안에서다. */
   pageSize?: number;
+  /** 거짓이면 "열" 메뉴를 두지 않는다(행 몇 개의 작은 표). */
+  columnMenu?: boolean;
 }
 
 /**
@@ -402,7 +404,8 @@ export function DataTable<T>(props: Props<T>) {
   );
   const colSpan = visible.length + (selectable ? 1 : 0) + (expandable ? 1 : 0);
   const loading = props.query?.isPending === true && props.rows.length === 0;
-  const hideable = props.columns.filter((c, i) => i > 0 && !c.actions);
+  const hideable =
+    props.columnMenu === false ? [] : props.columns.filter((c, i) => i > 0 && !c.actions);
   const rowState = (row: T, index: number) => ({
     "data-state": selected.has(rowId(row)) ? "selected" : undefined,
     "data-active": index === current ? "" : undefined,
