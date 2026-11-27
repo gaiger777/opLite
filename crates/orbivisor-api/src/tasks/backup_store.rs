@@ -233,7 +233,7 @@ fn covered_chunks(ranges: &[(u64, u64)], chunk: u64, size: u64) -> HashSet<u64> 
 /// 디스크 하나를 읽어 저장소에 쓴다(인덱스는 쓰지 않는다). base가 있고 비트맵 문맥이 있으면 바뀐 청크만 읽고 나머지는
 /// base의 id를 옮긴다(§8.3). 0으로 알린 청크는 읽지 않는다.
 async fn write_disk(
-    store: &Arc<Store>,
+    (store, store_name): (&Arc<Store>, &str),
     backup: Uuid,
     src: &DiskSource,
     base: Option<&FixedIndex>,
@@ -338,7 +338,7 @@ async fn write_disk(
                 if !seen.lock().unwrap().insert(id) {
                     return Ok((n, id, Outcome::Seen, read));
                 }
-                let name = |e| stores::store_error("", e);
+                let name = |e| stores::store_error(store_name, e);
                 if store.has_chunk(&id).await.map_err(name)? {
                     return Ok((n, id, Outcome::Exists, read));
                 }
@@ -395,7 +395,7 @@ async fn write_disk(
 /// 커밋 확인에서 사라진 청크(`missing`: 디스크 차례·청크 번호·id)를 아직 열린 원본에서 다시 읽어 올린다. 읽은 내용의
 /// id가 다르면(원본이 바뀌었다) 오류다.
 async fn reupload(
-    store: &Arc<Store>,
+    (store, store_name): (&Arc<Store>, &str),
     sources: &[DiskSource],
     missing: &[(usize, u64, ChunkId)],
 ) -> Result<u64, String> {
@@ -425,7 +425,7 @@ async fn reupload(
             store
                 .put_chunk(&encoded)
                 .await
-                .map_err(|e| stores::store_error("", e))?;
+                .map_err(|e| stores::store_error(store_name, e))?;
             bytes += encoded.data.len() as u64;
         }
         let _ = c.disconnect().await;
@@ -470,7 +470,7 @@ pub(super) async fn write_backup(
     let mut disks = Vec::with_capacity(sources.len());
     for (i, src) in sources.iter().enumerate() {
         let base = bases.and_then(|b| b.get(i));
-        let r = Box::pin(write_disk(store, c.backup, src, base))
+        let r = Box::pin(write_disk((store, &c.store_res.name), c.backup, src, base))
             .await
             .map_err(|e| format!("disk{i}: {e}"))?;
         stats.logical_bytes += r.index.virtual_bytes;
@@ -549,7 +549,7 @@ pub(super) async fn write_backup(
                     }
                 }
                 tracing::info!(backup = %c.backup, chunks = again.len(), "re-uploading chunks removed by a GC sweep or a verification");
-                let bytes = reupload(store, sources, &again).await?;
+                let bytes = reupload((store, &c.store_res.name), sources, &again).await?;
                 stats.new_chunks += again.len() as u64;
                 stats.reused_chunks -= again.len() as u64;
                 stats.new_bytes += bytes;
@@ -1102,7 +1102,7 @@ impl Drop for Serving {
 
 pub(super) async fn serve(
     ctx: &Ctx,
-    store: &Arc<Store>,
+    (store, store_name): (&Arc<Store>, &str),
     m: &Manifest,
     socket: PathBuf,
 ) -> Result<Serving, String> {
@@ -1115,7 +1115,7 @@ pub(super) async fn serve(
         let index = store
             .read_index(m, disk)
             .await
-            .map_err(|e| stores::store_error("", e))?;
+            .map_err(|e| stores::store_error(store_name, e))?;
         server.add(
             disk.name.clone(),
             Arc::new(StoreExport::new(store.clone(), index, cache.clone())),
@@ -1191,7 +1191,15 @@ pub(super) async fn restore(
     let serving = if live {
         None
     } else {
-        Some(serve(ctx, &store, &m, socket_path(ctx, "rs", task.id)).await?)
+        Some(
+            serve(
+                ctx,
+                (&store, &store_name),
+                &m,
+                socket_path(ctx, "rs", task.id),
+            )
+            .await?,
+        )
     };
     let (_, volumes) = ctx
         .cluster
@@ -1594,7 +1602,7 @@ pub(super) async fn copy(
     );
     copy.labels = source.labels.clone();
     ctx.cluster.create(&copy).await.map_err(|e| e.to_string())?;
-    let serving = serve(ctx, &src, &m, socket_path(ctx, "cp", copy.id)).await?;
+    let serving = serve(ctx, (&src, &from), &m, socket_path(ctx, "cp", copy.id)).await?;
     let sources: Vec<DiskSource> = m
         .disks
         .iter()

@@ -171,7 +171,7 @@ async fn sources(
         let (_, store) = open_store(ctx, name).await?;
         let (m, _) = read_snapshot(&store, backup).await?;
         let socket = paths.nbd_socket();
-        let serving = serve(ctx, &store, &m, socket.clone()).await?;
+        let serving = serve(ctx, (&store, name), &m, socket.clone()).await?;
         let disks = m
             .disks
             .iter()

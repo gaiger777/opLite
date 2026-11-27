@@ -57,6 +57,7 @@ pub mod snapshot;
 pub mod storage;
 pub mod subscription;
 pub mod task;
+pub mod task_failure;
 pub mod template;
 pub mod two_factor;
 pub mod version;

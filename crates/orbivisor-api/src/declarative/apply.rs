@@ -25,6 +25,8 @@ use super::plan::{Step, StoredPlan};
 use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::tasks::failure::{coded, coded_over};
+use orbivisor_types::task_failure::{TaskFailure, code};
 
 /// 쓰기가 만든 Task를 다시 보는 간격
 const POLL: Duration = Duration::from_millis(100);
@@ -67,10 +69,12 @@ pub(crate) async fn run(
     plan: Uuid,
 ) -> Result<Option<String>, String> {
     let state = api.ok_or("this node has no API to apply with")?;
-    let plan = state
-        .plans
-        .take(plan)
-        .ok_or("the plan is gone (it expired or the node restarted); apply again")?;
+    let plan = state.plans.take(plan).ok_or_else(|| {
+        coded(
+            TaskFailure::new(code::APPLY_PLAN_EXPIRED),
+            "the plan is gone (it expired or the node restarted); apply again",
+        )
+    })?;
     let mut meta = plan.meta.clone();
     meta.actor.task = Some(task.id);
     // 되돌리기는 요청한 곳의 출처(웹·CLI)를 그대로 둔다 — 이력 줄이 `restored_from`으로 되돌리기임을 보인다.
@@ -180,12 +184,30 @@ async fn execute(state: &Arc<AppState>, task: Uuid, plan: &StoredPlan) -> Result
             }
             Err(e) => {
                 record(state, &plan.owner, plan.id, step, Some(&e.message));
-                failure = Some(format!(
-                    "step {done}/{total} ({} {} {:?}) failed: {}",
+                let what = format!(
+                    "{} {} {:?}",
                     verb(step.action),
                     step.kind.as_str(),
-                    step.name,
-                    e.message
+                    step.name
+                );
+                // 계획을 만든 뒤 대상이 바뀌었으면 충돌, 그 밖은 단계 실패(서버 오류 코드는 `cause`) — 계획 77-2.
+                // 처리기가 안에서 단 코드(예: 저장소에 닿지 않음)는 버린다: 단계·항목을 잃고, 만들다 실패한 항목은 아직
+                // 화면에 없다(리뷰 I6).
+                let why = if e.code == "revision_mismatch" {
+                    code::APPLY_CONFLICT
+                } else {
+                    code::APPLY_STEP_FAILED
+                };
+                failure = Some(coded_over(
+                    TaskFailure::new(why)
+                        .param("step", format!("{done}/{total}"))
+                        .param("action", verb(step.action))
+                        .param("kind", step.kind.as_str())
+                        .param("name", &step.name)
+                        .param("cause", e.code)
+                        .param("reason", &e.message)
+                        .step(format!("step {done}/{total} ({what})")),
+                    format!("step {done}/{total} ({what}) failed: {}", e.message),
                 ));
                 break;
             }

@@ -206,6 +206,11 @@ async fn offline_node_tasks_fail_after_the_grace_and_free_the_vm() {
         get_task(&env, pending.id).status.error,
         Some(format!("node {away} is offline"))
     );
+    // 원인 코드와 노드 이름(계획 77-2)
+    let failure = get_task(&env, pending.id).status.failure.unwrap();
+    assert_eq!(failure.code, "node_offline");
+    assert_eq!(failure.params["node"], "node2");
+    assert!(failure.retryable);
     // Task 없이 남은 pending 스냅샷도 지운다.
     until("orphan snapshot", || snapshot_ids(&env).is_empty()).await;
     janitor.shutdown().await;
@@ -242,6 +247,10 @@ async fn removed_node_tasks_fail_at_once() {
     })
     .await;
     janitor.shutdown().await;
+    // 목록에 없는 노드는 id로(계획 77-2)
+    let failure = get_task(&env, pending.id).status.failure.unwrap();
+    assert_eq!(failure.code, "node_removed");
+    assert_eq!(failure.params["node"], gone.to_string());
 }
 
 #[tokio::test]

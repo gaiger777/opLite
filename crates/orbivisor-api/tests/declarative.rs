@@ -671,6 +671,16 @@ async fn a_failed_step_stops_and_reapplying_does_the_rest() {
         error.contains("step 2/2") && error.contains("Router"),
         "{error}"
     );
+    // 원인 코드와 단계(계획 77-2)
+    let failure = &task["status"]["failure"];
+    assert_eq!(failure["code"], "apply_step_failed", "{task}");
+    assert_eq!(failure["params"]["step"], "2/2");
+    assert_eq!(failure["params"]["kind"], "Router");
+    assert!(
+        error.ends_with(failure["params"]["reason"].as_str().unwrap()),
+        "{task}"
+    );
+    assert!(failure["step"].as_str().unwrap().starts_with("step 2/2 ("));
     let set = env
         .cluster
         .get_by_name::<ApplySetSpec>("net")

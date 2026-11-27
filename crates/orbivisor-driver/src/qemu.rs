@@ -42,9 +42,10 @@ use crate::hypervisor::{
     RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
-    CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
-    MirrorOptions, MirrorProgress, MirrorTarget, NBD_TLS_ID, format_duration, migration_tls_dir,
-    parse_qemu_version, pick_port, tcp_uri,
+    CANNOT_LISTEN_FOR_MIGRATION, CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID,
+    MigrateOptions, MigrateTarget, MirrorOptions, MirrorProgress, MirrorTarget, NBD_TLS_ID,
+    NO_FREE_MIGRATION_PORT, NoPort, format_duration, migration_tls_dir, parse_qemu_version,
+    pick_port, tcp_uri,
 };
 use crate::net::{HostNet, Tap};
 use crate::replication::{REPLICA_TLS_ID, ReceiverExport, ReplicateRequest};
@@ -837,12 +838,15 @@ impl QemuHypervisor {
         // 받는 쪽은 보내는 쪽이 넘긴 비트맵만 받는다.
         self.setup_migration(qmp, TlsEndpoint::Server, None, None, true, false)
             .await?;
-        let no_port = || {
-            DriverError::Migration(format!(
-                "no free migration port in {}-{} on {host}",
-                ports.start(),
-                ports.end()
-            ))
+        let no_port = |e: NoPort| {
+            DriverError::Migration(match e {
+                NoPort::Busy => format!(
+                    "{NO_FREE_MIGRATION_PORT}{}-{} on {host}",
+                    ports.start(),
+                    ports.end()
+                ),
+                NoPort::Bind(e) => format!("{CANNOT_LISTEN_FOR_MIGRATION}{host}: {e}"),
+            })
         };
         let _ports = self.incoming_ports.lock().await;
         let mut nbd = None;
@@ -853,7 +857,7 @@ impl QemuHypervisor {
                 tokio::time::timeout(QMP_TIMEOUT, add).await,
                 "QMP object-add",
             )?;
-            let port = pick_port(host, ports.clone(), &[]).ok_or_else(no_port)?;
+            let port = pick_port(host, ports.clone(), &[]).map_err(no_port)?;
             let start = qmp.nbd_server_start(host, port, NBD_TLS_ID);
             flatten(
                 tokio::time::timeout(QMP_TIMEOUT, start).await,
@@ -872,7 +876,7 @@ impl QemuHypervisor {
         }
         // NBD 서버가 연 포트는 열 수 없어 건너뛴다(가짜 QMP처럼 열지 않았어도 건너뛴다).
         let except: Vec<u16> = nbd.into_iter().collect();
-        let port = pick_port(host, ports.clone(), &except).ok_or_else(no_port)?;
+        let port = pick_port(host, ports.clone(), &except).map_err(no_port)?;
         let uri = tcp_uri(host, port);
         let listen = qmp.migrate_incoming(&uri);
         flatten(
@@ -4270,12 +4274,15 @@ async fn serve_replicas(
         let args = receiver_blockdev(&format!("{RECEIVER_NODE_PREFIX}{i}"), export)?;
         qmp_call(qmp.blockdev_add(args), "QMP blockdev-add").await?;
     }
-    let port = pick_port(host, ports.clone(), &[]).ok_or_else(|| {
-        DriverError::Replication(format!(
-            "no free port in {}-{} on {host}",
-            ports.start(),
-            ports.end()
-        ))
+    let port = pick_port(host, ports.clone(), &[]).map_err(|e| {
+        DriverError::Replication(match e {
+            NoPort::Busy => format!(
+                "no free port in {}-{} on {host}",
+                ports.start(),
+                ports.end()
+            ),
+            NoPort::Bind(e) => format!("cannot listen on {host}: {e}"),
+        })
     })?;
     let start = qmp.nbd_server_start(host, port, REPLICA_TLS_ID);
     qmp_call(start, "QMP nbd-server-start").await?;

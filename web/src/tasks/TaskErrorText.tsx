@@ -13,11 +13,14 @@ const LONG = 120;
  */
 export function TaskErrorText({
   text,
+  summary,
   warning = false,
   subject,
   className,
 }: {
   text: string;
+  /** 사람 말 요약(실패 원인 사전의 제목, 계획 77-2): 원문 위에 한 줄로 */
+  summary?: string | null;
   warning?: boolean;
   subject?: string;
   className?: string;
@@ -28,11 +31,12 @@ export function TaskErrorText({
   const long = text.length > LONG || text.includes("\n");
   return (
     <div className={cn("flex min-w-0 flex-col items-start gap-0.5 text-xs", className)}>
+      {summary && <p className="max-w-full font-medium break-words text-danger-fg">{summary}</p>}
       <p
         id={textId}
         className={cn(
           "max-w-full break-words whitespace-pre-wrap",
-          warning ? "text-warning-fg" : "text-danger-fg",
+          warning ? "text-warning-fg" : summary ? "text-muted-foreground" : "text-danger-fg",
           long && !open && "line-clamp-2",
         )}
       >

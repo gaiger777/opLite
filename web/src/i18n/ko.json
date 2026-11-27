@@ -528,7 +528,7 @@
     "errorLessOf": "접기: {{name}}",
     "drawer": {
       "title": "작업",
-      "description": "무엇을 누가 언제 했고 어떻게 끝났는지입니다. 오류는 서버가 남긴 원문 그대로입니다.",
+      "description": "무엇을 누가 언제 했고 어떻게 끝났는지입니다. 실패했으면 까닭과 고치는 법을 보이고, 서버가 남긴 원문은 \"자세히\"에 둡니다.",
       "gone": "이 작업은 더 이상 없습니다. 오래된 작업은 정리되어 사라집니다.",
       "requestedBy": "{{name}} 요청",
       "copyError": "오류 원문 복사",
@@ -3605,6 +3605,8 @@
     "retry": "다시 하기",
     "runJobAgain": "작업 다시 실행",
     "retryNamed": "다시 하기: {{label}}",
+    "retryAfterFix": "고친 뒤 다시 하기",
+    "retryAfterFixNamed": "고친 뒤 다시 하기: {{label}}",
     "jobRunning": "백업 일정이 도는 중입니다.",
     "jobDisabled": "백업 일정이 꺼져 있습니다.",
     "view": "보기"

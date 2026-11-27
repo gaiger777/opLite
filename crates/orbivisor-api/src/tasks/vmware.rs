@@ -106,8 +106,24 @@ fn foreign_message(names: &[&str]) -> String {
 impl From<VsphereError> for SyncError {
     fn from(e: VsphereError) -> Self {
         let restricted = matches!(e, VsphereError::Restricted(_));
+        // 닿지 않음·로그인 거절은 Task 실패의 원인 코드(계획 77-2)
+        let message = match &e {
+            VsphereError::Connect(_) | VsphereError::Timeout(_) => super::failure::coded(
+                orbivisor_types::task_failure::TaskFailure::new(
+                    orbivisor_types::task_failure::code::VMWARE_UNREACHABLE,
+                ),
+                e.to_string(),
+            ),
+            VsphereError::Auth { .. } => super::failure::coded(
+                orbivisor_types::task_failure::TaskFailure::new(
+                    orbivisor_types::task_failure::code::VMWARE_AUTH,
+                ),
+                e.to_string(),
+            ),
+            _ => e.to_string(),
+        };
         SyncError {
-            message: e.to_string(),
+            message,
             // 권한·인증·무료 ESXi는 다시 해도 같다.
             permanent: restricted
                 || matches!(

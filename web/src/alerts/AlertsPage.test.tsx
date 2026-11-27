@@ -63,6 +63,12 @@ it("lists active alerts and nodes that did not answer", async () => {
   expect(list).toHaveTextContent("cpu-hot");
   expect(list).toHaveTextContent("Pending");
   expect(list).toHaveTextContent("value 93.5 · threshold 90");
+  // 조건별 원인·해결(계획 77-2): 접혀 있다가 펼친다.
+  const runbook = within(list).getByText("Cause and fix", { selector: "summary" });
+  expect(runbook).toHaveAccessibleName("Cause and fix: cpu-hot");
+  await userEvent.click(runbook);
+  expect(runbook.closest("details")).toHaveAttribute("open");
+  expect(runbook.closest("details")).toHaveTextContent("crossed the rule's threshold");
   expect(
     screen.getByText(/did not answer, so their alerts are missing: node-b/),
   ).toBeInTheDocument();

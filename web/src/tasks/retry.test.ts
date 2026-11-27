@@ -1,6 +1,6 @@
 import type { Role, Task } from "@/api/types";
 import { Permissions } from "@/auth/permissions";
-import { latestTasks, type RetryContext, retryOf } from "@/tasks/retry";
+import { latestTasks, type RetryContext, retryLabel, retryOf } from "@/tasks/retry";
 import { backup, backupJob, task, vm } from "@/test/fixtures";
 
 const off = vm("db", "stopped");
@@ -118,4 +118,23 @@ it("does not retry a failure that a newer task on the same target replaced", () 
   expect(retryOf(old, ctx({ latest: latestTasks([old, other]) }))).toMatchObject({
     action: "start",
   });
+});
+
+it("keeps the retry of a failure that must be fixed first, named so (review I7)", () => {
+  const coded = (retryable: boolean): Task => ({
+    ...failed("vm-start", off.id),
+    status: { state: "failed", error: "boom", failure: { code: "qemu_start_failed", retryable } },
+  });
+  const t = ((key: string) => key) as never;
+  const fix = retryOf(coded(false), ctx())!;
+  expect(fix).toMatchObject({ action: "start", fixFirst: true });
+  expect(retryLabel(fix, t)).toBe("center.retryAfterFix");
+  const again = retryOf(coded(true), ctx())!;
+  expect(again).toMatchObject({ action: "start", fixFirst: false });
+  expect(retryLabel(again, t)).toBe("center.retry");
+  // 원인 코드가 없는 실패(옛 노드)는 지금처럼
+  expect(retryOf(failed("vm-start", off.id), ctx())!.fixFirst).toBeUndefined();
+  expect(retryLabel(retryOf(failed("vm-backup", off.id, { backup: bk.id }), ctx())!, t)).toBe(
+    "center.runJobAgain",
+  );
 });

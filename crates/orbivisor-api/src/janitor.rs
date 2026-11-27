@@ -20,7 +20,8 @@ use orbivisor_types::backup_store::BackupStoreSpec;
 use orbivisor_types::cpu::{CpuCatalog, CpuCatalogSpec};
 use orbivisor_types::node::{Node, NodeSpec};
 use orbivisor_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
-use orbivisor_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
+use orbivisor_types::task::{Task, TaskFailure, TaskOp, TaskSpec, TaskState, TaskStatus};
+use orbivisor_types::task_failure::code;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -476,6 +477,18 @@ async fn release_store_locks(cluster: &Cluster, backups: &[Backup], tasks: &[Tas
     }
 }
 
+/// 노드가 오프라인이거나 제거되어 끝낸 Task의 원인 코드(계획 77-2 — `decide`의 두 오류). 노드 이름은 지금 목록에서
+fn offline_failure(cluster: &Cluster, node: Uuid, error: &str) -> Option<TaskFailure> {
+    let code = if error.ends_with(" is offline") {
+        code::NODE_OFFLINE
+    } else if error.ends_with(" was removed") {
+        code::NODE_REMOVED
+    } else {
+        return None;
+    };
+    Some(TaskFailure::new(code).param("node", crate::tasks::failure::node_name(cluster, node)))
+}
+
 /// 할 일을 읽은 revision에서만 쓴다.
 async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> {
     match action {
@@ -485,13 +498,16 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
             error,
         } => {
             // 시작 시각은 잇는다(계획 77 — 읽은 것과 revision이 다르면 어차피 쓰기가 거절된다).
-            let prev = cluster
-                .get::<TaskSpec>(*id)
-                .ok()
-                .flatten()
-                .map(|t| t.status);
-            let status =
-                TaskStatus::finished(TaskState::Failed, Some(error.clone()), prev.as_ref());
+            let prev = cluster.get::<TaskSpec>(*id).ok().flatten();
+            let failure = prev
+                .as_ref()
+                .and_then(|t| offline_failure(cluster, t.spec.node, error));
+            let status = TaskStatus::finished(
+                TaskState::Failed,
+                Some(error.clone()),
+                prev.as_ref().map(|t| &t.status),
+            )
+            .with_failure(failure);
             cluster
                 .update_status_checked::<TaskSpec>(*id, *revision, &status)
                 .await

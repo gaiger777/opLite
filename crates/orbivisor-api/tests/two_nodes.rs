@@ -1727,6 +1727,14 @@ async fn failed_disk_copies_are_deleted_on_the_target() {
         task["status"]["error"],
         "not enough space in storage pool \"local\" on node \"node2\": need 1048576, available 1000"
     );
+    // 원인 코드와 사람에게 보일 값(계획 77-2)
+    assert_eq!(
+        task["status"]["failure"],
+        serde_json::json!({
+            "code": "pool_full",
+            "params": { "pool": "local", "node": "node2", "need_bytes": "1048576", "free_bytes": "1000" }
+        })
+    );
     assert!(b.storage.deleted().is_empty());
     assert!(!disk_record(&root, &a, &task).exists());
     set_space(None).await;

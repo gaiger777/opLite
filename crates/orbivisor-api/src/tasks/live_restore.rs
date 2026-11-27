@@ -88,7 +88,15 @@ pub(super) async fn run(
         Some(vm) if vm.status.live_restore.is_some() => {}
         // 갈아탄 뒤 끝을 적기 전에 opld가 죽었다.
         Some(_) if resume => return Ok(None),
-        Some(vm) => return Err(format!("VM {:?} already exists", vm.name)),
+        Some(vm) => {
+            return Err(super::failure::coded(
+                orbivisor_types::task_failure::TaskFailure::new(
+                    orbivisor_types::task_failure::code::RESTORE_NAME_TAKEN,
+                )
+                .param("name", &vm.name),
+                format!("VM {:?} already exists", vm.name),
+            ));
+        }
         None if resume => {
             return Err(
                 "interrupted: orbivisord restarted before the restored VM was created".into(),
@@ -339,7 +347,7 @@ async fn ensure_source(ctx: &Ctx, backup: &Backup, id: Uuid) -> Result<bool, Str
             }
             let (_, store) = open_store(ctx, name).await?;
             let (m, _) = read_snapshot(&store, backup).await?;
-            let s = serve(ctx, &store, &m, socket).await?;
+            let s = serve(ctx, (&store, name), &m, socket).await?;
             ctx.live_serving.lock().unwrap().insert(id, s);
             Ok(true)
         }

@@ -198,12 +198,39 @@ fn socket_addr(host: &str, port: u16) -> String {
     }
 }
 
+/// 받는 포트가 모두 쓰는 중일 때 오류의 머리(뒤에 `A-B on host`) — API가 Task 실패의 원인을 이 머리로 안다
+pub const NO_FREE_MIGRATION_PORT: &str = "no free migration port in ";
+/// 받는 주소에서 포트를 열지 못했을 때(그 노드의 주소가 아님 등) 오류의 머리(뒤에 `host`)
+pub const CANNOT_LISTEN_FOR_MIGRATION: &str = "cannot listen for migrations on ";
+
+/// [`pick_port`]가 포트를 고르지 못한 까닭
+#[derive(Debug)]
+pub(crate) enum NoPort {
+    /// 범위의 포트가 모두 쓰는 중이다(또는 이미 고른 것).
+    Busy,
+    /// 쓰는 중이 아닌 까닭으로 열지 못했다(주소가 이 기계의 것이 아님, 권한 등).
+    Bind(std::io::Error),
+}
+
 /// `ports`에서 `except`가 아니고 `host`에 지금 열 수 있는 첫 포트. 잠깐 열어 보고 닫는다. QEMU의
 /// `migrate-incoming`은 한 번만 부를 수 있어 포트가 쓰는 중이면 그 QEMU를 버려야 하므로 미리 고른다.
-pub(crate) fn pick_port(host: &str, ports: RangeInclusive<u16>, except: &[u16]) -> Option<u16> {
-    ports.into_iter().find(|&port| {
-        !except.contains(&port) && std::net::TcpListener::bind(socket_addr(host, port)).is_ok()
-    })
+/// 쓰는 중(`AddrInUse`)이 아닌 까닭으로 열지 못하면 다른 포트도 같으므로 바로 그 오류를 준다.
+pub(crate) fn pick_port(
+    host: &str,
+    ports: RangeInclusive<u16>,
+    except: &[u16],
+) -> Result<u16, NoPort> {
+    for port in ports {
+        if except.contains(&port) {
+            continue;
+        }
+        match std::net::TcpListener::bind(socket_addr(host, port)) {
+            Ok(_) => return Ok(port),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(e) => return Err(NoPort::Bind(e)),
+        }
+    }
+    Err(NoPort::Busy)
 }
 
 /// `qemu-system-* --version`의 첫 줄(`QEMU emulator version 8.2.2 (Debian ...)`)에서 버전을 읽는다.
@@ -279,21 +306,36 @@ mod tests {
     fn picks_first_port_that_is_free() {
         let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = busy.local_addr().unwrap().port();
-        assert_eq!(pick_port("127.0.0.1", port..=port, &[]), None);
+        assert!(matches!(
+            pick_port("127.0.0.1", port..=port, &[]),
+            Err(NoPort::Busy)
+        ));
         drop(busy);
         // 같은 시험 프로세스의 다른 시험이 그 순간 자식 프로세스를 띄우면(fork) 자식이 exec할 때까지 닫은 소켓을
         // 들고 있어 포트가 잠깐 쓰이는 것으로 보인다(swtpm 시험의 `ps` 등). 잠시 다시 본다.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while pick_port("127.0.0.1", port..=port, &[]).is_none() {
+        while pick_port("127.0.0.1", port..=port, &[]).is_err() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "port {port} stayed busy"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(pick_port("127.0.0.1", port..=port, &[]), Some(port));
+        assert_eq!(pick_port("127.0.0.1", port..=port, &[]).unwrap(), port);
         // 이미 고른 포트(아직 열지 않음)는 건너뛴다.
-        assert_eq!(pick_port("127.0.0.1", port..=port, &[port]), None);
+        assert!(matches!(
+            pick_port("127.0.0.1", port..=port, &[port]),
+            Err(NoPort::Busy)
+        ));
+    }
+
+    /// 이 기계의 주소가 아니면 쓰는 중과 따로 알린다(TEST-NET-1은 어느 기계의 주소도 아니다).
+    #[test]
+    fn a_foreign_address_is_not_a_busy_port() {
+        assert!(matches!(
+            pick_port("192.0.2.1", 60000..=60001, &[]),
+            Err(NoPort::Bind(_))
+        ));
     }
 
     #[test]

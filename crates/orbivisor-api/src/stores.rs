@@ -60,8 +60,24 @@ pub fn master_key(store: &BackupStore) -> Result<Option<MasterKey>, String> {
 }
 
 /// 저장소 오류의 문구(사용자에게 보이는 Task 오류)
+/// 닿지 않음·거절·공간 없음(디렉터리 저장소)·깨짐·다른 키는 Task 실패의 원인 코드를 단다(계획 77-2 — Task 밖이면 문구만).
 pub fn store_error(store: &str, e: StoreError) -> String {
-    format!("backup store {store:?}: {e}")
+    use orbivisor_types::task_failure::{TaskFailure, code, is_no_space};
+    let code = match &e {
+        StoreError::Unavailable(_) => Some(code::BACKUP_STORE_UNAVAILABLE),
+        StoreError::Denied(_) => Some(code::BACKUP_STORE_DENIED),
+        StoreError::Io(m) if is_no_space(m) => Some(code::BACKUP_STORE_FULL),
+        StoreError::Corrupt(_) => Some(code::BACKUP_CORRUPT),
+        StoreError::KeyMismatch(_) => Some(code::BACKUP_KEY_MISMATCH),
+        _ => None,
+    };
+    let message = format!("backup store {store:?}: {e}");
+    match code {
+        Some(code) => {
+            crate::tasks::failure::coded(TaskFailure::new(code).param("store", store), message)
+        }
+        None => message,
+    }
 }
 
 /// 노드 `node`가 저장소를 쓸 수 있는지(온라인 여부는 보지 않는다). 백업 풀 안 저장소는 풀이 그 노드에서 준비돼 있고

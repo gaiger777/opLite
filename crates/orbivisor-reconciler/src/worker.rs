@@ -60,7 +60,14 @@ const HA_UNAVAILABLE: &str = "HA is not available on this node";
 /// 다른 프로세스가 디스크 이미지를 잠가 두어 다시 시도하는 동안의 status
 const IMAGE_LOCKED: &str = "disk image is locked by another process; retrying";
 /// 방화벽이 없는 노드(nftables 없음, macOS)에서 보안 그룹을 건 NIC가 있는 VM을 켜려 할 때의 오류
-const NO_FIREWALL: &str = "failed to start: firewall: this node has no firewall (nftables)";
+pub const NO_FIREWALL: &str = "failed to start: firewall: this node has no firewall (nftables)";
+/// 켜기 전에 방화벽 규칙을 넣지 못했을 때 오류의 머리(뒤에 까닭, 다시 시도를 다 쓰면 `; gave up after …`)
+pub const FIREWALL_FAILED: &str = "failed to start: firewall: ";
+/// QEMU 프로세스가 켜자마자 오류로 끝났을 때 오류의 머리(뒤에 QEMU의 stderr). `DriverError::StartFailed`의 다른
+/// 내용(swtpm·vCPU 고정)은 [`START_FAILED_NOT_QEMU`]로 가린다.
+pub const QEMU_START_FAILED: &str = "failed to start: QEMU failed to start: ";
+/// `DriverError::StartFailed`이지만 QEMU가 아닌 것(머리 뒤): swtpm 준비·시작, vCPU 고정
+pub const START_FAILED_NOT_QEMU: &[&str] = &["swtpm", "cannot pin vCPU"];
 /// 남은 마이그레이션을 취소하지 못해(남은 디스크 미러) 표시를 남긴 채 다시 하는 연속 실패 수. 이만큼
 /// 실패하면 경고 뒤 표시를 지운다([`Worker::clear_migration`]).
 const CANCEL_ATTEMPTS: u32 = 3;
@@ -1321,7 +1328,7 @@ impl Worker {
             if let Err(e) = gate.sync().await {
                 tracing::warn!(vm = %self.id, error = %e, "cannot apply the firewall rules; not starting");
                 self.deactivate_disks(vm).await;
-                self.record_failure(format!("failed to start: firewall: {e}"));
+                self.record_failure(format!("{FIREWALL_FAILED}{e}"));
                 return Ok(Start::NotStarted);
             }
         }

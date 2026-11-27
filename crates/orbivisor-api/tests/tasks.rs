@@ -52,6 +52,11 @@ async fn tasks_left_running_by_a_previous_opld_are_failed() {
         task["status"]["error"],
         "interrupted: orbivisord restarted while the task was running"
     );
+    // 원인 코드(계획 77-2): 다시 하면 된다.
+    assert_eq!(
+        task["status"]["failure"],
+        serde_json::json!({ "code": "task_interrupted", "retryable": true })
+    );
 }
 
 #[tokio::test]

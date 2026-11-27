@@ -21,9 +21,11 @@ use sha2::{Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+use super::failure::coded;
 use super::migrate::write_progress;
 use super::{Ctx, clone, import_volume, resize_volume, volume_and_pool};
 use crate::volumes::{UPLOAD_RESERVE_BYTES, redact_url};
+use orbivisor_types::task_failure::{TaskFailure, code};
 
 /// 연결 한도
 pub(crate) const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,9 +100,12 @@ impl Want {
             .as_ref()
             .map(|u| format!(" (from {u})"))
             .unwrap_or_default();
-        Err(format!(
-            "checksum mismatch: expected {}{from}, got {got}",
-            self.value
+        Err(coded(
+            TaskFailure::new(code::UPLOAD_CHECKSUM),
+            format!(
+                "checksum mismatch: expected {}{from}, got {got}",
+                self.value
+            ),
         ))
     }
 }
@@ -265,7 +270,15 @@ async fn get(ctx: &Ctx, client: &reqwest::Client, url: &str) -> Result<reqwest::
         .await
         .map_err(|e| failed(&shown, e))?;
     if !response.status().is_success() {
-        return Err(format!("GET {shown}: HTTP {}", response.status()));
+        // 4xx(없는 파일·권한)는 다시 받아도 같다 — 주소를 고친 뒤 다시 한다.
+        let status = response.status();
+        return Err(coded(
+            TaskFailure {
+                retryable: !status.is_client_error(),
+                ..TaskFailure::new(code::DOWNLOAD_FAILED).param("url", &shown)
+            },
+            format!("GET {shown}: HTTP {status}"),
+        ));
     }
     Ok(response)
 }
@@ -274,7 +287,10 @@ async fn get(ctx: &Ctx, client: &reqwest::Client, url: &str) -> Result<reqwest::
 fn failed(shown: &str, e: reqwest::Error) -> String {
     match blocked(&e) {
         Some(ip) => format!("GET {shown}: {}", Blocked(ip)),
-        None => format!("GET {shown}: {}", e.without_url()),
+        None => coded(
+            TaskFailure::new(code::DOWNLOAD_FAILED).param("url", shown),
+            format!("GET {shown}: {}", e.without_url()),
+        ),
     }
 }
 
@@ -313,25 +329,42 @@ async fn fetch(
     let shown = redact_url(url);
     let mut response = get(ctx, client, url).await?;
     let total = response.content_length().unwrap_or(0);
+    // 받는 곳은 풀이 아니라 이 노드의 업로드 디렉터리다(리뷰 I3) — 그 노드·경로로 안내한다.
+    let full = || {
+        TaskFailure::new(code::UPLOAD_DIR_FULL)
+            .param(
+                "node",
+                super::failure::node_name(&ctx.cluster, ctx.config.node),
+            )
+            .param("dir", dir.display())
+    };
     if total > 0 {
         check_space(dir, total, || {
-            format!("not enough free space for a {total}-byte download")
+            coded(
+                full().param("need_bytes", total),
+                format!("not enough free space for a {total}-byte download"),
+            )
         })?;
     }
     let mut out = tokio::fs::File::create(file)
         .await
         .map_err(|e| e.to_string())?;
+    // 크기를 알리지 않은 받기는 쓰다가 공간이 바닥날 수 있다(필요한 크기는 모른다).
+    let write_failed = |e: std::io::Error| super::failure::if_no_space(e.to_string(), full);
     let mut hash = algorithm.hasher();
     let mut done = 0u64;
     let mut next_check = SPACE_CHECK_BYTES;
     let mut shown_at = Instant::now();
     while let Some(chunk) = response.chunk().await.map_err(|e| failed(&shown, e))? {
-        out.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        out.write_all(&chunk).await.map_err(write_failed)?;
         hash.update(&chunk);
         done += chunk.len() as u64;
         if let Some(need) = space_to_check(total, done, next_check) {
             check_space(dir, need, || {
-                format!("not enough free space to go on with the download after {done} bytes")
+                coded(
+                    full().param("need_bytes", need),
+                    format!("not enough free space to go on with the download after {done} bytes"),
+                )
             })?;
             next_check = done + SPACE_CHECK_BYTES;
         }
@@ -346,7 +379,7 @@ async fn fetch(
             shown_at = Instant::now();
         }
     }
-    out.sync_all().await.map_err(|e| e.to_string())?;
+    out.sync_all().await.map_err(write_failed)?;
     Ok((done, hex::encode(hash.finalize())))
 }
 
