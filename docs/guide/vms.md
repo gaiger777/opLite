@@ -1259,7 +1259,7 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
   바뀌면 다르게 고를 수 있고, 꺼진 채 만드는 VM에도 나올 수 있다 — 켤 때 다시 고른다), 준비 단계를 지나지 못했거나 노드가 정해지지 않았거나 루트
   `cluster.read`가 없으면 `null`이다. `start_node`는 **꺼진 채 노드 없이** 만들 때 지금 켜면 스케줄러가 고를 노드다(계획 77-5 — 웹 만들기
   화면의 "놓일 노드"와 여유 막대가 쓴다, 예상이고 잡아 두지 않는다). 켜진 채이거나 노드를 줬거나 놓을 노드가 없거나(만들기는 받는다 — 켤 때
-  까닭이 나온다) 노드 이름을 볼 수 없으면 칸이 없다. `machine`(채운 머신)·`cpu_model`(별칭을
+  까닭이 나온다) 노드 이름을 볼 수 없으면 칸이 없다(노드 이름을 볼 수 없는 사용자에게는 이 예상을 셈하지도, 부하 요약을 읽지도 않는다). `machine`(채운 머신)·`cpu_model`(별칭을
   버전 모델로 고정한 것)·`ips`(NIC마다 받을 SDN 주소 — 예상이고 잡아 두지 않음)는 준비 단계를 지났을 때만 채우고, 아니면 `null`·빈 목록이다.
 - **`at` 자리**(웹 빌더의 칸이자 폼 오류 열쇠의 꼴): `name`, `compute`, `disks`·`disks.N`, `cdroms`·`cdroms.N`, `nics`·`nics.N`, `cloudInit`,
   `placement`, `protection`, `replication`, `quota`, `spec`(그 밖). `N`은 요청 spec의 `disks`·`cdroms`·`nics` 차례다. 만들 볼륨의 문제는 그 볼륨을
