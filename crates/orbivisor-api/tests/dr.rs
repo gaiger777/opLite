@@ -508,6 +508,8 @@ async fn finished_run(
             plan_spec: spec,
             max_parallel: 4,
             cleanup: None,
+            allow_missing: false,
+            point_in_time: None,
         },
     );
     run.status = serde_json::from_value(json!({
@@ -649,11 +651,35 @@ async fn actions_check_the_request_and_make_run_records() {
     copy(&env, "web1-a", "web1", CA, 600).await;
     let p = create_plan(&env, "web-tier").await;
 
-    // 시험: 실행 리소스(계획 사본·첫 상태)를 만들고 계획에 적는다. db1은 복구 지점이 없어 곧 failed다.
-    let (status, run) = admin
+    // 시험망이 브리지(물리망)면 400(격리 아님 — 알고 진행하려면 `allow_routed_test_networks`), db1은 복구 지점이 없어 400
+    // (`allow_missing`이면 그 VM은 skipped)
+    let got = admin
         .post("/dr-plans/web-tier/actions/test", json!({}))
         .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "dr_test_network_not_isolated",
+    );
+    assert_eq!(got.1["details"]["networks"], json!(["dr-test-lan"]));
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/test",
+            json!({ "allow_routed_test_networks": true }),
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "dr_missing_recovery_points");
+    assert_eq!(got.1["details"]["vms"], json!(["db1"]));
+    assert!(env.cluster.list::<DrRunSpec>().unwrap().1.is_empty());
+    // 시험: 실행 리소스(계획 사본·첫 상태)를 만들고 계획에 적는다.
+    let (status, run) = admin
+        .post(
+            "/dr-plans/web-tier/actions/test",
+            json!({ "allow_routed_test_networks": true, "allow_missing": true }),
+        )
+        .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    assert_eq!(run["spec"]["allow_missing"], true);
     assert_eq!(run["spec"]["kind"], "test");
     assert_eq!(run["spec"]["plan"], p["id"]);
     assert_eq!(run["spec"]["plan_name"], "web-tier");
@@ -666,8 +692,16 @@ async fn actions_check_the_request_and_make_run_records() {
     );
     let steps = &run["status"]["steps"];
     assert_eq!(steps[0]["vm"], "db1");
-    assert_eq!(steps[0]["phase"], "failed");
+    assert_eq!(steps[0]["phase"], "skipped");
     assert_eq!(steps[0]["error"], "no recovery point");
+    // 장애 조치 준비: db1은 복구 지점이 없고, web1의 `lan`(네트워크 맵 없음 — 같은 이름)은 이 클러스터에 없다.
+    let ready = &run["status"]["failover_readiness"];
+    assert_eq!(ready[0]["vm"], "db1");
+    assert_eq!(ready[0]["issues"], json!([{ "kind": "recovery-point" }]));
+    assert_eq!(
+        ready[1]["issues"],
+        json!([{ "kind": "network", "name": "lan" }])
+    );
     assert_eq!(steps[1]["vm"], "web1");
     assert_eq!(steps[1]["phase"], "pending");
     assert_eq!(steps[1]["backup"], "web1-a");
@@ -676,15 +710,8 @@ async fn actions_check_the_request_and_make_run_records() {
     let (_, got) = admin.get("/dr-plans/web-tier").await;
     assert_eq!(got["status"]["run"], run["id"]);
 
-    // 도는 실행이 있으면 다른 실행은 409
-    for (path, body) in [
-        ("test", json!({})),
-        ("cleanup", json!({})),
-        (
-            "failover",
-            json!({ "mode": "disaster", "confirm": "web-tier" }),
-        ),
-    ] {
+    // 도는 실행이 있으면 다른 실행은 409(장애 조치는 도는 시험을 끊는다 — 따로 시험)
+    for (path, body) in [("test", json!({})), ("cleanup", json!({}))] {
         assert_error(
             &admin
                 .post(&format!("/dr-plans/web-tier/actions/{path}"), body)
@@ -731,9 +758,19 @@ async fn actions_check_the_request_and_make_run_records() {
         StatusCode::CONFLICT,
         "dr_no_active_run",
     );
-    labelled_vm(&env, "web1-drt", DR_TEST_LABEL, "web-tier").await;
+    // 시험이 만든 VM(실행 기록의 id + 시험 라벨)만 남은 것이다. 라벨만 단 VM, 다른 계획의 시험 VM, 장애 조치 VM은 아니다.
+    let made = labelled_vm(&env, "web1-drt", DR_TEST_LABEL, "web-tier").await;
+    labelled_vm(&env, "stray-drt", DR_TEST_LABEL, "web-tier").await;
     labelled_vm(&env, "other-drt", DR_TEST_LABEL, "other").await;
     labelled_vm(&env, "web1", DR_LABEL, "web-tier").await;
+    let id: Uuid = run["id"].as_str().unwrap().parse().unwrap();
+    let mut rec = env.cluster.get::<DrRunSpec>(id).unwrap().unwrap();
+    rec.status.steps[1].vm_id = Some(made);
+    rec.status.steps[1].new_vm = Some("web1-drt".into());
+    env.cluster
+        .update_status::<DrRunSpec>(id, &rec.status)
+        .await
+        .unwrap();
     let got = admin
         .post("/dr-plans/web-tier/actions/test", json!({}))
         .await;
@@ -750,7 +787,7 @@ async fn actions_check_the_request_and_make_run_records() {
     assert_eq!(cleanup["spec"]["kind"], "cleanup");
     assert_eq!(
         cleanup["spec"]["cleanup"],
-        json!({ "run": run["id"], "vms": ["web1-drt"] })
+        json!({ "run": run["id"], "vms": ["web1-drt"], "vm_ids": [made] })
     );
     assert_eq!(cleanup["status"]["steps"][0]["new_vm"], "web1-drt");
     assert_eq!(cleanup["status"]["steps"][0]["phase"], "pending");
@@ -800,14 +837,34 @@ async fn actions_check_the_request_and_make_run_records() {
         StatusCode::CONFLICT,
         "dr_source_unreachable",
     );
+    assert_error(
+        &admin
+            .post(
+                "/dr-plans/web-tier/actions/failover",
+                json!({ "mode": "disaster", "confirm": "web-tier" }),
+            )
+            .await,
+        StatusCode::BAD_REQUEST,
+        "dr_missing_recovery_points",
+    );
+    // `point_in_time`: 그 시각 이전의 사본이 없으면 web1도 빠진다.
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier", "point_in_time": now() - 3600 }),
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "dr_missing_recovery_points");
+    assert_eq!(got.1["details"]["vms"], json!(["db1", "web1"]));
     let (status, fo) = admin
         .post(
             "/dr-plans/web-tier/actions/failover",
-            json!({ "mode": "disaster", "confirm": "web-tier" }),
+            json!({ "mode": "disaster", "confirm": "web-tier", "allow_missing": true }),
         )
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{fo}");
     assert_eq!(fo["spec"]["kind"], "failover-disaster");
+    assert_eq!(fo["status"]["steps"][0]["phase"], "skipped");
     assert_eq!(fo["status"]["steps"][1]["phase"], "pending");
     finish(&env, &fo["id"], DrRunState::Partial).await;
     let (_, report) = admin.get("/dr-plans/web-tier/report").await;
@@ -852,7 +909,10 @@ async fn tests_without_sdn_need_every_test_network() {
     let (status, created) = admin.post("/dr-plans", body).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     let got = admin
-        .post("/dr-plans/web-tier/actions/test", json!({}))
+        .post(
+            "/dr-plans/web-tier/actions/test",
+            json!({ "allow_missing": true }),
+        )
         .await;
     assert_error(&got, StatusCode::BAD_REQUEST, "dr_test_network_required");
     assert!(
@@ -869,14 +929,19 @@ async fn tests_without_sdn_need_every_test_network() {
         .unwrap();
     env.cluster.delete::<BackupSpec>(b.id, None).await.unwrap();
     let (status, run) = admin
-        .post("/dr-plans/web-tier/actions/test", json!({}))
+        .post(
+            "/dr-plans/web-tier/actions/test",
+            json!({ "allow_missing": true }),
+        )
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{run}");
 }
 
-/// 계획된 이전은 운영 쪽(원격 역할의 두 번째 클러스터)에 닿아야 한다. 닿으면 VM마다 운영 쪽 준비부터다.
+/// 계획된 이전은 운영 쪽(원격 역할의 두 번째 클러스터)에 닿아야 하고, 운영 VM을 끄기 전에 사전 검사를 모두 지나야 한다
+/// (409 `dr_planned_preflight` — 운영 쪽에 이 클러스터의 원격이 없음, VM이 없음, 토큰이 admin이 아님). 아무것도 끄지 않고
+/// 실행도 만들지 않는다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn planned_failovers_start_when_the_source_answers() {
+async fn planned_failovers_check_the_source_before_stopping_anything() {
     let env = Env::start().await;
     set_dr(&env, true).await;
     pool(&env, "dr-pool", false).await;
@@ -895,18 +960,60 @@ async fn planned_failovers_start_when_the_source_answers() {
     p["spec"]["test_networks"] = json!({});
     let (status, body) = admin.post("/dr-plans", p).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let (status, run) = admin
+    let got = admin
         .post(
             "/dr-plans/web-tier/actions/failover",
             json!({ "mode": "planned", "confirm": "web-tier" }),
         )
         .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
-    assert_eq!(run["spec"]["kind"], "failover-planned");
-    for s in run["status"]["steps"].as_array().unwrap() {
-        assert_eq!(s["phase"], "preparing", "{run}");
-        assert_eq!(s["prepare"]["stage"], "shutdown", "{run}");
-    }
+    assert_error(&got, StatusCode::CONFLICT, "dr_planned_preflight");
+    let codes: Vec<(String, Option<String>)> = got.1["details"]["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["code"].as_str().unwrap().to_string(),
+                p["vm"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            ("no_remote_here".to_string(), None),
+            ("vm_missing".to_string(), Some("db1".to_string())),
+            ("vm_missing".to_string(), Some("web1".to_string())),
+        ],
+        "{}",
+        got.1
+    );
+    assert!(env.cluster.list::<DrRunSpec>().unwrap().1.is_empty());
+    // viewer 토큰이면 그것도 문제다(운영 쪽 복제는 admin).
+    let viewer = prod.user("viewer", "viewer").await;
+    let remote = env
+        .cluster
+        .get_by_name::<RemoteSpec>("prod")
+        .unwrap()
+        .unwrap();
+    let mut spec = remote.spec.clone();
+    spec.token = viewer.token.clone().unwrap();
+    env.cluster
+        .update_spec(remote.id, None, remote.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "planned", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "dr_planned_preflight");
+    assert_eq!(
+        got.1["details"]["problems"][0]["code"], "token_role",
+        "{}",
+        got.1
+    );
 }
 
 #[tokio::test]
@@ -996,6 +1103,27 @@ async fn reprotect_makes_a_replicating_backup_job_for_recovered_vms() {
     assert_eq!(again["id"], job["id"]);
     assert_eq!(again["spec"]["schedule"]["at"], "04:30");
     assert_eq!(env.cluster.list::<BackupJobSpec>().unwrap().1.len(), 1);
+    // 백업 작업 화면에서 보존 규칙을 고친 뒤 다시 보호해도(보존·시각을 주지 않음) 그대로 둔다.
+    let mut stored = env
+        .cluster
+        .get_by_name::<BackupJobSpec>("dr-reprotect-web-tier")
+        .unwrap()
+        .unwrap();
+    stored.spec.keep.last = 7;
+    env.cluster
+        .update_spec(stored.id, None, stored.labels.clone(), &stored.spec)
+        .await
+        .unwrap();
+    let (status, again) = admin
+        .post(
+            "/dr-plans/web-tier/actions/reprotect",
+            json!({ "remote": "prod", "pool": "prod-bk" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["spec"]["keep"]["last"], 7, "{again}");
+    assert_eq!(again["spec"]["schedule"]["at"], "04:30");
+    assert_eq!(again["spec"]["pool"], "bk");
 }
 
 // ---- 4단계: 실행 엔진 ----
@@ -1549,14 +1677,37 @@ async fn a_disaster_failover_uses_source_names_and_maps() {
         ["10.30.0.7".parse::<std::net::IpAddr>().unwrap()]
     );
     assert!(done.status.rto_secs.is_some());
+    assert_eq!(done.status.steps[0].failed_in, Some(DrPhase::Restoring));
     let st = settled(&env, "web-tier").await;
     assert_eq!(st.run, None);
     assert!(st.last_test.is_none());
+    assert_eq!(st.source_fence_pending, ["web1"]);
+    // 부분 실패 뒤 다시 돌리면 이 계획이 되살린 VM(web1)은 그대로 두고(`skipped`) 나머지만 다시 한다.
+    let (status, again) = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    let again = finished(&env, &again["id"]).await;
+    assert_eq!(
+        again.status.steps[1].phase,
+        DrPhase::Skipped,
+        "{:?}",
+        again.status
+    );
+    assert_eq!(
+        again.status.steps[1].error.as_deref(),
+        Some("already recovered by this plan")
+    );
+    assert_eq!(restore_tasks(&env, "web1").len(), 1);
     looper.shutdown().await;
 }
 
-/// 리더가 바뀜: 첫 스케줄러가 복원 Task를 내고 기록한 뒤 멈추고, 기록을 잃은 것처럼(Task id 없는 `restoring`) 둔다. 새
-/// 스케줄러는 같은 기록에서 이어 가며 이미 낸 Task를 찾아 쓴다 — 복원·시작 Task는 VM마다 하나다.
+/// 리더가 바뀜: 첫 스케줄러가 복원 Task를 내고 멈추고, 그 걸음의 기록을 통째로 잃은 것처럼(단계가 아직 `pending`) 둔다.
+/// 새 스케줄러는 몇 초 뒤 같은 기록에서 이어 가며(단계를 지금 시각으로 다시 든다) 이미 낸 Task를 찾아 쓴다 — 실행 시작
+/// 시각으로 찾으므로 복원·시작 Task는 VM마다 하나다(리뷰 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_leader_continues_without_issuing_tasks_twice() {
     let mut env = engine_env(std::sync::Arc::new(Agent::default())).await;
@@ -1589,14 +1740,20 @@ async fn a_new_leader_continues_without_issuing_tasks_twice() {
     .await;
     first.shutdown().await;
     let issued = run_of(&env, &run["id"]).status.steps[0].task.unwrap();
-    // 저장 전에 리더가 바뀐 것처럼 Task id를 지운다.
+    // 저장 전에 리더가 바뀐 것처럼 단계를 `pending`으로 되돌린다(Task는 남음).
     let mut lost = run_of(&env, &run["id"]);
     assert_eq!(lost.status.steps[0].phase, DrPhase::Restoring);
-    lost.status.steps[0].task = None;
+    let step = &mut lost.status.steps[0];
+    step.phase = DrPhase::Pending;
+    step.task = None;
+    step.new_vm = None;
+    step.vm_id = None;
     env.cluster
         .update_status::<DrRunSpec>(lost.id, &lost.status)
         .await
         .unwrap();
+    // 단계 시각으로 찾던 옛 길은 이만큼 지나면 놓쳤다.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     let second = scheduler(&env);
     until_long("the new leader did not pick up the task", || {
         run_of(&env, &run["id"]).status.steps[0].task == Some(issued)
@@ -1714,4 +1871,178 @@ async fn a_planned_failover_stops_backs_up_and_replicates_the_source_first() {
     assert_eq!(web.labels[DR_LABEL], "web-tier");
     assert_eq!(settled(&env, "web-tier").await.run, None);
     looper.shutdown().await;
+}
+
+// ---- 리뷰 1 ----
+
+/// 시험 도중 진짜 장애: 장애 조치가 도는 시험을 곧 끊고(`cancelled`·`preempted`, 진행 중 Task는 그대로) 시작한다. 끊은 시험이
+/// 만든 VM에도 시험 라벨을 달고, 장애 조치가 끝난 뒤에 그 뒷정리가 시작된다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failover_preempts_a_running_test() {
+    let mut env = engine_env(std::sync::Arc::new(Agent::default())).await;
+    let admin = env.admin().await;
+    restorable(&env, "db1-c", "db1", true).await;
+    restorable(&env, "web1-c", "web1", false).await;
+    let mut spec = engine_plan();
+    spec["groups"][0]["wait"] = json!("running");
+    make_plan(&admin, spec).await;
+    env.stop_runner().await;
+    let (status, test) = admin
+        .post("/dr-plans/web-tier/actions/test", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{test}");
+    let first = scheduler(&env);
+    until_long("the test never issued its restore", || {
+        run_of(&env, &test["id"]).status.steps[0].task.is_some()
+    })
+    .await;
+    first.shutdown().await;
+    let (status, fo) = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{fo}");
+    assert_eq!(fo["status"]["preempted_test"], test["id"]);
+    let cut = run_of(&env, &test["id"]);
+    assert_eq!(cut.status.state, DrRunState::Cancelled);
+    assert!(cut.status.preempted);
+    assert!(cut.status.steps.iter().all(|s| s.phase.is_terminal()));
+    assert_eq!(
+        plan_status(&env, "web-tier").run.map(|r| r.to_string()),
+        fo["id"].as_str().map(str::to_string)
+    );
+    // 끊은 시험의 복원 Task가 끝나 시험 VM이 생긴다.
+    env.start_runner_with(std::sync::Arc::new(common::FakeStorage::default()))
+        .await;
+    until_long("the test VM never appeared", || {
+        vm_named(&env, "db1-drt").is_some()
+    })
+    .await;
+    let looper = scheduler(&env);
+    let done = finished(&env, &fo["id"]).await;
+    assert_eq!(
+        done.status.state,
+        DrRunState::Succeeded,
+        "{:?}",
+        done.status
+    );
+    until_long("no cleanup after the failover", || {
+        env.cluster
+            .list::<DrRunSpec>()
+            .unwrap()
+            .1
+            .iter()
+            .any(|r| r.spec.kind == DrRunKind::Cleanup && r.status.state == DrRunState::Succeeded)
+    })
+    .await;
+    looper.shutdown().await;
+    assert!(vm_named(&env, "db1-drt").is_none());
+    assert_eq!(vm_named(&env, "db1").unwrap().labels[DR_LABEL], "web-tier");
+    // 재해 장애 조치로 되살린 VM은 운영 쪽에서 멈출 때까지 목록에 남는다.
+    assert_eq!(
+        settled(&env, "web-tier").await.source_fence_pending,
+        ["db1", "web1"]
+    );
+}
+
+/// fence-source: 재해 뒤 돌아온 운영 쪽(두 번째 클러스터)의 그 VM을 강제로 끄고 원하는 상태를 stopped로 둔다. 운영 쪽에 없는
+/// VM도 멈춘 것으로 보고 목록에서 뺀다. 목록이 비면 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fence_source_stops_the_recovered_vms_on_the_returned_source() {
+    let prod = Env::start().await;
+    let prod_admin = prod.admin().await;
+    let (status, vm) = prod_admin.post("/vms", common::vm_request("web1")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let task = prod_admin.act("web1", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let env = Env::start().await;
+    set_dr(&env, true).await;
+    pool(&env, "dr-pool", false).await;
+    let admin = env.admin().await;
+    let server = prod.serve_tls().await;
+    let (status, body) = admin
+        .post(
+            "/remotes",
+            json!({ "name": "prod", "url": server.url, "ca_fingerprint": prod.ca_fingerprint(),
+                    "token": prod_admin.token.clone().unwrap() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut p = plan("web-tier");
+    p["spec"]["test_networks"] = json!({});
+    let (status, created) = admin.post("/dr-plans", p).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_error(
+        &admin
+            .post("/dr-plans/web-tier/actions/fence-source", json!({}))
+            .await,
+        StatusCode::CONFLICT,
+        "dr_nothing_to_fence",
+    );
+    let plan = env
+        .cluster
+        .get_by_name::<RecoveryPlanSpec>("web-tier")
+        .unwrap()
+        .unwrap();
+    let mut st = plan.status.clone();
+    st.source_fence_pending = vec!["db1".into(), "web1".into()];
+    env.cluster
+        .update_status::<RecoveryPlanSpec>(plan.id, &st)
+        .await
+        .unwrap();
+    let (status, got) = admin
+        .post("/dr-plans/web-tier/actions/fence-source", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["pending"], json!([]), "{got}");
+    assert_eq!(got["results"][0]["vm"], "db1");
+    assert_eq!(got["results"][0]["error"], "not on the source cluster");
+    assert_eq!(got["results"][1]["ok"], true);
+    let source_vm = prod.cluster.get_by_name::<VmSpec>("web1").unwrap().unwrap();
+    assert_eq!(
+        source_vm.spec.power,
+        orbivisor_types::vm::PowerState::Stopped
+    );
+    assert!(
+        plan_status(&env, "web-tier")
+            .source_fence_pending
+            .is_empty()
+    );
+    let (_, report) = admin.get("/dr-plans/web-tier/report").await;
+    assert!(report.get("source_fence_pending").is_none(), "{report}");
+}
+
+/// 지난 시험이 남긴 시험 VM이 있으면 계획을 지우지 않는다(기록을 지우면 다시 찾지 못한다).
+#[tokio::test]
+async fn plans_with_test_leftovers_are_not_deleted() {
+    let env = dr_env().await;
+    let admin = env.admin().await;
+    copy(&env, "web1-a", "web1", CA, 600).await;
+    create_plan(&env, "web-tier").await;
+    let (status, run) = admin
+        .post(
+            "/dr-plans/web-tier/actions/test",
+            json!({ "allow_routed_test_networks": true, "allow_missing": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    finish(&env, &run["id"], DrRunState::Succeeded).await;
+    let made = labelled_vm(&env, "web1-drt", DR_TEST_LABEL, "web-tier").await;
+    let id: Uuid = run["id"].as_str().unwrap().parse().unwrap();
+    let mut rec = env.cluster.get::<DrRunSpec>(id).unwrap().unwrap();
+    rec.status.steps[1].vm_id = Some(made);
+    env.cluster
+        .update_status::<DrRunSpec>(id, &rec.status)
+        .await
+        .unwrap();
+    assert_error(
+        &admin.delete("/dr-plans/web-tier").await,
+        StatusCode::CONFLICT,
+        "dr_cleanup_required",
+    );
+    env.cluster.delete::<VmSpec>(made, None).await.unwrap();
+    let (status, _) = admin.delete("/dr-plans/web-tier").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }

@@ -2222,7 +2222,8 @@ async fn dr_rpo_alerts_fire_per_plan_and_resolve() {
     announce_dr(&rig.env).await;
     rig.target("ops", "json").await;
     let web = dr_plan(&rig.env, "web-tier", 86400, bad_protection()).await;
-    dr_plan(&rig.env, "off", 0, bad_protection()).await;
+    // RPO 목표를 끈 계획은 나이로 울리지 않는다(보호 상태가 over-rpo를 내지 않는다).
+    dr_plan(&rig.env, "off", 0, good_protection()).await;
     dr_plan(&rig.env, "other", 86400, bad_protection()).await;
     rig.rule(
         "rpo",
@@ -2274,6 +2275,8 @@ async fn dr_run(env: &Env, plan: Uuid, plan_name: &str, name: &str, state: &str,
             plan_spec: spec,
             max_parallel: 4,
             cleanup: None,
+            allow_missing: false,
+            point_in_time: None,
         },
     );
     run.status = serde_json::from_value(json!({
@@ -2391,7 +2394,12 @@ async fn dr_default_rules_are_made_once() {
         .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
-    assert_eq!(created, ["dr-rpo-exceeded", "dr-run-failed"], "{body}");
+    assert_eq!(
+        created,
+        ["dr-rpo-exceeded", "dr-run-failed", "dr-source-returned"],
+        "{body}"
+    );
+    assert_eq!(body["created"][2]["spec"]["severity"], "critical");
     assert_eq!(body["created"][1]["spec"]["severity"], "warning");
     assert_eq!(
         body["created"][1]["spec"]["condition"],
@@ -2404,6 +2412,149 @@ async fn dr_default_rules_are_made_once() {
     assert_eq!(again["created"], json!([]));
     assert_eq!(
         again["existing"],
-        json!(["dr-rpo-exceeded", "dr-run-failed"])
+        json!(["dr-rpo-exceeded", "dr-run-failed", "dr-source-returned"])
     );
+}
+
+/// RPO 목표가 0(끔)이어도 복구 지점이 없는 VM은 울린다(리뷰 1 — 목표를 끈 것과 보호가 없는 것은 다르다).
+#[tokio::test]
+async fn unprotected_vms_alert_even_without_an_rpo_target() {
+    let rig = Rig::start().await;
+    announce_dr(&rig.env).await;
+    rig.target("ops", "json").await;
+    dr_plan(
+        &rig.env,
+        "off",
+        0,
+        json!([
+            { "vm": "web3", "backup": "web3-a", "point_at": 1, "age_secs": 34 * 3600, "ok": true },
+            { "vm": "db1", "ok": false, "issue": "no-recovery-point" }
+        ]),
+    )
+    .await;
+    rig.rule(
+        "rpo",
+        json!({"condition": {"kind": "dr_rpo_exceeded"}, "severity": "warning", "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    let hits = rig.hook.wait(1).await;
+    assert_eq!(
+        hits[0].json()["detail"],
+        "plan off: 1 of 2 VMs unprotected (db1 no recovery point)\nPlan: /dr-plans/off"
+    );
+    engine.shutdown().await;
+}
+
+/// `dr_run_failed`의 "stalled"(리뷰 1): 도는 실행이 30분 넘게 나아가지 않으면 한 번 알린다(마지막 일시 오류와 함께). 같은
+/// 멈춤에 다시 알리지 않는다.
+#[tokio::test]
+async fn stalled_dr_runs_are_sent_once() {
+    use orbivisor_types::dr::DrRunSpec;
+    let rig = Rig::start().await;
+    announce_dr(&rig.env).await;
+    rig.target("ops", "json").await;
+    let web = dr_plan(&rig.env, "web-tier", 86400, good_protection()).await;
+    rig.rule(
+        "runs",
+        json!({"condition": {"kind": "dr_run_failed"}, "severity": "warning", "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    settle().await;
+    dr_run(&rig.env, web, "web-tier", "stuck", "running", unix_now()).await;
+    let mut run = rig
+        .env
+        .cluster
+        .get_by_name::<DrRunSpec>("stuck")
+        .unwrap()
+        .unwrap();
+    run.status.finished_at = None;
+    // 시험 시계는 1_700_000_000초다.
+    run.status.started_at = 1_700_000_000 - 3 * 3600;
+    run.status.progress_at = 1_700_000_000 - 2 * 3600;
+    run.status.steps[1].phase = orbivisor_types::dr::DrPhase::Preparing;
+    run.status.steps[1].last_error = Some("cannot read the source cluster: timed out".into());
+    rig.env
+        .cluster
+        .update_status::<DrRunSpec>(run.id, &run.status)
+        .await
+        .unwrap();
+    let hits = rig.hook.wait(1).await;
+    let v = hits[0].json();
+    assert_eq!(v["state"], "event", "{v}");
+    let detail = v["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("DR run stuck of plan web-tier stalled: no progress for 120 min"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("- db1: cannot read the source cluster: timed out"),
+        "{detail}"
+    );
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 1);
+    engine.shutdown().await;
+}
+
+/// `dr_source_returned`(리뷰 1): 재해 장애 조치로 되살린 VM이 운영 쪽에서 아직 멈추지 않았는데 운영 클러스터가 다시 닿으면
+/// 울린다. 목록을 비우면(fence-source) 풀린다.
+#[tokio::test]
+async fn a_returning_source_after_a_disaster_alerts() {
+    use orbivisor_types::dr::RecoveryPlanSpec;
+    use orbivisor_types::remote::RemoteSpec;
+    let rig = Rig::start().await;
+    announce_dr(&rig.env).await;
+    rig.target("ops", "json").await;
+    let web = dr_plan(&rig.env, "web-tier", 86400, good_protection()).await;
+    let mut plan = rig
+        .env
+        .cluster
+        .get::<RecoveryPlanSpec>(web)
+        .unwrap()
+        .unwrap();
+    plan.status.source_fence_pending = vec!["db1".into(), "web3".into()];
+    rig.env
+        .cluster
+        .update_status::<RecoveryPlanSpec>(web, &plan.status)
+        .await
+        .unwrap();
+    let mut remote: orbivisor_types::remote::Remote = Resource::new(
+        "prod",
+        serde_json::from_value(json!({
+            "url": "https://prod.example:8006",
+            "ca_fingerprint": "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "ca_pem": "",
+            "token": "t"
+        }))
+        .unwrap(),
+    );
+    remote.status.reachable = false;
+    rig.env.cluster.create(&remote).await.unwrap();
+    rig.rule(
+        "back",
+        json!({"condition": {"kind": "dr_source_returned"}, "severity": "critical", "targets": ["ops"]}),
+    )
+    .await;
+    let engine = rig.engine();
+    settle().await;
+    assert!(rig.hook.hits().is_empty(), "닿지 않는 동안은 조용하다");
+    remote.status.reachable = true;
+    rig.env
+        .cluster
+        .update_status::<RemoteSpec>(remote.id, &remote.status)
+        .await
+        .unwrap();
+    let hits = rig.hook.wait(1).await;
+    let v = hits[0].json();
+    assert_eq!(v["state"], "firing", "{v}");
+    assert_eq!(v["severity"], "critical");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("plan web-tier: the production cluster prod is reachable again and still runs VMs recovered here: db1, web3"),
+        "{v}"
+    );
+    engine.shutdown().await;
 }

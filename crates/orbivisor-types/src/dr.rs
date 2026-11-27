@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::backup::{Backup, BackupPhase};
+use crate::backup::{Backup, BackupPhase, VerifyState};
 use crate::cloud_init::{CloudInit, CloudInitDns, CloudInitNet, IpConfig, MAX_DNS_SERVERS};
 use crate::folder::parse_folder_path;
 use crate::resource::{Kind, NameError, Resource, ResourceSpec, validate_name};
@@ -46,6 +46,14 @@ pub const MAX_RUNS_PER_PLAN: usize = 20;
 pub const SHUTDOWN_GRACE_SECS: u64 = 300;
 /// 답이 없는 원격 부름(stop·백업)을 다시 보내는 간격(초)
 pub const RETRY_SECS: u64 = 60;
+/// 계획된 이전: 처음 shutdown을 보내고 이만큼 지나도 운영 VM이 꺼지지 않으면 그 VM `failed`(초)
+pub const PREPARE_STOP_LIMIT_SECS: u64 = 900;
+/// 계획된 이전: 운영 쪽 백업·복제가 이만큼 지나도 끝나지 않으면 그 VM `failed`(초)
+pub const PREPARE_COPY_LIMIT_SECS: u64 = 86_400;
+/// 실행이 이만큼 나아가지 않으면 경보 `dr_run_failed`가 "stalled"로 알린다(초)
+pub const STALL_SECS: u64 = 1800;
+/// VM 하나에 써 보는 복구 지점 수(복원이 실패하면 다음 오래된 사본으로 — 시험·재해 장애 조치)
+pub const MAX_RESTORE_ATTEMPTS: usize = 3;
 
 /// 장애 조치로 만든 VM의 라벨(값 = 계획 이름) — 설계의 태그 `dr:<plan>`
 pub const DR_LABEL: &str = "orbivisor.io/dr";
@@ -64,6 +72,12 @@ pub const ERR_RUN_ACTIVE: &str = "dr_run_active";
 pub const ERR_CLEANUP_REQUIRED: &str = "dr_cleanup_required";
 pub const ERR_TEST_NETWORK_REQUIRED: &str = "dr_test_network_required";
 pub const ERR_NAME_TAKEN: &str = "dr_name_taken";
+/// 계획된 이전의 사전 검사가 실패함(409, `details.problems`)
+pub const ERR_PLANNED_PREFLIGHT: &str = "dr_planned_preflight";
+/// 복구 지점이 없는 VM이 있음(400, `details.vms` — `allow_missing: true`면 그 VM을 건너뛰고 진행)
+pub const ERR_MISSING_RECOVERY_POINTS: &str = "dr_missing_recovery_points";
+/// 시험망이 라우터·업링크가 있는 네트워크임(400, `details.networks` — `allow_routed_test_networks: true`면 진행)
+pub const ERR_TEST_NETWORK_NOT_ISOLATED: &str = "dr_test_network_not_isolated";
 
 // ---- 계획 ----
 
@@ -96,6 +110,11 @@ pub struct RecoveryPlanSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub test_networks: BTreeMap<String, String>,
+    /// 계획된 이전: 운영 쪽에 그 VM의 지난 백업이 없을 때 마지막 백업을 뜰 운영 쪽 백업 풀(VM마다 덮어씀). 지난 백업이
+    /// 있으면 그 백업의 풀·저장소를 쓴다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub source_backup_pool: Option<String>,
     /// VM이 실패하거나 시간을 넘기면 계속할지(기본) 멈출지
     #[serde(default, skip_serializing_if = "OnTimeout::is_continue")]
     #[cfg_attr(feature = "openapi", schema(default))]
@@ -190,6 +209,10 @@ pub struct DrVm {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub live: bool,
+    /// 계획된 이전: 계획의 `source_backup_pool`을 이 VM만 덮어씀
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub source_backup_pool: Option<String>,
     /// 되살린 VM의 cloud-init 주소(NIC마다). 비면 백업의 cloud-init 그대로
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
@@ -298,6 +321,9 @@ impl RecoveryPlanSpec {
     pub fn validate(&self) -> Result<(), DrPlanError> {
         name("source", &self.source)?;
         name("pool", &self.pool)?;
+        if let Some(pool) = &self.source_backup_pool {
+            name("source_backup_pool", pool)?;
+        }
         range("rpo_target_secs", self.rpo_target_secs, 0, MAX_RPO_SECS)?;
         if let Some(folder) = &self.folder
             && Uuid::try_parse(folder).is_err()
@@ -354,6 +380,9 @@ impl RecoveryPlanSpec {
                 }
                 if let Some(node) = &v.node {
                     name(format!("groups[{gi}].vms[{vi}].node"), node)?;
+                }
+                if let Some(pool) = &v.source_backup_pool {
+                    name(format!("groups[{gi}].vms[{vi}].source_backup_pool"), pool)?;
                 }
                 validate_ip_rules(&v.vm, &v.ip)?;
             }
@@ -490,6 +519,11 @@ pub struct RecoveryPlanStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub run: Option<Uuid>,
+    /// 재해 장애 조치로 이곳에 되살린 VM(원본 이름). 운영 쪽이 돌아오면 같은 VM이 두 벌 돌 수 있다 — 경보
+    /// `dr_source_returned`, `POST /dr-plans/{key}/actions/fence-source`가 운영 쪽 그 VM들을 멈추면 비운다.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub source_fence_pending: Vec<String>,
 }
 
 /// VM 하나의 복구 지점
@@ -527,6 +561,8 @@ pub enum ProtectionIssue {
     NoRecoveryPoint,
     /// 가장 새 사본이 RPO 목표보다 오래됨
     OverRpo,
+    /// 가장 새 사본(이나 그 부모)이 검증에 실패함 — 복구 지점은 그 앞의 사본이다(있으면)
+    VerifyFailed,
 }
 
 /// 마지막 시험 장애 조치
@@ -540,14 +576,53 @@ pub struct LastTest {
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub rto_secs: Option<u64>,
     pub result: DrRunState,
+    /// 그 시험이 본 장애 조치 준비 문제가 있는 VM 수(시험 실행의 `failover_readiness`) — 시험이 성공해도 실제 장애 조치는
+    /// 그 VM에서 실패할 수 있다.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub readiness_issues: u32,
 }
 
 /// `vm`(원본 VM 이름)의 복구 지점: DR의 `ready` 사본 가운데 `origin.ca_fingerprint`가 운영 클러스터(원격)의 CA 지문이고
-/// 만든 때의 VM 이름이 같은 가장 새 것. 증분 사본은 부모 사슬(`status.parent`)이 모두 `ready`로 있어야 쓴다. 원격의
-/// 클러스터는 CA 지문으로 알아본다 — 이름(`origin.cluster`·원격 상태의 `cluster_name`)은 바뀌거나 겹칠 수 있다.
+/// 만든 때의 VM 이름이 같은 가장 새 것. 증분 사본은 부모 사슬(`status.parent`)이 모두 `ready`로 있어야 쓰고, 사슬의
+/// 어느 것이든 검증(`status.verify`)에 실패했으면 쓰지 않는다. 원격의 클러스터는 CA 지문으로 알아본다 — 이름
+/// (`origin.cluster`·원격 상태의 `cluster_name`)은 바뀌거나 겹칠 수 있다.
 pub fn recovery_point<'a>(vm: &str, backups: &'a [Backup], source_ca: &str) -> Option<&'a Backup> {
+    recovery_points(vm, backups, source_ca, None)
+        .into_iter()
+        .next()
+}
+
+/// [`recovery_point`]의 후보 모두(새것부터). `before`가 있으면 그 시각(유닉스 초) 이하에 만든 것만.
+pub fn recovery_points<'a>(
+    vm: &str,
+    backups: &'a [Backup],
+    source_ca: &str,
+    before: Option<u64>,
+) -> Vec<&'a Backup> {
     let by_id: HashMap<Uuid, &Backup> = backups.iter().map(|b| (b.id, b)).collect();
-    best_point(vm, backups, source_ca, &by_id)
+    points(vm, backups, source_ca, before, &by_id)
+}
+
+fn points<'a>(
+    vm: &str,
+    backups: &'a [Backup],
+    source_ca: &str,
+    before: Option<u64>,
+    by_id: &HashMap<Uuid, &'a Backup>,
+) -> Vec<&'a Backup> {
+    let mut out: Vec<&Backup> = backups
+        .iter()
+        .filter(|b| from_source(b, source_ca) && b.spec.vm_name == vm)
+        .filter(|b| {
+            b.status
+                .created_at
+                .is_some_and(|at| before.is_none_or(|t| at <= t))
+        })
+        .filter(|b| chain_ready(b, by_id) && !chain_verify_failed(b, by_id))
+        .collect();
+    out.sort_by_key(|b| std::cmp::Reverse((b.status.created_at, b.id)));
+    out
 }
 
 fn best_point<'a>(
@@ -556,11 +631,41 @@ fn best_point<'a>(
     source_ca: &str,
     by_id: &HashMap<Uuid, &'a Backup>,
 ) -> Option<&'a Backup> {
+    points(vm, backups, source_ca, None, by_id)
+        .into_iter()
+        .next()
+}
+
+/// 백업이나 그 부모 사슬의 어느 것이든 검증에 실패했는지
+fn chain_verify_failed(b: &Backup, by_id: &HashMap<Uuid, &Backup>) -> bool {
+    let mut cur = Some(b);
+    for _ in 0..=by_id.len() {
+        let Some(c) = cur else { return false };
+        if c.status
+            .verify
+            .as_ref()
+            .is_some_and(|v| v.state == VerifyState::Failed)
+        {
+            return true;
+        }
+        cur = c.status.parent.and_then(|p| by_id.get(&p).copied());
+    }
+    false
+}
+
+/// 운영 쪽에서 온 `ready` 사본 가운데 가장 새 것이 검증에 실패했는지(보호 상태의 `verify-failed`)
+fn newest_verify_failed(
+    vm: &str,
+    backups: &[Backup],
+    source_ca: &str,
+    by_id: &HashMap<Uuid, &Backup>,
+) -> bool {
     backups
         .iter()
         .filter(|b| from_source(b, source_ca) && b.spec.vm_name == vm)
         .filter(|b| b.status.created_at.is_some() && chain_ready(b, by_id))
         .max_by_key(|b| (b.status.created_at, b.id))
+        .is_some_and(|b| chain_verify_failed(b, by_id))
 }
 
 fn from_source(b: &Backup, source_ca: &str) -> bool {
@@ -600,6 +705,8 @@ pub fn protection(
     plan.vms()
         .map(|(_, v)| {
             let point = source_ca.and_then(|ca| best_point(&v.vm, backups, ca, &by_id));
+            let verify_failed =
+                source_ca.is_some_and(|ca| newest_verify_failed(&v.vm, backups, ca, &by_id));
             match point {
                 None => VmProtection {
                     vm: v.vm.clone(),
@@ -608,7 +715,11 @@ pub fn protection(
                     point_at: None,
                     age_secs: None,
                     ok: false,
-                    issue: Some(ProtectionIssue::NoRecoveryPoint),
+                    issue: Some(if verify_failed {
+                        ProtectionIssue::VerifyFailed
+                    } else {
+                        ProtectionIssue::NoRecoveryPoint
+                    }),
                 },
                 Some(b) => {
                     let at = b.status.created_at.unwrap_or(0);
@@ -620,8 +731,12 @@ pub fn protection(
                         backup_id: Some(b.id),
                         point_at: Some(at),
                         age_secs: Some(age),
-                        ok: !over,
-                        issue: over.then_some(ProtectionIssue::OverRpo),
+                        ok: !over && !verify_failed,
+                        issue: if verify_failed {
+                            Some(ProtectionIssue::VerifyFailed)
+                        } else {
+                            over.then_some(ProtectionIssue::OverRpo)
+                        },
                     }
                 }
             }
@@ -645,6 +760,9 @@ pub fn rpo_summary(
         .take(5)
         .map(|p| match (p.issue, p.age_secs) {
             (Some(ProtectionIssue::OverRpo), Some(age)) => format!("{} {}", p.vm, short_secs(age)),
+            (Some(ProtectionIssue::VerifyFailed), _) => {
+                format!("{} newest copy failed verification", p.vm)
+            }
             _ => format!("{} no recovery point", p.vm),
         })
         .collect();
@@ -693,6 +811,66 @@ pub fn bubble_sources(
         }
     }
     out.into_iter().collect()
+}
+
+/// 장애 조치 준비(설계 §3.2 보강, 리뷰 1): VM마다 실제 장애 조치가 쓸 것 — 복구 지점, 그 복구 지점이 쓰는 원본 네트워크·
+/// 보안 그룹의 대상(`networks`·`security_groups` 맵, 없으면 같은 이름 — `user` 네트워크는 빼고), 복원 풀(VM의 `pool`, 없으면
+/// 계획의 `pool`), 복원 노드 — 가 이 클러스터에 있는지. 시험은 거품·시험망으로 가므로 이것을 따로 본다.
+pub fn failover_readiness(
+    plan: &RecoveryPlanSpec,
+    backups: &[Backup],
+    source_ca: Option<&str>,
+    here: &DrInventory,
+) -> Vec<VmReadiness> {
+    let by_id: HashMap<Uuid, &Backup> = backups.iter().map(|b| (b.id, b)).collect();
+    plan.vms()
+        .map(|(_, v)| {
+            let mut issues = Vec::new();
+            let mut issue = |kind, name: &str| {
+                let i = ReadinessIssue {
+                    kind,
+                    name: name.to_string(),
+                };
+                if !issues.contains(&i) {
+                    issues.push(i);
+                }
+            };
+            let pool = v.pool.as_deref().unwrap_or(&plan.pool);
+            if !here.pools.contains(pool) {
+                issue(ReadinessKind::Pool, pool);
+            }
+            if let Some(node) = &v.node
+                && !here.nodes.contains(node)
+            {
+                issue(ReadinessKind::Node, node);
+            }
+            match source_ca.and_then(|ca| best_point(&v.vm, backups, ca, &by_id)) {
+                None => issue(ReadinessKind::RecoveryPoint, ""),
+                Some(b) => {
+                    for nic in &b.spec.vm_spec.nics {
+                        if nic.network == crate::network::USER_NETWORK {
+                            continue;
+                        }
+                        let to = plan.networks.get(&nic.network).unwrap_or(&nic.network);
+                        if !here.networks.contains(to) {
+                            issue(ReadinessKind::Network, to);
+                        }
+                        for g in &nic.security_groups {
+                            let to = plan.security_groups.get(g).unwrap_or(g);
+                            if !here.security_groups.contains(to) {
+                                issue(ReadinessKind::SecurityGroup, to);
+                            }
+                        }
+                    }
+                }
+            }
+            VmReadiness {
+                vm: v.vm.clone(),
+                ok: issues.is_empty(),
+                issues,
+            }
+        })
+        .collect()
 }
 
 // ---- 이름 ----
@@ -769,6 +947,14 @@ pub struct DrRunSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cleanup: Option<DrCleanupTarget>,
+    /// 복구 지점이 없는 VM을 `skipped`로 두고 진행(요청의 `allow_missing`)
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub allow_missing: bool,
+    /// 이 시각(유닉스 초) 이전의 가장 새 복구 지점을 쓴다(요청의 `point_in_time`). 없으면 가장 새 것
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub point_in_time: Option<u64>,
 }
 
 fn default_max_parallel() -> u32 {
@@ -831,6 +1017,10 @@ pub struct DrCleanupTarget {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub vms: Vec<String>,
+    /// `vms`와 같은 차례의 VM id(시험 실행이 만든 VM — 뒷정리는 id와 시험 라벨이 둘 다 맞는 VM만 지운다)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub vm_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub networks: Vec<String>,
@@ -880,6 +1070,74 @@ pub struct DrRunStatus {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub steps: Vec<DrStep>,
+    /// 마지막으로 나아간 시각(단계·그룹·거품이 바뀐 때, 유닉스 초). [`STALL_SECS`] 넘게 그대로면 경보가 "stalled"로 알린다.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub progress_at: u64,
+    /// 시험 실행: 장애 조치가 이 시험을 끊었다(곧 `cancelled`, 진행 중 Task는 그대로 — 뒷정리는 그 장애 조치가 끝난 뒤)
+    #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub preempted: bool,
+    /// 장애 조치 실행: 시작하며 끊은 시험 실행
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub preempted_test: Option<Uuid>,
+    /// 시험 실행: 시작할 때 본 장애 조치 준비(VM마다 — 시험은 거품·시험망으로 가므로 장애 조치의 네트워크 맵·보안 그룹·
+    /// 풀·노드·복구 지점은 따로 본다). 문제가 있어도 시험 결과는 그대로다.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub failover_readiness: Vec<VmReadiness>,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+/// 장애 조치 준비(VM 하나): 실제 장애 조치가 지금 그 VM을 되살릴 수 있는지
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct VmReadiness {
+    /// 원본 VM 이름
+    pub vm: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub issues: Vec<ReadinessIssue>,
+}
+
+/// 장애 조치 준비 문제 하나: `kind`의 `name`이 이 클러스터에 없다(복구 지점은 `name` 없음).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReadinessIssue {
+    pub kind: ReadinessKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadinessKind {
+    /// 쓸 수 있는 복구 지점이 없음
+    RecoveryPoint,
+    /// 복구 지점이 쓰는 원본 네트워크의 대상(`networks` 맵, 없으면 같은 이름)이 없음
+    Network,
+    /// 보안 그룹 대상(`security_groups` 맵, 없으면 같은 이름)이 없음
+    SecurityGroup,
+    /// 복원 풀이 없음
+    Pool,
+    /// 복원 노드가 없음
+    Node,
+}
+
+/// 이 클러스터에 있는 이름들(장애 조치 준비 검사의 입력)
+#[derive(Debug, Clone, Default)]
+pub struct DrInventory {
+    pub networks: BTreeSet<String>,
+    pub security_groups: BTreeSet<String>,
+    pub pools: BTreeSet<String>,
+    pub nodes: BTreeSet<String>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -958,6 +1216,34 @@ pub struct DrStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub prepare: Option<DrPrepare>,
+    /// 이 실행이 만든(만드는) VM의 id(복원 Task의 대상). 라벨·뒷정리는 이 id로 본다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub vm_id: Option<Uuid>,
+    /// 라이브 복원: VM이 켜진 뒤에도 디스크를 옮기는 복원 Task(끝나면 비움 — 실패하면 `notes`에 경고)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub copy_task: Option<Uuid>,
+    /// 복원이 실패해 버린 복구 지점(사본 이름, 차례대로)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub tried: Vec<String>,
+    /// 경고·되돌림 기록(다른 복구 지점으로 다시 함, 운영 쪽 VM을 다시 켬, 라이브 복원의 복사 실패 등)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub notes: Vec<String>,
+    /// 다시 해 보는 중인 마지막 일시 오류(운영 쪽에 닿지 않음 등). 나아가면 비운다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub last_error: Option<String>,
+    /// `last_error`가 처음 난 시각(유닉스 초)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub retrying_since: Option<u64>,
+    /// `failed`·`timed_out`이면 그때 있던 단계(`preparing`·`restoring`·`starting`·`waiting` — 처음부터 실패면 없음)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub failed_in: Option<DrPhase>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1012,6 +1298,22 @@ pub struct DrPrepare {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub source_backup_id: Option<Uuid>,
+    /// 지금 단계에 든 시각(shutdown을 처음 보낸 때, 백업을 시작한 때 — 단계 상한을 센다)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub stage_at: Option<u64>,
+    /// 이 실행이 운영 쪽 VM에 shutdown·stop을 보냈다(되살리지 못하면 다시 켠다)
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub stopped: bool,
+    /// 운영 쪽 VM을 다시 켜는 부름을 처음 보낸 시각
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub restart_at: Option<u64>,
+    /// 다시 켜기가 끝남(켬·포기)
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub restarted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1049,6 +1351,10 @@ pub struct DrObservation {
     pub source_ca: Option<String>,
     /// 운영 클러스터에서 본 것(계획된 이전만). 닿지 않으면 `None`이고 준비는 기다린다.
     pub source: Option<SourceObservation>,
+    /// 운영 쪽을 읽지 못한 까닭(`source`가 `None`일 때)
+    pub source_error: Option<String>,
+    /// 시험 라벨이 이 계획인 네트워크 이름(이미 있는 거품 네트워크가 이 계획의 것인지)
+    pub test_networks: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1067,6 +1373,9 @@ pub struct VmObservation {
     /// 게스트 에이전트가 보고한 주소
     pub ips: Vec<IpAddr>,
     pub node: Option<String>,
+    pub id: Option<Uuid>,
+    /// 이 실행의 라벨(`orbivisor.io/dr`·`orbivisor.io/dr-test` = 계획)이 붙었다
+    pub labelled: bool,
 }
 
 /// 운영 클러스터에서 본 것(프록시로 읽음)
@@ -1122,9 +1431,15 @@ pub enum DrAction {
     BackupSource { step: usize, vm: String },
     /// 운영 쪽 `POST /backups/{backup}/actions/replicate`(이 클러스터로)
     ReplicateSource { step: usize, backup: String },
+    /// 되살리지 못한 VM의 운영 쪽 VM을 다시 켠다(`POST /vms/{vm}/actions/start`, 이 실행이 끈 것만)
+    StartSource { step: usize, vm: String },
     /// 시험 VM을 끄고 지운다. 켜진 VM은 끄는 Task(`Task(id)`)를 내고 그 Task가 끝나 VM이 꺼지면 같은 할 일을 다시 받는다.
     /// 꺼진 VM은 지우고 디스크 지우기 Task(`Task(id)`, 디스크가 없으면 `Done`)를 낸다. 이미 없으면 `Done`(`deleted`).
-    DeleteVm { step: usize, vm: String },
+    DeleteVm {
+        step: usize,
+        vm: String,
+        id: Option<Uuid>,
+    },
     /// 거품 네트워크를 지운다. 이미 없으면 결과는 `Done`이다.
     DeleteNetwork { bubble: usize, name: String },
     /// 취소한 시험의 뒷정리 실행을 시작한다(실행이 끝날 때 한 번).
@@ -1135,9 +1450,55 @@ pub enum DrAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrResult {
     Task(Uuid),
-    SourceBackup { name: String, id: Uuid },
+    /// 복원 Task와 그 Task가 만들 VM의 id
+    Restored {
+        task: Uuid,
+        vm: Uuid,
+    },
+    SourceBackup {
+        name: String,
+        id: Uuid,
+    },
     Done,
+    /// 일시 오류: 다음 걸음에 다시 한다(단계의 `last_error`)
+    Retry(String),
     Failed(String),
+}
+
+impl DrStep {
+    fn new(group: String, vm: String, node: Option<String>, now: u64) -> Self {
+        DrStep {
+            group,
+            vm,
+            backup: None,
+            backup_id: None,
+            phase: DrPhase::Pending,
+            new_vm: None,
+            task: None,
+            node,
+            error: None,
+            at: now,
+            prepare: None,
+            vm_id: None,
+            copy_task: None,
+            tried: Vec::new(),
+            notes: Vec::new(),
+            last_error: None,
+            retrying_since: None,
+            failed_in: None,
+        }
+    }
+
+    /// 일시 오류를 적는다(처음 난 시각은 그대로).
+    fn retrying(&mut self, e: String, now: u64) {
+        self.last_error = Some(e);
+        self.retrying_since.get_or_insert(now);
+    }
+
+    fn cleared(&mut self) {
+        self.last_error = None;
+        self.retrying_since = None;
+    }
 }
 
 impl DrRunStatus {
@@ -1146,6 +1507,7 @@ impl DrRunStatus {
     pub fn start(spec: &DrRunSpec, backups: &[Backup], source_ca: Option<&str>, now: u64) -> Self {
         let mut s = DrRunStatus {
             started_at: now,
+            progress_at: now,
             ..Default::default()
         };
         let plan = &spec.plan_spec;
@@ -1153,23 +1515,17 @@ impl DrRunStatus {
             let target = spec.cleanup.clone().unwrap_or(DrCleanupTarget {
                 run: Uuid::nil(),
                 vms: Vec::new(),
+                vm_ids: Vec::new(),
                 networks: Vec::new(),
             });
             s.steps = target
                 .vms
                 .iter()
-                .map(|vm| DrStep {
-                    group: String::new(),
-                    vm: vm.clone(),
-                    backup: None,
-                    backup_id: None,
-                    phase: DrPhase::Pending,
+                .enumerate()
+                .map(|(i, vm)| DrStep {
                     new_vm: Some(vm.clone()),
-                    task: None,
-                    node: None,
-                    error: None,
-                    at: now,
-                    prepare: None,
+                    vm_id: target.vm_ids.get(i).copied(),
+                    ..DrStep::new(String::new(), vm.clone(), None, now)
                 })
                 .collect();
             s.bubbles = target
@@ -1185,21 +1541,13 @@ impl DrRunStatus {
                 .collect();
             return s;
         }
-        let points = protection(plan, backups, source_ca, now);
-        for ((g, v), p) in plan.vms().zip(&points) {
-            let mut step = DrStep {
-                group: g.name.clone(),
-                vm: v.vm.clone(),
-                backup: None,
-                backup_id: None,
-                phase: DrPhase::Pending,
-                new_vm: None,
-                task: None,
-                node: v.node.clone(),
-                error: None,
-                at: now,
-                prepare: None,
-            };
+        for (g, v) in plan.vms() {
+            let mut step = DrStep::new(g.name.clone(), v.vm.clone(), v.node.clone(), now);
+            let point = source_ca.and_then(|ca| {
+                recovery_points(&v.vm, backups, ca, spec.point_in_time)
+                    .into_iter()
+                    .next()
+            });
             if spec.kind == DrRunKind::FailoverPlanned {
                 step.phase = DrPhase::Preparing;
                 step.prepare = Some(DrPrepare {
@@ -1207,10 +1555,18 @@ impl DrRunStatus {
                     requested_at: None,
                     source_backup: None,
                     source_backup_id: None,
+                    stage_at: None,
+                    stopped: false,
+                    restart_at: None,
+                    restarted: false,
                 });
-            } else if p.backup_id.is_some() {
-                step.backup = p.backup.clone();
-                step.backup_id = p.backup_id;
+            } else if let Some(b) = point {
+                step.backup = Some(b.name.clone());
+                step.backup_id = Some(b.id);
+            } else if spec.allow_missing {
+                // 요청이 알고 진행했다: 실패가 아니고 `on_timeout`에 들지 않는다.
+                step.phase = DrPhase::Skipped;
+                step.error = Some("no recovery point".into());
             } else {
                 step.phase = DrPhase::Failed;
                 step.error = Some("no recovery point".into());
@@ -1218,7 +1574,16 @@ impl DrRunStatus {
             s.steps.push(step);
         }
         if spec.kind == DrRunKind::Test {
-            s.bubbles = bubble_sources(plan, backups, source_ca)
+            // 고른 복구 지점이 쓰는 원본 네트워크 가운데 시험망 맵에 없는 것(`point_in_time`이면 가장 새 것과 다를 수 있다)
+            let chosen: BTreeSet<String> = s
+                .steps
+                .iter()
+                .filter_map(|st| st.backup_id)
+                .filter_map(|id| backups.iter().find(|b| b.id == id))
+                .flat_map(|b| b.spec.vm_spec.nics.iter().map(|n| n.network.clone()))
+                .filter(|n| !plan.test_networks.contains_key(n))
+                .collect();
+            s.bubbles = chosen
                 .into_iter()
                 .enumerate()
                 .map(|(i, source)| DrBubble {
@@ -1237,10 +1602,8 @@ impl DrRunStatus {
     /// 같은 할 일을 다시 받는다).
     pub fn record(&mut self, action: &DrAction, result: DrResult, now: u64) {
         let fail = |step: &mut DrStep, e: String| {
-            step.phase = DrPhase::Failed;
+            set_phase(step, DrPhase::Failed, now);
             step.error = Some(e);
-            step.task = None;
-            step.at = now;
         };
         match action {
             DrAction::CreateBubble { bubble, .. } | DrAction::DeleteNetwork { bubble, .. } => {
@@ -1268,15 +1631,59 @@ impl DrRunStatus {
                     return;
                 };
                 match result {
-                    DrResult::Task(id) => st.task = Some(id),
-                    DrResult::Failed(e) => fail(st, e),
+                    DrResult::Task(id) => {
+                        st.task = Some(id);
+                        st.cleared();
+                    }
+                    DrResult::Restored { task, vm } => {
+                        st.task = Some(task);
+                        st.vm_id = Some(vm);
+                        st.cleared();
+                    }
+                    DrResult::Retry(e) => st.retrying(e, now),
+                    DrResult::Failed(e) => {
+                        // 복원을 거절당했다(이름 겹침 등): 이 실행은 VM을 만들지 않았다.
+                        if matches!(action, DrAction::Restore { .. }) {
+                            st.new_vm = None;
+                        }
+                        fail(st, e);
+                    }
+                    // 장애 조치를 다시 돌림: 이 계획이 지난번에 되살린 VM이 그 이름으로 있다(다시 만들지 않는다).
+                    DrResult::Done if matches!(action, DrAction::Restore { .. }) => {
+                        set_phase(st, DrPhase::Skipped, now);
+                        st.error = Some("already recovered by this plan".into());
+                    }
                     // 뒷정리: VM을 곧바로 지웠다(Task 없이 — 꺼진 VM, 지울 디스크 없음) 또는 이미 없었다.
                     DrResult::Done if matches!(action, DrAction::DeleteVm { .. }) => {
                         st.phase = DrPhase::Deleted;
                         st.task = None;
                         st.at = now;
+                        st.cleared();
                     }
                     _ => {}
+                }
+            }
+            DrAction::StartSource { step, vm } => {
+                let Some(st) = self.steps.get_mut(*step) else {
+                    return;
+                };
+                let Some(p) = &mut st.prepare else { return };
+                match result {
+                    DrResult::Retry(e) => {
+                        st.retrying(format!("restarting the source VM {vm}: {e}"), now);
+                    }
+                    DrResult::Failed(e) => {
+                        p.restarted = true;
+                        st.notes
+                            .push(format!("could not restart the source VM {vm}: {e}"));
+                    }
+                    _ => {
+                        p.restarted = true;
+                        st.notes.push(format!(
+                            "restarted the source VM {vm} (it is not recovered here)"
+                        ));
+                        st.cleared();
+                    }
                 }
             }
             DrAction::ShutdownSource { step, .. }
@@ -1292,20 +1699,32 @@ impl DrRunStatus {
                             p.source_backup = Some(name);
                             p.source_backup_id = Some(id);
                         }
+                        st.cleared();
                     }
+                    DrResult::Retry(e) => st.retrying(e, now),
                     DrResult::Failed(e) => fail(st, e),
-                    _ => {}
+                    _ => st.cleared(),
                 }
             }
             DrAction::StartCleanup => {}
         }
     }
 
-    /// 이 (시험) 실행을 치울 뒷정리 대상: 이름을 정한 시험 VM과 거품 네트워크(지운 것 빼고)
+    /// 이 (시험) 실행을 치울 뒷정리 대상: 이 실행이 만든(복원 Task를 낸) 시험 VM(id와 이름 — 이름 겹침으로 복원을 거절당한
+    /// 단계는 없다)과 거품 네트워크(지운 것 빼고). 그 VM·네트워크가 아직 있고 시험 라벨이 이 계획인지는 부르는 쪽이 본다.
     pub fn cleanup_target(&self, run: Uuid) -> DrCleanupTarget {
+        let made: Vec<(String, Uuid)> = self
+            .steps
+            .iter()
+            .filter_map(|s| {
+                let id = s.vm_id?;
+                Some((s.new_vm.clone().unwrap_or_else(|| test_vm_name(&s.vm)), id))
+            })
+            .collect();
         DrCleanupTarget {
             run,
-            vms: self.steps.iter().filter_map(|s| s.new_vm.clone()).collect(),
+            vms: made.iter().map(|(n, _)| n.clone()).collect(),
+            vm_ids: made.iter().map(|(_, id)| *id).collect(),
             networks: self
                 .bubbles
                 .iter()
@@ -1340,7 +1759,37 @@ pub fn advance(
     } else {
         advance_recovery(spec, &mut s, obs, &mut actions);
     }
+    if progress(current) != progress(&s) {
+        s.progress_at = obs.now;
+    }
     (s, actions)
+}
+
+/// 나아감을 견주는 것: 그룹·상태·거품, 단계마다 단계·Task·복구 지점·준비 단계(일시 오류·라벨 다시 달기는 빼고)
+type Progress = (
+    u32,
+    DrRunState,
+    Vec<BubbleState>,
+    Vec<(DrPhase, Option<Uuid>, Option<Uuid>, Option<PrepareStage>)>,
+);
+
+fn progress(s: &DrRunStatus) -> Progress {
+    (
+        s.group,
+        s.state,
+        s.bubbles.iter().map(|b| b.state).collect(),
+        s.steps
+            .iter()
+            .map(|st| {
+                (
+                    st.phase,
+                    st.task,
+                    st.backup_id,
+                    st.prepare.as_ref().map(|p| p.stage),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Task 결과. Task가 없어졌으면 `done`(그 단계가 바라던 것 — 예: VM이 있음)으로 판단한다.
@@ -1384,6 +1833,9 @@ fn wait_met(wait: DrWait, vm: &VmObservation, rules: &[DrIpRule]) -> bool {
 }
 
 fn set_phase(step: &mut DrStep, phase: DrPhase, now: u64) {
+    if matches!(phase, DrPhase::Failed | DrPhase::TimedOut) && !step.phase.is_terminal() {
+        step.failed_in = Some(step.phase);
+    }
     step.phase = phase;
     step.task = None;
     step.at = now;
@@ -1397,6 +1849,7 @@ fn advance_recovery(
 ) {
     let plan = &spec.plan_spec;
     let now = obs.now;
+    let planned = spec.kind == DrRunKind::FailoverPlanned;
     let groups: Vec<&DrGroup> = plan.groups.iter().collect();
     let group_of = |name: &str| groups.iter().position(|g| g.name == name);
     let vm_of = |name: &str| plan.vms().find(|(_, v)| v.vm == name).map(|(_, v)| v);
@@ -1405,18 +1858,53 @@ fn advance_recovery(
     // 1. 진행 중인 단계를 관찰로 옮긴다.
     for step in &mut s.steps {
         let new_vm = step.new_vm.clone().unwrap_or_default();
-        let seen = obs.vms.get(&new_vm);
+        let seen = seen_vm(obs, step);
         if let Some(node) = seen.and_then(|v| v.node.clone()) {
             step.node = Some(node);
         }
+        // 라이브 복원: VM이 켜진 뒤에도 디스크를 옮기는 복원 Task를 따로 지켜본다.
+        if let Some(t) = step.copy_task {
+            match outcome(obs, t, true) {
+                TaskOutcome::Running => {}
+                TaskOutcome::Succeeded => step.copy_task = None,
+                TaskOutcome::Failed(e) => {
+                    step.copy_task = None;
+                    step.notes.push(format!(
+                        "the live restore did not finish copying the disks: {e}"
+                    ));
+                }
+            }
+        }
         match (step.phase, step.task) {
             (DrPhase::Restoring, Some(t)) => match outcome(obs, t, seen.is_some()) {
+                // 라이브 복원은 Task가 VM을 켜면 다음으로 넘어간다(RTO는 켜진 때 — 복사 끝을 기다리지 않는다).
+                TaskOutcome::Running if live(&step.vm) && seen.is_some_and(|v| v.running) => {
+                    set_phase(step, DrPhase::Waiting, now);
+                    step.copy_task = Some(t);
+                }
                 TaskOutcome::Running => {}
                 TaskOutcome::Succeeded if live(&step.vm) => set_phase(step, DrPhase::Waiting, now),
                 TaskOutcome::Succeeded => set_phase(step, DrPhase::Starting, now),
                 TaskOutcome::Failed(e) => {
-                    set_phase(step, DrPhase::Failed, now);
-                    step.error = Some(e);
+                    match (!planned).then(|| older_point(spec, step, obs)).flatten() {
+                        // 데이터가 깨진 사본일 수 있다: 다음 오래된 복구 지점으로 다시(계획된 이전은 막 보낸 사본뿐이라 하지 않는다).
+                        Some((name, id)) => {
+                            let failed = step.backup.clone().unwrap_or_default();
+                            step.notes.push(format!(
+                            "restoring {failed} failed ({e}); trying the older recovery point {name}"
+                        ));
+                            step.tried.push(failed);
+                            step.backup = Some(name);
+                            step.backup_id = Some(id);
+                            step.vm_id = None;
+                            set_phase(step, DrPhase::Restoring, now);
+                        }
+                        None => {
+                            set_phase(step, DrPhase::Failed, now);
+                            step.new_vm = None;
+                            step.error = Some(e);
+                        }
+                    }
                 }
             },
             (DrPhase::Starting, Some(t)) => {
@@ -1461,10 +1949,11 @@ fn advance_recovery(
     }
 
     // 2. 계획된 이전은 운영 쪽 준비가 모두 끝나야 그룹을 시작한다.
-    if spec.kind == DrRunKind::FailoverPlanned && s.prepare_secs.is_none() && !s.cancel_requested {
+    if planned && s.prepare_secs.is_none() && !s.cancel_requested {
         if !advance_prepare(spec, s, obs, actions) {
             check_stop(plan, s);
             if !s.stopping {
+                source_tail(s, now, actions);
                 return;
             }
         } else {
@@ -1472,11 +1961,21 @@ fn advance_recovery(
         }
     }
 
-    // 3. 시험의 거품 네트워크
+    // 3. 시험의 거품 네트워크(되살릴 VM이 하나도 없으면 만들지 않는다)
+    if s.steps.iter().all(|st| st.phase.is_terminal()) {
+        s.bubbles.retain(|b| b.state != BubbleState::Pending);
+    }
     for (i, b) in s.bubbles.iter_mut().enumerate() {
         if b.state == BubbleState::Pending {
-            if obs.networks.contains(&b.name) {
+            if obs.test_networks.contains(&b.name) {
                 b.state = BubbleState::Ready;
+            } else if obs.networks.contains(&b.name) {
+                // 같은 이름의 남의 네트워크는 격리를 알 수 없다: 쓰지 않는다.
+                b.state = BubbleState::Failed;
+                b.error = Some(format!(
+                    "a network named {} exists and is not a test network of plan {}",
+                    b.name, spec.plan_name
+                ));
             } else {
                 actions.push(DrAction::CreateBubble {
                     bubble: i,
@@ -1518,6 +2017,7 @@ fn advance_recovery(
             }
         }
     }
+    source_tail(s, now, actions);
 
     // 5. 그룹 차례
     if !(s.cancel_requested || s.stopping) && bubbles_ready {
@@ -1556,9 +2056,101 @@ fn advance_recovery(
         }
     }
 
-    // 6. 끝
-    if s.steps.iter().all(|st| st.phase.is_terminal()) && actions.is_empty() {
+    // 6. 끝: 모든 단계가 끝나고, 라이브 복원의 복사가 끝나고, 되살린 VM에 라벨이 붙었을 때
+    let settled = s
+        .steps
+        .iter()
+        .all(|st| st.phase.is_terminal() && st.copy_task.is_none() && labelled(obs, st));
+    if settled && actions.is_empty() {
         finish(spec, s, now, actions);
+    }
+}
+
+/// 단계가 가리키는 VM(이름으로 보되, 이 실행이 만든 VM id를 알면 그 VM일 때만 — 같은 이름의 남의 VM은 보지 않는다)
+fn seen_vm<'a>(obs: &'a DrObservation, step: &DrStep) -> Option<&'a VmObservation> {
+    let name = step.new_vm.as_deref()?;
+    obs.vms
+        .get(name)
+        .filter(|v| step.vm_id.is_none() || v.id == step.vm_id)
+}
+
+/// 이 실행이 만든 VM에 라벨이 붙었는지(없어졌으면 참)
+fn labelled(obs: &DrObservation, step: &DrStep) -> bool {
+    step.vm_id.is_none() || seen_vm(obs, step).is_none_or(|v| v.labelled)
+}
+
+/// 복원이 실패한 단계가 다음에 쓸 더 오래된 복구 지점(이름·id): 써 본 수가 [`MAX_RESTORE_ATTEMPTS`]보다 적고, 지금 사본보다
+/// 앞서 만든 것 가운데 가장 새 것(검증 실패·사슬 깨짐 빼고, `point_in_time` 안에서)
+fn older_point(spec: &DrRunSpec, step: &DrStep, obs: &DrObservation) -> Option<(String, Uuid)> {
+    if step.tried.len() + 1 >= MAX_RESTORE_ATTEMPTS {
+        return None;
+    }
+    let ca = obs.source_ca.as_deref()?;
+    let current = obs
+        .backups
+        .iter()
+        .find(|b| Some(b.id) == step.backup_id)?
+        .status
+        .created_at?;
+    recovery_points(&step.vm, &obs.backups, ca, spec.point_in_time)
+        .into_iter()
+        .find(|b| {
+            b.status.created_at.is_some_and(|at| at < current) && !step.tried.contains(&b.name)
+        })
+        .map(|b| (b.name.clone(), b.id))
+}
+
+/// 계획된 이전의 운영 쪽 뒤처리: 끝난(실패·건너뜀) 단계의 운영 쪽 할 일은 버리고(멈춤·취소로 건너뛴 VM에 shutdown을 보내지
+/// 않는다), 이 실행이 끄고 되살리지 못한 VM — 준비에서 실패했거나 복원 전에 건너뛴 것 — 은 운영 쪽에서 다시 켠다. 다시
+/// 켜기는 [`RETRY_SECS`]마다, 처음부터 [`PREPARE_STOP_LIMIT_SECS`]까지 해 본다.
+fn source_tail(s: &mut DrRunStatus, now: u64, actions: &mut Vec<DrAction>) {
+    let steps = &s.steps;
+    let mut unsent = Vec::new();
+    actions.retain(|a| match a {
+        DrAction::ShutdownSource { step, .. }
+        | DrAction::StopSource { step, .. }
+        | DrAction::BackupSource { step, .. }
+        | DrAction::ReplicateSource { step, .. } => {
+            let keep = steps.get(*step).is_some_and(|st| !st.phase.is_terminal());
+            if !keep && matches!(a, DrAction::ShutdownSource { .. }) {
+                unsent.push(*step);
+            }
+            keep
+        }
+        _ => true,
+    });
+    // 첫 shutdown을 보내지 않았으면 이 실행이 끈 VM이 아니다.
+    for i in unsent {
+        if let Some(p) = s.steps.get_mut(i).and_then(|st| st.prepare.as_mut()) {
+            p.stopped = false;
+            p.requested_at = None;
+            p.stage_at = None;
+        }
+    }
+    for (i, st) in s.steps.iter_mut().enumerate() {
+        let Some(p) = &mut st.prepare else { continue };
+        let not_recovered = match st.phase {
+            DrPhase::Skipped => true,
+            DrPhase::Failed => p.stage != PrepareStage::Done,
+            _ => false,
+        };
+        if !not_recovered || !p.stopped || p.restarted {
+            continue;
+        }
+        let first = *p.restart_at.get_or_insert(now);
+        if now >= first + PREPARE_STOP_LIMIT_SECS {
+            p.restarted = true;
+            st.notes.push(format!(
+                "gave up restarting the source VM {}; start it on the source cluster",
+                st.vm
+            ));
+        } else if first == now || p.requested_at.is_none_or(|t| now >= t + RETRY_SECS) {
+            p.requested_at = Some(now);
+            actions.push(DrAction::StartSource {
+                step: i,
+                vm: st.vm.clone(),
+            });
+        }
     }
 }
 
@@ -1680,8 +2272,9 @@ fn restore_action(
 }
 
 /// 계획된 이전의 운영 쪽 준비(설계 §3.2): 그룹 역순으로 shutdown(5분 뒤 stop) → 새 백업 → 이 클러스터로 복제 → 사본이
-/// 오면 그 VM은 `pending`. 모두 끝났으면 참. 원격에 닿지 않으면 기다린다(사람이 취소할 수 있다). 뒤 그룹부터 보므로 한
-/// 걸음에 뒤 그룹이 꺼진 것을 보고 앞 그룹의 shutdown을 낸다.
+/// 오면 그 VM은 `pending`. 모두 끝났으면 참. 원격에 닿지 않으면 기다리고 그 까닭을 단계의 `last_error`에 적는다(사람이 취소할
+/// 수 있다). 단계마다 상한이 있다: 꺼지기 [`PREPARE_STOP_LIMIT_SECS`], 백업·복제 [`PREPARE_COPY_LIMIT_SECS`]. 뒤 그룹부터
+/// 보므로 한 걸음에 뒤 그룹이 꺼진 것을 보고 앞 그룹의 shutdown을 낸다.
 fn advance_prepare(
     spec: &DrRunSpec,
     s: &mut DrRunStatus,
@@ -1696,29 +2289,54 @@ fn advance_prepare(
         .map(|(i, g)| (g.name.as_str(), i))
         .collect();
     let gi = |st: &DrStep| group_index.get(st.group.as_str()).copied().unwrap_or(0);
-    if let Some(src) = &obs.source {
-        let by_id: HashMap<Uuid, &Backup> = obs.backups.iter().map(|b| (b.id, b)).collect();
-        let mut order: Vec<usize> = (0..s.steps.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(gi(&s.steps[i])));
-        for i in order {
-            let g = gi(&s.steps[i]);
-            // 뒤 그룹이 모두 꺼졌는지(이 그룹의 shutdown을 시작해도 되는지)
-            let later_stopped = s.steps.iter().filter(|st| gi(st) > g).all(|st| {
-                st.phase != DrPhase::Preparing
-                    || st.prepare.as_ref().is_some_and(|p| {
-                        !matches!(p.stage, PrepareStage::Shutdown | PrepareStage::Stop)
-                    })
-            });
-            // 단계가 할 일 없이 넘어가면 같은 걸음에 다음 단계도 본다.
-            for _ in 0..4 {
-                if !prepare_step(&mut s.steps[i], i, later_stopped, src, obs, &by_id, actions) {
-                    break;
+    match &obs.source {
+        None => {
+            let e = format!(
+                "{SOURCE_READ}: {}",
+                obs.source_error.as_deref().unwrap_or("no answer")
+            );
+            for st in s
+                .steps
+                .iter_mut()
+                .filter(|st| st.phase == DrPhase::Preparing)
+            {
+                st.retrying(e.clone(), obs.now);
+            }
+        }
+        Some(src) => {
+            let by_id: HashMap<Uuid, &Backup> = obs.backups.iter().map(|b| (b.id, b)).collect();
+            let mut order: Vec<usize> = (0..s.steps.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(gi(&s.steps[i])));
+            for i in order {
+                if s.steps[i]
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(SOURCE_READ))
+                {
+                    s.steps[i].cleared();
+                }
+                let g = gi(&s.steps[i]);
+                // 뒤 그룹이 모두 꺼졌는지(이 그룹의 shutdown을 시작해도 되는지)
+                let later_stopped = s.steps.iter().filter(|st| gi(st) > g).all(|st| {
+                    st.phase != DrPhase::Preparing
+                        || st.prepare.as_ref().is_some_and(|p| {
+                            !matches!(p.stage, PrepareStage::Shutdown | PrepareStage::Stop)
+                        })
+                });
+                // 단계가 할 일 없이 넘어가면 같은 걸음에 다음 단계도 본다.
+                for _ in 0..4 {
+                    if !prepare_step(&mut s.steps[i], i, later_stopped, src, obs, &by_id, actions) {
+                        break;
+                    }
                 }
             }
         }
     }
     s.steps.iter().all(|st| st.phase != DrPhase::Preparing)
 }
+
+/// 운영 쪽을 읽지 못한 일시 오류의 머리(다시 읽으면 비운다)
+const SOURCE_READ: &str = "cannot read the source cluster";
 
 /// 준비 중인 VM 하나를 한 단계 본다. 할 일 없이 다음 단계로 넘어갔으면 참.
 fn prepare_step(
@@ -1740,23 +2358,37 @@ fn prepare_step(
     let vm = step.vm.clone();
     let mut failed = None;
     let mut moved = false;
+    let over = |at: Option<u64>, limit: u64| at.is_some_and(|t| now >= t + limit);
     match p.stage {
         PrepareStage::Shutdown if !later_stopped => {}
         PrepareStage::Shutdown | PrepareStage::Stop => match src.vms.get(&vm) {
-            None => failed = Some(format!("VM {vm} is not on the source cluster")),
+            None => {
+                // 운영 쪽에 없는 VM은 다시 켤 것도 없다.
+                p.stopped = false;
+                failed = Some(format!("VM {vm} is not on the source cluster"));
+            }
             Some(true) => {
                 p.stage = PrepareStage::Backup;
                 p.requested_at = None;
+                p.stage_at = Some(now);
                 moved = true;
+            }
+            Some(false) if over(p.stage_at, PREPARE_STOP_LIMIT_SECS) => {
+                failed = Some(format!(
+                    "the source VM {vm} did not stop within {PREPARE_STOP_LIMIT_SECS} s"
+                ));
             }
             Some(false) => match (p.stage, p.requested_at) {
                 (PrepareStage::Shutdown, None) => {
                     p.requested_at = Some(now);
+                    p.stage_at = Some(now);
+                    p.stopped = true;
                     actions.push(DrAction::ShutdownSource { step: i, vm });
                 }
                 (PrepareStage::Shutdown, Some(t)) if now >= t + SHUTDOWN_GRACE_SECS => {
                     p.stage = PrepareStage::Stop;
                     p.requested_at = Some(now);
+                    p.stopped = true;
                     actions.push(DrAction::StopSource { step: i, vm });
                 }
                 (PrepareStage::Stop, Some(t)) if now >= t + RETRY_SECS => {
@@ -1766,6 +2398,11 @@ fn prepare_step(
                 _ => {}
             },
         },
+        _ if over(p.stage_at, PREPARE_COPY_LIMIT_SECS) => {
+            failed = Some(format!(
+                "the source backup and copy of {vm} did not finish within {PREPARE_COPY_LIMIT_SECS} s"
+            ));
+        }
         PrepareStage::Backup => match &p.source_backup {
             None => {
                 if p.requested_at.is_none_or(|t| now >= t + RETRY_SECS) {
@@ -1802,11 +2439,13 @@ fn prepare_step(
                 step.backup = Some(copy.name.clone());
                 step.backup_id = Some(copy.id);
                 set_phase(step, DrPhase::Pending, now);
+                step.cleared();
                 return false;
             }
             match src.backups.get(&name).and_then(|b| b.replica_error.clone()) {
                 Some(e) => failed = Some(format!("replicating {name}: {e}")),
-                None if p.requested_at.is_none() => {
+                // 운영 쪽은 이미 가는 복제를 다시 내지 않으므로 답이 없었던 부름도 다시 보낸다.
+                None if p.requested_at.is_none_or(|t| now >= t + RETRY_SECS) => {
                     p.requested_at = Some(now);
                     actions.push(DrAction::ReplicateSource {
                         step: i,
@@ -1826,7 +2465,7 @@ fn prepare_step(
     moved
 }
 
-/// 실행을 끝낸다: 결과·끝난 시각·RTO. 취소한 시험은 뒷정리를 시작한다.
+/// 실행을 끝낸다: 결과·끝난 시각·RTO. 취소한 시험은 뒷정리를 시작한다(장애 조치가 끊은 시험은 그 장애 조치가 끝난 뒤).
 fn finish(spec: &DrRunSpec, s: &mut DrRunStatus, now: u64, actions: &mut Vec<DrAction>) {
     let ok = |p: DrPhase| matches!(p, DrPhase::Ready | DrPhase::Deleted);
     let all = s.steps.iter().all(|st| ok(st.phase));
@@ -1854,7 +2493,7 @@ fn finish(spec: &DrRunSpec, s: &mut DrRunStatus, now: u64, actions: &mut Vec<DrA
             .max()
             .map(|t| t.saturating_sub(s.started_at));
     }
-    if spec.kind == DrRunKind::Test && s.cancel_requested {
+    if spec.kind == DrRunKind::Test && s.cancel_requested && !s.preempted {
         actions.push(DrAction::StartCleanup);
     }
 }
@@ -1870,7 +2509,7 @@ fn advance_cleanup(
     let max = spec.max_parallel.max(1) as usize;
     for step in &mut s.steps {
         let vm = step.new_vm.clone().unwrap_or_default();
-        let seen = obs.vms.get(&vm);
+        let seen = seen_vm(obs, step);
         let present = seen.is_some();
         match (step.phase, step.task) {
             (DrPhase::Pending | DrPhase::Deleting, None) if !present => {
@@ -1881,6 +2520,8 @@ fn advance_cleanup(
                 TaskOutcome::Succeeded if !present => set_phase(step, DrPhase::Deleted, now),
                 // 끄는 Task가 끝났다(켜진 VM은 먼저 끈다): 이제 지운다(같은 할 일을 다시 낸다).
                 TaskOutcome::Succeeded if seen.is_some_and(|v| !v.running) => step.task = None,
+                // 끄는 Task가 끝났는데 아직 켜져 보인다(상태 반영이 늦음): 한동안 기다린다.
+                TaskOutcome::Succeeded if now < step.at + RETRY_SECS => {}
                 TaskOutcome::Succeeded => {
                     set_phase(step, DrPhase::Failed, now);
                     step.error = Some(format!("VM {vm} is still there"));
@@ -1902,6 +2543,7 @@ fn advance_cleanup(
                 actions.push(DrAction::DeleteVm {
                     step: i,
                     vm: step.new_vm.clone().unwrap_or_default(),
+                    id: step.vm_id,
                 });
             }
             (DrPhase::Pending, _) if s.cancel_requested => {
@@ -1911,6 +2553,7 @@ fn advance_cleanup(
             (DrPhase::Deleting, None) => actions.push(DrAction::DeleteVm {
                 step: i,
                 vm: step.new_vm.clone().unwrap_or_default(),
+                id: step.vm_id,
             }),
             _ => {}
         }

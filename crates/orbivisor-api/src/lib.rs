@@ -533,6 +533,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(dr::cleanup_plan))
         .routes(routes!(dr::cancel_plan))
         .routes(routes!(dr::reprotect_plan))
+        .routes(routes!(dr::fence_source))
         .routes(routes!(vm_exports::export_vm))
         .routes(routes!(r::list_vm_exports))
         .routes(routes!(r::get_vm_export, vm_exports::delete_export))

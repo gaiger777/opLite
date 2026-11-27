@@ -7,13 +7,14 @@
 //! - 실행 끝점은 요청을 보고 실행 리소스(`DrRun`, 시작한 때의 계획 사본과 [`DrRunStatus::start`]의 첫 상태)를 만들 뿐이다.
 //!   진행은 리더의 DR 스케줄러가 한다. 계획 하나에 도는 실행은 하나다(상태 머신이 `dr-run` 독점 값으로 지킨다 — 409
 //!   `dr_run_active`).
+//! - `fence-source`도 여기서 끝난다: 재해 장애 조치 뒤 돌아온 운영 쪽의 그 VM들을 멈춘다(두 벌 막기).
 //! - `reprotect`는 여기서 끝난다: 장애 조치로 되살린 VM(라벨 `orbivisor.io/dr` = 계획)에 백업 작업
 //!   `dr-reprotect-<plan>`(복제 `{remote, pool}`)을 만들거나 바꾼다.
 
 pub(crate) mod protection;
 pub(crate) mod scheduler;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,8 +29,9 @@ use orbivisor_types::backup_job::{
 };
 use orbivisor_types::dr::{
     self, DEFAULT_MAX_PARALLEL, DR_LABEL, DR_TEST_LABEL, DrCleanupTarget, DrPhase, DrRun,
-    DrRunKind, DrRunSpec, DrRunState, DrRunStatus, ERR_CLEANUP_REQUIRED, ERR_RUN_ACTIVE,
-    ERR_SOURCE_MISSING, ERR_TEST_NETWORK_REQUIRED, MAX_RUNS_PER_PLAN, RecoveryPlan,
+    DrRunKind, DrRunSpec, DrRunState, DrRunStatus, ERR_CLEANUP_REQUIRED,
+    ERR_MISSING_RECOVERY_POINTS, ERR_PLANNED_PREFLIGHT, ERR_RUN_ACTIVE, ERR_SOURCE_MISSING,
+    ERR_TEST_NETWORK_NOT_ISOLATED, ERR_TEST_NETWORK_REQUIRED, MAX_RUNS_PER_PLAN, RecoveryPlan,
     RecoveryPlanSpec, RecoveryPlanStatus, VmProtection,
 };
 use orbivisor_types::network::NetworkSpec;
@@ -172,8 +174,9 @@ pub async fn update_plan(
     )?))
 }
 
-/// 계획과 그 실행 기록을 지운다. 도는 실행이 있으면 409 `dr_run_active`(취소하고 끝나기를 기다린다). 실행이 만든 VM·
-/// 네트워크는 그대로 둔다.
+/// 계획과 그 실행 기록을 지운다. 도는 실행이 있으면 409 `dr_run_active`(취소하고 끝나기를 기다린다), 지난 시험이 남긴 VM·
+/// 거품 네트워크가 있으면 409 `dr_cleanup_required`(먼저 `cleanup` — 기록을 지우면 다시 찾지 못한다). 장애 조치로 만든 VM은
+/// 그대로 둔다.
 #[utoipa::path(delete, path = "/dr-plans/{key}", tag = "dr",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -191,6 +194,23 @@ pub async fn delete_plan(
     let runs = runs_of(&state.cluster, plan.id)?;
     if let Some(run) = active(&runs) {
         return Err(run_active(&plan.name, run));
+    }
+    // 실행 기록을 지우면 남은 시험 VM·거품 네트워크를 다시 찾지 못한다.
+    let left = leftovers(&state, &plan, &runs)?;
+    if !left.vms.is_empty() || !left.networks.is_empty() {
+        return Err(ApiError::conflict(
+            ERR_CLEANUP_REQUIRED,
+            format!(
+                "plan {:?} has test VMs or networks left ({}); run cleanup first",
+                plan.name,
+                left.vms
+                    .iter()
+                    .chain(&left.networks)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
     }
     state
         .cluster
@@ -334,6 +354,13 @@ pub struct DrReport {
     pub protected: usize,
     /// VM마다의 복구 지점(그룹 차례, 지금 다시 셈)
     pub protection: Vec<VmProtection>,
+    /// VM마다의 장애 조치 준비(지금 셈 — 네트워크 맵·보안 그룹 대상, 풀, 노드, 복구 지점이 이 클러스터에 있는지)
+    pub failover_readiness: Vec<dr::VmReadiness>,
+    /// 재해 장애 조치 뒤 운영 쪽에서 아직 멈추지 않은 VM(계획 `status.source_fence_pending`)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_fence_pending: Vec<String>,
+    /// 지난 시험이 남긴 것(뒷정리가 지울 시험 VM·거품 네트워크 — `cleanup`이 받는 것과 같다)
+    pub leftovers: DrCleanupTarget,
     /// 최근 끝난 시험(새것부터 셋까지)
     pub tests: Vec<DrRunSummary>,
     /// 마지막으로 끝난 장애 조치
@@ -363,6 +390,8 @@ pub async fn plan_report(
     let ca = protection::source_ca(&plan.spec, &remotes);
     let at = now();
     let protection = dr::protection(&plan.spec, &backups, ca, at);
+    let failover_readiness =
+        dr::failover_readiness(&plan.spec, &backups, ca, &inventory(&state.cluster)?);
     let runs = runs_of(&state.cluster, plan.id)?;
     let finished = |r: &&DrRun| r.status.state.is_finished();
     Ok(Json(DrReport {
@@ -375,6 +404,9 @@ pub async fn plan_report(
         total: protection.len(),
         protected: protection.iter().filter(|p| p.ok).count(),
         protection,
+        failover_readiness,
+        source_fence_pending: plan.status.source_fence_pending.clone(),
+        leftovers: leftovers(&state, &plan, &runs)?,
         tests: runs
             .iter()
             .filter(finished)
@@ -429,45 +461,96 @@ fn source_of(state: &AppState, plan: &RecoveryPlan) -> Result<Remote, ApiError> 
         .ok_or_else(|| source_missing(&plan.spec.source))
 }
 
-/// 지난 시험이 남긴 것: 시험 라벨(`orbivisor.io/dr-test` = 계획)이 붙은 VM과 시험 실행이 정한 시험 VM·거품 네트워크
-/// 가운데 아직 있는 것
+/// 지난 시험이 남긴 것: 시험 실행이 만든 VM(기록한 id) 가운데 아직 있고 시험 라벨(`orbivisor.io/dr-test`)이 이 계획인 것,
+/// 시험 실행의 거품 네트워크 가운데 아직 있고 시험 라벨이 이 계획인 것. 이름만 같은 VM·라벨만 단 VM은 넣지 않는다 — 시험이
+/// 만들지 않은 것을 지우지 않는다(리뷰 1).
 fn leftovers(
     state: &AppState,
     plan: &RecoveryPlan,
     runs: &[DrRun],
 ) -> Result<DrCleanupTarget, ApiError> {
-    let c = &state.cluster;
-    let vms = c.list::<VmSpec>()?.1;
-    let networks = c.list::<NetworkSpec>()?.1;
     let tests: Vec<&DrRun> = runs
         .iter()
         .filter(|r| r.spec.kind == DrRunKind::Test)
         .collect();
-    let mut want_vms: BTreeSet<String> = vms
-        .iter()
-        .filter(|v| v.labels.get(DR_TEST_LABEL) == Some(&plan.name))
-        .map(|v| v.name.clone())
-        .collect();
-    let mut want_nets = BTreeSet::new();
+    let mut vms: BTreeMap<String, Uuid> = BTreeMap::new();
+    let mut nets = BTreeSet::new();
     for run in &tests {
-        let t = run.status.cleanup_target(run.id);
-        want_vms.extend(
-            t.vms
-                .into_iter()
-                .filter(|n| vms.iter().any(|v| v.name == *n)),
-        );
-        want_nets.extend(
-            run.status
-                .bubbles
-                .iter()
-                .map(|b| b.name.clone())
-                .filter(|n| networks.iter().any(|x| x.name == *n)),
-        );
+        let (v, n) = left_by(&state.cluster, &plan.name, run)?;
+        vms.extend(v);
+        nets.extend(n);
     }
     Ok(DrCleanupTarget {
         run: tests.first().map_or(Uuid::nil(), |r| r.id),
-        vms: want_vms.into_iter().collect(),
-        networks: want_nets.into_iter().collect(),
+        vm_ids: vms.values().copied().collect(),
+        vms: vms.into_keys().collect(),
+        networks: nets.into_iter().collect(),
+    })
+}
+
+/// 시험 실행 하나가 남긴 VM(이름 → id)과 거품 네트워크
+fn left_by(
+    c: &Cluster,
+    plan: &str,
+    run: &DrRun,
+) -> Result<(BTreeMap<String, Uuid>, BTreeSet<String>), ApiError> {
+    let mine = |labels: &std::collections::BTreeMap<String, String>| {
+        labels.get(DR_TEST_LABEL).map(String::as_str) == Some(plan)
+    };
+    let mut vms = BTreeMap::new();
+    for id in run.status.cleanup_target(run.id).vm_ids {
+        if let Some(vm) = c.get::<VmSpec>(id)?
+            && mine(&vm.labels)
+        {
+            vms.insert(vm.name, id);
+        }
+    }
+    let mut nets = BTreeSet::new();
+    for b in &run.status.bubbles {
+        if let Some(n) = c.get_by_name::<NetworkSpec>(&b.name)?
+            && mine(&n.labels)
+        {
+            nets.insert(n.name);
+        }
+    }
+    Ok((vms, nets))
+}
+
+/// 실행을 시작하는 요청의 고름
+#[derive(Debug, Clone, Default)]
+struct RunOptions {
+    allow_missing: bool,
+    point_in_time: Option<u64>,
+    preempted_test: Option<Uuid>,
+}
+
+/// 이 클러스터에 있는 네트워크·보안 그룹·풀·노드 이름(장애 조치 준비 검사)
+fn inventory(c: &Cluster) -> Result<dr::DrInventory, ApiError> {
+    Ok(dr::DrInventory {
+        networks: c
+            .list::<NetworkSpec>()?
+            .1
+            .into_iter()
+            .map(|n| n.name)
+            .collect(),
+        security_groups: c
+            .list::<SecurityGroupSpec>()?
+            .1
+            .into_iter()
+            .map(|g| g.name)
+            .collect(),
+        pools: c
+            .list::<StoragePoolSpec>()?
+            .1
+            .into_iter()
+            .map(|p| p.name)
+            .collect(),
+        nodes: c
+            .list::<NodeSpec>()?
+            .1
+            .into_iter()
+            .map(|n| n.name)
+            .collect(),
     })
 }
 
@@ -478,6 +561,7 @@ async fn start_run(
     plan: &RecoveryPlan,
     kind: DrRunKind,
     cleanup: Option<DrCleanupTarget>,
+    opts: RunOptions,
 ) -> Result<DrRun, ApiError> {
     let c = &state.cluster;
     let spec = DrRunSpec {
@@ -489,16 +573,19 @@ async fn start_run(
         max_parallel: crate::settings::current(c)
             .map_or(DEFAULT_MAX_PARALLEL, |s| s.spec.dr_max_parallel()),
         cleanup,
+        allow_missing: opts.allow_missing,
+        point_in_time: opts.point_in_time,
     };
     let backups = c.list::<BackupSpec>()?.1;
     let remotes = c.list::<RemoteSpec>()?.1;
     let at = now();
-    let status = DrRunStatus::start(
-        &spec,
-        &backups,
-        protection::source_ca(&plan.spec, &remotes),
-        at,
-    );
+    let ca = protection::source_ca(&plan.spec, &remotes);
+    let mut status = DrRunStatus::start(&spec, &backups, ca, at);
+    status.preempted_test = opts.preempted_test;
+    if kind == DrRunKind::Test {
+        status.failover_readiness =
+            dr::failover_readiness(&plan.spec, &backups, ca, &inventory(c)?);
+    }
     let base = dr::run_name(&plan.name, kind_word(kind), at);
     let mut run: DrRun = Resource::new(base.clone(), spec);
     run.status = status;
@@ -555,23 +642,114 @@ async fn prune(cluster: &Cluster, plan: Uuid) {
         .skip(MAX_RUNS_PER_PLAN)
         .filter(|r| r.status.state.is_finished())
     {
+        // 남긴 것이 있는 시험 기록은 둔다(뒷정리가 그 기록으로 찾는다).
+        if run.spec.kind == DrRunKind::Test
+            && left_by(cluster, &run.spec.plan_name, run)
+                .is_ok_and(|(v, n)| !v.is_empty() || !n.is_empty())
+        {
+            continue;
+        }
         delete_run(cluster, run).await;
     }
+}
+
+/// `POST /dr-plans/{key}/actions/test` 본문(없어도 된다)
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TestRequest {
+    /// 복구 지점이 없는 VM을 `skipped`로 두고 진행(없으면 400 `dr_missing_recovery_points`)
+    #[serde(default)]
+    #[schema(default)]
+    pub allow_missing: bool,
+    /// 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub point_in_time: Option<u64>,
+    /// `test_networks`가 라우터·업링크가 있는(밖과 닿을 수 있는) 네트워크를 가리켜도 진행(없으면 400
+    /// `dr_test_network_not_isolated`)
+    #[serde(default)]
+    #[schema(default)]
+    pub allow_routed_test_networks: bool,
+}
+
+/// 복구 지점이 없는 VM(400 `dr_missing_recovery_points`, `details.vms`)
+fn check_points(
+    state: &AppState,
+    plan: &RecoveryPlan,
+    ca: &str,
+    point_in_time: Option<u64>,
+    allow: bool,
+) -> Result<(), ApiError> {
+    if allow {
+        return Ok(());
+    }
+    let backups = state.cluster.list::<BackupSpec>()?.1;
+    let missing: Vec<String> = plan
+        .spec
+        .vms()
+        .filter(|(_, v)| dr::recovery_points(&v.vm, &backups, ca, point_in_time).is_empty())
+        .map(|(_, v)| v.vm.clone())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut e = ApiError::new(
+        StatusCode::BAD_REQUEST,
+        ERR_MISSING_RECOVERY_POINTS,
+        format!(
+            "no recovery point{} for {}; give allow_missing to skip {} and go on",
+            if point_in_time.is_some() {
+                " at or before point_in_time"
+            } else {
+                ""
+            },
+            missing.join(", "),
+            if missing.len() == 1 { "it" } else { "them" }
+        ),
+    );
+    e.details = Some(serde_json::json!({ "vms": missing }));
+    Err(e)
+}
+
+/// 시험망이 밖과 닿을 수 있는지: 브리지(물리망) 네트워크, 공급자(업링크) SDN 네트워크, 라우터에 붙은 네트워크
+fn routed_networks(state: &AppState, plan: &RecoveryPlan) -> Result<Vec<String>, ApiError> {
+    let c = &state.cluster;
+    let routers = c.list::<orbivisor_types::router::RouterSpec>()?.1;
+    let mut out = BTreeSet::new();
+    for to in plan.spec.test_networks.values() {
+        let Some(net) = c.get_by_name::<NetworkSpec>(to)? else {
+            continue;
+        };
+        let routed = routers.iter().any(|r| {
+            r.spec.interfaces.iter().any(|i| &i.network == to)
+                || r.spec.external.as_ref().is_some_and(|x| &x.network == to)
+        });
+        if net.spec.bridge.is_some() || net.spec.is_provider() || routed {
+            out.insert(to.clone());
+        }
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// 시험 장애 조치를 시작한다(설계 §3.2): 운영 쪽을 건드리지 않고 시험 VM(`<vm>-drt`, 폴더 `dr-test/<plan>`)을 격리망
 /// (`test_networks` 맵, 없는 원본 네트워크는 거품 SDN 네트워크)에서 되살린다. 도는 실행이 있으면 409 `dr_run_active`,
 /// 지난 시험의 VM·네트워크가 남았으면 409 `dr_cleanup_required`(먼저 `cleanup`), 원격이 없으면 409 `dr_source_missing`,
-/// 거품 네트워크가 필요한데 SDN이 세워지지 않았으면 400 `dr_test_network_required`.
+/// 거품 네트워크가 필요한데 SDN이 세워지지 않았으면 400 `dr_test_network_required`, 시험망이 밖과 닿을 수 있으면 400
+/// `dr_test_network_not_isolated`(`allow_routed_test_networks`), 복구 지점이 없는 VM이 있으면 400
+/// `dr_missing_recovery_points`(`allow_missing`). 실행의 `failover_readiness`에 장애 조치 준비(네트워크 맵·보안 그룹·풀·
+/// 노드·복구 지점)를 적는다.
 #[utoipa::path(post, path = "/dr-plans/{key}/actions/test", tag = "dr",
     params(("key" = String, Path, description = "id or name")),
+    request_body(content = Option<TestRequest>),
     responses((status = 202, body = Resource<DrRunSpec, DrRunStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn test_plan(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
+    req: Option<Json<TestRequest>>,
 ) -> Result<(StatusCode, Json<DrRun>), ApiError> {
+    let req = req.map(|Json(r)| r).unwrap_or_default();
     let (plan, runs) = plan_for_action(&state, &principal, &key)?;
     audit.detail(format!("dr-plan test {}", plan.name));
     no_active(&plan, &runs)?;
@@ -589,8 +767,25 @@ pub async fn test_plan(
             ),
         ));
     }
+    if !req.allow_routed_test_networks {
+        let routed = routed_networks(&state, &plan)?;
+        if !routed.is_empty() {
+            let mut e = ApiError::new(
+                StatusCode::BAD_REQUEST,
+                ERR_TEST_NETWORK_NOT_ISOLATED,
+                format!(
+                    "test network {} can reach other networks (bridge, provider uplink or router); test VMs come up with production addresses and names — map isolated networks, or give allow_routed_test_networks",
+                    routed.join(", ")
+                ),
+            );
+            e.details = Some(serde_json::json!({ "networks": routed }));
+            return Err(e);
+        }
+    }
+    let ca = source.spec.ca_fingerprint.clone();
+    check_points(&state, &plan, &ca, req.point_in_time, req.allow_missing)?;
     let backups = state.cluster.list::<BackupSpec>()?.1;
-    let bubbles = dr::bubble_sources(&plan.spec, &backups, Some(&source.spec.ca_fingerprint));
+    let bubbles = dr::bubble_sources(&plan.spec, &backups, Some(&ca));
     if !bubbles.is_empty() && crate::sdn::require_ready(&state.cluster).is_err() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -601,7 +796,12 @@ pub async fn test_plan(
             ),
         ));
     }
-    let run = start_run(&state, &plan, DrRunKind::Test, None).await?;
+    let opts = RunOptions {
+        allow_missing: req.allow_missing,
+        point_in_time: req.point_in_time,
+        preempted_test: None,
+    };
+    let run = start_run(&state, &plan, DrRunKind::Test, None, opts).await?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -621,6 +821,14 @@ pub struct FailoverRequest {
     pub mode: FailoverMode,
     /// 계획 이름(실수로 누르지 않게 그대로 다시 친다)
     pub confirm: String,
+    /// 재해: 복구 지점이 없는 VM을 `skipped`로 두고 진행(없으면 400 `dr_missing_recovery_points`)
+    #[serde(default)]
+    #[schema(default)]
+    pub allow_missing: bool,
+    /// 재해: 이 시각(유닉스 초) 이전의 가장 새 복구 지점으로(랜섬웨어·논리 손상이 복제된 경우)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub point_in_time: Option<u64>,
 }
 
 /// 운영 쪽(원격)에 닿는지 본다(저장한 CA와 토큰으로 `GET /cluster`, 10초 제한).
@@ -639,9 +847,210 @@ async fn reach(remote: &Remote) -> Result<(), String> {
         .unwrap_or_else(|_| Err("timed out".into()))
 }
 
-/// 실제 장애 조치를 시작한다(설계 §3.2). `confirm`이 계획 이름과 다르면 400 `dr_confirm_mismatch`. `planned`는 운영 쪽에
-/// 닿아야 한다(409 `dr_source_unreachable`). 도는 실행이 있으면 409 `dr_run_active`, 원격이 없으면 409
-/// `dr_source_missing`.
+/// 계획된 이전의 사전 검사 문제 하나(409 `dr_planned_preflight`의 `details.problems`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct PreflightProblem {
+    /// `token_role`(원격 토큰이 admin이 아님 — 운영 쪽 복제는 루트 `cluster.admin`), `no_remote_here`(운영 쪽에 이 클러스터의
+    /// 원격이 없음), `vm_missing`(운영 쪽에 그 VM이 없음), `no_backup_pool`(운영 쪽 지난 백업도 `source_backup_pool`도 없음),
+    /// `no_receiving_pool`(이 클러스터에 사본을 받을 백업 풀이 없음), `unreadable`(운영 쪽 목록을 읽지 못함)
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub vm: Option<String>,
+    pub message: String,
+}
+
+fn problem(code: &str, vm: Option<&str>, message: String) -> PreflightProblem {
+    PreflightProblem {
+        code: code.into(),
+        vm: vm.map(str::to_string),
+        message,
+    }
+}
+
+/// 계획된 이전의 사전 검사(리뷰 1): 운영 쪽에서 아무것도 끄기 전에 끝까지 갈 수 있는지 본다 — 원격 토큰의 역할(admin),
+/// 운영 쪽에 이 클러스터의 원격(CA 지문)이 있는지, 계획의 VM이 운영 쪽에 있고 마지막 백업을 뜰 풀(지난 백업의 풀·저장소,
+/// 없으면 `source_backup_pool`)이 있는지, 이 클러스터에 사본을 받을 백업 풀이 있는지.
+async fn planned_preflight(
+    state: &AppState,
+    plan: &RecoveryPlan,
+    remote: &Remote,
+) -> Vec<PreflightProblem> {
+    let mut out = Vec::new();
+    let Some(side) = scheduler::SourceSide::new(state, remote) else {
+        out.push(problem(
+            "unreadable",
+            None,
+            format!(
+                "cannot use the stored address and CA of remote {:?}",
+                remote.name
+            ),
+        ));
+        return out;
+    };
+    let read = |what: &str, e: crate::remote_client::RemoteError| {
+        problem(
+            "unreadable",
+            None,
+            format!("cannot read {what} on the source cluster: {e}"),
+        )
+    };
+    match side.get("/auth/whoami").await {
+        Ok(me) => {
+            let role = me["role"].as_str().unwrap_or("none");
+            if role != "admin" {
+                out.push(problem(
+                    "token_role",
+                    None,
+                    format!(
+                        "the token of remote {:?} is {role}; a planned failover stops VMs, backs them up and replicates them on the source cluster, which needs an admin token",
+                        remote.name
+                    ),
+                ));
+            }
+        }
+        Err(e) => {
+            out.push(read("the token", e));
+            return out;
+        }
+    }
+    match side.get("/remotes").await {
+        Ok(list) => {
+            let here = list["items"].as_array().into_iter().flatten().any(|r| {
+                side.local_ca.as_deref().is_some_and(|ca| {
+                    r["spec"]["ca_fingerprint"].as_str() == Some(ca)
+                        || r["ca_fingerprint"].as_str() == Some(ca)
+                })
+            });
+            if !here {
+                out.push(problem(
+                    "no_remote_here",
+                    None,
+                    "the source cluster has no remote for this cluster (same CA fingerprint); register this cluster there so it can replicate the last backups here".into(),
+                ));
+            }
+        }
+        Err(e) => out.push(read("the remotes", e)),
+    }
+    let vms = match side.get("/vms").await {
+        Ok(v) => v,
+        Err(e) => {
+            out.push(read("the VMs", e));
+            return out;
+        }
+    };
+    let backups = match side.get("/backups").await {
+        Ok(b) => b,
+        Err(e) => {
+            out.push(read("the backups", e));
+            return out;
+        }
+    };
+    let names: BTreeSet<&str> = vms["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v["name"].as_str())
+        .collect();
+    let local = state
+        .cluster
+        .list::<BackupSpec>()
+        .map(|l| l.1)
+        .unwrap_or_default();
+    let backup_pools = state
+        .cluster
+        .list::<StoragePoolSpec>()
+        .map(|l| l.1)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|p| p.spec.backups);
+    let mut receive = true;
+    for (_, v) in plan.spec.vms() {
+        if !names.contains(v.vm.as_str()) {
+            out.push(problem(
+                "vm_missing",
+                Some(&v.vm),
+                format!("VM {} is not on the source cluster", v.vm),
+            ));
+            continue;
+        }
+        let has_backup = backups["items"].as_array().into_iter().flatten().any(|b| {
+            b["spec"]["vm_name"] == v.vm.as_str()
+                && b["spec"]["origin"].is_null()
+                && (b["spec"]["store"].is_string() || b["spec"]["pool"].is_string())
+        });
+        if !has_backup && scheduler::source_backup_pool(&plan.spec, &v.vm).is_none() {
+            out.push(problem(
+                "no_backup_pool",
+                Some(&v.vm),
+                format!(
+                    "VM {} has no backup on the source cluster to take the backup pool from; set source_backup_pool",
+                    v.vm
+                ),
+            ));
+        }
+        let copy_pool = dr::recovery_point(&v.vm, &local, &remote.spec.ca_fingerprint)
+            .is_some_and(|b| b.spec.store.is_none());
+        receive &= copy_pool || backup_pools;
+    }
+    if !receive {
+        out.push(problem(
+            "no_receiving_pool",
+            None,
+            "this cluster has no backup pool to receive the last backups".into(),
+        ));
+    }
+    out
+}
+
+/// 도는 시험을 장애 조치가 끊는다(리뷰 1): 곧 `cancelled`(진행 중인 Task는 그대로 — 그 VM은 라벨로 뒷정리 대상), 자동
+/// 뒷정리는 장애 조치가 끝난 뒤로 미룬다. 끝난 시험을 계획에 적는다.
+async fn preempt_test(c: &Cluster, test: &DrRun) -> Result<(), ApiError> {
+    for _ in 0..10 {
+        let Some(fresh) = c.get::<DrRunSpec>(test.id)? else {
+            return Ok(());
+        };
+        if fresh.status.state.is_finished() {
+            scheduler::settle(c, &fresh).await;
+            return Ok(());
+        }
+        let at = now();
+        let mut status = fresh.status.clone();
+        status.state = DrRunState::Cancelled;
+        status.cancel_requested = true;
+        status.preempted = true;
+        status.finished_at = Some(at);
+        for st in status.steps.iter_mut().filter(|s| !s.phase.is_terminal()) {
+            st.phase = DrPhase::Skipped;
+            st.error = Some("stopped for a failover".into());
+            st.at = at;
+        }
+        match c
+            .update_status_checked::<DrRunSpec>(fresh.id, fresh.revision, &status)
+            .await
+        {
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                let done = DrRun { status, ..fresh };
+                scheduler::settle(c, &done).await;
+                return Ok(());
+            }
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the running test kept changing while being stopped for the failover; try again",
+    ))
+}
+
+/// 실제 장애 조치를 시작한다(설계 §3.2). `confirm`이 계획 이름과 다르면 400 `dr_confirm_mismatch`. 원격이 없으면 409
+/// `dr_source_missing`. 도는 시험은 끊고(곧 `cancelled`, 그 뒷정리는 장애 조치가 끝난 뒤 — 실행의 `preempted_test`) 다른
+/// 실행이 돌면 409 `dr_run_active`.
+/// - `planned`는 운영 쪽에 닿아야 하고(409 `dr_source_unreachable`) 사전 검사를 모두 지나야 한다(409
+///   `dr_planned_preflight`, `details.problems` — 아무것도 끄지 않는다).
+/// - `disaster`는 복구 지점이 없는 VM이 있으면 400 `dr_missing_recovery_points`(`allow_missing`이면 그 VM `skipped`),
+///   `point_in_time`이면 그 시각 이전의 가장 새 복구 지점.
 #[utoipa::path(post, path = "/dr-plans/{key}/actions/failover", tag = "dr",
     params(("key" = String, Path, description = "id or name")),
     request_body = FailoverRequest,
@@ -666,8 +1075,13 @@ pub async fn failover_plan(
             format!("confirm must be the plan name {:?}", plan.name),
         ));
     }
-    no_active(&plan, &runs)?;
+    let test = match active(&runs) {
+        Some(r) if r.spec.kind == DrRunKind::Test => Some(r.clone()),
+        Some(r) => return Err(run_active(&plan.name, r)),
+        None => None,
+    };
     let source = source_of(&state, &plan)?;
+    let mut opts = RunOptions::default();
     let kind = match req.mode {
         FailoverMode::Planned => {
             if let Err(e) = reach(&source).await {
@@ -679,11 +1093,43 @@ pub async fn failover_plan(
                     ),
                 ));
             }
+            let problems = planned_preflight(&state, &plan, &source).await;
+            if !problems.is_empty() {
+                let mut e = ApiError::conflict(
+                    ERR_PLANNED_PREFLIGHT,
+                    format!(
+                        "a planned failover of {:?} would stop production VMs and then fail: {}",
+                        plan.name,
+                        problems
+                            .iter()
+                            .map(|p| p.message.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                );
+                e.details = Some(serde_json::json!({ "problems": problems }));
+                return Err(e);
+            }
             DrRunKind::FailoverPlanned
         }
-        FailoverMode::Disaster => DrRunKind::FailoverDisaster,
+        FailoverMode::Disaster => {
+            check_points(
+                &state,
+                &plan,
+                &source.spec.ca_fingerprint,
+                req.point_in_time,
+                req.allow_missing,
+            )?;
+            opts.allow_missing = req.allow_missing;
+            opts.point_in_time = req.point_in_time;
+            DrRunKind::FailoverDisaster
+        }
     };
-    let run = start_run(&state, &plan, kind, None).await?;
+    if let Some(test) = &test {
+        preempt_test(&state.cluster, test).await?;
+        opts.preempted_test = Some(test.id);
+    }
+    let run = start_run(&state, &plan, kind, None, opts).await?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -708,7 +1154,14 @@ pub async fn cleanup_plan(
             format!("no test VMs or networks of plan {:?} are left", plan.name),
         ));
     }
-    let run = start_run(&state, &plan, DrRunKind::Cleanup, Some(target)).await?;
+    let run = start_run(
+        &state,
+        &plan,
+        DrRunKind::Cleanup,
+        Some(target),
+        RunOptions::default(),
+    )
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -765,14 +1218,18 @@ pub struct ReprotectRequest {
     pub remote: String,
     /// 그 원격의 백업 풀
     pub pool: String,
-    pub schedule: JobSchedule,
-    /// 이 클러스터에서 백업을 쓸 백업 풀. 없으면 계획의 `pool`(백업 풀이어야 한다)
+    /// 백업 시각. 작업이 이미 있으면 없어도 된다(그대로) — 처음 만들 때는 있어야 한다(400).
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub schedule: Option<JobSchedule>,
+    /// 이 클러스터에서 백업을 쓸 백업 풀. 없으면 이미 있는 작업의 풀, 그것도 없으면 계획의 `pool`(백업 풀이어야 한다)
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub backup_pool: Option<String>,
+    /// 보존 규칙. 없으면 이미 있는 작업의 것 그대로(처음이면 모두 둠)
     #[serde(default)]
-    #[schema(default)]
-    pub keep: Keep,
+    #[schema(nullable = false, default)]
+    pub keep: Option<Keep>,
 }
 
 /// 되돌리기 준비(설계 §3.6): 장애 조치로 되살린 VM(라벨 `orbivisor.io/dr` = 계획)에 백업 작업 `dr-reprotect-<plan>`
@@ -809,24 +1266,33 @@ pub async fn reprotect_plan(
             ),
         ));
     }
+    let name = dr::reprotect_job_name(&plan.name);
+    let existing = c.get_by_name::<BackupJobSpec>(&name)?;
+    let old = existing.as_ref().map(|j| &j.spec);
+    // 주지 않은 칸은 이미 있는 작업의 것(백업 작업 화면에서 고친 보존·시각·요일 — 다시 저장해도 지우지 않는다)
+    let Some(schedule) = req.schedule.or_else(|| old.map(|o| o.schedule.clone())) else {
+        return Err(bad("schedule is required for a new reprotect job"));
+    };
     let mut spec = BackupJobSpec {
         vms: VmSelector::Labels([(DR_LABEL.to_string(), plan.name.clone())].into()),
-        pool: req.backup_pool.unwrap_or_else(|| plan.spec.pool.clone()),
-        store: None,
-        schedule: req.schedule,
-        keep: req.keep,
+        pool: req
+            .backup_pool
+            .or_else(|| old.map(|o| o.pool.clone()))
+            .unwrap_or_else(|| plan.spec.pool.clone()),
+        store: old.and_then(|o| o.store.clone()),
+        schedule,
+        keep: req.keep.or_else(|| old.map(|o| o.keep)).unwrap_or_default(),
         enabled: true,
         replicate: Some(ReplicateTarget {
             remote: req.remote,
             pool: req.pool,
         }),
-        full_every: 0,
-        copy_to: None,
+        full_every: old.map_or(0, |o| o.full_every),
+        copy_to: old.and_then(|o| o.copy_to.clone()),
     };
     crate::backup_jobs::check_spec(&state, &mut spec)?;
-    let name = dr::reprotect_job_name(&plan.name);
     let labels = [(DR_LABEL.to_string(), plan.name.clone())].into();
-    if let Some(job) = c.get_by_name::<BackupJobSpec>(&name)? {
+    if let Some(job) = existing {
         if job.spec != spec || job.labels != labels {
             let reschedule = job.spec.schedule != spec.schedule || !job.spec.enabled;
             c.update_spec(job.id, Some(job.revision), labels, &spec)
@@ -850,4 +1316,130 @@ pub async fn reprotect_plan(
     job.status.next_run = Some(next_run(&job.spec.schedule, now()));
     job.revision = c.create(&job).await?;
     Ok((StatusCode::CREATED, Json(job)))
+}
+
+/// fence-source 결과(VM 하나)
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FenceResult {
+    /// 운영 쪽 VM 이름
+    pub vm: String,
+    /// 멈춤(강제 stop을 받았거나 운영 쪽에 없음)
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub error: Option<String>,
+}
+
+/// `POST /dr-plans/{key}/actions/fence-source` 응답
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FenceResponse {
+    pub results: Vec<FenceResult>,
+    /// 아직 멈추지 못한 VM(계획 `status.source_fence_pending`)
+    pub pending: Vec<String>,
+}
+
+/// 재해 장애 조치 뒤 돌아온 운영 쪽을 막는다(리뷰 1, split-brain): 계획 `status.source_fence_pending`의 VM(이곳에 되살린
+/// 것)을 운영 쪽에서 강제로 끄고 원하는 상태를 `stopped`로 둔다(`POST /vms/{vm}/actions/stop?mode=force` — 노드가 돌아와도
+/// 다시 켜지 않는다). 멈춘 VM(운영 쪽에 없는 것 포함)은 목록에서 뺀다. 자동으로는 하지 않는다(경보 `dr_source_returned`).
+/// 사전 검사: 목록이 비면 409 `dr_nothing_to_fence`, 운영 쪽에 닿지 않으면 409 `dr_source_unreachable`, 토큰이 VM을 끌 수
+/// 없으면(viewer) 409 `dr_fence_preflight`.
+#[utoipa::path(post, path = "/dr-plans/{key}/actions/fence-source", tag = "dr",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 200, body = FenceResponse), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn fence_source(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<Json<FenceResponse>, ApiError> {
+    let (plan, _) = plan_for_action(&state, &principal, &key)?;
+    audit.detail(format!("dr-plan fence-source {}", plan.name));
+    let pending = plan.status.source_fence_pending.clone();
+    if pending.is_empty() {
+        return Err(ApiError::conflict(
+            "dr_nothing_to_fence",
+            format!(
+                "plan {:?} has no recovered VMs to fence on the source cluster",
+                plan.name
+            ),
+        ));
+    }
+    let source = source_of(&state, &plan)?;
+    let unreachable = |e: String| {
+        ApiError::conflict(
+            "dr_source_unreachable",
+            format!(
+                "the production cluster {:?} cannot be reached: {e}",
+                source.name
+            ),
+        )
+    };
+    let side = scheduler::SourceSide::new(&state, &source)
+        .ok_or_else(|| unreachable("the stored address or CA is not usable".into()))?;
+    let me = side
+        .get("/auth/whoami")
+        .await
+        .map_err(|e| unreachable(e.to_string()))?;
+    let role = me["role"].as_str().unwrap_or("none");
+    if !matches!(role, "admin" | "operator") {
+        return Err(ApiError::conflict(
+            "dr_fence_preflight",
+            format!(
+                "the token of remote {:?} is {role}; stopping VMs on the source cluster needs an operator or admin token",
+                source.name
+            ),
+        ));
+    }
+    let mut results = Vec::new();
+    for vm in &pending {
+        let path = format!(
+            "/vms/{}/actions/stop?mode=force",
+            scheduler::path_segment(vm)
+        );
+        let (ok, error) = match side.post(&path, &serde_json::json!({})).await {
+            Ok(_) => (true, None),
+            Err((Some(404), _, _)) => (true, Some("not on the source cluster".into())),
+            Err((Some(409), code, _)) if code == "vm_stopped" || code == "vm_not_running" => {
+                (true, None)
+            }
+            Err((_, _, e)) => (false, Some(e)),
+        };
+        results.push(FenceResult {
+            vm: vm.clone(),
+            ok,
+            error,
+        });
+    }
+    let fenced: BTreeSet<&str> = results
+        .iter()
+        .filter(|r| r.ok)
+        .map(|r| r.vm.as_str())
+        .collect();
+    let c = &state.cluster;
+    let mut left = pending.clone();
+    for _ in 0..10 {
+        let Some(p) = c.get::<RecoveryPlanSpec>(plan.id)? else {
+            break;
+        };
+        let mut status = p.status.clone();
+        status
+            .source_fence_pending
+            .retain(|v| !fenced.contains(v.as_str()));
+        left = status.source_fence_pending.clone();
+        if status == p.status {
+            break;
+        }
+        match c
+            .update_status_checked::<RecoveryPlanSpec>(p.id, p.revision, &status)
+            .await
+        {
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.into()),
+            Ok(_) => break,
+        }
+    }
+    Ok(Json(FenceResponse {
+        results,
+        pending: left,
+    }))
 }

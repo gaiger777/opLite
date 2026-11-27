@@ -603,6 +603,11 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
         "/dr-plans/{key}/actions/reprotect",
         Root(ClusterAdmin),
     ),
+    (
+        "POST",
+        "/dr-plans/{key}/actions/fence-source",
+        Root(ClusterAdmin),
+    ),
     ("GET", "/vmware-vms", Root(SystemRead)),
     ("GET", "/vmware-vms/{key}", Root(SystemRead)),
     ("POST", "/vmware-vms/{key}/retry", Root(VmCreate)),

@@ -722,6 +722,11 @@ impl Engine {
                     None => continue,
                 },
                 AlertCondition::DrRunFailed { .. } => self.dr_run_failed(now, &rule),
+                // 재해 뒤 돌아온 운영 쪽(리뷰 1): 계획의 `source_fence_pending`과 원격 상태(리더 RemotePoller)
+                AlertCondition::DrSourceReturned { .. } => match self.source_returned(&rule) {
+                    Some(f) => self.subject_rule(now, &rule, f, "The recovery plan was deleted."),
+                    None => continue,
+                },
                 // 링크 조건(계획 75 §3.4): 노드 상태의 포트·본딩. 영향을 읽지 못하면 그대로 둔다.
                 ref c if c.is_link() => match self.link_findings(&rule, nodes, &mut link_world) {
                     Some((f, quiet)) => {
@@ -1322,8 +1327,9 @@ impl Engine {
         (status, out)
     }
 
-    /// 계획마다(규칙의 `plans`에 드는 것): 보호 상태에 RPO를 지키지 못하는 VM(복구 지점 없음·RPO 넘음)이 있으면 참.
-    /// RPO 목표가 0(끔)인 계획은 거짓이다. 문구는 [`dr::rpo_summary`]에 계획 화면의 웹 경로를 붙인다.
+    /// 계획마다(규칙의 `plans`에 드는 것): 보호 상태에 RPO를 지키지 못하는 VM(복구 지점 없음·검증 실패·RPO 넘음)이 있으면
+    /// 참. RPO 목표가 0(끔)이어도 복구 지점이 없거나 검증에 실패한 VM은 울린다(목표를 끈 것과 보호가 없는 것은 다르다).
+    /// 문구는 [`dr::rpo_summary`]에 계획 화면의 웹 경로를 붙인다.
     fn rpo_findings(&self, rule: &AlertRule) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
         let (_, plans) = self.cluster().list::<RecoveryPlanSpec>().ok()?;
         Some(
@@ -1331,12 +1337,9 @@ impl Engine {
                 .iter()
                 .filter(|p| rule.spec.condition.applies_to_plan(&p.name))
                 .map(|p| {
-                    let detail = (p.spec.rpo_target_secs > 0)
-                        .then(|| {
-                            dr::rpo_summary(&p.name, p.spec.rpo_target_secs, &p.status.protection)
-                        })
-                        .flatten()
-                        .map(|s| format!("{s}\nPlan: {}", plan_path(&p.name)));
+                    let detail =
+                        dr::rpo_summary(&p.name, p.spec.rpo_target_secs, &p.status.protection)
+                            .map(|s| format!("{s}\nPlan: {}", plan_path(&p.name)));
                     let subject = AlertSubject {
                         kind: SubjectKind::RecoveryPlan,
                         id: p.id,
@@ -1350,8 +1353,53 @@ impl Engine {
         )
     }
 
+    /// 계획마다: 재해 장애 조치로 되살린 VM이 운영 쪽에서 아직 멈추지 않았는데(`source_fence_pending`) 운영 클러스터(원격)가
+    /// 다시 닿으면 참 — 같은 VM이 두 벌 돌 수 있다.
+    fn source_returned(
+        &self,
+        rule: &AlertRule,
+    ) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
+        let (_, plans) = self.cluster().list::<RecoveryPlanSpec>().ok()?;
+        let (_, remotes) = self
+            .cluster()
+            .list::<orbivisor_types::remote::RemoteSpec>()
+            .ok()?;
+        Some(
+            plans
+                .iter()
+                .filter(|p| rule.spec.condition.applies_to_plan(&p.name))
+                .map(|p| {
+                    let back = !p.status.source_fence_pending.is_empty()
+                        && remotes
+                            .iter()
+                            .any(|r| r.name == p.spec.source && r.status.reachable);
+                    let detail = back.then(|| {
+                        format!(
+                            "plan {}: the production cluster {} is reachable again and still runs VMs recovered here: {} — stop them there before both copies serve (POST /dr-plans/{}/actions/fence-source)\nPlan: {}",
+                            p.name,
+                            p.spec.source,
+                            p.status.source_fence_pending.join(", "),
+                            p.name,
+                            plan_path(&p.name)
+                        )
+                    });
+                    let subject = AlertSubject {
+                        kind: SubjectKind::RecoveryPlan,
+                        id: p.id,
+                        name: p.name.clone(),
+                        node: None,
+                        port: None,
+                    };
+                    (subject, back, detail)
+                })
+                .collect(),
+        )
+    }
+
     /// DR 실행이 `failed`·`partial`로 끝나면 한 번 알린다(이벤트, `backup_failed`처럼 `status.notified`에 실행 id를
-    /// 적는다 — 규칙을 만들기 전에 끝난 실행과 지운 실행은 알리지 않고 잊는다).
+    /// 적는다 — 규칙을 만들기 전에 끝난 실행과 지운 실행은 알리지 않고 잊는다). 도는 실행이 [`dr::STALL_SECS`] 넘게
+    /// 나아가지 않으면 "stalled"로도 한 번 알린다(같은 멈춤에 한 번 — `notified`에 음수 시각으로 적고, 다시 나아갔다 멈추면
+    /// 또 알린다).
     fn dr_run_failed(
         &self,
         now: i64,
@@ -1365,8 +1413,54 @@ impl Engine {
         let mut status = rule.status.clone();
         status.active.clear();
         let failed = new_run_failures(&mut status.notified, &runs, created_ms(rule.id));
+        let stalled = new_stalls(&mut status.notified, &runs, now / 1000);
         if !rule.spec.enabled {
             return (status, out);
+        }
+        for run in stalled
+            .into_iter()
+            .filter(|r| rule.spec.condition.applies_to_plan(&r.spec.plan_name))
+        {
+            let mut detail = format!(
+                "DR run {} of plan {} stalled: no progress for {} min",
+                run.name,
+                run.spec.plan_name,
+                u64::try_from(now / 1000)
+                    .unwrap_or(0)
+                    .saturating_sub(run.status.progress_at.max(run.status.started_at))
+                    / 60
+            );
+            for s in run
+                .status
+                .steps
+                .iter()
+                .filter(|s| s.last_error.is_some())
+                .take(5)
+            {
+                detail.push_str(&format!(
+                    "\n- {}: {}",
+                    s.vm,
+                    s.last_error.as_deref().unwrap_or_default()
+                ));
+            }
+            detail.push_str(&format!(
+                "\nPlan: {}\nRun: /dr-runs/{}",
+                plan_path(&run.spec.plan_name),
+                run.id
+            ));
+            let subject = AlertSubject {
+                kind: SubjectKind::RecoveryPlan,
+                id: run.spec.plan,
+                name: run.spec.plan_name.clone(),
+                node: None,
+                port: None,
+            };
+            out.push(Pending {
+                alert: event_alert(rule, subject, now),
+                rule: rule.clone(),
+                state: NotificationState::Event,
+                detail: Some(detail),
+            });
         }
         for run in failed
             .into_iter()
@@ -1612,7 +1706,8 @@ fn new_run_failures<'r>(
     let mut out: Vec<&DrRun> = runs
         .iter()
         .filter(|r| matches!(r.status.state, DrRunState::Failed | DrRunState::Partial))
-        .filter(|r| !notified.contains_key(&r.id))
+        // 음수는 멈춤을 알린 표시다(끝난 실패는 따로 알린다).
+        .filter(|r| notified.get(&r.id).is_none_or(|at| *at < 0))
         .filter_map(|r| {
             let at = i64::try_from(r.status.finished_at?)
                 .unwrap_or(i64::MAX / 1000)
@@ -1624,6 +1719,30 @@ fn new_run_failures<'r>(
     for r in &out {
         let at = r.status.finished_at.unwrap_or(0) as i64 * 1000;
         notified.insert(r.id, at);
+    }
+    out
+}
+
+/// 도는 실행 가운데 [`dr::STALL_SECS`] 넘게 나아가지 않은 것(아직 이 멈춤을 알리지 않은 것)을 `notified`에 `-progress_at`으로
+/// 적고 돌려준다. 다시 나아가면 `progress_at`이 바뀌어 다음 멈춤을 또 알린다.
+fn new_stalls<'r>(
+    notified: &mut BTreeMap<Uuid, i64>,
+    runs: &'r [DrRun],
+    now: i64,
+) -> Vec<&'r DrRun> {
+    let now = u64::try_from(now).unwrap_or(0);
+    let mut out = Vec::new();
+    for r in runs.iter().filter(|r| !r.status.state.is_finished()) {
+        let since = r.status.progress_at.max(r.status.started_at);
+        if now < since + dr::STALL_SECS {
+            continue;
+        }
+        let mark = -i64::try_from(since).unwrap_or(i64::MAX);
+        if notified.get(&r.id) == Some(&mark) {
+            continue;
+        }
+        notified.insert(r.id, mark);
+        out.push(r);
     }
     out
 }

@@ -66,6 +66,7 @@ fn group(name: &str, vms: &[&str]) -> DrGroup {
                 node: None,
                 live: false,
                 ip: Vec::new(),
+                source_backup_pool: None,
             })
             .collect(),
     }
@@ -80,6 +81,7 @@ fn plan(groups: Vec<DrGroup>) -> RecoveryPlanSpec {
         networks: BTreeMap::new(),
         security_groups: BTreeMap::new(),
         test_networks: BTreeMap::new(),
+        source_backup_pool: None,
         on_timeout: OnTimeout::Continue,
         groups,
     }
@@ -93,6 +95,8 @@ fn run_spec(kind: DrRunKind, plan_spec: RecoveryPlanSpec) -> DrRunSpec {
         plan_spec,
         max_parallel: DEFAULT_MAX_PARALLEL,
         cleanup: None,
+        allow_missing: false,
+        point_in_time: None,
     }
 }
 
@@ -398,8 +402,10 @@ fn protection_picks_newest_ready_copy_from_the_source() {
             at: now,
             rto_secs: Some(42),
             result: DrRunState::Succeeded,
+            readiness_issues: 0,
         }),
         run: None,
+        source_fence_pending: Vec::new(),
     };
     let v = serde_json::to_value(&status).unwrap();
     assert_eq!(
@@ -569,6 +575,8 @@ struct World {
     tasks: BTreeMap<Uuid, (&'static str, String)>,
     /// 만든 Task 수(할 일 종류마다)
     issued: BTreeMap<&'static str, usize>,
+    /// 복원 Task → 만들 VM id
+    vm_ids: BTreeMap<Uuid, Uuid>,
 }
 
 impl World {
@@ -581,6 +589,7 @@ impl World {
             },
             tasks: BTreeMap::new(),
             issued: BTreeMap::new(),
+            vm_ids: BTreeMap::new(),
         }
     }
 
@@ -594,11 +603,19 @@ impl World {
 
     fn perform(&mut self, a: &DrAction) -> DrResult {
         match a {
-            DrAction::Restore { name, .. } => self.task("restore", name),
+            DrAction::Restore { name, .. } => {
+                let DrResult::Task(task) = self.task("restore", name) else {
+                    unreachable!()
+                };
+                let vm = Uuid::now_v7();
+                self.vm_ids.insert(task, vm);
+                DrResult::Restored { task, vm }
+            }
             DrAction::Start { vm, .. } => self.task("start", vm),
             DrAction::DeleteVm { vm, .. } => self.task("delete", vm),
             DrAction::CreateBubble { name, .. } => {
                 self.obs.networks.insert(name.clone());
+                self.obs.test_networks.insert(name.clone());
                 DrResult::Done
             }
             DrAction::DeleteNetwork { name, .. } => {
@@ -639,7 +656,12 @@ impl World {
             self.obs.tasks.insert(id, TaskOutcome::Succeeded);
             match what {
                 "restore" => {
-                    self.obs.vms.insert(vm, VmObservation::default());
+                    let seen = VmObservation {
+                        id: self.vm_ids.get(&id).copied(),
+                        labelled: true,
+                        ..Default::default()
+                    };
+                    self.obs.vms.insert(vm, seen);
                 }
                 "start" => {
                     let v = self.obs.vms.entry(vm).or_default();
@@ -1017,8 +1039,9 @@ fn test_run_uses_bubbles_and_test_names() {
         ]
     );
     let mut w = World::new(now);
-    // 한 거품은 이미 있음(앞 리더가 만들고 적지 못함)
+    // 한 거품은 이미 있음(앞 리더가 만들고 적지 못함 — 시험 라벨이 이 계획)
     w.obs.networks.insert("drt-web-tier-1".into());
+    w.obs.test_networks.insert("drt-web-tier-1".into());
     let (s, a) = w.tick(&spec, &s0);
     assert_eq!(
         a,
@@ -1098,6 +1121,8 @@ fn ip_wait_without_rules_takes_any_global_address() {
         guest: true,
         ips: ips.iter().map(|a| a.parse().unwrap()).collect(),
         node: None,
+        id: None,
+        labelled: false,
     };
     assert!(!wait_met(DrWait::Ip, &v(&[]), &[]));
     assert!(!wait_met(
@@ -1140,10 +1165,18 @@ fn planned_failover_prepares_the_source_first() {
     let s0 = DrRunStatus::start(&spec, &[], Some(CA), now);
     assert!(s0.steps.iter().all(|st| st.phase == DrPhase::Preparing));
     let mut w = World::new(now);
-    // 원격에 닿지 않으면 기다린다.
+    // 원격에 닿지 않으면 기다리고 그 까닭을 적는다(나아감은 아니다).
+    w.obs.source_error = Some("timed out".into());
     let (s, a) = advance(&spec, &s0, &w.obs);
     assert!(a.is_empty());
-    assert_eq!(s, s0);
+    assert_eq!(s.progress_at, s0.progress_at);
+    for st in &s.steps {
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("cannot read the source cluster: timed out")
+        );
+        assert_eq!(st.retrying_since, Some(now));
+    }
     let mut src = SourceObservation::default();
     src.vms.insert("db1".into(), false);
     src.vms.insert("web1".into(), false);
@@ -1272,10 +1305,17 @@ fn planned_failover_prepares_the_source_first() {
     assert!(s.steps[0].error.as_deref().unwrap().contains("disk full"));
     assert_eq!(s.prepare_secs, Some(w.obs.now - now));
     assert_eq!(s.steps[1].backup_id, Some(c.id));
-    // 준비가 끝나 db 그룹(실패)을 지나 web 그룹을 복원한다.
+    // 준비가 끝나 db 그룹(실패)을 지나 web 그룹을 복원한다. 이 실행이 끄고 되살리지 못하는 db1은 운영 쪽에서 다시 켠다.
     assert!(
-        matches!(&a[..], [DrAction::Restore { name, backup, .. }] if name == "web1" && *backup == c.id),
+        matches!(&a[..], [DrAction::StartSource { step: 0, vm }, DrAction::Restore { name, backup, .. }]
+            if vm == "db1" && name == "web1" && *backup == c.id),
         "{a:?}"
+    );
+    assert!(s.steps[0].prepare.as_ref().unwrap().restarted);
+    assert!(
+        s.steps[0].notes[0].starts_with("restarted the source VM db1"),
+        "{:?}",
+        s.steps[0].notes
     );
     let mut s = s;
     for _ in 0..3 {
@@ -1296,6 +1336,7 @@ fn cleanup_deletes_vms_then_bubbles() {
     spec.cleanup = Some(DrCleanupTarget {
         run: Uuid::now_v7(),
         vms: vec!["web1-drt".into(), "web2-drt".into(), "gone-drt".into()],
+        vm_ids: Vec::new(),
         networks: vec!["drt-web-tier-1".into(), "drt-web-tier-2".into()],
     });
     let s0 = DrRunStatus::start(&spec, &[], None, now);
@@ -1316,7 +1357,8 @@ fn cleanup_deletes_vms_then_bubbles() {
         a,
         vec![DrAction::DeleteVm {
             step: 0,
-            vm: "web1-drt".into()
+            vm: "web1-drt".into(),
+            id: None
         }]
     );
     assert_eq!(s.steps[2].phase, DrPhase::Deleted, "없는 VM");
@@ -1327,7 +1369,8 @@ fn cleanup_deletes_vms_then_bubbles() {
         a,
         vec![DrAction::DeleteVm {
             step: 1,
-            vm: "web2-drt".into()
+            vm: "web2-drt".into(),
+            id: None
         }]
     );
     w.finish_tasks(&[]);
@@ -1371,6 +1414,7 @@ fn cleanup_stops_running_vms_before_deleting_them() {
     spec.cleanup = Some(DrCleanupTarget {
         run: Uuid::now_v7(),
         vms: vec!["web1-drt".into(), "web2-drt".into()],
+        vm_ids: Vec::new(),
         networks: vec![],
     });
     let s0 = DrRunStatus::start(&spec, &[], None, now);
@@ -1400,7 +1444,8 @@ fn cleanup_stops_running_vms_before_deleting_them() {
         a,
         vec![DrAction::DeleteVm {
             step: 0,
-            vm: "web1-drt".into()
+            vm: "web1-drt".into(),
+            id: None
         }]
     );
     assert_eq!(s.steps[0].phase, DrPhase::Deleting);
@@ -1450,6 +1495,7 @@ fn run_round_trips() {
     spec.cleanup = Some(DrCleanupTarget {
         run: Uuid::nil(),
         vms: vec![],
+        vm_ids: vec![],
         networks: vec![],
     });
     assert_eq!(
@@ -1460,7 +1506,7 @@ fn run_round_trips() {
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(
         v,
-        json!({ "state": "running", "started_at": now, "steps": [
+        json!({ "state": "running", "started_at": now, "progress_at": now, "steps": [
             { "group": "db", "vm": "db1", "phase": "preparing", "at": now,
               "prepare": { "stage": "shutdown" } } ] })
     );
@@ -1476,4 +1522,319 @@ fn run_round_trips() {
     assert_eq!(RecoveryPlanSpec::KIND, Kind::RecoveryPlan);
     assert_eq!(DrRunSpec::KIND, Kind::DrRun);
     assert!(DrRunKind::FailoverDisaster.is_failover() && !DrRunKind::Test.is_failover());
+}
+
+// ---- 리뷰 1 ----
+
+/// 복원 Task가 실패하면(깨진 사본일 수 있다) 다음 오래된 복구 지점으로 다시 한다 — 써 본 것을 적고, 모두 셋까지. 검증에
+/// 실패한 사본은 처음부터 고르지 않는다.
+#[test]
+fn a_failed_restore_falls_back_to_older_recovery_points() {
+    let now = 10_000;
+    let spec = run_spec(
+        DrRunKind::FailoverDisaster,
+        plan(vec![group("db", &["db1"])]),
+    );
+    let mut bad = copy("db1-new", "db1", CA, now - 60);
+    bad.status.verify =
+        Some(serde_json::from_value(json!({ "at": now, "state": "failed" })).unwrap());
+    let backups = vec![
+        copy("db1-a", "db1", CA, now - 400),
+        copy("db1-b", "db1", CA, now - 300),
+        copy("db1-c", "db1", CA, now - 200),
+        copy("db1-d", "db1", CA, now - 100),
+        bad,
+    ];
+    let s0 = DrRunStatus::start(&spec, &backups, Some(CA), now);
+    assert_eq!(
+        s0.steps[0].backup.as_deref(),
+        Some("db1-d"),
+        "검증 실패 사본은 건너뜀"
+    );
+    let mut w = World::new(now);
+    w.obs.backups = backups.clone();
+    let (mut s, _) = w.tick(&spec, &s0);
+    for want in ["db1-c", "db1-b"] {
+        w.finish_tasks(&["db1"]);
+        w.obs.now += 5;
+        let (next, a) = w.tick(&spec, &s);
+        s = next;
+        assert!(
+            matches!(&a[..], [DrAction::Restore { backup, .. }] if Some(*backup) == s.steps[0].backup_id),
+            "{a:?}"
+        );
+        assert_eq!(s.steps[0].backup.as_deref(), Some(want));
+        assert_eq!(s.steps[0].phase, DrPhase::Restoring);
+        assert!(s.steps[0].notes.last().unwrap().contains(want));
+    }
+    assert_eq!(s.steps[0].tried, ["db1-d", "db1-c"]);
+    // 셋째도 실패하면 그 VM은 실패(db1-a는 쓰지 않는다)
+    w.finish_tasks(&["db1"]);
+    w.obs.now += 5;
+    let s = w.tick(&spec, &s).0;
+    assert_eq!(s.steps[0].phase, DrPhase::Failed);
+    assert_eq!(s.steps[0].new_vm, None);
+    assert_eq!(w.issued.get("restore"), Some(&3));
+    // 시각을 주면 그 시각 이전의 가장 새 것
+    let mut at = spec.clone();
+    at.point_in_time = Some(now - 250);
+    let s = DrRunStatus::start(&at, &backups, Some(CA), now);
+    assert_eq!(s.steps[0].backup.as_deref(), Some("db1-b"));
+}
+
+/// `allow_missing`이면 복구 지점이 없는 VM은 실패가 아니라 `skipped`이고 `on_timeout: stop`에 들지 않는다.
+#[test]
+fn allowed_missing_points_are_skipped_not_failed() {
+    let now = 10_000;
+    let mut p = plan(vec![group("db", &["db1"]), group("web", &["web1"])]);
+    p.on_timeout = OnTimeout::Stop;
+    let mut spec = run_spec(DrRunKind::FailoverDisaster, p);
+    spec.allow_missing = true;
+    let s0 = DrRunStatus::start(&spec, &copies(&["db1"], now), Some(CA), now);
+    assert_eq!(s0.steps[1].phase, DrPhase::Skipped);
+    let mut w = World::new(now);
+    let (mut s, a) = w.tick(&spec, &s0);
+    assert!(!s.stopping);
+    assert!(matches!(&a[..], [DrAction::Restore { name, .. }] if name == "db1"));
+    for _ in 0..3 {
+        w.finish_tasks(&[]);
+        w.obs.now += 5;
+        s = w.tick(&spec, &s).0;
+    }
+    assert_eq!(s.steps[0].phase, DrPhase::Ready);
+    assert_eq!(s.state, DrRunState::Partial);
+}
+
+/// 라이브 복원: Task가 VM을 켜면(Task는 아직 디스크를 옮김) 곧 기다림으로 넘어가 RTO는 그때다. 복사가 실패하면 경고만 적고,
+/// 실행은 복사가 끝나야 끝난다.
+#[test]
+fn live_restores_count_when_the_vm_runs() {
+    let now = 10_000;
+    let mut p = plan(vec![group("web", &["web1"])]);
+    p.groups[0].vms[0].live = true;
+    let spec = run_spec(DrRunKind::FailoverDisaster, p);
+    let s0 = DrRunStatus::start(&spec, &copies(&["web1"], now), Some(CA), now);
+    let mut w = World::new(now);
+    let (s, _) = w.tick(&spec, &s0);
+    let task = s.steps[0].task.unwrap();
+    // VM이 켜졌다(라이브 복원 Task는 아직 돈다).
+    w.obs.now += 5;
+    w.obs.vms.insert(
+        "web1".into(),
+        VmObservation {
+            running: true,
+            id: s.steps[0].vm_id,
+            labelled: true,
+            ..Default::default()
+        },
+    );
+    let (s, a) = w.tick(&spec, &s);
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(s.steps[0].phase, DrPhase::Ready);
+    assert_eq!(s.steps[0].copy_task, Some(task));
+    assert_eq!(s.state, DrRunState::Running, "복사가 끝나야 끝난다");
+    let ready_at = w.obs.now;
+    w.obs.now += 600;
+    w.obs
+        .tasks
+        .insert(task, TaskOutcome::Failed("mirror broke".into()));
+    let (s, _) = w.tick(&spec, &s);
+    assert_eq!(s.steps[0].copy_task, None);
+    assert!(s.steps[0].notes[0].contains("mirror broke"));
+    assert_eq!(s.state, DrRunState::Succeeded);
+    assert_eq!(s.rto_secs, Some(ready_at - now));
+}
+
+/// 되살린 VM에 라벨이 붙지 않았으면 실행은 끝나지 않는다(스케줄러가 틱마다 다시 단다). 복원을 거절당한(이름 겹침) VM은 이
+/// 실행이 만든 것이 아니라 새 VM·뒷정리 대상이 아니다.
+#[test]
+fn runs_finish_only_after_labels_and_skip_refused_restores() {
+    let now = 10_000;
+    let spec = run_spec(DrRunKind::Test, plan(vec![group("web", &["web1", "web2"])]));
+    let s0 = DrRunStatus::start(&spec, &copies(&["web1", "web2"], now), Some(CA), now);
+    let mut w = World::new(now);
+    // 첫 걸음은 거품 네트워크
+    let (s, _) = w.tick(&spec, &s0);
+    let (mut s, a) = advance(&spec, &s, &w.obs);
+    assert_eq!(a.len(), 2, "{a:?}");
+    for act in &a {
+        let r = match act {
+            DrAction::Restore { step: 1, .. } => {
+                DrResult::Failed("dr_name_taken: VM exists".into())
+            }
+            other => w.perform(other),
+        };
+        s.record(act, r, w.obs.now);
+    }
+    assert_eq!(s.steps[1].phase, DrPhase::Failed);
+    assert_eq!(s.steps[1].new_vm, None);
+    for _ in 0..2 {
+        w.finish_tasks(&[]);
+        w.obs.vms.get_mut("web1-drt").unwrap().labelled = false;
+        w.obs.now += 5;
+        s = w.tick(&spec, &s).0;
+    }
+    assert_eq!(s.steps[0].phase, DrPhase::Ready);
+    assert_eq!(s.state, DrRunState::Running, "라벨이 아직 없다");
+    w.obs.vms.get_mut("web1-drt").unwrap().labelled = true;
+    s = w.tick(&spec, &s).0;
+    assert_eq!(s.state, DrRunState::Partial);
+    let t = s.cleanup_target(Uuid::nil());
+    assert_eq!(t.vms, ["web1-drt"]);
+    assert_eq!(t.vm_ids, [s.steps[0].vm_id.unwrap()]);
+}
+
+/// 같은 이름의 네트워크가 이 계획의 시험 라벨 없이 있으면 그 거품은 쓰지 않는다(격리를 알 수 없음 — 실행 멈춤).
+#[test]
+fn a_foreign_network_with_the_bubble_name_fails_the_bubble() {
+    let now = 10_000;
+    let spec = run_spec(DrRunKind::Test, plan(vec![group("web", &["web1"])]));
+    let s0 = DrRunStatus::start(&spec, &copies(&["web1"], now), Some(CA), now);
+    let mut w = World::new(now);
+    w.obs.networks.insert("drt-web-tier-1".into());
+    let (s, a) = w.tick(&spec, &s0);
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(s.bubbles[0].state, BubbleState::Failed);
+    assert!(s.stopping);
+    assert_eq!(s.steps[0].phase, DrPhase::Skipped);
+    // 되살릴 VM이 없으면 거품을 만들지 않는다.
+    let s0 = DrRunStatus::start(&spec, &[], Some(CA), now);
+    let (s, a) = advance(&spec, &s0, &World::new(now).obs);
+    assert!(a.is_empty());
+    assert!(s.bubbles.is_empty());
+}
+
+/// 계획된 이전 + `on_timeout: stop`: 뒤 그룹의 준비가 실패하면 앞 그룹 VM에 shutdown을 보내지 않고, 이미 끈 뒤 그룹 VM은
+/// 운영 쪽에서 다시 켠다. 꺼지지 않는 운영 VM은 상한 뒤 실패다.
+#[test]
+fn planned_stop_spares_the_rest_and_restarts_what_it_stopped() {
+    let now = 10_000;
+    let mut p = plan(vec![group("db", &["db1"]), group("web", &["web1", "web2"])]);
+    p.on_timeout = OnTimeout::Stop;
+    let spec = run_spec(DrRunKind::FailoverPlanned, p);
+    let s0 = DrRunStatus::start(&spec, &[], Some(CA), now);
+    let mut w = World::new(now);
+    let mut src = SourceObservation::default();
+    for vm in ["db1", "web1", "web2"] {
+        src.vms.insert(vm.into(), false);
+    }
+    w.obs.source = Some(src);
+    let (s, a) = w.tick(&spec, &s0);
+    assert_eq!(a.len(), 2, "뒤 그룹 둘에 shutdown: {a:?}");
+    // web1은 꺼졌고 web2는 그 VM이 운영 쪽에서 사라졌다(실패).
+    let src = w.obs.source.as_mut().unwrap();
+    src.vms.insert("web1".into(), true);
+    src.vms.remove("web2");
+    w.obs.now += 5;
+    let (s, a) = w.tick(&spec, &s);
+    assert_eq!(s.steps[2].phase, DrPhase::Failed);
+    assert!(s.stopping);
+    assert!(
+        !a.iter().any(|a| matches!(
+            a,
+            DrAction::ShutdownSource { .. } | DrAction::BackupSource { .. }
+        )),
+        "{a:?}"
+    );
+    assert_eq!(
+        a,
+        vec![DrAction::StartSource {
+            step: 1,
+            vm: "web1".into()
+        }]
+    );
+    assert_eq!(s.steps[0].phase, DrPhase::Skipped);
+    assert_eq!(s.steps[1].phase, DrPhase::Skipped);
+    assert!(s.steps[1].prepare.as_ref().unwrap().restarted);
+    assert!(
+        !s.steps[0].prepare.as_ref().unwrap().stopped,
+        "db1은 끄지 않았다"
+    );
+    assert_eq!(s.state, DrRunState::Running, "다시 켜기를 보낸 걸음");
+    w.obs.now += 5;
+    let (s, a) = w.tick(&spec, &s);
+    assert!(a.is_empty(), "{a:?}");
+    assert_eq!(s.state, DrRunState::Failed);
+
+    // 꺼지지 않는 운영 VM: 상한이 지나면 그 VM은 실패
+    let spec = run_spec(
+        DrRunKind::FailoverPlanned,
+        plan(vec![group("db", &["db1"])]),
+    );
+    let s0 = DrRunStatus::start(&spec, &[], Some(CA), now);
+    let mut w = World::new(now);
+    let mut src = SourceObservation::default();
+    src.vms.insert("db1".into(), false);
+    w.obs.source = Some(src);
+    let (mut s, _) = w.tick(&spec, &s0);
+    w.obs.now += PREPARE_STOP_LIMIT_SECS;
+    let (next, a) = w.tick(&spec, &s);
+    s = next;
+    assert_eq!(s.steps[0].phase, DrPhase::Failed);
+    assert!(
+        s.steps[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("did not stop")
+    );
+    assert!(matches!(&a[..], [DrAction::StartSource { .. }]), "{a:?}");
+}
+
+/// 장애 조치 준비: 복구 지점이 쓰는 네트워크·보안 그룹의 대상(맵, 없으면 같은 이름), 풀, 노드가 이 클러스터에 있는지
+#[test]
+fn failover_readiness_checks_maps_pools_and_nodes() {
+    let now = 10_000;
+    let mut p = plan(vec![group("web", &["web1", "web2"])]);
+    p.networks.insert("lan".into(), "dr-lan".into());
+    p.groups[0].vms[1].node = Some("n9".into());
+    let mut b = copy("web1-c", "web1", CA, now - 60);
+    b.spec.vm_spec = serde_json::from_value(json!({
+        "cpu": { "cores": 1 }, "memory_mib": 512, "machine": "virt",
+        "disks": [ { "volume": "root", "bus": "virtio-blk" } ],
+        "nics": [ { "network": "lan", "model": "virtio", "security_groups": ["web"] },
+                  { "network": "user", "model": "virtio" } ]
+    }))
+    .unwrap();
+    let here = DrInventory {
+        networks: ["dr-lan".to_string()].into(),
+        security_groups: BTreeSet::new(),
+        pools: ["local".to_string()].into(),
+        nodes: BTreeSet::new(),
+    };
+    let r = failover_readiness(&p, &[b], Some(CA), &here);
+    assert_eq!(r[0].vm, "web1");
+    assert_eq!(
+        r[0].issues,
+        [ReadinessIssue {
+            kind: ReadinessKind::SecurityGroup,
+            name: "web".into()
+        }]
+    );
+    assert!(!r[1].ok);
+    let kinds: Vec<ReadinessKind> = r[1].issues.iter().map(|i| i.kind).collect();
+    assert_eq!(kinds, [ReadinessKind::Node, ReadinessKind::RecoveryPoint]);
+}
+
+/// 가장 새 사본이 검증에 실패하면 보호 상태는 `verify-failed`(복구 지점은 그 앞의 것)
+#[test]
+fn protection_flags_a_newest_copy_that_failed_verification() {
+    let now = 10_000;
+    let p = plan(vec![group("web", &["web1"])]);
+    let mut bad = copy("web1-new", "web1", CA, now - 60);
+    bad.status.verify =
+        Some(serde_json::from_value(json!({ "at": now, "state": "failed" })).unwrap());
+    let old = copy("web1-old", "web1", CA, now - 600);
+    let got = protection(&p, &[bad.clone(), old.clone()], Some(CA), now);
+    assert!(!got[0].ok);
+    assert_eq!(got[0].issue, Some(ProtectionIssue::VerifyFailed));
+    assert_eq!(got[0].backup.as_deref(), Some("web1-old"));
+    let got = protection(&p, &[bad], Some(CA), now);
+    assert_eq!(got[0].issue, Some(ProtectionIssue::VerifyFailed));
+    assert_eq!(got[0].backup, None);
+    assert!(
+        rpo_summary("web-tier", 0, &got)
+            .unwrap()
+            .contains("web1 newest copy failed verification")
+    );
 }

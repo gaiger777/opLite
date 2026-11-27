@@ -346,9 +346,17 @@ pub enum AlertCondition {
         #[cfg_attr(feature = "openapi", schema(default))]
         plans: Vec<String>,
     },
-    /// DR 실행(시험·장애 조치·뒷정리)이 `failed`·`partial`로 끝남(이벤트, 계획 76, 리더, 대상 복구 계획). `plans`가 비면
-    /// 모든 계획
+    /// DR 실행(시험·장애 조치·뒷정리)이 `failed`·`partial`로 끝남, 또는 도는 실행이 30분 넘게 나아가지 않음("stalled")
+    /// (이벤트, 계획 76, 리더, 대상 복구 계획). `plans`가 비면 모든 계획
     DrRunFailed {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        plans: Vec<String>,
+    },
+    /// 재해 장애 조치 뒤 운영 클러스터(원격)가 다시 닿는데 이곳에 되살린 VM이 운영 쪽에서 아직 멈추지 않음(계획
+    /// `status.source_fence_pending` — 같은 VM이 두 벌 돌 수 있다, 계획 76 리뷰 1, 리더, 대상 복구 계획). `plans`가 비면 모든
+    /// 계획. `POST /dr-plans/{key}/actions/fence-source`가 풀어 준다.
+    DrSourceReturned {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(feature = "openapi", schema(default))]
         plans: Vec<String>,
@@ -401,6 +409,7 @@ impl AlertCondition {
             Self::BondDegraded => "bond_degraded",
             Self::DrRpoExceeded { .. } => "dr_rpo_exceeded",
             Self::DrRunFailed { .. } => "dr_run_failed",
+            Self::DrSourceReturned { .. } => "dr_source_returned",
         }
     }
 
@@ -459,13 +468,18 @@ impl AlertCondition {
 
     /// DR 조건(계획 76 — 기능 `dr-plans`)인지
     pub fn is_dr(&self) -> bool {
-        matches!(self, Self::DrRpoExceeded { .. } | Self::DrRunFailed { .. })
+        matches!(
+            self,
+            Self::DrRpoExceeded { .. } | Self::DrRunFailed { .. } | Self::DrSourceReturned { .. }
+        )
     }
 
     /// DR 조건의 계획 거르기. 다른 조건은 `None`
     pub fn plans(&self) -> Option<&[String]> {
         match self {
-            Self::DrRpoExceeded { plans } | Self::DrRunFailed { plans } => Some(plans),
+            Self::DrRpoExceeded { plans }
+            | Self::DrRunFailed { plans }
+            | Self::DrSourceReturned { plans } => Some(plans),
             _ => None,
         }
     }
@@ -507,7 +521,9 @@ impl AlertCondition {
             Self::BackupStoreUnavailable => SubjectKind::BackupStore,
             Self::CertificateRenewFailed { .. } => SubjectKind::Certificate,
             Self::ApplySetDrift => SubjectKind::ApplySet,
-            Self::DrRpoExceeded { .. } | Self::DrRunFailed { .. } => SubjectKind::RecoveryPlan,
+            Self::DrRpoExceeded { .. }
+            | Self::DrRunFailed { .. }
+            | Self::DrSourceReturned { .. } => SubjectKind::RecoveryPlan,
         }
     }
 
@@ -656,7 +672,9 @@ impl AlertRuleSpec {
             } if !crate::physical::valid_port_glob(ports) => {
                 return Err(AlertRuleError::Ports(ports.clone()));
             }
-            AlertCondition::DrRpoExceeded { plans } | AlertCondition::DrRunFailed { plans } => {
+            AlertCondition::DrRpoExceeded { plans }
+            | AlertCondition::DrRunFailed { plans }
+            | AlertCondition::DrSourceReturned { plans } => {
                 if plans.len() > MAX_RULE_SUBJECTS {
                     return Err(AlertRuleError::TooManySubjects);
                 }
@@ -1557,7 +1575,7 @@ pub fn link_default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpe
 }
 
 /// "DR 경보 켜기"(계획 76 §3.4)의 권하는 규칙: 복구 계획의 RPO 넘음 warning(보호 상태는 1분마다 다시 세므로 지속 시간 0),
-/// DR 실행 실패 warning(이벤트). 대상은 `targets`다. 모든 계획에 걸린다(`plans` 비움).
+/// DR 실행 실패·멈춤 warning(이벤트), 재해 뒤 운영 쪽이 돌아옴 critical(두 벌 위험). 대상은 `targets`다. 모든 계획에 걸린다(`plans` 비움).
 pub fn dr_default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpec)> {
     let rule = |condition| AlertRuleSpec {
         enabled: true,
@@ -1579,6 +1597,13 @@ pub fn dr_default_rules(targets: &[String]) -> Vec<(&'static str, AlertRuleSpec)
             "dr-run-failed",
             rule(AlertCondition::DrRunFailed { plans: Vec::new() }),
         ),
+        (
+            "dr-source-returned",
+            AlertRuleSpec {
+                severity: Severity::Critical,
+                ..rule(AlertCondition::DrSourceReturned { plans: Vec::new() })
+            },
+        ),
     ]
 }
 
@@ -1587,9 +1612,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// DR 묶음(계획 76): 두 조건, 이름·심각도(둘 다 warning), 모두 검증을 지난다.
+    /// DR 묶음(계획 76): 세 조건, 이름·심각도(운영 쪽이 돌아옴만 critical), 모두 검증을 지난다.
     #[test]
-    fn dr_default_rules_are_the_two_dr_conditions() {
+    fn dr_default_rules_are_the_dr_conditions() {
         let rules = dr_default_rules(&["ops".into()]);
         let got: Vec<_> = rules
             .iter()
@@ -1605,7 +1630,8 @@ mod tests {
             got,
             [
                 ("dr-rpo-exceeded", Severity::Warning, 0),
-                ("dr-run-failed", Severity::Warning, 0)
+                ("dr-run-failed", Severity::Warning, 0),
+                ("dr-source-returned", Severity::Critical, 0)
             ]
         );
     }
