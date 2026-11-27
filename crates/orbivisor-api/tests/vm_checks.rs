@@ -1,7 +1,7 @@
 //! 계획 71: VM 만들기 미리 확인 `POST /vm-checks` — 만들기와 같은 검사를 만들 볼륨·배치 규칙을 얹어 쓰지 않고 돌린다.
 //! 통과(고를 노드·채운 머신·CPU 모델), 아무것도 만들지 않음, 문제를 자리마다 모음(권한·없는 ISO·할당량), 만들 볼륨(없는
 //! 풀·권한 없는 풀·같은 이름·풀 용량 경고), 만들 규칙(영역 규칙 → 그 영역 노드, 맞는 노드 없음 → `placement`, 권한),
-//! 이름·머신 문제, 폴더 `vm.create` 없음 → 403, 노드 이름을 볼 수 없으면 `node: null`, 기능 `vm-check` → 409, 감사 없음.
+//! 이름·머신 문제, 폴더 `vm.create` 없음 → 403, 노드 이름을 볼 수 없으면 `node: null`, 꺼진 채면 켜면 놓일 `start_node`(계획 77-5), 기능 `vm-check` → 409, 감사 없음.
 
 mod common;
 
@@ -171,12 +171,25 @@ async fn a_passing_check_names_the_node_and_creates_nothing() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["spec"]["node"], env.node.to_string(), "{created}");
 
-    // 꺼진 채 노드 없이 만들면 고를 노드가 없다.
+    // 꺼진 채 노드 없이 만들면 고를 노드가 없다 — 대신 지금 켜면 놓일 노드(예상, 계획 77-5)를 준다.
     let mut off = check_body("off");
     off["spec"]["power"] = json!("stopped");
-    let answer = check(&admin, off).await;
+    let answer = check(&admin, off.clone()).await;
     assert_eq!(answer["ok"], true, "{answer}");
     assert_eq!(answer["node"], Value::Null);
+    assert_eq!(answer["start_node"], "node1", "{answer}");
+    // 켜진 채면 `node`만, 꺼진 채 노드를 주면 둘 다 없다(그 노드에 만든다).
+    assert!(
+        check(&admin, check_body("on"))
+            .await
+            .get("start_node")
+            .is_none()
+    );
+    off["spec"]["node"] = json!(env.node.to_string());
+    let answer = check(&admin, off).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert!(answer.get("start_node").is_none(), "{answer}");
+    assert_eq!(counts(&env)[0], before[0] + 1, "only the VM created above");
 }
 
 #[tokio::test]
@@ -618,6 +631,13 @@ async fn planned_zone_rules_steer_the_node() {
     assert_eq!(answer["ok"], true, "{answer}");
     assert_eq!(answer["node"], Value::Null);
     assert_eq!(answer["machine"], "virt");
+    // 꺼진 채로도 켜면 놓일 노드를 알리지 않는다.
+    let mut body = check_body("web");
+    body["spec"]["folder"] = json!(team);
+    body["spec"]["power"] = json!("stopped");
+    let answer = check(&alice, body).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert!(answer.get("start_node").is_none(), "{answer}");
 }
 
 #[tokio::test]

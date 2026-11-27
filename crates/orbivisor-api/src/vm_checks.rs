@@ -174,6 +174,7 @@ impl Problems {
             ok: !self.found.iter().any(|p| p.level == VmCheckLevel::Error),
             problems: self.found,
             node: None,
+            start_node: None,
             machine: None,
             cpu_model: None,
             ips: Vec::new(),
@@ -397,7 +398,9 @@ pub(crate) async fn check_planned(
 
     let mut vm: Vm = Resource::new(req.name, spec);
     vm.labels = req.labels;
-    let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
+    // 꺼진 채 노드 없이 만들어도 "켜면 놓일 노드"를 미리 보이므로(계획 77-5) 노드가 없으면 부하를 읽는다.
+    let picks = vm.spec.node.is_none();
+    let off = vm.spec.power != PowerState::Running && picks;
     let scoring = score::scorer(state, picks).await;
     match prepare_with(state, &mut vm, &scoring.scorer(), &planned) {
         Err(e) => {
@@ -407,15 +410,23 @@ pub(crate) async fn check_planned(
             Ok(Checked::answer(found))
         }
         Ok(()) => {
-            let node = match vm.spec.node {
-                Some(id) if crate::cpu::sees_node_names(state, principal) => {
-                    state.cluster.get::<NodeSpec>(id)?.map(|n| n.name)
+            let sees = crate::cpu::sees_node_names(state, principal);
+            let name = |id: Option<Uuid>| -> Result<Option<String>, ApiError> {
+                match id {
+                    Some(id) if sees => Ok(state.cluster.get::<NodeSpec>(id)?.map(|n| n.name)),
+                    _ => Ok(None),
                 }
-                _ => None,
+            };
+            let node = name(vm.spec.node)?;
+            let start_node = if off {
+                name(start_node(state, &vm, &scoring.scorer(), &planned)?)?
+            } else {
+                None
             };
             Ok(Checked {
                 check: VmCheck {
                     node,
+                    start_node,
                     machine: Some(vm.spec.machine),
                     cpu_model: Some(vm.spec.cpu.model.clone()),
                     ips: vm.spec.nics.iter().map(|n| n.ips.clone()).collect(),
@@ -425,6 +436,22 @@ pub(crate) async fn check_planned(
             })
         }
     }
+}
+
+/// 꺼진 채 노드 없이 만들 VM을 지금 켜면 스케줄러가 고를 노드(예상). 놓을 노드가 없으면 없다 — 만들기는 받으므로 문제로
+/// 적지 않는다(켤 때 그 까닭이 나온다).
+fn start_node(
+    state: &AppState,
+    vm: &Vm,
+    scorer: &score::Scorer,
+    planned: &Planned,
+) -> Result<Option<Uuid>, ApiError> {
+    let mut inv = crate::scheduler::Inventory::load(&state.cluster)?;
+    inv.volumes.extend(planned.volumes.iter().cloned());
+    inv.rules.extend(planned.rules.iter().cloned());
+    let mut on = vm.clone();
+    on.spec.power = PowerState::Running;
+    Ok(crate::scheduler::schedule_with(&on, &inv, scorer).ok())
 }
 
 #[cfg(test)]

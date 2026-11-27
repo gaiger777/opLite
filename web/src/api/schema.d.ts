@@ -11933,7 +11933,8 @@ export interface components {
                     progress?: components["schemas"]["TaskProgress"];
                     /**
                      * Format: int64
-                     * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+                     * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+                     *     (기록 Task는 끝 시각과 같다).
                      */
                     started_at?: number;
                     /** @default pending */
@@ -17020,7 +17021,8 @@ export interface components {
                 progress?: components["schemas"]["TaskProgress"];
                 /**
                  * Format: int64
-                 * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+                 * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+                 *     (기록 Task는 끝 시각과 같다).
                  */
                 started_at?: number;
                 /** @default pending */
@@ -19185,7 +19187,8 @@ export interface components {
             progress?: components["schemas"]["TaskProgress"];
             /**
              * Format: int64
-             * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status·기록 Task에는 없다.
+             * @description 실행기가 시작한 시각(유닉스 ms, 계획 77). 옛 노드가 쓴 status와 시작하지 않고 끝난 Task에는 없다
+             *     (기록 Task는 끝 시각과 같다).
              */
             started_at?: number;
             /** @default pending */
@@ -20010,6 +20013,11 @@ export interface components {
             /** @description `problems`에 오류(`error`)가 없다 */
             ok: boolean;
             problems: components["schemas"]["VmCheckProblem"][];
+            /**
+             * @description 꺼진 채 노드 없이 만들 때: 지금 켜면 스케줄러가 고를 노드(예상 — 잡아 두지 않는다, 계획 77-5). 통과하지 못했거나
+             *     놓을 노드가 없거나 노드 이름을 볼 수 없거나 켜진 채·노드를 준 요청이면 없다(그때는 `node`).
+             */
+            start_node?: string;
         };
         /**
          * @description 문제의 무게

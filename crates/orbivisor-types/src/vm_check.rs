@@ -42,6 +42,11 @@ pub struct VmCheck {
     /// 켜진 채 노드 없이 만들면 스케줄러가 고를 노드(노드를 준 요청은 그 노드). 통과하지 못했거나 꺼진 채 노드 없이
     /// 만들거나 노드 이름을 볼 수 없으면(루트 `cluster.read` 없음) null
     pub node: Option<String>,
+    /// 꺼진 채 노드 없이 만들 때: 지금 켜면 스케줄러가 고를 노드(예상 — 잡아 두지 않는다, 계획 77-5). 통과하지 못했거나
+    /// 놓을 노드가 없거나 노드 이름을 볼 수 없거나 켜진 채·노드를 준 요청이면 없다(그때는 `node`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub start_node: Option<String>,
     /// 채운 머신(통과했을 때만)
     pub machine: Option<MachineType>,
     /// 별칭을 버전 모델로 고정한 CPU 모델(통과했을 때만)
@@ -67,6 +72,7 @@ mod tests {
                 level: VmCheckLevel::Warn,
             }],
             node: None,
+            start_node: Some("node2".into()),
             machine: Some(MachineType::Virt),
             cpu_model: Some(CpuModel::Host),
             ips: vec![vec!["10.0.0.5".parse().unwrap()]],
@@ -74,8 +80,17 @@ mod tests {
         let json = serde_json::to_value(&check).unwrap();
         assert_eq!(json["problems"][0]["level"], "warn");
         assert_eq!(json["machine"], "virt");
+        assert_eq!(json["start_node"], "node2");
         assert_eq!(json["cpu_model"], "host");
         assert_eq!(json["ips"], serde_json::json!([["10.0.0.5"]]));
         assert_eq!(serde_json::from_value::<VmCheck>(json).unwrap(), check);
+        // 옛 답(칸 없음)도 읽고, 없으면 쓰지 않는다.
+        let old = VmCheck {
+            start_node: None,
+            ..check
+        };
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("start_node").is_none());
+        assert_eq!(serde_json::from_value::<VmCheck>(json).unwrap(), old);
     }
 }
