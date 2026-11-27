@@ -1395,6 +1395,7 @@ orbivisorctl alert rule create backup --backup-job-failed --target ops-mail
 orbivisorctl alert rule create chassis --condition sdn_chassis_down --for 1m --node n2 --target ops-mail
 orbivisorctl alert rule add-sdn-defaults --target ops-mail   # 권하는 SDN 규칙 여덟을 한 번에(같은 이름은 그대로 둠)
 orbivisorctl alert rule add-link-defaults --target ops-mail  # 권하는 링크 규칙 둘(업링크 포트 끊김·본딩 저하)
+orbivisorctl alert rule add-dr-defaults --target ops-mail    # 권하는 DR 규칙 둘(RPO 넘음·DR 실행 실패, 계획 76)
 orbivisorctl alert rule list                     # NAME ENABLED SEVERITY CONDITION FOR TARGETS
 orbivisorctl alert rule set cpu-hot --gt 95      # 준 것만 바꾼다(--gt·--lt만 주면 문턱만)
 orbivisorctl alert rule set cpu-hot --disable    # --enable, --all-nodes, --all-vms
@@ -1421,6 +1422,8 @@ orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보�
 | `--condition sdn_lb_member_down` | 부하 분산기의 건강 검사 멤버 가운데 죽은 것이 있음(LB마다 하나) | **리더** | 부하 분산기 |
 | `node_link_down`(웹·API) | 노드의 랜 포트 링크가 끊김(계획 75, [링크 경보](#링크-경보)) | **리더** | 노드의 포트 |
 | `bond_degraded`(웹·API) | 본딩이 저하(구성 포트 일부가 끊기거나 사라져 이중화를 잃음 — 통째로 끊기면 `node_link_down`이 새로 내고 이 경보는 그대로) | **리더** | 노드의 본딩 |
+| `dr_rpo_exceeded`(API) | 복구 계획에 복구 지점이 없거나 RPO 목표보다 오래된 VM이 있음(계획 76, [DR 계획](backup.md#보호-상태와-rpo-경보) — 계획마다 하나, `plans`로 거름) | **리더** | 복구 계획 |
+| `dr_run_failed`(API) | DR 실행(시험·장애 조치·뒷정리)이 `failed`·`partial`로 끝남(이벤트) | **리더** | 복구 계획 |
 
 - **칸.** `--for`(조건이 이만큼 이어지면 알림, `0`~`24h`, 기본 0), `--severity info|warning|critical`(기본 warning), `--target`
   (알림 대상 이름 1~16개, 있어야 함), `--repeat`(계속 firing이면 이 간격으로 다시, 기본 `4h`, `0`이면 다시 보내지 않음,

@@ -36,7 +36,7 @@
 | 홈 `/` | 없음(한 화면) |
 | 가상 머신 `/vms` | VM(목록 `/vms` \| 폴더 `/vm-folders`) · 템플릿 `/templates` · 이미지·ISO(이미지 라이브러리 `/images` \| ISO 이미지 `/isos`) · 가져오기(가져오기 `/imports` \| VMware 이전 `/vmware-migrations` \| VMware 원본 `/vmware-sources` \| 내보내기 `/vm-exports` — 계획 72) |
 | 인프라 `/infra` | 노드(노드 `/nodes` \| 지도 `/cluster/map` — 계획 70 \| 클러스터 `/cluster`) · 스토리지 풀(목록 `/storage-pools` \| 폴더 `/storage-folders`) · 볼륨 `/volumes` · Ceph `/ceph` · 네트워크(목록 `/networks` \| 폴더 `/network-folders` \| 라우터 `/routers` \| 유동 IP `/floating-ips` \| 부하 분산 `/load-balancers` \| 토폴로지 `/networks/topology` \| SDN `/sdn`) · 보안 그룹 `/security-groups` |
-| 보호 `/protect` | 백업 `/backups`(파일 찾아보기 `/backups/<id>/files` — 계획 69) · 백업 작업 `/backup-jobs` · 백업 저장소 `/backup-stores`(계획 68) · 원격 복제 `/remotes`(원격 읽기 권한) · HA 그룹 `/ha-groups` · HA 검사 `/ha-checks` · 배치(배치 규칙 `/placement-rules` \| 최적 배치 `/placement`) |
+| 보호 `/protect` | 백업 `/backups`(파일 찾아보기 `/backups/<id>/files` — 계획 69) · 백업 작업 `/backup-jobs` · 백업 저장소 `/backup-stores`(계획 68) · 원격 복제 `/remotes`(원격 읽기 권한) · DR `/dr-plans`(실행 `/dr-runs/<id>`도 — 계획 76) · HA 그룹 `/ha-groups` · HA 검사 `/ha-checks` · 배치(배치 규칙 `/placement-rules` \| 최적 배치 `/placement`) |
 | 활동 `/activity` | 작업 `/tasks` · 경보 `/alerts` · 감사(감사 로그 `/audit`(admin) \| 설정 기록 `/history` \| 선언 묶음 `/apply-sets`(루트 `system.read`) — 계획 73) |
 | 설정 `/settings` (아래 고정) | 일반 `/settings` · 사용자 `/settings/users`(사용자 읽기 권한) · 인증 영역 `/settings/realms`(영역 읽기 권한) · 권한 `/settings/permissions`(admin) · 역할 `/settings/roles`(admin) · 그룹 `/settings/groups`(그룹 읽기 권한) · 보안(보안 `/settings/security`(admin, 2단계 인증 정책) \| 인증서 `/settings/certificates`(루트 `cluster.read`, ACME — 계획 73)) · API 토큰 `/settings/tokens`(모두, 자기 토큰) · 2단계 인증 `/settings/account`(모두, 자기 요소) · 원격 클러스터 `/settings/remotes`(admin) · 알림 대상 `/settings/notifications`(admin) · 구독 `/settings/subscription` |
 
@@ -444,6 +444,21 @@ gzip 8.4 KB)이다. 쓰는 법과 보안 모형은 [파일 단위 복원](backup
 세션을 여는 것은 화면이 열릴 때다(같은 사용자의 열린 세션은 서버가 다시 줌). 부팅 중 2초, 준비된 뒤 20초마다 세션을 다시 읽어 볼륨
 상태·닫힐 시각을 맞춘다. **화면을 떠나도 세션을 닫지 않는다** — 진행 중인 내려받기·VM으로 복원 작업이 같은 세션을 쓰고, 돌아오면 다시
 부팅하지 않아도 된다. 쓰지 않으면 서버가 15분 뒤 닫는다.
+
+## DR 화면
+
+DR 복구 계획(계획 76)도 사이드바 항목을 더하지 않는다. **보호 › DR** 탭(`/dr-plans`, 실행 화면 `/dr-runs/<id>`도 이 탭)이고 화면 코드는
+늦게 읽는 조각(`web/src/dr/`)이다. **목록**은 계획마다 운영 클러스터·VM 수·RPO 지킴 막대("2/3 RPO 지킴")·마지막 시험 RTO·도는 실행이고
+"새 계획"은 루트 `cluster.admin`에게만 보인다. **계획 화면**은 탭 셋이다: 개요(보호 상태 표 — VM마다 복구 지점·만든 때·나이·상태 —,
+최근 시험 셋, 지난 장애 조치), 계획(편집 — 운영 클러스터·복원 풀·폴더·RPO 목표(시간)·시간 초과 때 할 일, 부팅 그룹을 끌어 놓기 없이
+위·아래 단추로, 그룹마다 준비된 때·시간 초과·다음 그룹 앞 쉼, "VM 더하기"는 운영 쪽 VM 목록(중계로 읽음 — 못 읽으면 알리고 이곳 사본만)과
+이곳의 사본을 함께 보이고, VM마다 풀·노드·라이브 복원·IP 규칙, 네트워크·보안 그룹·시험 네트워크 맵 표 — 저장은 PUT 통째 `If-Match`,
+어긋나면 "다시 읽기"), 실행(기록). 단추는 "시험", "장애 조치"(방식 계획된 이전·재해와 그 설명, 재해 경고, **계획 이름을 쳐야** 켜짐,
+HA가 꺼져 있다는 안내), "뒷정리"(지울 시험 VM·네트워크 목록), "실행 취소", "다시 보호"(복제할 원격·원격 백업 풀·이곳 백업 풀·시각),
+"계획 지우기"다. **실행 화면**은 그룹 띠, VM마다 단계 점(기다림·운영 쪽 준비·복원·시작·준비 기다림·준비됨·실패·시간 초과·건너뜀, 뒷정리는 지우는 중·지움), 새 VM·Task 링크·오류,
+격리(거품) 네트워크, 도는 동안 흐르는 RTO 시계이고 watch(`recovery-plan`·`dr-run`)로 갱신된다. 기능 `dr-plans`를 모르는 노드가 있으면
+띠로 알리고 쓰기·실행 단추를 막는다. 경보 `recovery_plan` 대상 링크는 그 계획 화면이다. 백업 복원 대화상자는 백업의 네트워크마다 이
+클러스터의 네트워크를 고르게 한다(복원 맵). 쓰는 법은 [DR 계획](backup.md#dr-계획복구-계획).
 
 ## 클러스터 지도 화면
 
