@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto";
+
 import { http, HttpResponse } from "msw";
 
 import type { Task } from "@/api/types";
 import {
   cancelChunked,
   chunkedSupported,
+  type Fingerprint,
+  fingerprintOf,
   loadServerUploads,
   pauseChunked,
   remainingSeconds,
@@ -23,7 +27,6 @@ beforeEach(() => vi.stubGlobal("XMLHttpRequest", FakeXhr));
 afterEach(() => {
   vi.unstubAllGlobals();
   resetChunked();
-  localStorage.clear();
 });
 
 const PARAMS = { name: "disk", pool: "local", format: "qcow2", sourceFormat: "qcow2" } as const;
@@ -43,20 +46,32 @@ function up(offset: number, extra: Partial<ServerUpload> = {}): ServerUpload {
     created_at: 0,
     updated_at: 0,
     expires_at: 0,
+    node: "n1",
     ...extra,
   };
 }
 
+interface ServerState {
+  offset: number;
+  opened: unknown[];
+  deleted: number;
+  completed: number;
+  sha256?: unknown;
+}
+
+const fresh = (offset = 0): ServerState => ({ offset, opened: [], deleted: 0, completed: 0 });
+
 /** 서버: 업로드 열기·받은 데 묻기·끝내기·버리기. `state.offset`이 받은 데다. */
-function serve(state: { offset: number; opened: unknown[]; deleted: number; completed: number }) {
+function serve(state: ServerState) {
   server.use(
     http.post(apiUrl("/uploads"), async ({ request }) => {
       state.opened.push(await request.json());
       return HttpResponse.json(up(0), { status: 201 });
     }),
     http.get(apiUrl("/uploads/u1"), () => HttpResponse.json(up(state.offset))),
-    http.post(apiUrl("/uploads/u1/complete"), () => {
+    http.post(apiUrl("/uploads/u1/complete"), async ({ request }) => {
       state.completed += 1;
+      state.sha256 = ((await request.json()) as { sha256?: unknown }).sha256;
       return HttpResponse.json(task("t1", "volume-import", "v1"), { status: 202 });
     }),
     http.delete(apiUrl("/uploads/u1"), () => {
@@ -77,6 +92,12 @@ async function nextXhr(prev?: FakeXhr): Promise<FakeXhr> {
 }
 
 const file = () => new File(["0123456789"], "disk.qcow2", { lastModified: 7 });
+const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+const FP: Fingerprint = {
+  file_name: "disk.qcow2",
+  last_modified: 7,
+  head_sha256: sha("0123456789"),
+};
 
 it("is used only when the serving node knows chunked uploads", () => {
   const knows = { ...NODE, status: { ...NODE.status, features: ["chunked-uploads"] } };
@@ -87,15 +108,23 @@ it("is used only when the serving node knows chunked uploads", () => {
 });
 
 it("sends the chunks in order, follows the server offset and completes into a task", async () => {
-  const state = { offset: 0, opened: [] as unknown[], deleted: 0, completed: 0 };
+  const state = fresh();
   serve(state);
   const tasks: Task[] = [];
-  startChunked(file(), PARAMS, (t) => tasks.push(t));
+  expect(await fingerprintOf(file())).toEqual(FP);
+  startChunked(file(), PARAMS, (t) => tasks.push(t), FP);
   expect(uploadItems()[0]).toMatchObject({ phase: "starting", name: "disk", size: 10 });
 
   let xhr = await nextXhr();
   expect(state.opened).toEqual([
-    { name: "disk", pool: "local", format: "qcow2", source_format: "qcow2", size: 10 },
+    {
+      name: "disk",
+      pool: "local",
+      format: "qcow2",
+      source_format: "qcow2",
+      size: 10,
+      fingerprint: FP,
+    },
   ]);
   expect(xhr.method).toBe("PUT");
   expect(xhr.url).toMatch(/\/api\/v1\/uploads\/u1\?offset=0$/);
@@ -122,8 +151,8 @@ it("sends the chunks in order, follows the server offset and completes into a ta
   await vi.waitFor(() => expect(tasks.map((t) => t.id)).toEqual(["t1"]));
   expect(state.completed).toBe(1);
   expect(uploadItems()[0]).toMatchObject({ phase: "processing", task: "t1", sent: 10 });
-  // 다 올렸으면 이 브라우저의 파일 표시를 지운다.
-  expect(localStorage.getItem("orbivisor.uploads")).toBe("{}");
+  // 올리며 센 파일 전체의 SHA-256을 보낸다(서버가 건너뛰라 한 4..8도 파일에서 읽어 셈).
+  expect(state.sha256).toBe(sha("0123456789"));
 });
 
 it("stops on a refusal and keeps the server message", async () => {
@@ -135,15 +164,17 @@ it("stops on a refusal and keeps the server message", async () => {
       ),
     ),
   );
-  startChunked(file(), PARAMS, () => {});
+  startChunked(file(), PARAMS, () => {}, FP);
   await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("failed"));
   expect(String(uploadItems()[0]?.error)).toContain("not enough free space");
+  // 열지 못했으니 서버에 버릴 것이 없다.
+  expect(uploadItems()[0]?.kept).toBe(false);
 });
 
 it("retries a dropped chunk from what the server received", async () => {
-  const state = { offset: 0, opened: [] as unknown[], deleted: 0, completed: 0 };
+  const state = fresh();
   serve(state);
-  startChunked(file(), PARAMS, () => {});
+  startChunked(file(), PARAMS, () => {}, FP);
   let xhr = await nextXhr();
   xhr.progress(3, 4);
   // 연결이 끊겼다 — 3바이트가 닿았다.
@@ -156,9 +187,9 @@ it("retries a dropped chunk from what the server received", async () => {
 });
 
 it("pauses, resumes with the same file and cancels", async () => {
-  const state = { offset: 0, opened: [] as unknown[], deleted: 0, completed: 0 };
+  const state = fresh();
   serve(state);
-  const key = startChunked(file(), PARAMS, () => {});
+  const key = startChunked(file(), PARAMS, () => {}, FP);
   let xhr = await nextXhr();
   state.offset = 4;
   xhr.respond(200, up(4));
@@ -172,29 +203,140 @@ it("pauses, resumes with the same file and cancels", async () => {
   expect(xhr.url).toMatch(/offset=4$/);
   cancelChunked(key);
   expect(xhr.aborted).toBe(true);
-  expect(uploadItems()[0]?.phase).toBe("cancelled");
-  await vi.waitFor(() => expect(state.deleted).toBe(1));
+  expect(uploadItems()[0]?.phase).toBe("discarding");
+  await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("cancelled"));
+  expect(state.deleted).toBe(1);
 });
 
 it("lists the uploads left on the server and resumes only with the same file", async () => {
-  const state = { offset: 6, opened: [] as unknown[], deleted: 0, completed: 0 };
+  const state = fresh(6);
   serve(state);
-  localStorage.setItem(
-    "orbivisor.uploads",
-    JSON.stringify({ u1: { fileName: "disk.qcow2", size: 10, lastModified: 7 } }),
+  server.use(
+    http.get(apiUrl("/uploads"), () => HttpResponse.json({ items: [up(6, { fingerprint: FP })] })),
   );
-  server.use(http.get(apiUrl("/uploads"), () => HttpResponse.json({ items: [up(6)] })));
   await loadServerUploads();
   expect(uploadItems()).toEqual([
     expect.objectContaining({ key: "u1", phase: "needsFile", sent: 6, fileName: "disk.qcow2" }),
   ]);
-  // 크기가 같아도 다른 파일(이름·고친 시각)이면 잇지 않는다.
-  expect(resumeChunked("u1", new File(["abcdefghij"], "other.qcow2"), () => {})).toBe(false);
-  // 같은 파일을 다시 고르면(새 업로드를 열지 않고) 받은 데부터
-  startChunked(file(), PARAMS, () => {});
+  // 크기·이름·고친 시각이 같아도 내용(앞부분 해시)이 다르면 잇지 않는다(다른 PC에서 같은 이름의 다른 이미지).
+  const lookalike = new File(["abcdefghij"], "disk.qcow2", { lastModified: 7 });
+  expect(await resumeChunked("u1", lookalike, () => {})).toBe(false);
+  expect(await resumeChunked("u1", new File(["0123456789"], "disk.qcow2"), () => {})).toBe(false);
+  // 같은 파일을 다시 고르면(새 업로드를 열지 않고) 받은 데부터 — 받은 앞부분의 해시는 파일에서 다시 센다.
+  startChunked(file(), PARAMS, () => {}, FP);
   const xhr = await nextXhr();
   expect(xhr.url).toMatch(/offset=6$/);
   expect(state.opened).toEqual([]);
+  state.offset = 10;
+  xhr.respond(200, up(10));
+  await vi.waitFor(() => expect(state.sha256).toBe(sha("0123456789")));
+});
+
+it("starts over when the name or the pool changed", async () => {
+  const state = fresh(6);
+  serve(state);
+  server.use(
+    http.get(apiUrl("/uploads"), () => HttpResponse.json({ items: [up(6, { fingerprint: FP })] })),
+  );
+  await loadServerUploads();
+  startChunked(file(), { ...PARAMS, name: "disk-2" }, () => {}, FP);
+  await vi.waitFor(() => expect(state.deleted).toBe(1));
+  await vi.waitFor(() =>
+    expect(state.opened).toEqual([expect.objectContaining({ name: "disk-2", size: 10 })]),
+  );
+  expect(uploadItems().map((x) => [x.name, x.phase])).toEqual([
+    ["disk-2", "uploading"],
+    ["disk", "cancelled"],
+  ]);
+});
+
+it("sends the discard again while the server is busy and keeps a stuck one to retry", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const state = fresh();
+    serve(state);
+    let refuse = 2;
+    server.use(
+      http.delete(apiUrl("/uploads/u1"), () => {
+        if (refuse-- > 0) {
+          return HttpResponse.json(
+            { code: "upload_busy", message: "receiving another request" },
+            { status: 409 },
+          );
+        }
+        state.deleted += 1;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    const key = startChunked(file(), PARAMS, () => {}, FP);
+    const first = await nextXhr();
+    cancelChunked(key);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("cancelled"));
+    expect(state.deleted).toBe(1);
+
+    // 끝내 버리지 못하면 "버리지 못함"으로 남아 다시 버린다.
+    server.use(
+      http.delete(apiUrl("/uploads/u1"), () =>
+        HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+      ),
+    );
+    resetChunked();
+    const again = startChunked(file(), PARAMS, () => {}, FP);
+    await nextXhr(first);
+    cancelChunked(again);
+    await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("discardFailed"));
+    expect(uploadItems()[0]?.kept).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("lets a failed upload that the server keeps resume or be discarded", async () => {
+  const state = fresh();
+  serve(state);
+  const key = startChunked(file(), PARAMS, () => {}, FP);
+  let xhr = await nextXhr();
+  xhr.respond(507, { code: "insufficient_storage", message: "not enough free space" });
+  await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("failed"));
+  expect(uploadItems()[0]?.kept).toBe(true);
+  // 공간을 비운 뒤 이어 올린다.
+  expect(resumeSame(key, () => {})).toBe(true);
+  xhr = await nextXhr(xhr);
+  xhr.respond(507, { code: "insufficient_storage", message: "not enough free space" });
+  await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("failed"));
+  cancelChunked(key);
+  await vi.waitFor(() => expect(uploadItems()[0]?.phase).toBe("cancelled"));
+  expect(state.deleted).toBe(1);
+});
+
+it("finds the import task when only the complete response was lost", async () => {
+  const state = fresh();
+  serve(state);
+  let calls = 0;
+  server.use(
+    http.post(apiUrl("/uploads/u1/complete"), () => {
+      calls += 1;
+      // 처음 것은 서버가 끝냈지만 응답이 끊겼다 — 다시 보내면 기록이 없다.
+      return calls === 1
+        ? HttpResponse.error()
+        : HttpResponse.json({ code: "not_found", message: "gone" }, { status: 404 });
+    }),
+    http.get(apiUrl("/volumes/disk"), () => HttpResponse.json({ id: "v1", name: "disk" })),
+    http.get(apiUrl("/tasks"), () =>
+      HttpResponse.json({ items: [task("t9", "volume-import", "v1")], revision: 1 }),
+    ),
+  );
+  const tasks: Task[] = [];
+  startChunked(file(), PARAMS, (t) => tasks.push(t), FP);
+  let xhr = await nextXhr();
+  xhr.respond(200, up(4));
+  xhr = await nextXhr(xhr);
+  xhr.respond(200, up(8));
+  xhr = await nextXhr(xhr);
+  xhr.respond(200, up(10));
+  await vi.waitFor(() => expect(tasks.map((t) => t.id)).toEqual(["t9"]), { timeout: 5000 });
+  expect(uploadItems()[0]).toMatchObject({ phase: "processing", task: "t9" });
 });
 
 it("works out the remaining time and the stage after the upload", () => {
@@ -213,6 +355,16 @@ it("works out the remaining time and the stage after the upload", () => {
       },
     }),
   ).toEqual({ stage: "converting", percent: 30 });
+  expect(
+    uploadStage({
+      ...t1,
+      status: {
+        state: "running",
+        error: null,
+        progress: { stage: "finishing", done_bytes: 100, total_bytes: 100 },
+      },
+    }),
+  ).toEqual({ stage: "finishing" });
   expect(uploadStage({ ...t1, status: { state: "succeeded", error: null } })).toEqual({
     stage: "done",
   });

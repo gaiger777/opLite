@@ -188,7 +188,10 @@
     "manifest_unsupported": "이 종류는 선언하거나 내보낼 수 없습니다: {{message}}",
     "http01_unavailable": "HTTP-01 확인을 받을 수 없습니다: {{message}}",
     "apply_set_too_large": "적용 묶음이 너무 커서 저장할 수 없습니다: {{message}}",
-    "withDetail": "{{text}} 자세히: {{detail}}"
+    "withDetail": "{{text}} 자세히: {{detail}}",
+    "upload_checksum_mismatch": "서버가 받은 파일이 보낸 파일과 다릅니다(SHA-256이 다름). 서버는 받은 것을 버렸습니다 — 파일을 처음부터 다시 올리세요.",
+    "upload_busy": "이 업로드에 다른 요청이 아직 진행 중입니다. 잠시 뒤 다시 시도하세요.",
+    "pool_not_responding": "업로드를 받는 스토리지가 응답하지 않습니다(NFS 서버 등). 잠시 뒤 다시 시도하세요."
   },
   "nav": {
     "vms": "가상 머신",
@@ -483,7 +486,7 @@
       "template": "템플릿 VM 만드는 중",
       "guestWriting": "게스트에 쓰는 중({{done}})",
       "checking": "이미지 확인 중",
-      "converting": "변환 {{percent}}% ({{done}}/{{total}} GiB)",
+      "converting": "변환 {{percent}}%",
       "finishing": "볼륨 마무리 중"
     },
     "detail": {
@@ -1462,13 +1465,16 @@
       "failed": "실패",
       "paused": "일시정지",
       "needsFile": "파일을 다시 고르면 이어 올립니다",
-      "done": "볼륨 준비됨"
+      "done": "볼륨 준비됨",
+      "discarding": "버리는 중…",
+      "discardFailed": "버리지 못함"
     },
     "step": {
       "upload": "올리는 중",
       "convert": "변환",
       "check": "확인",
-      "done": "끝"
+      "done": "끝",
+      "finish": "마무리"
     },
     "stepsLabel": "업로드 단계",
     "amount": "{{percent}}% · {{sent}} / {{total}}",
@@ -1492,7 +1498,17 @@
     "keepsGoing": "이 창을 닫아도 업로드는 계속됩니다. 진행은 머리줄의 작업·알림 센터에서도 볼 수 있습니다. 끊기면 받은 데부터 이어 올립니다.",
     "showInCenter": "작업·알림 센터에서 보기",
     "close": "닫기",
-    "resumeNote": "전에 올리다 멈춘 파일입니다({{sent}} / {{total}} 받음). 받은 데부터 이어 올립니다."
+    "resumeNote": "전에 올리다 멈춘 파일입니다({{sent}} / {{total}} 받음). 받은 데부터 이어 올립니다. 이름·풀·형식을 바꾸면 전에 받은 것을 버리고 처음부터 올립니다.",
+    "pauseNamed": "{{name}} 일시정지",
+    "resumeNamed": "{{name}} 이어 올리기",
+    "pickToResumeNamed": "{{name}}: 같은 파일 골라 이어 올리기",
+    "cancelNamed": "{{name}} 업로드 취소",
+    "discard": "업로드 버리기",
+    "discardNamed": "{{name}} 업로드 버리기",
+    "discardAgain": "다시 버리기",
+    "discardAgainNamed": "{{name}} 다시 버리기",
+    "lost": "이 노드에서 업로드를 찾지 못했습니다. 업로드를 연 노드({{node}})가 아닌 노드에 접속해 있으면 그 노드에 다시 접속해 이어 올리세요. 24시간 동안 조각이 오지 않았으면 서버가 버렸으니 처음부터 다시 올리세요.",
+    "restartNote": "전에 이 파일을 올리다 멈췄습니다({{sent}} / {{total}} 받음). 이름·풀·형식을 바꿨으므로 전에 받은 것을 버리고 처음부터 올립니다."
   },
   "pools": {
     "path": "디렉터리",

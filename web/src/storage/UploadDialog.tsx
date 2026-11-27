@@ -22,8 +22,11 @@ import { isoPools } from "@/isos/isos";
 import { formatBytes } from "@/lib/format";
 import {
   chunkedSupported,
+  type Fingerprint,
+  fingerprintOf,
   loadServerUploads,
   resumableFor,
+  sameTarget,
   startChunked,
   type UploadItem,
   useUploads,
@@ -73,8 +76,15 @@ export function UploadDialog({
       void loadServerUploads();
     }
   }, [chunked]);
-  // 고른 파일을 전에 올리다 멈췄으면 그 업로드를 잇는다(같은 이름·풀로).
-  const resumable = chunked && file ? resumableFor(file) : undefined;
+  // 고른 파일의 지문(이름·고친 시각·앞 1 MiB의 SHA-256 — 이어 올릴 업로드를 찾는다)
+  const [fingerprint, setFingerprint] = useState<{ file: File; value: Fingerprint } | null>(null);
+  const fp = fingerprint && fingerprint.file === file ? fingerprint.value : null;
+  // 고른 파일을 전에 올리다 멈췄으면 그 업로드를 잇는다. 이름·풀·형식을 바꾸면 그 업로드를 버리고 새로 올린다.
+  const resumable = chunked && file && fp ? resumableFor(file, fp) : undefined;
+  const params = iso
+    ? ({ name, pool, format: "raw", sourceFormat: "raw", content: "iso" } as const)
+    : { name, pool, format, sourceFormat };
+  const resuming = resumable !== undefined && sameTarget(resumable, params);
   const onTask = (task: Parameters<typeof trackTask>[0], up: UploadItem) =>
     trackTask(task, t("tasks.op.volume-import", { target: up.name }));
   // 형식은 풀 종류를 따른다(LVM-thin 풀은 raw만). 풀을 바꾸면 그 풀의 기본 형식으로 돌린다.
@@ -86,16 +96,26 @@ export function UploadDialog({
 
   function choose(chosen: File | null) {
     setFile(chosen);
-    const before = chunked && chosen ? resumableFor(chosen) : undefined;
-    if (before) {
-      setName(before.name);
-      setPool(before.pool);
-      return;
-    }
     if (chosen) {
       setName(nameFromFile(chosen.name));
       setSourceFormat(sourceFormatOf(chosen.name));
     }
+    if (!chunked || !chosen) {
+      return;
+    }
+    // 전에 올리다 멈춘 파일이면 그 이름·풀·형식으로 채운다(지문을 센 뒤 — 이 사이에 다른 파일을 골랐으면 버린다).
+    void fingerprintOf(chosen).then((value) => {
+      setFingerprint({ file: chosen, value });
+      const before = resumableFor(chosen, value);
+      if (before) {
+        setName(before.name);
+        setPool(before.pool);
+        setSourceFormat(before.sourceFormat);
+        if (before.format) {
+          setFormat(before.format);
+        }
+      }
+    });
   }
 
   async function submit() {
@@ -103,8 +123,8 @@ export function UploadDialog({
     if (!file) {
       found.file = "uploads.errors.file";
     }
-    if (file && resumable) {
-      setStarted(startChunked(file, { name, pool, format, sourceFormat }, onTask));
+    if (file && resuming) {
+      setStarted(startChunked(file, params, onTask, fp!));
       return false;
     }
     const nameError = volumeNameError(name, volumes.data?.map((v) => v.name) ?? []);
@@ -118,12 +138,9 @@ export function UploadDialog({
     if (Object.keys(found).length > 0) {
       return false;
     }
-    const params = iso
-      ? ({ name, pool, format: "raw", sourceFormat: "raw", content: "iso" } as const)
-      : { name, pool, format, sourceFormat };
     if (chunked) {
       // 이 창이 진행을 보인다(닫아도 계속).
-      setStarted(startChunked(file!, params, onTask));
+      setStarted(startChunked(file!, params, onTask, fp ?? (await fingerprintOf(file!))));
       return false;
     }
     // 옛 한 번 올리기(섞인 판): 올리는 동안 대화상자를 닫아 둔다. 진행률은 알림에 보인다.
@@ -163,7 +180,7 @@ export function UploadDialog({
     <FormDialog
       title={iso ? t("uploads.isoTitle") : t("uploads.title")}
       description={t(iso ? "uploads.isoDescription" : "uploads.description", { node: here })}
-      submitLabel={resumable ? t("uploads.resume") : t("uploads.submit")}
+      submitLabel={resuming ? t("uploads.resume") : t("uploads.submit")}
       onClose={onClose}
       onSubmit={submit}
     >
@@ -178,7 +195,7 @@ export function UploadDialog({
         error={errors.file}
         help={
           resumable
-            ? t("uploads.resumeNote", {
+            ? t(resuming ? "uploads.resumeNote" : "uploads.restartNote", {
                 sent: formatBytes(resumable.sent),
                 total: formatBytes(resumable.size),
               })

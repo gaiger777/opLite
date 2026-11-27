@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 import type { TFunction } from "i18next";
 
+import { ApiError } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Task } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -34,7 +35,8 @@ export function durationText(seconds: number, t: TFunction): string {
   return m > 0 ? t("uploads.time.ms", { m, s }) : t("uploads.time.s", { s });
 }
 
-type Step = "upload" | "convert" | "check" | "done";
+/** 단계(서버 가져오기 Task 순서와 같다 — 확인 → 변환 → 마무리, 뒤로 가지 않음) */
+type Step = "upload" | "check" | "convert" | "finish" | "done";
 
 /** 이 업로드의 VM 만들기 주소(77-5 화면): ISO는 설치 CD에, 디스크 이미지는 첫 디스크로 */
 export function createVmHref(item: Pick<UploadItem, "name" | "content">): string {
@@ -44,9 +46,9 @@ export function createVmHref(item: Pick<UploadItem, "name" | "content">): string
 }
 
 /**
- * 업로드 하나의 진행(계획 77-8 — 업로드 대화상자와 작업·알림 센터가 함께 그림): 단계(올리는 중 → 변환 → 확인 → 끝), 진행 막대,
- * 올린 양/전체·속도·남은 시간, 일시정지·이어 올리기·취소, 파일을 다시 골라 잇기(탭을 닫았다 옴), 끝나면 "이 이미지로 VM
- * 만들기". 다 보낸 뒤의 단계는 가져오기 Task 진행이다.
+ * 업로드 하나의 진행(계획 77-8 — 업로드 대화상자와 작업·알림 센터가 함께 그림): 단계(올리는 중 → 확인 → 변환 → 마무리 → 끝),
+ * 진행 막대, 올린 양/전체·속도·남은 시간, 일시정지·이어 올리기·취소, 실패하면 이어 올리기·버리기(서버에 받은 것이 남았을 때),
+ * 파일을 다시 골라 잇기(탭을 닫았다 옴), 끝나면 "이 이미지로 VM 만들기". 다 보낸 뒤의 단계는 가져오기 Task 진행이다.
  */
 export function UploadProgress({
   item,
@@ -61,6 +63,7 @@ export function UploadProgress({
 }) {
   const { t } = useTranslation();
   const tasks = useList("task");
+  const nodes = useList("node");
   const taskHref = useTaskHref();
   const pickId = useId();
   // 이어 올리려 고른 파일이 이 업로드의 파일이 아니다(크기·이름이 다름)
@@ -70,17 +73,27 @@ export function UploadProgress({
   const step: Step =
     after?.stage === "done"
       ? "done"
-      : after?.stage === "converting"
-        ? "convert"
-        : after || item.phase === "completing"
-          ? "check"
-          : "upload";
+      : after?.stage === "finishing"
+        ? "finish"
+        : after?.stage === "converting"
+          ? "convert"
+          : after || item.phase === "completing"
+            ? "check"
+            : "upload";
   const steps: Step[] = item.direct
-    ? ["upload", "check", "done"]
-    : ["upload", "convert", "check", "done"];
+    ? ["upload", "check", "finish", "done"]
+    : ["upload", "check", "convert", "finish", "done"];
   const at = steps.indexOf(step);
   const failed = item.phase === "failed" || after?.stage === "failed";
   const cancelled = item.phase === "cancelled";
+  const discarding = item.phase === "discarding";
+  const stuck = item.phase === "discardFailed";
+  // 실패했지만 서버에 받은 것이 남았다 — 이어 올리거나 버린다(리뷰 I2)
+  const kept = item.phase === "failed" && item.kept && item.id !== null;
+  const waiting = item.phase === "paused" || item.phase === "needsFile" || kept;
+  // 이 노드에 업로드가 없다 — 다른 노드에 접속했거나(VIP 이동) 시간이 지나 서버가 버렸다(리뷰 S3)
+  const lost = item.error instanceof ApiError && item.error.status === 404 && !cancelled;
+  const nodeName = nodes.data?.find((n) => n.id === item.node)?.name ?? item.node ?? "—";
   const live = item.phase === "uploading" || item.phase === "starting";
   const percent =
     after?.stage === "converting"
@@ -97,15 +110,20 @@ export function UploadProgress({
 
   const status = cancelled
     ? t("uploads.state.cancelled")
-    : failed
-      ? t("uploads.state.failed")
-      : item.phase === "paused"
-        ? t("uploads.state.paused")
-        : item.phase === "needsFile"
-          ? t("uploads.state.needsFile")
-          : step === "done"
-            ? t("uploads.state.done")
-            : t(`uploads.step.${step}`);
+    : discarding
+      ? t("uploads.state.discarding")
+      : stuck
+        ? t("uploads.state.discardFailed")
+        : failed
+          ? t("uploads.state.failed")
+          : item.phase === "paused"
+            ? t("uploads.state.paused")
+            : item.phase === "needsFile"
+              ? t("uploads.state.needsFile")
+              : step === "done"
+                ? t("uploads.state.done")
+                : t(`uploads.step.${step}`);
+  const named = (key: string) => t(key, { name: item.name });
 
   return (
     <div className="flex flex-col gap-1.5" data-upload={item.key}>
@@ -173,10 +191,12 @@ export function UploadProgress({
         <span className="text-xs text-muted-foreground">{t("uploads.converting")}</span>
       )}
       {item.error != null && !cancelled && (
-        <span className={cn("text-xs", failed ? "text-destructive" : "text-warning-fg")}>
+        <span className={cn("text-xs", failed || stuck ? "text-destructive" : "text-warning-fg")}>
           {live
             ? t("uploads.retrying", { error: errorMessage(t, item.error) })
-            : errorMessage(t, item.error)}
+            : lost
+              ? t("uploads.lost", { node: nodeName })
+              : errorMessage(t, item.error)}
         </span>
       )}
       {after?.stage === "failed" && task?.status.error && (
@@ -189,18 +209,28 @@ export function UploadProgress({
       )}
       <div className="flex flex-wrap items-center gap-2">
         {live && (
-          <Button variant="outline" size="sm" onClick={() => pauseChunked(item.key)}>
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label={named("uploads.pauseNamed")}
+            onClick={() => pauseChunked(item.key)}
+          >
             <Pause />
             {t("uploads.pause")}
           </Button>
         )}
-        {item.phase === "paused" && hasFile(item.key) && (
-          <Button variant="outline" size="sm" onClick={() => resumeSame(item.key, onTask)}>
+        {waiting && item.phase !== "needsFile" && hasFile(item.key) && (
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label={named("uploads.resumeNamed")}
+            onClick={() => resumeSame(item.key, onTask)}
+          >
             <Play />
             {t("uploads.resume")}
           </Button>
         )}
-        {(item.phase === "needsFile" || (item.phase === "paused" && !hasFile(item.key))) && (
+        {waiting && (item.phase === "needsFile" || !hasFile(item.key)) && (
           <label
             htmlFor={pickId}
             className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md border px-3 text-sm font-medium hover:bg-accent focus-within:ring-2 focus-within:ring-ring"
@@ -211,20 +241,37 @@ export function UploadProgress({
               id={pickId}
               type="file"
               className="sr-only"
+              aria-label={named("uploads.pickToResumeNamed")}
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 e.target.value = "";
                 if (file) {
-                  setWrong(!resumeChunked(item.key, file, onTask));
+                  void resumeChunked(item.key, file, onTask).then((ok) => setWrong(!ok));
                 }
               }}
             />
           </label>
         )}
         {(live || item.phase === "paused" || item.phase === "needsFile") && (
-          <Button variant="ghost" size="sm" onClick={() => cancelChunked(item.key)}>
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={named("uploads.cancelNamed")}
+            onClick={() => cancelChunked(item.key)}
+          >
             <X />
             {t("uploads.cancel")}
+          </Button>
+        )}
+        {(kept || stuck) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={named(stuck ? "uploads.discardAgainNamed" : "uploads.discardNamed")}
+            onClick={() => cancelChunked(item.key)}
+          >
+            <X />
+            {t(stuck ? "uploads.discardAgain" : "uploads.discard")}
           </Button>
         )}
         {step === "done" && (
@@ -240,7 +287,7 @@ export function UploadProgress({
             {t("uploads.viewTask")}
           </Link>
         )}
-        {(step === "done" || failed || cancelled) && (
+        {(step === "done" || (failed && !kept) || cancelled) && (
           <Button
             variant="ghost"
             size="sm"

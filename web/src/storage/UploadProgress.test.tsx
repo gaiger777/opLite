@@ -2,8 +2,9 @@ import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
+import { ApiError } from "@/api/client";
 import type { Task } from "@/api/types";
-import { resetChunked, type UploadItem } from "@/storage/chunked";
+import { fingerprintOf, resetChunked, type UploadItem, uploadItems } from "@/storage/chunked";
 import { UploadDialog } from "@/storage/UploadDialog";
 import { createVmHref, durationText, UploadProgress } from "@/storage/UploadProgress";
 import { expectNoAxeViolations } from "@/test/axe";
@@ -16,7 +17,6 @@ beforeEach(() => vi.stubGlobal("XMLHttpRequest", FakeXhr));
 afterEach(() => {
   vi.unstubAllGlobals();
   resetChunked();
-  localStorage.clear();
 });
 
 function item(extra: Partial<UploadItem> = {}): UploadItem {
@@ -26,6 +26,8 @@ function item(extra: Partial<UploadItem> = {}): UploadItem {
     name: "ubuntu",
     pool: "local",
     content: "disk",
+    format: "qcow2",
+    sourceFormat: "qcow2",
     fileName: "ubuntu.qcow2",
     size: 4 * 1024 * 1024 * 1024,
     sent: 1024 * 1024 * 1024,
@@ -34,6 +36,9 @@ function item(extra: Partial<UploadItem> = {}): UploadItem {
     direct: false,
     task: null,
     error: null,
+    fingerprint: null,
+    node: "n1",
+    kept: true,
     ...extra,
   };
 }
@@ -46,7 +51,7 @@ it("shows the steps, the amount, the speed and the time left with pause and canc
     within(steps)
       .getAllByRole("listitem")
       .map((li) => li.textContent),
-  ).toEqual(["Uploading", "→Convert", "→Check", "→Done"]);
+  ).toEqual(["Uploading", "→Check", "→Convert", "→Finish", "→Done"]);
   expect(within(steps).getByText("Uploading").closest("li")).toHaveAttribute(
     "aria-current",
     "step",
@@ -61,8 +66,9 @@ it("shows the steps, the amount, the speed and the time left with pause and canc
       (_, el) => el?.textContent === "25% · 1 GiB / 4 GiB · 50 MiB/s · 1 min 2 s left",
     ),
   ).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Pause" })).toBeEnabled();
-  expect(screen.getByRole("button", { name: "Cancel upload" })).toBeEnabled();
+  // 센터에 여럿이어도 단추 이름으로 어느 업로드인지 안다.
+  expect(screen.getByRole("button", { name: "Pause ubuntu" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Cancel upload ubuntu" })).toBeEnabled();
   await expectNoAxeViolations(container, { disable: ["region"] });
 });
 
@@ -87,7 +93,30 @@ it("follows the import task: converting, then done with a link to create a VM", 
     ),
   );
   expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "30");
+  // 확인은 이미 지났다(서버 순서: 확인 → 변환 → 마무리).
+  expect(within(steps).getByText("Check").closest("li")).toHaveClass("text-success-fg");
   view.unmount();
+
+  mockLists({
+    task: [
+      {
+        ...converting,
+        status: {
+          state: "running",
+          error: null,
+          progress: { stage: "finishing", done_bytes: 100, total_bytes: 100 },
+        },
+      },
+    ],
+  });
+  const finishing = renderPage(
+    <UploadProgress item={item({ phase: "processing", task: "t1" })} onTask={() => {}} />,
+  );
+  const later = await screen.findByRole("list", { name: "Upload steps" });
+  await vi.waitFor(() =>
+    expect(within(later).getByText("Finish").closest("li")).toHaveAttribute("aria-current", "step"),
+  );
+  finishing.unmount();
 
   mockLists({ task: [{ ...converting, status: { state: "succeeded", error: null } }] });
   renderPage(<UploadProgress item={item({ phase: "processing", task: "t1" })} onTask={() => {}} />);
@@ -103,7 +132,39 @@ it("asks for the same file when the tab was closed and refuses another file", as
     screen.getByLabelText("Choose the same file to resume"),
     new File(["x"], "other.iso"),
   );
-  expect(screen.getByRole("alert")).toHaveTextContent(/not the file of this upload/);
+  expect(await screen.findByRole("alert")).toHaveTextContent(/not the file of this upload/);
+});
+
+it("offers to resume or discard a failed upload the server keeps, and explains a lost one", async () => {
+  mockLists({ node: [NODE] });
+  const failed = renderPage(
+    <UploadProgress
+      item={item({ phase: "failed", speed: null, error: new Error("no space") })}
+      onTask={() => {}}
+    />,
+  );
+  expect(await screen.findByRole("button", { name: "Discard upload ubuntu" })).toBeEnabled();
+  expect(screen.getByLabelText("Choose the same file to resume ubuntu")).toBeInTheDocument();
+  // 버리기 전에는 닫기(서버에 남김)를 보이지 않는다.
+  expect(screen.queryByRole("button", { name: /Close the upload item/ })).toBeNull();
+  failed.unmount();
+
+  renderPage(
+    <UploadProgress
+      item={item({
+        phase: "failed",
+        kept: false,
+        speed: null,
+        error: new ApiError(404, "not_found", "upload u1 not found"),
+      })}
+      onTask={() => {}}
+    />,
+  );
+  await vi.waitFor(() =>
+    expect(screen.getByText(/connect to that node again/)).toHaveTextContent(`(${NODE.name})`),
+  );
+  expect(screen.queryByRole("button", { name: /Discard/ })).toBeNull();
+  expect(screen.getByRole("button", { name: "Close the upload item ubuntu" })).toBeEnabled();
 });
 
 it("links ISOs to the install CD and writes short durations", () => {
@@ -160,7 +221,56 @@ it("uploads in chunks from the dialog when the serving node knows them", async (
   ).toBeInTheDocument();
   await vi.waitFor(() => expect(FakeXhr.last?.url).toMatch(/\/uploads\/u1\?offset=0$/));
   expect(opened).toEqual([
-    { name: "ubuntu", pool: "local", format: "qcow2", source_format: "qcow2", size: 4 },
+    {
+      name: "ubuntu",
+      pool: "local",
+      format: "qcow2",
+      source_format: "qcow2",
+      size: 4,
+      fingerprint: expect.objectContaining({ file_name: "Ubuntu.qcow2" }),
+    },
   ]);
-  expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Pause ubuntu" })).toBeInTheDocument();
+});
+
+it("fills the dialog from an upload of the same file and starts over when the name changes", async () => {
+  const knows = { ...NODE, status: { ...NODE.status, features: ["chunked-uploads"] } };
+  mockLists({ "storage-pool": [pool("local")], node: [knows] });
+  const chosen = new File(["disk"], "Ubuntu.qcow2", { lastModified: 9 });
+  const fingerprint = await fingerprintOf(chosen);
+  server.use(
+    http.get(apiUrl("/uploads"), () =>
+      HttpResponse.json({
+        items: [
+          {
+            id: "u7",
+            name: "old-ubuntu",
+            pool: "local",
+            format: "qcow2",
+            source_format: "qcow2",
+            content: "disk",
+            size: 4,
+            offset: 2,
+            chunk_size: 16,
+            direct: false,
+            node: "n1",
+            fingerprint,
+            created_at: 0,
+            updated_at: 0,
+            expires_at: 0,
+          },
+        ],
+      }),
+    ),
+  );
+  renderPage(<UploadDialog onClose={() => {}} />);
+  const dialog = await screen.findByRole("dialog", { name: "Upload a disk image" });
+  await vi.waitFor(() => expect(uploadItems()).toHaveLength(1));
+  await userEvent.upload(within(dialog).getByLabelText("Image file"), chosen);
+  await vi.waitFor(() => expect(within(dialog).getByLabelText("Name")).toHaveValue("old-ubuntu"));
+  expect(within(dialog).getByText(/The upload resumes from there/)).toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Resume upload" })).toBeInTheDocument();
+  await userEvent.type(within(dialog).getByLabelText("Name"), "-2");
+  expect(within(dialog).getByText(/You changed the name, pool or format/)).toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Upload" })).toBeInTheDocument();
 });

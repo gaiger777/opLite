@@ -188,7 +188,10 @@
     "manifest_unsupported": "This kind cannot be declared or exported: {{message}}",
     "http01_unavailable": "The HTTP-01 challenge cannot be served: {{message}}",
     "apply_set_too_large": "The apply set is too large to store: {{message}}",
-    "withDetail": "{{text}} Details: {{detail}}"
+    "withDetail": "{{text}} Details: {{detail}}",
+    "upload_checksum_mismatch": "The file the server received differs from the file sent (SHA-256 differs). The server discarded what it received — upload the file again from the start.",
+    "upload_busy": "Another request for this upload is still running. Try again in a moment.",
+    "pool_not_responding": "The storage that receives the upload does not respond (an NFS server, for example). Try again in a moment."
   },
   "nav": {
     "vms": "Virtual machines",
@@ -483,7 +486,7 @@
       "template": "Creating the template VM",
       "guestWriting": "Writing into the guest ({{done}} so far)",
       "checking": "Checking the image",
-      "converting": "Converting {{percent}}% ({{done}}/{{total}} GiB)",
+      "converting": "Converting {{percent}}%",
       "finishing": "Finishing the volume"
     },
     "detail": {
@@ -1462,13 +1465,16 @@
       "failed": "Failed",
       "paused": "Paused",
       "needsFile": "Choose the file again to resume",
-      "done": "Volume ready"
+      "done": "Volume ready",
+      "discarding": "Discarding…",
+      "discardFailed": "Could not discard"
     },
     "step": {
       "upload": "Uploading",
       "convert": "Convert",
       "check": "Check",
-      "done": "Done"
+      "done": "Done",
+      "finish": "Finish"
     },
     "stepsLabel": "Upload steps",
     "amount": "{{percent}}% · {{sent}} / {{total}}",
@@ -1492,7 +1498,17 @@
     "keepsGoing": "The upload goes on if you close this window. You can also follow it in the Tasks and notifications center in the header. If the connection drops, it resumes from what the server received.",
     "showInCenter": "Show in the notifications center",
     "close": "Close",
-    "resumeNote": "You started uploading this file before ({{sent}} / {{total}} received). The upload resumes from there."
+    "resumeNote": "You started uploading this file before ({{sent}} / {{total}} received). The upload resumes from there. If you change the name, pool or format, what was received is discarded and the upload starts over.",
+    "pauseNamed": "Pause {{name}}",
+    "resumeNamed": "Resume upload {{name}}",
+    "pickToResumeNamed": "Choose the same file to resume {{name}}",
+    "cancelNamed": "Cancel upload {{name}}",
+    "discard": "Discard upload",
+    "discardNamed": "Discard upload {{name}}",
+    "discardAgain": "Try discarding again",
+    "discardAgainNamed": "Try discarding again {{name}}",
+    "lost": "This node does not have the upload. If you are connected to a node other than the one that opened it ({{node}}), connect to that node again to resume. If no chunk arrived for 24 hours, the server discarded it — upload again from the start.",
+    "restartNote": "You started uploading this file before ({{sent}} / {{total}} received). You changed the name, pool or format, so what was received is discarded and the upload starts over."
   },
   "pools": {
     "path": "Directory",
