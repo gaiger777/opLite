@@ -653,6 +653,7 @@ export function BackupTable({
  * 백업에서 새 VM을 만드는 대화상자. 열 때만 그린다. 보통은 꺼진 VM이고, "라이브 복원"(계획 68 §11)이면 디스크를 다 받기 전에
  * VM을 켜고 뒤에서 옮긴다(새 폴더의 `vm.power`도 든다 — 없으면 스위치를 보이지 않는다). 백업의 네트워크마다 이 클러스터의
  * 네트워크를 고른다(기본은 같은 이름 — 계획 76 §3.3). 바꾼 것만 `networks` 맵으로 보낸다(아무것도 바꾸지 않으면 옛 서버도 받는다).
+ * 백업 NIC의 보안 그룹 가운데 이 클러스터에 없는 것만 대신할 그룹을 고르게 한다(`security_groups` — 다른 클러스터의 사본, 리뷰 1 웹 14).
  */
 function RestoreDialog({
   backup,
@@ -668,6 +669,7 @@ function RestoreDialog({
   const vms = useList("vm");
   const pools = useList("storage-pool");
   const networks = useList("network");
+  const securityGroups = useList("security-group");
   const [name, setName] = useState("");
   const [pool, setPool] = useState("");
   const [live, setLive] = useState(false);
@@ -680,6 +682,14 @@ function RestoreDialog({
   const [targets, setTargets] = useState<Record<string, string>>({});
   const known = new Set((networks.data ?? []).map((n) => n.name));
   const targetOf = (from: string) => targets[from] ?? (known.has(from) ? from : "");
+  // 이곳에 없는 보안 그룹(목록을 받은 뒤에만 — 받기 전에는 묻지 않는다)
+  const groupNames = new Set((securityGroups.data ?? []).map((g) => g.name));
+  const missingGroups = securityGroups.data
+    ? [...new Set((backup.spec.vm_spec.nics ?? []).flatMap((n) => n.security_groups ?? []))].filter(
+        (g) => !groupNames.has(g),
+      )
+    : [];
+  const [groupTargets, setGroupTargets] = useState<Record<string, string>>({});
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -696,10 +706,16 @@ function RestoreDialog({
         found[`net-${from}`] = "backups.errors.network";
       }
     }
+    for (const from of missingGroups) {
+      if (!groupTargets[from]) {
+        found[`sg-${from}`] = "backups.errors.securityGroup";
+      }
+    }
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return false;
     }
+    const groupMap = Object.fromEntries(missingGroups.map((from) => [from, groupTargets[from]!]));
     const map = Object.fromEntries(
       sources.filter((from) => targetOf(from) !== from).map((from) => [from, targetOf(from)]),
     );
@@ -712,6 +728,7 @@ function RestoreDialog({
           pool,
           ...(live && { live: true }),
           ...(Object.keys(map).length > 0 && { networks: map }),
+          ...(Object.keys(groupMap).length > 0 && { security_groups: groupMap }),
         },
       }),
     );
@@ -783,6 +800,39 @@ function RestoreDialog({
                   {(networks.data ?? []).map((n) => (
                     <NativeSelectOption key={n.id} value={n.name}>
                       {n.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
+            </Field>
+          ))}
+        </fieldset>
+      )}
+      {missingGroups.length > 0 && (
+        <fieldset className="flex flex-col gap-2">
+          <legend className="text-sm font-medium">{t("backups.securityGroupMap")}</legend>
+          <p className="text-xs text-muted-foreground">{t("backups.securityGroupMapHint")}</p>
+          {missingGroups.map((from, i) => (
+            <Field
+              key={from}
+              id={`restore-sg-${i}`}
+              label={t("backups.securityGroupFor", { name: from })}
+              error={errors[`sg-${from}`]}
+            >
+              {(a11y) => (
+                <NativeSelect
+                  id={`restore-sg-${i}`}
+                  className="w-full"
+                  value={groupTargets[from] ?? ""}
+                  onChange={(e) => setGroupTargets({ ...groupTargets, [from]: e.target.value })}
+                  {...a11y}
+                >
+                  <NativeSelectOption value="">
+                    {t("backups.chooseSecurityGroup")}
+                  </NativeSelectOption>
+                  {(securityGroups.data ?? []).map((g) => (
+                    <NativeSelectOption key={g.id} value={g.name}>
+                      {g.name}
                     </NativeSelectOption>
                   ))}
                 </NativeSelect>

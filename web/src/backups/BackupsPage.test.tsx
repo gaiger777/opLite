@@ -1,10 +1,19 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { BackupsPage } from "@/backups/BackupsPage";
 import { resetTasks } from "@/tasks/tasks";
-import { backup, backupJob, pool, remote, sdnNetwork, task, vm } from "@/test/fixtures";
+import {
+  backup,
+  backupJob,
+  pool,
+  remote,
+  sdnNetwork,
+  securityGroup,
+  task,
+  vm,
+} from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -255,6 +264,52 @@ it("maps the networks of the backed-up VM when restoring", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
   expect(await screen.findByText("Restore db-1 as db-dr")).toBeInTheDocument();
   expect(body).toEqual({ name: "db-dr", pool: "local", networks: { dmz: "dr-dmz" } });
+});
+
+it("asks for the security groups the backup uses that this cluster lacks", async () => {
+  const withGroups = vm("db", "stopped", {
+    spec: {
+      ...gone.spec,
+      nics: [{ network: "lan", model: "virtio", security_groups: ["web", "prod-db"] }],
+    },
+  });
+  const ofGroups = backup("db-2", withGroups, 6);
+  mockLists({
+    vm: [web],
+    backup: [ofGroups],
+    "storage-pool": [pool("local")],
+    network: [sdnNetwork("lan")],
+    "security-group": [securityGroup("web"), securityGroup("dr-db")],
+  });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl(`/backups/${ofGroups.id}/restore`), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "backup-restore", "new-vm"), { status: 202 });
+    }),
+  );
+  renderPage(<BackupsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Restore db-2" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore db-2" });
+  await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-dr");
+  await userEvent.selectOptions(
+    within(dialog).getByLabelText("Storage pool for the disks"),
+    "local",
+  );
+  // 이곳에 있는 web은 묻지 않는다
+  const prodDb = await within(dialog).findByLabelText("Security group for prod-db");
+  expect(within(dialog).queryByLabelText("Security group for web")).not.toBeInTheDocument();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
+  expect(within(dialog).getByText("Choose a security group.")).toBeVisible();
+  await userEvent.selectOptions(prodDb, "dr-db");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
+  await waitFor(() =>
+    expect(body).toEqual({
+      name: "db-dr",
+      pool: "local",
+      security_groups: { "prod-db": "dr-db" },
+    }),
+  );
 });
 
 it("deletes a backup after confirming", async () => {

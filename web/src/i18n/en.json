@@ -996,7 +996,8 @@
       "pool": "Choose a storage pool.",
       "remote": "Choose a remote cluster.",
       "store": "Choose a backup store.",
-      "network": "Choose a network."
+      "network": "Choose a network.",
+      "securityGroup": "Choose a security group."
     },
     "target": "Target",
     "targetHint": "A backup pool keeps a qcow2 file per disk. A store keeps each changed chunk once.",
@@ -1033,7 +1034,11 @@
     "networkMap": "Networks",
     "networkMapHint": "Choose the network of this cluster for each network of the backed-up VM. The same name is chosen when it exists here.",
     "networkFor": "Network for {{name}}",
-    "chooseNetwork": "Choose a network"
+    "chooseNetwork": "Choose a network",
+    "securityGroupMap": "Security groups",
+    "securityGroupMapHint": "These security groups of the backed-up VM are not on this cluster. Choose one of this cluster for each.",
+    "securityGroupFor": "Security group for {{name}}",
+    "chooseSecurityGroup": "Choose a security group"
   },
   "backupJobs": {
     "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
