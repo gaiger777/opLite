@@ -378,6 +378,25 @@ orbivisorctl volume download noble --pool nas --source-format qcow2 \
 - **업로드 사전 확인.** 웹과 `orbivisorctl volume import`는 파일을 보내기 전에 받을 수 있는지 먼저 묻는다
   (`POST /api/v1/volumes/import/check`): 권한, 이름, 풀이 있는지, 풀이 접속한 노드에서 준비됐는지, 같은 이름의 볼륨이
   있는지, 파일 크기 + 1 GiB의 빈 공간이 있는지. 거절되면 파일을 보내지 않고 이유를 보인다.
+- **조각 업로드·이어 올리기(계획 77-8).** 접속한 노드가 기능 `chunked-uploads`를 알리면 웹은 파일을 조각(16 MiB)으로
+  보낸다: `POST /api/v1/uploads {name, pool, format?, source_format, content?, size, fingerprint?}`(확인은 사전 확인과 같다 —
+  공간은 받을 자리에서, 같은 자리에 받는 중인 다른 업로드의 남은 양을 더해 본다. 빈 파일은 받지 않는다) →
+  `PUT /uploads/{id}?offset=`(받은 데와 다르면 409 `upload_offset_mismatch`, `details.offset`이 받은 데. 조각마다 받는
+  자리에 조각 + 1 GiB가 남는지 다시 보고 아니면 507) → `POST /uploads/{id}/complete {sha256?}`가 볼륨과 가져오기 Task(202)를
+  돌려준다. 서버는 받으며 SHA-256을 세고(노드를 다시 켰으면 끝낼 때 받은 파일을 읽어 셈), 웹이 보낸 `sha256`과 다르면 400
+  `upload_checksum_mismatch`로 업로드를 버린다. Task를 만들지 못하면 받은 것은 그대로 남아 다시 끝낼 수 있다. 끊기면
+  `GET /uploads/{id}`의 `offset`부터 잇고, 탭을 닫았거나 다른 브라우저여도 열 때 둔 지문(이름·크기·고친 시각·앞 1 MiB의
+  SHA-256)이 같은 파일을 고르면 잇는다(`GET /uploads` — 연 사람의 것만, 받는 노드 `node`). 이름·풀·형식을 바꾸면 웹이 전
+  업로드를 버리고 새로 연다. `DELETE /uploads/{id}`는 조각을 받는 중이어도 거절하지 않는다 — 이름·공간 예약은 바로 풀리고
+  그 조각이 끝나면 받은 것을 지운다. raw를 raw로 두는 디렉터리·NFS 풀(ISO 포함)은
+  풀 안에 바로 써(`.upload-<노드>.<id>.raw.part`) 끝내면 그 파일이 볼륨이 된다(변환·사본 없음). 그 밖은 업로드 디렉터리에
+  받아 Task가 변환하며, 진행은 Task 진행 `checking` → `converting`(qemu-img `-p`) → `finishing`이다. 24시간 조각이 오지
+  않은 업로드는 지운다 — 받는 풀이 마운트되지 않았거나 응답하지 않으면(NFS) 지우지 않고 다음에 다시 본다. 풀 경로 호출은
+  30초 제한 시간을 두고(멈춘 NFS는 503 `pool_not_responding`), 감사 기록에는 열기·끝내기·버리기만 적는다(조각은 적지 않음).
+  웹은 업로드 창과 작업·알림 센터에 단계(올리는 중 → 확인 → 변환 → 마무리 → 끝)·올린 양·속도·남은 시간·일시정지·취소를
+  보이고, 실패했지만 서버에 받은 것이 남았으면 "이어 올리기"·"업로드 버리기"를,
+  끝나면 "이 이미지로 VM 만들기"(`/vms/-new?purpose=image&disk=` — ISO는 `?purpose=iso&iso=`)로 간다. 기능이 없는 노드에
+  접속했으면 옛 한 번 올리기(`POST /volumes/import`)를 쓴다.
 - **처리 대기.** 웹에서 파일을 다 보낸 뒤 서버가 2분 동안 응답하지 않으면 "처리 중" 알림이 "<이름>: 서버
   응답이 없습니다. 볼륨 목록에서 결과를 확인하세요."로 바뀌고 닫을 수 있다. 업로드는 끊지 않고 서버에서 계속된다.
   나중에 응답이 오면 평소처럼 결과를 알린다.

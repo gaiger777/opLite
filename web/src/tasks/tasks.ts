@@ -245,6 +245,16 @@ export function describeProgress(task: Task, t: TFunction): string | null {
         })
       : t("tasks.progress.downloadingUnknown", { done: gib(done) });
   }
+  // 올린·받은 이미지 가져오기(계획 77-8): 원본 확인 → 변환(qemu-img 진행) → 마무리
+  // 바이트는 원본 파일(압축된 qcow2·vmdk) 크기라 쓰는 양과 달라 퍼센트만 보인다(리뷰 77-8 S8).
+  if (progress?.stage === "converting") {
+    return t("tasks.progress.converting", {
+      percent: bytePercent(progress.done_bytes, progress.total_bytes),
+    });
+  }
+  if (progress?.stage === "checking" || progress?.stage === "finishing") {
+    return t(`tasks.progress.${progress.stage}`);
+  }
   // 체크섬 파일 받기(받기 전), 확인·가져오기, 받은 디스크로 템플릿 만들기(계획 58)
   if (
     progress?.stage === "checksum" ||

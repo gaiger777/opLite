@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -6,10 +6,18 @@ import { AlertList } from "@/alerts/AlertList";
 import { useAlerts } from "@/alerts/alerts";
 import { SEVERITIES } from "@/alerts/severity";
 import { useList } from "@/api/live";
+import { useOptionalPrincipal } from "@/auth/AuthProvider";
 import type { Task } from "@/api/types";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { errorMessage } from "@/i18n/errors";
+import {
+  chunkedSupported,
+  loadServerUploads,
+  type UploadItem,
+  useUploads,
+} from "@/storage/chunked";
+import { UploadProgress } from "@/storage/UploadProgress";
 import { formatTime, uuidTime } from "@/lib/format";
 import { isActive, isRinging, setCenterOpen } from "@/tasks/center";
 import { failureTitle } from "@/tasks/failures/failure";
@@ -17,7 +25,7 @@ import { useFailureStrings } from "@/tasks/failures/strings";
 import { TaskErrorText } from "@/tasks/TaskErrorText";
 import { useTaskHref } from "@/tasks/taskLink";
 import { alertHref } from "@/tasks/target";
-import { describeProgress, describeTask } from "@/tasks/tasks";
+import { describeProgress, describeTask, trackTask } from "@/tasks/tasks";
 import { newestFirst, TaskStateBadge, useTaskTarget } from "@/tasks/TasksPage";
 import { retryLabel } from "@/tasks/retry";
 import { useRetry } from "@/tasks/useRetry";
@@ -46,6 +54,19 @@ export function NotificationCenter() {
   const alerts = useAlerts();
   const all = useMemo(() => newestFirst(tasks.data ?? []), [tasks.data]);
   const running = all.filter(isActive);
+  // 조각 업로드(계획 77-8): 올리는 것과 끝난 것(닫을 때까지)
+  const uploads = useUploads();
+  const nodes = useList("node");
+  const serving = useOptionalPrincipal()?.node?.id;
+  const chunked = chunkedSupported(nodes.data, serving);
+  // 탭을 닫았다 왔으면 서버에 남은 내 업로드를 "같은 파일 골라 이어 올리기"로 보인다.
+  useEffect(() => {
+    if (chunked) {
+      void loadServerUploads();
+    }
+  }, [chunked]);
+  const onTask = (task: Task, up: UploadItem) =>
+    trackTask(task, t("tasks.op.volume-import", { target: up.name }));
   const recent = all.filter((task) => !isActive(task)).slice(0, RECENT_LIMIT);
   const active = useMemo(
     () =>
@@ -64,6 +85,17 @@ export function NotificationCenter() {
         }
       }}
     >
+      {uploads.length > 0 && (
+        <Section id="center-uploads" title={t("center.uploads", { n: uploads.length })}>
+          <ul aria-labelledby="center-uploads" className="flex flex-col divide-y">
+            {uploads.map((up) => (
+              <li key={up.key} className="py-2">
+                <UploadProgress item={up} onTask={onTask} compact />
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
       <Section id="center-running" title={t("center.running", { n: running.length })}>
         {running.length === 0 ? (
           <Empty>{t("center.noRunning")}</Empty>

@@ -105,6 +105,8 @@ pub struct AppState {
     pub acme: crate::acme::AcmeNodeConfig,
     /// 운영자 대시보드 두 읽기(`/topology/physical`·`/capacity`, 계획 75)의 마지막 결과
     pub(crate) dashboard: crate::dashboard::DashboardCache,
+    /// 이 노드의 조각 업로드(계획 77-8 — 쓰는 중인 업로드와 버려진 업로드 정리)
+    pub(crate) uploads: crate::uploads::Uploads,
 }
 
 impl AppState {
@@ -155,6 +157,7 @@ impl AppState {
             plans: Default::default(),
             acme: Default::default(),
             dashboard: Default::default(),
+            uploads: Default::default(),
         }
     }
 }

@@ -241,6 +241,15 @@ export function mapLabels(t: Translate, model: ClusterModel, scene: MapScene): M
         case "hidden":
           out.set(cell.key, t(`${L}.hidden`, { count: cell.count, node: ownerName(item) }));
           break;
+        case "fold":
+          out.set(
+            cell.key,
+            t(`${L}.${cell.open ? "unfold" : "fold"}`, {
+              count: cell.count,
+              node: ownerName(item),
+            }),
+          );
+          break;
       }
     }
   }

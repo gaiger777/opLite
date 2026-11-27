@@ -188,7 +188,10 @@
     "manifest_unsupported": "이 종류는 아직 YAML로 적용하거나 내보낼 수 없습니다: {{message}}",
     "http01_unavailable": "HTTP-01 확인을 받을 수 없습니다: {{message}}",
     "apply_set_too_large": "YAML 묶음이 너무 커서 저장할 수 없습니다: {{message}}",
-    "withDetail": "{{text}} 자세히: {{detail}}"
+    "withDetail": "{{text}} 자세히: {{detail}}",
+    "upload_checksum_mismatch": "서버가 받은 파일이 보낸 파일과 다릅니다(SHA-256이 다름). 서버는 받은 것을 버렸습니다 — 파일을 처음부터 다시 올리세요.",
+    "upload_busy": "이 업로드에 다른 요청이 아직 진행 중입니다. 잠시 뒤 다시 시도하세요.",
+    "pool_not_responding": "업로드를 받는 스토리지가 응답하지 않습니다(NFS 서버 등). 잠시 뒤 다시 시도하세요."
   },
   "nav": {
     "vms": "가상 머신",
@@ -483,7 +486,10 @@
       "importing": "볼륨으로 가져오는 중",
       "checksum": "체크섬 파일 받는 중",
       "template": "템플릿 VM 만드는 중",
-      "guestWriting": "게스트에 쓰는 중({{done}})"
+      "guestWriting": "게스트에 쓰는 중({{done}})",
+      "checking": "이미지 확인 중",
+      "converting": "변환 {{percent}}%",
+      "finishing": "볼륨 마무리 중"
     },
     "detail": {
       "vms": "VM: {{vms}}.",
@@ -1452,7 +1458,60 @@
     },
     "isoTitle": "ISO 이미지 올리기",
     "isoDescription": "파일은 접속한 노드({{node}})로 가므로 그 노드의 디렉터리·NFS 풀만 고를 수 있습니다. 이미지는 그대로(raw) 둡니다.",
-    "noIsoPool": "쓸 수 있는 디렉터리·NFS 풀이 없습니다. ISO 이미지는 디렉터리·NFS 풀에만 둘 수 있습니다."
+    "noIsoPool": "쓸 수 있는 디렉터리·NFS 풀이 없습니다. ISO 이미지는 디렉터리·NFS 풀에만 둘 수 있습니다.",
+    "item": {
+      "disk": "이미지 {{name}}",
+      "iso": "ISO {{name}}"
+    },
+    "state": {
+      "cancelled": "취소함",
+      "failed": "실패",
+      "paused": "일시정지",
+      "needsFile": "파일을 다시 고르면 이어 올립니다",
+      "done": "볼륨 준비됨",
+      "discarding": "버리는 중…",
+      "discardFailed": "버리지 못함"
+    },
+    "step": {
+      "upload": "올리는 중",
+      "convert": "변환",
+      "check": "확인",
+      "done": "끝",
+      "finish": "마무리"
+    },
+    "stepsLabel": "업로드 단계",
+    "amount": "{{percent}}% · {{sent}} / {{total}}",
+    "speed": "{{speed}}/초",
+    "left": "남은 시간 {{time}}",
+    "time": {
+      "hm": "{{h}}시간 {{m}}분",
+      "ms": "{{m}}분 {{s}}초",
+      "s": "{{s}}초"
+    },
+    "converting": "올린 이미지를 볼륨 형식으로 바꾸는 중입니다.",
+    "retrying": "연결이 불안정해 다시 보냅니다. {{error}}",
+    "pause": "일시정지",
+    "resume": "이어 올리기",
+    "pickToResume": "같은 파일 골라 이어 올리기",
+    "cancel": "업로드 취소",
+    "createVm": "이 이미지로 VM 만들기",
+    "viewTask": "작업 보기",
+    "dismissNamed": "{{name}} 업로드 항목 닫기",
+    "otherFile": "이 업로드의 파일이 아닙니다. 처음 고른 파일({{name}}, {{size}})을 고르세요.",
+    "keepsGoing": "이 창을 닫아도 업로드는 계속됩니다. 진행은 머리줄의 작업·알림 센터에서도 볼 수 있습니다. 끊기면 받은 데부터 이어 올립니다.",
+    "showInCenter": "작업·알림 센터에서 보기",
+    "close": "닫기",
+    "resumeNote": "전에 올리다 멈춘 파일입니다({{sent}} / {{total}} 받음). 받은 데부터 이어 올립니다. 이름·풀·형식을 바꾸면 전에 받은 것을 버리고 처음부터 올립니다.",
+    "pauseNamed": "{{name}} 일시정지",
+    "resumeNamed": "{{name}} 이어 올리기",
+    "pickToResumeNamed": "{{name}}: 같은 파일 골라 이어 올리기",
+    "cancelNamed": "{{name}} 업로드 취소",
+    "discard": "업로드 버리기",
+    "discardNamed": "{{name}} 업로드 버리기",
+    "discardAgain": "다시 버리기",
+    "discardAgainNamed": "{{name}} 다시 버리기",
+    "lost": "이 노드에서 업로드를 찾지 못했습니다. 업로드를 연 노드({{node}})가 아닌 노드에 접속해 있으면 그 노드에 다시 접속해 이어 올리세요. 24시간 동안 조각이 오지 않았으면 서버가 버렸으니 처음부터 다시 올리세요.",
+    "restartNote": "전에 이 파일을 올리다 멈췄습니다({{sent}} / {{total}} 받음). 이름·풀·형식을 바꿨으므로 전에 받은 것을 버리고 처음부터 올립니다."
   },
   "pools": {
     "path": "디렉터리",
@@ -3622,7 +3681,8 @@
     "retryAfterFixNamed": "고친 뒤 다시 하기: {{label}}",
     "jobRunning": "백업 일정이 도는 중입니다.",
     "jobDisabled": "백업 일정이 꺼져 있습니다.",
-    "view": "보기"
+    "view": "보기",
+    "uploads": "올리기 ({{n}})"
   },
   "capacity": {
     "title": "용량",

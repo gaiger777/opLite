@@ -642,6 +642,13 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/volumes/import", Handler),
     ("POST", "/volumes/import/check", Handler),
     ("POST", "/volumes/download", Handler),
+    // 조각 업로드(계획 77-8): 여는 것은 풀 `storage.allocate`(핸들러 — 옛 업로드와 같음), 그 뒤는 연 사람만(핸들러).
+    ("GET", "/uploads", List),
+    ("POST", "/uploads", Handler),
+    ("GET", "/uploads/{id}", Handler),
+    ("PUT", "/uploads/{id}", Handler),
+    ("DELETE", "/uploads/{id}", Handler),
+    ("POST", "/uploads/{id}/complete", Handler),
     ("GET", "/volumes/{key}", Read(Volume)),
     ("DELETE", "/volumes/{key}", Object(Volume, StorageAllocate)),
     (

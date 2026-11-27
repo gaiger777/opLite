@@ -172,7 +172,7 @@ pub(super) async fn download(
         want.check(&sum)?;
     }
     write_progress(ctx, task.id, "importing", done).await;
-    import_volume(ctx, volume, &file, source_format).await?;
+    import_volume(ctx, task.id, volume, &file, source_format).await?;
     match template {
         Some(draft) => {
             write_progress(ctx, task.id, "template", done).await;

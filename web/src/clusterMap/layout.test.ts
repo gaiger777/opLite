@@ -1,5 +1,6 @@
 import { type Box, boxBounds, boxFace, type Point } from "@/components/iso/iso";
 import {
+  DENSE_MAX,
   GAP,
   layoutCluster,
   MAX_CELLS,
@@ -131,29 +132,34 @@ it("keeps every VM tile in its name-order cell when states change", () => {
   expect(before.nodes[0]!.stack).toBe(2 * TILE_H);
 });
 
-it("folds VMs past 64 cells into +N and shows unreadable VMs as +N hidden", () => {
+it("packs a busy node's VMs into one dense layer on its top and shows unreadable VMs as +N hidden", () => {
   const n = mapNode(1, "a");
   const vms = Array.from({ length: 70 }, (_, i) =>
     mapVm(i, `vm${String(i).padStart(2, "0")}`, n.id),
   );
   const s = layoutCluster(toModel({ nodes: [n], vms }));
-  const cells = s.nodes[0]!.grid!.cells;
-  expect(cells).toHaveLength(MAX_CELLS);
-  expect(cells[63]).toMatchObject({
-    kind: "more",
-    key: `more:node:${n.id}`,
-    count: 7,
-    tone: "more",
-  });
-  expect(cells.filter((c) => c.kind === "vm")).toHaveLength(63);
+  const node = s.nodes[0]!;
+  const grid = node.grid!;
+  // 64칸을 넘으면 층을 쌓지 않고 칸을 줄여 한 층에 모두(이름 순 자리)
+  expect(grid.cells).toHaveLength(70);
+  expect(grid.layers).toBe(1);
+  expect(grid.size).toBeLessThan(20);
+  expect(grid.cells.every((c) => c.kind === "vm" && c.layer === 0)).toBe(true);
+  expect(node.stack).toBe(grid.h);
+  for (const c of grid.cells) {
+    // 노드 윗면 안
+    expect(c.box.x).toBeGreaterThanOrEqual(node.box.x);
+    expect(c.box.y).toBeGreaterThanOrEqual(node.box.y);
+    expect(c.box.x + c.box.w).toBeLessThanOrEqual(node.box.x + NODE);
+    expect(c.box.y + c.box.d).toBeLessThanOrEqual(node.box.y + NODE);
+  }
   // 읽을 수 없는 VM이 있으면 그 칸도
   const hidden = layoutCluster(
     toModel({ nodes: [n], vms, placement: placement([load(n, { vms: 75 })]), vmsLimited: true }),
   );
   const hc = hidden.nodes[0]!.grid!.cells;
-  expect(hc).toHaveLength(MAX_CELLS);
-  expect(hc[62]).toMatchObject({ kind: "more", count: 8 });
-  expect(hc[63]).toMatchObject({ kind: "hidden", key: `hidden:node:${n.id}`, count: 5 });
+  expect(hc).toHaveLength(71);
+  expect(hc[70]).toMatchObject({ kind: "hidden", key: `hidden:node:${n.id}`, count: 5 });
   // 적으면 VM 뒤에 한 칸
   const few = layoutCluster(
     toModel({
@@ -164,6 +170,65 @@ it("folds VMs past 64 cells into +N and shows unreadable VMs as +N hidden", () =
     }),
   );
   expect(few.nodes[0]!.grid!.cells.map((c) => c.kind)).toEqual(["vm", "vm", "vm", "hidden"]);
+  // 촘촘한 격자도 DENSE_MAX를 넘으면 "+N"
+  const many = Array.from({ length: DENSE_MAX + 5 }, (_, i) => mapVm(i, `v${i}`, n.id));
+  const huge = layoutCluster(toModel({ nodes: [n], vms: many })).nodes[0]!.grid!.cells;
+  expect(huge).toHaveLength(DENSE_MAX);
+  expect(huge.at(-1)).toMatchObject({ kind: "more", count: 6 });
+});
+
+it("folds a busy node's stopped VMs into one band that unfolds on request", () => {
+  const n = mapNode(1, "a");
+  // 131대 가운데 66대 꺼짐(계획 77 관찰의 devserver 노드)
+  const vms = Array.from({ length: 131 }, (_, i) =>
+    mapVm(i, `vm${String(i).padStart(3, "0")}`, n.id, i % 2 === 0 ? "stopped" : "running"),
+  );
+  const s = layoutCluster(toModel({ nodes: [n], vms }));
+  const node = s.nodes[0]!;
+  const cells = node.grid!.cells;
+  expect(cells.filter((c) => c.kind === "vm")).toHaveLength(65);
+  const fold = cells.at(-1)!;
+  expect(fold).toMatchObject({ kind: "fold", key: `fold:node:${n.id}`, count: 66, open: false });
+  // 덩어리는 윗면 앞쪽 띠(격자 앞, 윗면 안)
+  expect(fold.box.w).toBeGreaterThan(cells[0]!.box.w * 5);
+  expect(fold.box.y).toBeGreaterThan(Math.max(...cells.slice(0, -1).map((c) => c.box.y)));
+  expect(fold.box.y + fold.box.d).toBeLessThanOrEqual(node.box.y + NODE);
+  expect(s.tiles.get(fold.key)!.node).toBe(node);
+  // 펼치면 꺼진 VM도 칸으로, 띠는 접기 단추로 남는다
+  const open = layoutCluster(toModel({ nodes: [n], vms }), { open: new Set([node.key]) });
+  const oc = open.nodes[0]!.grid!.cells;
+  expect(oc.filter((c) => c.kind === "vm")).toHaveLength(131);
+  expect(oc.at(-1)).toMatchObject({ kind: "fold", count: 66, open: true });
+  // 꺼진 VM이 없으면 띠도 없다
+  const on = vms.map((vm, i) => mapVm(i, vm.name, n.id));
+  expect(
+    layoutCluster(toModel({ nodes: [n], vms: on })).nodes[0]!.grid!.cells.some(
+      (c) => c.kind === "fold",
+    ),
+  ).toBe(false);
+});
+
+it("keeps the not-placed tray no bigger than a node block", () => {
+  const n = mapNode(1, "a");
+  for (const count of [1, 5, 16, 17, 66, 300]) {
+    const vms = Array.from({ length: count }, (_, i) =>
+      mapVm(i, `vm${i}`, null, i % 3 === 0 ? "running" : "stopped", {
+        status: { node: null },
+      }),
+    );
+    const s = layoutCluster(toModel({ nodes: [n], vms }));
+    const tray = s.slabs.find((x) => x.kind === "unplaced")!;
+    expect(tray.count).toBe(count);
+    expect(tray.box.w).toBeLessThanOrEqual(NODE);
+    expect(tray.box.d).toBeLessThanOrEqual(NODE);
+    const cells = s.byKey.get("unplaced")!.grid!.cells;
+    for (const c of cells) {
+      expect(c.box.x + c.box.w).toBeLessThanOrEqual(tray.box.x + tray.box.w);
+      expect(c.box.y + c.box.d).toBeLessThanOrEqual(tray.box.y + tray.box.d);
+    }
+    // 16대를 넘으면 꺼진 VM을 접는다
+    expect(cells.some((c) => c.kind === "fold")).toBe(count > 16);
+  }
 });
 
 it("shows a migrating VM on its source and a ghost on the target's next cell", () => {

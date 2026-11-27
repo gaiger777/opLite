@@ -88,6 +88,7 @@ mod telemetry;
 mod topology;
 pub mod two_factor;
 mod updates;
+mod uploads;
 pub mod users;
 pub mod vip;
 mod vm_checks;
@@ -546,6 +547,13 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(volumes::import_volume))
         .routes(routes!(volumes::check_import_volume))
         .routes(routes!(volumes::download_volume))
+        .routes(routes!(uploads::list_uploads, uploads::create_upload))
+        .routes(routes!(
+            uploads::get_upload,
+            uploads::put_upload_chunk,
+            uploads::delete_upload
+        ))
+        .routes(routes!(uploads::complete_upload))
         .routes(routes!(r::get_volume, volumes::delete_volume))
         .routes(routes!(volumes::resize_volume))
         .routes(routes!(volumes::flatten_volume))

@@ -197,6 +197,35 @@ export function applyPurpose(
 }
 
 /**
+ * 올린 디스크 이미지로 만들기(계획 77-8 — 업로드가 끝나면 "이 이미지로 VM 만들기", 주소 `?purpose=image&disk=`): ISO 카드의
+ * 크기(vCPU·메모리)에 그 볼륨을 첫 디스크로(먼저 부팅), 기본 NIC. 볼륨을 붙일 수 없으면(없음·다른 VM이 씀) 디스크 없이
+ * `missed: ["disk"]`.
+ */
+export function withImage(start: BuilderState, ctx: BuilderCtx, volume: string): BuilderState {
+  const size = PURPOSE_SIZE.iso!;
+  let s: BuilderState = {
+    ...start,
+    values: { ...start.values, sockets: 1, cores: String(size.cores), memory: String(size.memory) },
+  };
+  const before = s.values.disks.length;
+  s = put(
+    s,
+    ctx,
+    parts(s, ctx).find((x) => x.id === `volume:${volume}`),
+    "disks",
+  );
+  if (s.values.disks.length === before) {
+    s = miss(s, "disk");
+  }
+  const net = defaultNetwork(s, ctx);
+  s = put(s, ctx, net, "nics");
+  if (!net || net.name === USER_NETWORK) {
+    s = miss(s, "nic");
+  }
+  return s;
+}
+
+/**
  * OS 고르기 카드에서 ISO를 넣는다: 빈 CD 드라이브가 있으면 그것(`which`가 "drivers"면 둘째 드라이브 — 없으면 더함),
  * 없으면 먼저 부팅하는 드라이브를 더한다. 놓기 규칙이 거절하면 그대로다.
  */

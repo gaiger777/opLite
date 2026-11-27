@@ -107,6 +107,33 @@ it("skips ghost tiles of VMs migrating in", () => {
   expect(neighbor(s, node(2), "]")).toBeNull();
 });
 
+it("moves ↑·↓ by rows on a busy node's dense grid, down to the stopped-VM band", () => {
+  const a = mapNode(1, "a");
+  const vms = Array.from({ length: 131 }, (_, i) =>
+    mapVm(i, `vm${String(i).padStart(3, "0")}`, a.id, i % 2 === 0 ? "stopped" : "running"),
+  );
+  const s = layoutCluster(toModel({ nodes: [a], vms }));
+  const grid = s.nodes[0]!.grid!;
+  expect(grid.size).toBeLessThan(20);
+  const at = (key: string) => grid.cells.find((c) => c.key === key)!;
+  const go = (key: string, k: NavKey) => {
+    const f = neighbor(s, { kind: "tile", node: `node:${a.id}`, key }, k);
+    return f?.kind === "tile" ? at(f.key) : null;
+  };
+  const vmCells = grid.cells.filter((c) => c.kind === "vm");
+  const first = vmCells[2]!;
+  // 아래 줄 같은 열, 위로는 맨 뒤 줄에서 멈춤
+  expect(go(first.key, "ArrowDown")).toMatchObject({ row: 1, col: 2 });
+  expect(go(go(first.key, "ArrowDown")!.key, "ArrowUp")).toBe(first);
+  expect(go(first.key, "ArrowUp")).toBeNull();
+  // 맨 앞 줄에서 ↓는 꺼진 VM 띠, 띠에서 ↑는 맨 앞 줄의 첫 열
+  const last = vmCells.at(-1)!;
+  const fold = go(last.key, "ArrowDown")!;
+  expect(fold.kind).toBe("fold");
+  expect(go(fold.key, "ArrowDown")).toBeNull();
+  expect(go(fold.key, "ArrowUp")).toMatchObject({ row: last.row, col: 0 });
+});
+
 it("reaches every node with arrows and every tile from ] (property)", () => {
   const keys: NavKey[] = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
   for (let seed = 1; seed <= 40; seed++) {

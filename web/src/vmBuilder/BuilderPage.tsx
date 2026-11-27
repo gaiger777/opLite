@@ -32,10 +32,12 @@ import { blocking, browserProblems, type Problem, problems } from "@/vmBuilder/m
 import { checkBody, requests, type RuleRequest, zoneRule } from "@/vmBuilder/model/requests";
 import {
   applyPurpose,
+  insertIso,
   picksOs,
   type Purpose,
   purposeBlocked,
   PURPOSES,
+  withImage,
 } from "@/vmBuilder/model/purposes";
 import { listOf, slotOf } from "@/vmBuilder/model/slots";
 import {
@@ -241,7 +243,16 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
   const start = (p: Purpose, template?: string): string => {
     const base = fresh();
     const kept = { ...base, values: { ...base.values, folder: s.values.folder } };
-    const next = setName(applyPurpose(kept, p, ctx, template), s.values.name);
+    // 올린 이미지·ISO로(계획 77-8 — 업로드 끝의 "이 이미지로 VM 만들기": `?disk=`·`?iso=`)
+    const disk = params.get("disk");
+    const iso = params.get("iso");
+    const shaped =
+      p === "image" && disk
+        ? withImage(kept, ctx, disk)
+        : p === "iso" && iso
+          ? insertIso(applyPurpose(kept, p, ctx), ctx, iso)
+          : applyPurpose(kept, p, ctx, template);
+    const next = setName(shaped, s.values.name);
     setApplied(p);
     setAutoModel(base.values.model);
     setHist({ past: [], present: next });
@@ -281,6 +292,9 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     focusTo.current = { heading: start(p, template) };
     const next = new URLSearchParams(params);
     next.set("purpose", p);
+    // 카드를 다시 고르면 업로드에서 온 이미지·ISO는 놓는다
+    next.delete("disk");
+    next.delete("iso");
     if (template) {
       next.set("template", template);
     } else {

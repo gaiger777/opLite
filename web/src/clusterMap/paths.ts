@@ -12,6 +12,7 @@ import {
   type NodeItem,
   type NodeTag,
   portRowShown,
+  TILE,
   type TileCell,
   type TileTone,
 } from "@/clusterMap/layout";
@@ -320,15 +321,24 @@ export function nodeElements(node: NodeItem, lod: Lod, marks: NodeMarks): number
  */
 export const FRAME_ELEMENTS = 1 + 2 + 1 + 3 * 3 + 2 + 4 + 1;
 
+/** 촘촘한 격자에도 자세히 단계에서 이름을 적는 칸 수 한도(넘으면 가리키면 카드 — 글 원소 예산) */
+export const DENSE_NAMES = 200;
+
 /**
- * 칸에 글을 적는가: 윗면이 보이는 칸만(위 층이 덮으면 아니다) — 자세히는 모든 칸(이름 앞 8자·"+N"), 타일 단계는 "+N" 칸만.
+ * 칸에 글을 적는가: 윗면이 보이는 칸만(위 층이 덮으면 아니다) — 자세히는 모든 칸(이름 앞 8자·"+N"), 타일 단계는 "+N"·꺼진
+ * VM 덩어리 칸만. 촘촘한 격자(VM이 많은 노드)는 칸이 `DENSE_NAMES` 이하일 때만 이름(칸 크기에 맞춘 작은 글 — 더 확대하면 읽힘).
  */
 export function cellText(node: NodeItem, cell: TileCell, lod: Lod): boolean {
   const grid = node.grid;
   if (lod === "summary" || !grid || coveredTop(grid.cells, cell, grid.perLayer)) {
     return false;
   }
-  return lod === "detail" || cell.kind === "more" || cell.kind === "hidden";
+  return (
+    (lod === "detail" && (grid.size >= TILE || grid.cells.length <= DENSE_NAMES)) ||
+    cell.kind === "more" ||
+    cell.kind === "hidden" ||
+    cell.kind === "fold"
+  );
 }
 
 /**

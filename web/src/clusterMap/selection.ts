@@ -80,6 +80,7 @@ export function selectionOf(key: string, scene: MapScene): MapSelection | null {
       return { kind: "vm", id: rest };
     case "more":
     case "hidden":
+    case "fold":
       return rest.startsWith("node:") ? { kind: "node", id: rest.slice(5) } : null;
     case "move":
     case "rec": {
@@ -120,6 +121,24 @@ export function keyOfSelection(sel: MapSelection, scene: MapScene): string | nul
   }
 }
 
+const vmOf = (model: ClusterModel, text: string) =>
+  model.vms.find((x) => x.name === text) ?? model.vms.find((x) => x.id === text);
+
+/** 가리킨 VM이 접힌 꺼진 VM 덩어리 안이면 펼칠 그 덩어리의 주인(`node:<id>`·`unplaced`), 아니면 `null`(계획 77-8 리뷰 I11) */
+export function foldedOwner(
+  target: FocusTarget,
+  model: ClusterModel,
+  scene: MapScene,
+): string | null {
+  const vm = target.kind === "vm" ? vmOf(model, target.vm) : undefined;
+  if (!vm || scene.tiles.has(`vm:${vm.id}`)) {
+    return null;
+  }
+  const owner = vm.node === null ? "unplaced" : `node:${vm.node}`;
+  const fold = scene.tiles.get(`fold:${owner}`)?.cell;
+  return fold && !fold.open ? owner : null;
+}
+
 /**
  * `focus`의 뜻 → 그림의 초점. 노드·VM은 이름이 먼저, 그다음 id. 포트가 줄에 없으면(8개 넘음·물리 관계 없음) 그 노드,
  * 레일은 그 레일에 선이 있는 첫 노드에서 들어간 것으로.
@@ -133,8 +152,7 @@ export function focusOf(target: FocusTarget, model: ClusterModel, scene: MapScen
       return n && scene.byKey.has(`node:${n.id}`) ? { kind: "node", key: `node:${n.id}` } : null;
     }
     case "vm": {
-      const vm =
-        model.vms.find((x) => x.name === target.vm) ?? model.vms.find((x) => x.id === target.vm);
+      const vm = vmOf(model, target.vm);
       const tile = vm ? scene.tiles.get(`vm:${vm.id}`) : undefined;
       return tile ? { kind: "tile", node: tile.node.key, key: tile.cell.key } : null;
     }

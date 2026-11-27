@@ -996,7 +996,100 @@ pub async fn create_overlay(qemu_img: &Path, path: &Path, size: u64) -> Result<(
     Ok(())
 }
 
+/// `qemu-img convert`의 진행 알림(0~100, 퍼센트). [`with_convert_progress`]로 건다.
+pub type ConvertProgress = Arc<dyn Fn(f64) + Send + Sync>;
+
+tokio::task_local! {
+    static CONVERT_PROGRESS: ConvertProgress;
+}
+
+/// `f` 안에서 도는 `qemu-img convert`가 `-q` 대신 `-p`로 돌며 진행을 `report`로 알린다(계획 77-8 — 올린 이미지의
+/// 변환 진행). 백엔드(디렉터리·LVM·ZFS·RBD)마다 따로 고치지 않고 같은 future 안의 변환에 건다. 다른 명령과 이 future
+/// 밖의 변환은 그대로다.
+pub async fn with_convert_progress<F: std::future::Future>(
+    report: ConvertProgress,
+    f: F,
+) -> F::Output {
+    CONVERT_PROGRESS.scope(report, f).await
+}
+
+/// `qemu-img -p`의 진행 줄(`    (12.34/100%)`)의 퍼센트
+fn parse_convert_progress(line: &[u8]) -> Option<f64> {
+    let line = std::str::from_utf8(line).ok()?.trim();
+    let percent: f64 = line
+        .strip_prefix('(')?
+        .strip_suffix("/100%)")?
+        .parse()
+        .ok()?;
+    (0.0..=100.0).contains(&percent).then_some(percent)
+}
+
+/// 진행을 알리며 `qemu-img convert`를 돌린다: `-q`를 빼고 `-p`를 넣어 표준 출력의 진행 줄(`\r`로 나뉨)을 읽는다.
+async fn run_convert_with_progress(
+    qemu_img: &Path,
+    args: &[&str],
+    report: ConvertProgress,
+) -> Result<Vec<u8>, DriverError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut args: Vec<&str> = args.iter().copied().filter(|a| *a != "-q").collect();
+    args.insert(1, "-p");
+    let mut child = tokio::process::Command::new(qemu_img)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let errors = async {
+        let mut text = Vec::new();
+        stderr.read_to_end(&mut text).await.map(|_| text)
+    };
+    let progress = async {
+        let mut buf = [0u8; 512];
+        let mut line = Vec::new();
+        loop {
+            let n = stdout.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                if b == b'\r' || b == b'\n' {
+                    if let Some(p) = parse_convert_progress(&line) {
+                        report(p);
+                    }
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+        if let Some(p) = parse_convert_progress(&line) {
+            report(p);
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let (errors, progress) = tokio::join!(errors, progress);
+    let status = child.wait().await?;
+    let errors = errors?;
+    progress?;
+    if !status.success() {
+        return Err(DriverError::ToolFailed {
+            tool: "qemu-img",
+            stderr: String::from_utf8_lossy(&errors).trim().to_string(),
+        });
+    }
+    Ok(Vec::new())
+}
+
 async fn run_qemu_img(qemu_img: &Path, args: &[&str]) -> Result<Vec<u8>, DriverError> {
+    if args.first() == Some(&"convert")
+        && let Ok(report) = CONVERT_PROGRESS.try_with(Arc::clone)
+    {
+        return run_convert_with_progress(qemu_img, args, report).await;
+    }
     let out = tokio::process::Command::new(qemu_img)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -2648,6 +2741,64 @@ pub(crate) mod tests {
             .unwrap();
         sh.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
         assert!(sh.wait().unwrap().success(), "cannot write {path:?}");
+    }
+
+    /// 진행을 걸면 변환이 `-q` 대신 `-p`로 돌고 진행 줄(`\r`로 나뉨)을 알린다. 걸지 않으면 `-q` 그대로다(계획 77-8).
+    #[tokio::test]
+    async fn convert_reports_progress_only_inside_the_scope() {
+        let tools = tempfile::tempdir().unwrap();
+        let args = tools.path().join("args");
+        let body = format!(
+            "printf '%s\\n' \"$@\" > {args:?}; printf '    (0.00/100%%)\\r    (42.50/100%%)\\r    (100.00/100%%)\\r\\n'"
+        );
+        let tool = fake_tool(tools.path(), &body);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let report: ConvertProgress = {
+            let seen = seen.clone();
+            Arc::new(move |p| seen.lock().unwrap().push(p))
+        };
+        let out = with_convert_progress(
+            report,
+            run_qemu_img(&tool, &["convert", "-q", "-O", "raw", "a", "b"]),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(*seen.lock().unwrap(), [0.0, 42.5, 100.0]);
+        let used = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(
+            used.lines().collect::<Vec<_>>(),
+            ["convert", "-p", "-O", "raw", "a", "b"]
+        );
+
+        run_qemu_img(&tool, &["convert", "-q", "a", "b"])
+            .await
+            .unwrap();
+        let used = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(
+            used.lines().collect::<Vec<_>>(),
+            ["convert", "-q", "a", "b"]
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(parse_convert_progress(b"garbage"), None);
+        assert_eq!(parse_convert_progress(b"(140.00/100%)"), None);
+    }
+
+    /// 진행을 건 변환도 실패하면 표준 오류를 알린다.
+    #[tokio::test]
+    async fn convert_with_progress_reports_failures() {
+        let tools = tempfile::tempdir().unwrap();
+        let tool = fake_tool(tools.path(), "echo 'no space left' >&2; exit 1");
+        let err = with_convert_progress(
+            Arc::new(|_| {}),
+            run_qemu_img(&tool, &["convert", "a", "b"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, DriverError::ToolFailed { stderr, .. } if stderr == "no space left"),
+            "{err:?}"
+        );
     }
 
     /// 실행 파일 셸 스크립트를 만든다. `"$last"`에 마지막 인자가 들어 있다.
