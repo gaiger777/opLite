@@ -34,14 +34,14 @@ async function signIn(page: Page) {
   await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
 }
 
-/** 이미지·이전 묶음의 화면 하나(VMware 이전·원본은 "VMware migration" 항목의 화면 안 탭) */
+/** 이미지·이전 묶음의 화면 하나(VMware 이전·원본은 "VMware migration (copy while running)" 항목의 화면 안 탭) */
 async function importsView(page: Page, view: string) {
   if (view === "Exports") {
     await openItem(page, "Images & migration", "Exports");
     return;
   }
-  await openItem(page, "Images & migration", "VMware migration");
-  await openPageTab(page, "VMware migration", view);
+  await openItem(page, "Images & migration", "VMware migration (copy while running)");
+  await openPageTab(page, "VMware migration (copy while running)", view);
 }
 
 test("migrates a running VMware VM warm, cuts it over and exports it as OVA", async ({ page }) => {

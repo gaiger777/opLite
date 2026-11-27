@@ -42,6 +42,8 @@ export interface NavGroup {
   items: NavItem[];
   /** 사이드바에 없는 묶음(내 계정 — 사용자 메뉴에서 연다) */
   hidden?: boolean;
+  /** 팔레트가 이 묶음의 항목마다 더 찾는 낱말(번역 키): 예전 사이드바의 영역 이름(계획 61 — 인프라·보호·활동·설정) */
+  keywords?: string;
 }
 
 /** 항목이 화면 하나뿐일 때 */
@@ -118,6 +120,7 @@ export const GROUPS: NavGroup[] = [
   {
     id: "storage",
     key: "nav.group.storage",
+    keywords: "nav.oldArea.infra",
     items: [
       {
         ...one("pools", "nav.pools", { to: "/storage-pools" }),
@@ -130,6 +133,7 @@ export const GROUPS: NavGroup[] = [
   {
     id: "network",
     key: "nav.group.network",
+    keywords: "nav.oldArea.infra",
     items: [
       {
         ...one("networks", "nav.networks", { to: "/networks" }),
@@ -159,6 +163,7 @@ export const GROUPS: NavGroup[] = [
   {
     id: "cluster",
     key: "nav.group.cluster",
+    keywords: "nav.oldArea.infra",
     items: [
       one("nodes", "nav.nodes", { to: "/nodes", kind: "node" }),
       one("cluster", "nav.item.cluster", { to: "/cluster", key: "nav.cluster", kind: "node" }),
@@ -185,6 +190,7 @@ export const GROUPS: NavGroup[] = [
   {
     id: "backup",
     key: "nav.group.backup",
+    keywords: "nav.oldArea.protect",
     items: [
       one("backups", "nav.backups", { to: "/backups" }),
       one("backupJobs", "nav.item.backupJobs", {
@@ -213,6 +219,7 @@ export const GROUPS: NavGroup[] = [
   {
     id: "records",
     key: "nav.group.records",
+    keywords: "nav.oldArea.activity",
     items: [
       {
         ...one("tasks", "nav.item.tasks", { to: "/tasks", key: "nav.tasks" }),
@@ -236,6 +243,7 @@ export const GROUPS: NavGroup[] = [
   {
     id: "admin",
     key: "nav.group.admin",
+    keywords: "nav.oldArea.settings",
     items: [
       one("general", "nav.item.general", { to: "/settings", key: "nav.general", kind: "settings" }),
       {
@@ -294,19 +302,44 @@ export const GROUPS: NavGroup[] = [
   },
 ];
 
+export interface LegacyRedirect {
+  from: string;
+  to: string;
+  /** 이 묶음들의 보이는 첫 항목으로 간다(없으면 `to`). 예전 영역에 지금은 여러 묶음에 흩어진 화면이 있을 때 */
+  groups?: GroupId[];
+}
+
 /**
  * 옛 주소 → 새 주소. 쿼리와 해시를 그대로 붙여 `replace`로 넘긴다. 예전 사이드바의 영역 주소(계획 61)는 그 영역의
- * 첫 화면으로 간다.
+ * 첫 화면으로 간다(예전 인프라 영역은 노드를 못 읽는 사용자에게 스토리지·네트워크의 보이는 첫 화면).
  */
-export const LEGACY_REDIRECTS: { from: string; to: string }[] = [
+export const LEGACY_REDIRECTS: LegacyRedirect[] = [
   { from: "/users", to: "/settings/users" },
   { from: "/realms", to: "/settings/realms" },
   { from: "/tokens", to: "/settings/tokens" },
-  { from: "/infra", to: "/nodes" },
+  { from: "/infra", to: "/nodes", groups: ["cluster", "storage", "network"] },
   { from: "/protect", to: "/backups" },
   { from: "/activity", to: "/tasks" },
   { from: "/settings/remotes", to: "/remotes/-manage" },
 ];
+
+/** 옛 주소가 지금 권한으로 갈 곳 */
+export function legacyTarget(redirect: LegacyRedirect, gate: Gate) {
+  for (const id of redirect.groups ?? []) {
+    const group = GROUPS.find((g) => g.id === id);
+    const first = group && visibleItems(group, gate)[0];
+    if (first) {
+      return itemHome(first, gate);
+    }
+  }
+  return redirect.to;
+}
+
+/** 옛 주소(넘기기 경로)인지. 넘기기 전에 "권한 없음"으로 막지 않는다(`/settings/remotes`는 `/settings` 아래다). */
+export function isLegacyPath(pathname: string) {
+  const path = pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
+  return LEGACY_REDIRECTS.some((redirect) => redirect.from === path);
+}
 
 /** 사이드바 없이 전체 폭으로 보이는 경로(콘솔) */
 export function isFullWidth(pathname: string) {
@@ -407,7 +440,7 @@ export function onListPage(pathname: string, hit: NavHit) {
 const openKey = "nav.open";
 
 /**
- * 펼친 묶음(사용자별 `{user}.nav.open`, 쉼표로 나눈 id). 기억이 없으면 null — 그러면 지금 화면의 묶음만 펼친다.
+ * 펼친 묶음(사용자별 `{user}.nav.open`, 쉼표로 나눈 id). 기억이 없으면 null — 그러면 모든 묶음을 펼친다.
  * 저장소를 못 써도 null이다(`readPref`가 실패를 삼킨다).
  */
 export function readOpenGroups(read: (key: string) => string | null): Set<GroupId> | null {

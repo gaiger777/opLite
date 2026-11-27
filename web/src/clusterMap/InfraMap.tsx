@@ -144,7 +144,7 @@ function useMapStrings(): boolean {
 
 export interface InfraMapProps {
   /**
-   * `page`: 인프라 › 노드 › 지도(도구 띠·범례·서랍 — 계획 70 그대로). `home`: 홈의 큰 칸(고정 높이, 범례 접힘, 보기 설정은
+   * `page`: 개요 › 인프라 지도(도구 띠·범례·서랍 — 계획 70 그대로). `home`: 홈의 큰 칸(고정 높이, 범례 접힘, 보기 설정은
    * 단추 하나, 서랍 없음 — 고른 것은 `onSelect`로 밖에 알린다).
    */
   variant: "home" | "page";

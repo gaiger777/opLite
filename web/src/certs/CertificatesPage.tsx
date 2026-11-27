@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
@@ -160,6 +161,15 @@ export function CertificatesPage() {
         title={t("nav.certificates")}
         description={t("certs.pageHint")}
       />
+      {/* 노드 HTTPS 인증서를 서명하는 클러스터 CA는 클러스터 화면에 있다(두 화면이 서로 가리킨다). */}
+      {perms.reads("node") && (
+        <p className="text-sm text-muted-foreground">
+          {t("certs.caHint")}{" "}
+          <Link to="/cluster" className="underline underline-offset-4">
+            {t("nav.group.cluster")} › {t("nav.item.cluster")}
+          </Link>
+        </p>
+      )}
       <Section
         id="certs-list"
         title={t("certs.certificates")}

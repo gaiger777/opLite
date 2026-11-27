@@ -1,6 +1,6 @@
 import { cn } from "cn";
 import { ChevronDown, ChevronsLeft, ChevronsRight } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
@@ -15,9 +15,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Kbd } from "@/components/ui/kbd";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type Badges, useNavBadges } from "@/layout/badges";
 import {
   type Gate,
+  GROUPS,
   itemHome,
   type NavGroup,
   type NavItem,
@@ -27,16 +29,16 @@ import {
   visibleItems,
   writeOpenGroups,
 } from "@/layout/nav";
-import { readPref, readUserPref, writePref, writeUserPref } from "@/lib/prefs";
+import { readUserPref, writeUserPref } from "@/lib/prefs";
 import { keyLabel } from "@/lib/shortcuts";
 
 const RAIL_PREF = "nav.rail";
 /** 이 폭부터 사이드바를 펼친 채 시작한다. 그 아래는 아이콘 레일 + 펼침 창이다(계획 77 설계). */
 const WIDE = "(min-width: 1280px)";
 
-/** 접은 레일인지. 사용자가 고른 것을 기억하고, 고른 적이 없으면 화면 폭으로 정한다. */
-export function readRail(): boolean {
-  const saved = readPref(RAIL_PREF);
+/** 접은 레일인지. 사용자마다 고른 것을 기억하고(`{user}.nav.rail`), 고른 적이 없으면 화면 폭으로 정한다. */
+export function readRail(user: string): boolean {
+  const saved = readUserPref(user, RAIL_PREF);
   if (saved === "1" || saved === "0") {
     return saved === "1";
   }
@@ -45,22 +47,43 @@ export function readRail(): boolean {
 
 /** 레일 접기 상태. 머리줄 단축키 `[`와 사이드바 단추가 함께 쓴다. */
 export function useRail() {
-  const [rail, setRail] = useState(readRail);
+  const { user } = useNavUser();
+  const [rail, setRail] = useState(() => readRail(user));
   const toggle = () => {
-    writePref(RAIL_PREF, rail ? "0" : "1");
+    writeUserPref(user, RAIL_PREF, rail ? "0" : "1");
     setRail(!rail);
   };
   return { rail, toggle };
 }
 
+/** 예전 사이드바(계획 61)가 영역마다 남긴 마지막 탭 기억(`{user}.nav.last.*`)을 지운다. 이제 쓰지 않는다. */
+function dropLastTabs(user: string) {
+  try {
+    const prefix = `opl.${user}.nav.last.`;
+    for (const key of Object.keys(window.localStorage)) {
+      if (key.startsWith(prefix)) {
+        window.localStorage.removeItem(key);
+      }
+    }
+  } catch {
+    // 저장소를 못 쓰면 남은 것도 없다.
+  }
+}
+
+/** 한 탭 안의 다른 `NavTree`(데스크톱 사이드바·☰ 서랍)에 펼침이 바뀐 것을 알린다. */
+const OPEN_EVENT = "opl:nav-open";
+
 /**
- * 펼친 묶음. 사용자별로 기억하고(`{user}.nav.open`), 지금 화면의 묶음은 늘 펼친 채 시작한다(기억이 없으면 그것만).
- * 다른 묶음의 화면으로 가면 그 묶음을 펼친다(지금 묶음을 접으면 다시 그 묶음에 들어올 때까지 닫혀 있다).
+ * 펼친 묶음. 사용자별로 기억하고(`{user}.nav.open`), 기억이 없으면(처음 로그인·저장소를 못 씀) 모든 묶음을 펼친다.
+ * 지금 화면의 묶음은 늘 펼친 채 시작하고, 다른 묶음의 화면으로 가면 그 묶음을 펼친다(지금 묶음을 접으면 다시 그
+ * 묶음에 들어올 때까지 닫혀 있다).
  */
 function useOpenGroups(current: GroupId | undefined) {
   const { user } = useNavUser();
   const [state, setState] = useState(() => {
-    const open = readOpenGroups((key) => readUserPref(user, key)) ?? new Set<GroupId>();
+    const open =
+      readOpenGroups((key) => readUserPref(user, key)) ??
+      new Set(GROUPS.filter((group) => !group.hidden).map((group) => group.id));
     return { open: current ? new Set([...open, current]) : open, current };
   });
   // 다른 묶음의 화면으로 오면 그 묶음을 펼친다(그리는 중에 고친다 — 효과로 하면 한 번 접힌 채 그린다).
@@ -69,13 +92,22 @@ function useOpenGroups(current: GroupId | undefined) {
       current && !state.open.has(current) ? new Set([...state.open, current]) : state.open;
     setState({ open, current });
   }
+  useEffect(() => dropLastTabs(user), [user]);
+  useEffect(() => {
+    const sync = (event: Event) => {
+      const open = new Set((event as CustomEvent<GroupId[]>).detail);
+      setState((prev) => ({ open, current: prev.current }));
+    };
+    window.addEventListener(OPEN_EVENT, sync);
+    return () => window.removeEventListener(OPEN_EVENT, sync);
+  }, []);
   const toggle = (id: GroupId) => {
     const next = new Set(state.open);
     if (!next.delete(id)) {
       next.add(id);
     }
     writeOpenGroups((key, value) => writeUserPref(user, key, value), next);
-    setState({ open: next, current });
+    window.dispatchEvent(new CustomEvent(OPEN_EVENT, { detail: [...next] }));
   };
   return { open: state.open, toggle };
 }
@@ -209,9 +241,93 @@ export function NavTree({ onNavigate }: { onNavigate?(): void }) {
 }
 
 /**
- * 접은 레일: 묶음 아이콘마다 펼침 창(메뉴)이 그 묶음의 항목을 보인다. 메뉴라서 Enter·Space·↓로 열고 ↑·↓로 고르고
- * Esc면 아이콘으로 포커스가 돌아간다.
+ * 접은 레일의 묶음 아이콘 하나. 펼침 창(메뉴)이 그 묶음의 항목을 보인다. 메뉴라서 Enter·Space·↓로 열고 ↑·↓로 고르고
+ * Esc면 아이콘으로 포커스가 돌아간다. 마우스를 올리거나 키보드로 오면 툴팁이 묶음 이름을 보인다(메뉴가 열린 동안은
+ * 숨긴다). 지금 화면의 묶음인지와 숫자(경보·실패)는 설명(aria-describedby)으로 읽어 준다.
  */
+function RailGroup({
+  group,
+  gate,
+  hit,
+  badges,
+}: {
+  group: NavGroup;
+  gate: Gate;
+  hit: ReturnType<typeof navOf>;
+  badges: Badges;
+}) {
+  const { t } = useTranslation();
+  const [menu, setMenu] = useState(false);
+  const [tip, setTip] = useState(false);
+  const descId = useId();
+  const Icon = GROUP_ICONS[group.id];
+  const items = visibleItems(group, gate);
+  const here = hit?.group.id === group.id;
+  const counts = items.flatMap((item) =>
+    item.badge && badges[item.badge] > 0
+      ? [
+          t(item.badge === "alerts" ? "nav.badgeAlerts" : "nav.badgeFailedTasks", {
+            n: badges[item.badge],
+          }),
+        ]
+      : [],
+  );
+  const description = [...(here ? [t("nav.currentGroup")] : []), ...counts].join(", ");
+  const name = t(group.key);
+  return (
+    <li>
+      <DropdownMenu open={menu} onOpenChange={setMenu}>
+        <Tooltip open={tip && !menu} onOpenChange={setTip}>
+          <DropdownMenuTrigger asChild>
+            <TooltipTrigger asChild aria-describedby={description ? descId : undefined}>
+              <button
+                type="button"
+                data-flyout-trigger
+                data-current={here || undefined}
+                aria-label={t("nav.groupMenu", { group: name })}
+                className={cn(
+                  "relative flex h-10 w-full items-center justify-center rounded-md text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-foreground",
+                  "data-[current]:bg-sidebar-accent data-[current]:text-brand data-[state=open]:bg-sidebar-accent",
+                )}
+              >
+                <Icon className={RAIL_ICON_SIZE} aria-hidden />
+                {counts.length > 0 && (
+                  <span
+                    aria-hidden
+                    className="absolute top-1.5 right-2.5 size-2 rounded-full bg-danger-fg"
+                  />
+                )}
+              </button>
+            </TooltipTrigger>
+          </DropdownMenuTrigger>
+          <TooltipContent side="right">{name}</TooltipContent>
+        </Tooltip>
+        <DropdownMenuContent side="right" align="start" className="min-w-56">
+          <DropdownMenuLabel>{name}</DropdownMenuLabel>
+          {items.map((item) => (
+            <DropdownMenuItem key={item.id} asChild>
+              <Link
+                to={itemHome(item, gate)}
+                aria-current={hit?.item === item ? "page" : undefined}
+                className="aria-[current=page]:font-medium aria-[current=page]:text-brand"
+              >
+                <span className="min-w-0 flex-1">{t(item.key)}</span>
+                <BadgeCount item={item} badges={badges} />
+              </Link>
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {description && (
+        <span id={descId} hidden>
+          {description}
+        </span>
+      )}
+    </li>
+  );
+}
+
+/** 접은 레일: 묶음 아이콘들(관리는 맨 아래) */
 function RailNav() {
   const { t } = useTranslation();
   const { gate } = useNavUser();
@@ -219,53 +335,9 @@ function RailNav() {
   const hit = navOf(pathname);
   const badges = useNavBadges();
   const groups = visibleGroups(gate);
-  const icon = (group: NavGroup) => {
-    const Icon = GROUP_ICONS[group.id];
-    const items = visibleItems(group, gate);
-    const here = hit?.group.id === group.id;
-    const counted = items.some((item) => item.badge && badges[item.badge] > 0);
-    return (
-      <li key={group.id}>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              data-flyout-trigger
-              data-current={here || undefined}
-              aria-label={t("nav.groupMenu", { group: t(group.key) })}
-              className={cn(
-                "relative flex h-10 w-full items-center justify-center rounded-md text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-foreground",
-                "data-[current]:bg-sidebar-accent data-[current]:text-brand data-[state=open]:bg-sidebar-accent",
-              )}
-            >
-              <Icon className={RAIL_ICON_SIZE} aria-hidden />
-              {counted && (
-                <span
-                  aria-hidden
-                  className="absolute top-1.5 right-2.5 size-2 rounded-full bg-danger-fg"
-                />
-              )}
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent side="right" align="start" className="min-w-56">
-            <DropdownMenuLabel>{t(group.key)}</DropdownMenuLabel>
-            {items.map((item) => (
-              <DropdownMenuItem key={item.id} asChild>
-                <Link
-                  to={itemHome(item, gate)}
-                  aria-current={hit?.item === item ? "page" : undefined}
-                  className="aria-[current=page]:font-medium aria-[current=page]:text-brand"
-                >
-                  <span className="min-w-0 flex-1">{t(item.key)}</span>
-                  <BadgeCount item={item} badges={badges} />
-                </Link>
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </li>
-    );
-  };
+  const icon = (group: NavGroup) => (
+    <RailGroup key={group.id} group={group} gate={gate} hit={hit} badges={badges} />
+  );
   return (
     <nav aria-label={t("nav.main")} className="flex min-h-0 flex-1 flex-col gap-1 px-2 pb-2">
       <ul className="flex flex-col gap-1">

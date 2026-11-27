@@ -68,6 +68,10 @@ it("lists certificates with expiry and failure chips, accounts and DNS providers
   const accounts = screen.getByRole("table", { name: "ACME accounts" });
   expect(within(accounts).getByRole("row", { name: /le/ })).toHaveTextContent("Registered");
   expect(screen.getByRole("table", { name: "DNS providers" })).toHaveTextContent("Cloudflare");
+  // 노드 HTTPS 인증서를 서명하는 클러스터 CA는 클러스터 화면에 있다.
+  expect(
+    screen.getByRole("link", { name: "Cluster & availability › Cluster (members, CA)" }),
+  ).toHaveAttribute("href", "/cluster");
   // DNS 비밀은 보기에 없다
   expect(container).not.toHaveTextContent("api_token");
   await expectNoAxeViolations(container);

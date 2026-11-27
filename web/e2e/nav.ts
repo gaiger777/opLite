@@ -10,7 +10,9 @@ export async function openItem(page: Page, group: string, item: string) {
   if ((await head.getAttribute("aria-expanded")) !== "true") {
     await head.click();
   }
-  await nav.getByRole("link", { name: item, exact: true }).click();
+  // 숫자가 붙은 항목은 이름 뒤에 " (울리는 경보 n개)"가 붙는다 — 이름 앞부분으로 찾는다.
+  const escaped = item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  await nav.getByRole("link", { name: new RegExp(`^${escaped}( \\(.*\\))?$`) }).click();
 }
 
 /** 한 항목의 화면 안 탭(라우터 | 공인 IP 등) */

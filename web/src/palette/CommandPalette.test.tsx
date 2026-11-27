@@ -333,17 +333,14 @@ it("offers the SDN view to admins", async () => {
 
 it("goes to every item, page tab and folder view", async () => {
   const { router } = shell();
-  const { user } = await search(
-    "cluster",
-    "Cluster & availability › Cluster (members, certificates)",
-  );
+  const { user } = await search("cluster", "Cluster & availability › Cluster (members, CA)");
   await user.click(
     screen.getByRole("option", {
-      name: "Cluster & availability › Cluster (members, certificates)",
+      name: "Cluster & availability › Cluster (members, CA)",
     }),
   );
   await waitFor(() => expect(router.state.location.pathname).toBe("/cluster"));
-  const second = await search("floating", "Networking › Routers & public IPs › Floating IPs");
+  const second = await search("floating", "Networking › Routers & floating IPs › Floating IPs");
   await second.user.keyboard("{Escape}");
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   await search("vm folders", "Virtual machines › All VMs › VM folders");
@@ -420,4 +417,13 @@ it("has no axe violations when open", async () => {
   shell();
   await search("web", /^web-db/);
   await expectNoAxeViolations(document.body);
+});
+
+it("finds items by the old sidebar area names (77-3 review)", async () => {
+  shell();
+  // 예전 설정 영역 → 관리 묶음, 예전 인프라 영역 → 스토리지·네트워크·클러스터 묶음
+  await search("settings", "Administration › General & updates");
+  await userEvent.setup().keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await search("infrastructure", "Storage › Storage pools");
 });

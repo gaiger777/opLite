@@ -39,7 +39,7 @@ import { formatBytes } from "@/lib/format";
 import { useCreateParam, useOpenParam } from "@/lib/createParam";
 
 /**
- * 보호 › 백업 저장소(계획 68 §14 웹): 목록(이름·백엔드·암호화 배지와 지문·스냅샷 수·저장 크기·dedup 배율·마지막 GC·마지막
+ * 백업·복구 › 백업 저장소(계획 68 §14 웹): 목록(이름·백엔드·암호화 배지와 지문·스냅샷 수·저장 크기·dedup 배율·마지막 GC·마지막
  * 검증·상태), 만들기 마법사, 서랍(설정·키 카드·GC·검증·노드별 닿음·읽기 전용이면 scan·넘겨받기). 늦게 읽는 조각이다.
  */
 export function BackupStoresPage() {

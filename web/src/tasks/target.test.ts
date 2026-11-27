@@ -73,7 +73,7 @@ it("links alert subjects", () => {
   // 계획 73: 인증서는 설정 › 보안 › 인증서, 적용 묶음은 그 묶음의 상세
   expect(alertHref({ ...s, kind: "certificate" })).toBe("/settings/certificates");
   expect(alertHref({ ...s, kind: "apply_set" })).toBe("/apply-sets/a%20b");
-  // 계획 76: 복구 계획은 데이터 보호 › DR의 그 계획
+  // 계획 76: 복구 계획은 백업·복구 › DR(재해 복구)의 그 계획
   expect(alertHref({ ...s, kind: "recovery_plan" })).toBe("/dr-plans/a%20b");
 });
 

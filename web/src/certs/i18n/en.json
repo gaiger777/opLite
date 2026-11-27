@@ -1,6 +1,7 @@
 {
   "certs": {
     "pageHint": "Public certificates for the API and web listener from an ACME CA (Let's Encrypt, ZeroSSL, your own step-ca). The leader orders and renews them; nodes swap them in without a restart.",
+    "caHint": "The cluster CA that signs every node's HTTPS certificate (fingerprint, download) is under",
     "certificates": "Certificates",
     "accounts": "ACME accounts",
     "dnsProviders": "DNS providers",

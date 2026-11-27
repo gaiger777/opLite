@@ -179,7 +179,9 @@ it.each([
     await screen.findByRole("heading", { level: 1, name: title }, { timeout: 3000 }),
   ).toBeInTheDocument();
   // 상세(새 계획)와 내보내기에는 화면 안 탭이 없다
-  const tabs = screen.queryByRole("navigation", { name: "VMware migration pages" });
+  const tabs = screen.queryByRole("navigation", {
+    name: "VMware migration (copy while running) pages",
+  });
   if (path.endsWith("-new") || path === "/vm-exports") {
     expect(tabs).not.toBeInTheDocument();
     return;
@@ -297,14 +299,14 @@ it("opens the cluster map lazily under Overview and keeps [ inside the map", asy
   expect(screen.getByRole("button", { name: "Overview menu" })).toHaveAttribute("data-current");
   const block = await screen.findByRole("button", { name: /^Node node-a, online/ });
   // 그림 밖의 `[`는 사이드바를 접는다
-  expect(localStorage.getItem("opl.nav.rail")).toBeNull();
+  expect(localStorage.getItem(`opl.${ADMIN.user}.nav.rail`)).toBeNull();
   fireEvent.keyDown(document.body, { key: "[" });
-  const rail = localStorage.getItem("opl.nav.rail");
+  const rail = localStorage.getItem(`opl.${ADMIN.user}.nav.rail`);
   expect(rail).not.toBeNull();
   // 그림 안의 `[`·`]`는 그림이 받는다(사이드바 그대로)
   block.focus();
   fireEvent.keyDown(block, { key: "]" });
   fireEvent.keyDown(block, { key: "[" });
-  expect(localStorage.getItem("opl.nav.rail")).toBe(rail);
+  expect(localStorage.getItem(`opl.${ADMIN.user}.nav.rail`)).toBe(rail);
   expect(where(router)).toBe("/cluster/map");
 });

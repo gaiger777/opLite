@@ -50,23 +50,23 @@ const groupButtons = (nav: HTMLElement) =>
 const group = (nav: HTMLElement, name: string) =>
   within(nav).getByRole("button", { name, expanded: true }).nextElementSibling as HTMLElement;
 
-it("has nine groups plus administration, with only the current group open by default", async () => {
+it("has nine groups plus administration, all open on a first sign-in", async () => {
   const wide = wideScreen();
   const { container } = shell();
   const nav = await screen.findByRole("navigation", { name: "Main" });
+  // 기억이 없으면(처음 로그인) 모든 묶음을 펼쳐 무엇이 있는지 보인다(설계 "실패해도 기본 펼침").
   expect(groupButtons(nav)).toEqual([
     ["Overview", "true"],
-    ["Virtual machines", "false"],
-    ["Images & migration", "false"],
-    ["Storage", "false"],
-    ["Networking", "false"],
-    ["Cluster & availability", "false"],
-    ["Backup & recovery", "false"],
-    ["Records", "false"],
-    ["Administration", "false"],
+    ["Virtual machines", "true"],
+    ["Images & migration", "true"],
+    ["Storage", "true"],
+    ["Networking", "true"],
+    ["Cluster & availability", "true"],
+    ["Backup & recovery", "true"],
+    ["Records", "true"],
+    ["Administration", "true"],
   ]);
-  // 접은 묶음의 항목은 보이지 않는다(hidden).
-  expect(links(nav)).toEqual([
+  expect(links(group(nav, "Overview"))).toEqual([
     ["Dashboard", "/"],
     ["Infrastructure map", "/cluster/map"],
     ["Alerts", "/alerts"],
@@ -98,21 +98,21 @@ it("lists every group's items for admins", async () => {
     "OS images",
     "ISO files",
     "Imports (OVA, ESXi)",
-    "VMware migration",
+    "VMware migration (copy while running)",
     "Exports",
   ]);
   expect(names("Storage")).toEqual(["Storage pools", "Disks (volumes)", "Ceph"]);
   expect(names("Networking")).toEqual([
     "Networks",
     "Firewall (security groups)",
-    "Routers & public IPs",
+    "Routers & floating IPs",
     "Load balancers",
     "SDN (virtual networks)",
     "Topology diagram",
   ]);
   expect(names("Cluster & availability")).toEqual([
     "Nodes",
-    "Cluster (members, certificates)",
+    "Cluster (members, CA)",
     "Automatic recovery (HA)",
     "Failure detection (HA checks)",
     "Placement rules & balancing",
@@ -144,27 +144,29 @@ it("lists every group's items for admins", async () => {
   wide.mockRestore();
 });
 
-it("remembers open groups per user and opens the group of a page it goes to", async () => {
+it("remembers the groups a user closed and opens the group of a page it goes to", async () => {
   const user = userEvent.setup();
   const wide = wideScreen();
   const first = shell("/volumes");
   const nav = await screen.findByRole("navigation", { name: "Main" });
-  expect(within(nav).getByRole("button", { name: "Storage" })).toHaveAttribute(
-    "aria-expanded",
-    "true",
-  );
   await user.click(within(nav).getByRole("button", { name: "Backup & recovery" }));
   await user.click(within(nav).getByRole("button", { name: "Storage" }));
-  expect(localStorage.getItem(`opl.${ADMIN.user}.nav.open`)).toBe("backup");
+  expect(within(nav).getByRole("button", { name: "Storage" })).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  expect(localStorage.getItem(`opl.${ADMIN.user}.nav.open`)).toBe(
+    "overview,vms,images,network,cluster,records,admin",
+  );
   first.unmount();
-  // 다시 열면 기억한 묶음 + 지금 화면의 묶음이 펼쳐진다.
-  shell("/nodes");
+  // 다시 열면 접은 묶음은 접힌 채이고, 지금 화면의 묶음(백업·복구)만은 펼친다.
+  shell("/backups");
   const again = await screen.findByRole("navigation", { name: "Main" });
   expect(
     groupButtons(again)
-      .filter(([, expanded]) => expanded === "true")
+      .filter(([, expanded]) => expanded === "false")
       .map(([name]) => name),
-  ).toEqual(["Cluster & availability", "Backup & recovery"]);
+  ).toEqual(["Storage"]);
   wide.mockRestore();
 });
 
@@ -173,12 +175,12 @@ it("opens the group of a page in another group and marks its item", async () => 
   shell("/floating-ips");
   const nav = await screen.findByRole("navigation", { name: "Main" });
   const item = within(group(nav, "Networking")).getByRole("link", {
-    name: "Routers & public IPs",
+    name: "Routers & floating IPs",
   });
   expect(item).toHaveAttribute("aria-current", "page");
   expect(item).toHaveAttribute("href", "/routers");
   // 화면 안 탭(라우터 | 공인 IP)
-  const tabs = screen.getByRole("navigation", { name: "Routers & public IPs pages" });
+  const tabs = screen.getByRole("navigation", { name: "Routers & floating IPs pages" });
   expect(links(tabs)).toEqual([
     ["Routers", "/routers"],
     ["Floating IPs", "/floating-ips"],
@@ -191,7 +193,7 @@ it("opens the group of a page in another group and marks its item", async () => 
   const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
   expect(within(crumbs).queryByRole("link", { name: "Networking" })).toBeNull();
   expect(within(crumbs).getByText("Networking")).toBeInTheDocument();
-  expect(within(crumbs).getByRole("link", { name: "Routers & public IPs" })).toHaveAttribute(
+  expect(within(crumbs).getByRole("link", { name: "Routers & floating IPs" })).toHaveAttribute(
     "href",
     "/routers",
   );
@@ -326,16 +328,72 @@ it("opens a group's items from the rail with the keyboard and returns focus", as
   expect(trigger).toHaveFocus();
 });
 
+it("names each rail icon in a tooltip on hover and keyboard focus (77-3 review)", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.get(apiUrl("/alerts"), () =>
+      HttpResponse.json({
+        alerts: [
+          {
+            rule: "r",
+            rule_name: "cpu",
+            condition: "c",
+            severity: "critical",
+            since: 0,
+            state: "firing",
+            subject: { kind: "node", id: "n", name: "n1" },
+          },
+        ],
+        unreachable: [],
+        unsupported: [],
+      }),
+    ),
+  );
+  shell("/volumes");
+  const storage = await screen.findByRole("button", { name: "Storage menu" });
+  // 지금 화면의 묶음과 경보 수는 설명으로 읽어 준다(이름은 그대로).
+  expect(storage).toHaveAccessibleDescription("current page");
+  const overview = screen.getByRole("button", { name: "Overview menu" });
+  await vi.waitFor(() => expect(overview).toHaveAccessibleDescription("1 alerts ringing"));
+  await user.hover(overview);
+  expect(await screen.findByRole("tooltip")).toHaveTextContent("Overview");
+  await user.keyboard("{Escape}");
+  await vi.waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+  // 키보드로 와도 보이고, 메뉴가 열린 동안은 숨는다.
+  storage.focus();
+  expect(await screen.findByRole("tooltip")).toHaveTextContent("Storage");
+  await user.keyboard("{Enter}");
+  await screen.findByRole("menu");
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+});
+
+it("keeps the sidebar and the menu sheet in step when a group is closed", async () => {
+  const user = userEvent.setup();
+  const wide = wideScreen();
+  shell("/vms");
+  await user.click(await screen.findByRole("button", { name: "Open menu" }));
+  const sheet = await screen.findByRole("dialog", { name: "Orbivisor" });
+  await user.click(within(sheet).getByRole("button", { name: "Storage" }));
+  await user.keyboard("{Escape}");
+  await vi.waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  const nav = screen.getAllByRole("navigation", { name: "Main" })[0]!;
+  expect(within(nav).getByRole("button", { name: "Storage" })).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  wide.mockRestore();
+});
+
 it("collapses the sidebar to an icon rail and remembers it", async () => {
   const user = userEvent.setup();
   const wide = wideScreen();
   shell();
   // 넓은 화면은 펼친 채 시작한다.
   await user.click(await screen.findByRole("button", { name: "Collapse sidebar" }));
-  expect(localStorage.getItem("opl.nav.rail")).toBe("1");
+  expect(localStorage.getItem(`opl.${ADMIN.user}.nav.rail`)).toBe("1");
   expect(screen.getByRole("button", { name: "Overview menu" })).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
-  expect(localStorage.getItem("opl.nav.rail")).toBe("0");
+  expect(localStorage.getItem(`opl.${ADMIN.user}.nav.rail`)).toBe("0");
   expect(screen.getByRole("button", { name: "Overview" })).toBeInTheDocument();
   wide.mockRestore();
 });
@@ -432,7 +490,7 @@ it("has a skip link to the content", async () => {
 it("has no accessibility violations in the shell, wide and as a rail", async () => {
   const wide = wideScreen();
   const first = shell("/routers");
-  await screen.findByRole("navigation", { name: "Routers & public IPs pages" });
+  await screen.findByRole("navigation", { name: "Routers & floating IPs pages" });
   await expectNoAxeViolations(first.container);
   first.unmount();
   wide.mockRestore();

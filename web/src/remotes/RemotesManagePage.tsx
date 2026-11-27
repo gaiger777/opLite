@@ -29,8 +29,8 @@ import { type RemoteView, useRemotes } from "@/remotes/remotes";
 import { validName } from "@/vms/form";
 
 /**
- * 설정 › 원격 클러스터(admin): 주소·CA 지문·토큰을 더하고 고치고 지운다. 상태 카드와 원격 VM은 보호 › 원격
- * 복제(`RemotesPage`)에 있다.
+ * 백업·복구 › 원격 클러스터·복제 › 원격 클러스터(admin, 예전 설정 › 원격 클러스터): 주소·CA 지문·토큰을 더하고 고치고
+ * 지운다. 상태 카드와 원격 VM은 같은 항목의 원격 복제 탭(`RemotesPage`)에 있다.
  */
 export function RemotesManagePage() {
   const { t } = useTranslation();

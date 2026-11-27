@@ -86,12 +86,9 @@ it("refreshes a remote", async () => {
   renderPage(<RemotesPage />);
   await userEvent.click(await screen.findByRole("button", { name: "Refresh dr" }));
   expect(await screen.findByText("0.38.0")).toBeInTheDocument();
-  // 고치기·지우기는 같은 항목의 원격 클러스터 관리 탭에 있다.
+  // 고치기·지우기는 같은 항목의 원격 클러스터 관리 탭(화면 안 탭)에 있다. 화면 머리에 따로 링크를 두지 않는다.
   expect(screen.queryByRole("button", { name: "Edit dr" })).not.toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Manage remote clusters" })).toHaveAttribute(
-    "href",
-    "/remotes/-manage",
-  );
+  expect(screen.queryByRole("link", { name: "Manage remote clusters" })).not.toBeInTheDocument();
 });
 
 it("lists the backup jobs that copy to remote clusters", async () => {

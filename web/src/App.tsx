@@ -325,9 +325,9 @@ export const appRoutes: RouteObject[] = [
                 path: "settings/subscription",
                 lazy: page(() => import("@/settings/SubscriptionPage"), "SubscriptionPage"),
               },
-              ...LEGACY_REDIRECTS.map(({ from, to }) => ({
-                path: from.slice(1),
-                element: <Redirect to={to} />,
+              ...LEGACY_REDIRECTS.map((redirect) => ({
+                path: redirect.from.slice(1),
+                element: <Redirect redirect={redirect} />,
               })),
               { path: "*", element: <NotFoundPage /> },
             ],

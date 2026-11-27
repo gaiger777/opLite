@@ -39,7 +39,7 @@ export function DriftChip({ set }: { set: ApplySet }) {
 }
 
 /**
- * 활동 › 감사 › 선언 묶음(계획 73 §12.5·§13): 적용 묶음 목록 — 이름·객체 수·마지막 적용(누가)·드리프트 칩. 루트
+ * 기록 › 코드로 관리(YAML)(계획 73 §12.5·§13): 적용 묶음 목록 — 이름·객체 수·마지막 적용(누가)·드리프트 칩. 루트
  * `system.read`로 읽는다. 늦게 읽는 조각이다.
  */
 export function ApplySetsPage() {

@@ -3,6 +3,7 @@ import { Download, Plus } from "lucide-react";
 import { Check } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
@@ -88,6 +89,15 @@ export function ClusterPage() {
       <section className="flex flex-col gap-2">
         <h2 className="font-medium">{t("cluster.ca")}</h2>
         <p className="text-sm text-muted-foreground">{t("cluster.caNote")}</p>
+        {/* ACME 공인 인증서는 관리 › 보안·인증서에 있다(두 화면이 서로 가리킨다). */}
+        {perms.reads("certificate") && (
+          <p className="text-sm text-muted-foreground">
+            {t("cluster.acmeHint")}{" "}
+            <Link to="/settings/certificates" className="underline underline-offset-4">
+              {t("nav.group.admin")} › {t("nav.item.security")}
+            </Link>
+          </p>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <code className="rounded-md bg-muted px-2 py-1 text-xs break-all">{fingerprint}</code>
           <CopyButton text={fingerprint} label={t("cluster.copyFingerprint")} />

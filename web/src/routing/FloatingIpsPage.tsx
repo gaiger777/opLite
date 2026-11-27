@@ -76,7 +76,7 @@ function nicLabel(t: (key: string, values?: Record<string, unknown>) => string, 
 }
 
 /**
- * 인프라 › 네트워크 › 유동 IP(계획 66): 목록(주소·대상 VM·상태 칩)과 만들기·붙이기 대화상자. 붙이기는 라우팅되는 NIC만
+ * 네트워크 › 라우터·유동 IP › 유동 IP(계획 66): 목록(주소·대상 VM·상태 칩)과 만들기·붙이기 대화상자. 붙이기는 라우팅되는 NIC만
  * 고를 수 있고 막힌 NIC는 까닭과 함께 보인다.
  */
 export function FloatingIpsPage() {

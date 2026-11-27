@@ -39,7 +39,7 @@ function vmCount(plan: RecoveryPlan) {
 }
 
 /**
- * 데이터 보호 › DR(계획 76 §4): 복구 계획 목록 — 원천(원격), 보호 VM 수, RPO 지킴 막대, 마지막 시험의 RTO·결과, 도는 실행.
+ * 백업·복구 › DR(재해 복구)(계획 76 §4): 복구 계획 목록 — 원천(원격), 보호 VM 수, RPO 지킴 막대, 마지막 시험의 RTO·결과, 도는 실행.
  * 만들기는 루트 `cluster.admin`(`recovery-plan` 쓰기)이고 새 계획은 편집 화면(`/dr-plans/-new`)이다. 늦게 읽는 조각이다.
  */
 export function PlansPage() {

@@ -9,8 +9,10 @@ import {
   GROUPS,
   hitVisible,
   isFullWidth,
+  isLegacyPath,
   itemHome,
   LEGACY_REDIRECTS,
+  legacyTarget,
   navOf,
   pageVisible,
   readOpenGroups,
@@ -238,7 +240,7 @@ it.each([
       { label: "Storage folders" },
     ],
   ],
-  ["/cluster", [{ label: "Cluster & availability" }, { label: "Cluster (members, certificates)" }]],
+  ["/cluster", [{ label: "Cluster & availability" }, { label: "Cluster (members, CA)" }]],
   ["/cluster/map", [{ label: "Overview" }, { label: "Infrastructure map" }]],
   [
     "/vms/web%20db/edit",
@@ -286,4 +288,22 @@ it("finds VMware, OVA, drift and ACME words for the palette", () => {
   expect(words("history")).toContain("drift");
   expect(words("applySets")).toContain("yaml");
   expect(words("security", 1)).toContain("ACME");
+});
+
+it("sends the old infrastructure area to the first item the user can see (77-3 review)", () => {
+  const infra = LEGACY_REDIRECTS.find((r) => r.from === "/infra")!;
+  expect(legacyTarget(infra, gate("admin"))).toBe("/nodes");
+  // 노드를 못 읽는 폴더 사용자는 "권한 없음" 대신 스토리지의 첫 화면으로 간다.
+  expect(legacyTarget(infra, FOLDER_ONLY)).toBe("/storage-pools");
+  const tokens = LEGACY_REDIRECTS.find((r) => r.from === "/tokens")!;
+  expect(legacyTarget(tokens, FOLDER_ONLY)).toBe("/settings/tokens");
+});
+
+it("knows the old addresses so the shell does not deny them before redirecting", () => {
+  // `/settings/remotes`는 `/settings`(설정 읽기) 아래지만 넘기기 경로다.
+  expect(navOf("/settings/remotes")?.item.id).toBe("general");
+  expect(isLegacyPath("/settings/remotes")).toBe(true);
+  expect(isLegacyPath("/settings/remotes/")).toBe(true);
+  expect(isLegacyPath("/settings")).toBe(false);
+  expect(isLegacyPath("/remotes/-manage")).toBe(false);
 });

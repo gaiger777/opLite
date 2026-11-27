@@ -875,7 +875,7 @@ SSE는 없다. WebSocket 둘이다.
 
 - **스택.** React 19, Vite 8, react-router 7(지연 로딩 경로), TanStack Query 5, openapi-fetch, radix-ui/shadcn,
   Tailwind 4, i18next, uPlot(차트), noVNC(콘솔), vitest·msw·Playwright(`web/package.json`).
-- **화면(계획 61).** 영역 여섯(홈, VM, 인프라, 보호, 활동, 설정)과 영역 안 탭, ⌘K 명령 팔레트(`web/src/layout/nav.ts:39-132`,
+- **화면(계획 77).** 2단 사이드바(묶음 9개 + 관리 → 항목, 한 항목에 화면이 둘 이상이면 화면 안 탭)와 ⌘K 명령 팔레트(`web/src/layout/nav.ts:56-321`의 `GROUPS`·`LEGACY_REDIRECTS`,
   `web/src/palette/`).
 - **빌드와 내장.** `pnpm -C web build`가 `web/dist`를 만든다. orbivisord의 `web-ui` 기능이 rust-embed로 `$ORBIVISOR_WEB_DIST`
   (`crates/orbivisord/build.rs`가 `web/dist` 절대 경로로 정함)를 바이너리에 넣는다. 배포 빌드는 없으면 실패하고, 디버그
@@ -1715,7 +1715,7 @@ graph LR
   둔다. 알림 본문에 지도 경로(`/cluster/map?focus=port:<노드>/<포트>` — 웹훅 JSON은 `subject.map`)를 붙인다. 권하는 묶음 `link_default_rules`(`node-link-down` critical 30초, `bond-degraded` warning 60초)가
   `POST /alert-rules/link-defaults`이고 SDN 묶음과 같은 `create_default_rules`를 쓴다(같은 이름은 그대로). 조건 만들기·묶음은 기능
   `link-alerts`가 모든 노드에 있어야 한다.
-- **웹.** 홈(`web/src/pages/DashboardPage.tsx`)이 늦게 읽는 `dashboard/OperatorBoard`(지도·자세히 판·할당 표), 지도는 인프라 › 지도와 같은
+- **웹.** 홈(`web/src/pages/DashboardPage.tsx`)이 늦게 읽는 `dashboard/OperatorBoard`(지도·자세히 판·할당 표), 지도는 개요 › 인프라 지도와 같은
   `clusterMap/InfraMap`(`variant: home|page`)이고 네트워크 층(포트 줄·레일, `clusterMap/network.ts`·`netPaths.ts`·늦게 읽는 `netUi.tsx`)을
   더했다. `/capacity`가 409면 지난 홈이다.
 

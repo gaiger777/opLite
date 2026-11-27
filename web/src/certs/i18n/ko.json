@@ -1,6 +1,7 @@
 {
   "certs": {
     "pageHint": "ACME CA(Let's Encrypt·ZeroSSL·사내 step-ca)에서 API·웹 리스너의 공개 인증서를 받습니다. 리더가 주문하고 갱신하며, 노드는 다시 시작하지 않고 바꿔 끼웁니다.",
+    "caHint": "노드의 HTTPS 인증서를 서명하는 클러스터 CA(지문·내려받기)는 여기 있습니다:",
     "certificates": "인증서",
     "accounts": "ACME 계정",
     "dnsProviders": "DNS 공급자",

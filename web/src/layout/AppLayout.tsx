@@ -44,6 +44,7 @@ import {
   GROUPS,
   hitVisible,
   isFullWidth,
+  isLegacyPath,
   itemHome,
   navOf,
   visibleItems,
@@ -76,7 +77,7 @@ export function AppLayout() {
   // 숨긴 탭의 주소를 바로 열면(`/nodes` 등) 그 화면은 묻지 않는 목록을 끝없이 기다린다. 권한을 받은 뒤 안내로 바꾼다.
   const ready = usePermissionsReady();
   const hit = navOf(pathname);
-  const denied = ready && hit !== null && !hitVisible(hit, me.gate);
+  const denied = ready && hit !== null && !isLegacyPath(pathname) && !hitVisible(hit, me.gate);
   const { rail, toggle: toggleRail } = useRail();
   const [palette, setPalette] = useState(false);
   const [help, setHelp] = useState(false);

@@ -26,9 +26,9 @@ import { errorMessage } from "@/i18n/errors";
 import { type RemoteView, useRemotes } from "@/remotes/remotes";
 
 /**
- * 보호 › 원격 복제: 원격 클러스터의 상태 카드, 원격으로 사본을 보내는 백업 작업, 원격 VM 보기(카드의 이름)다.
- * 상태는 리더가 모은 것을 10초마다 다시 읽는다. 추가·고치기·지우기는 설정 › 원격 클러스터(`RemotesManagePage`)에
- * 있다.
+ * 백업·복구 › 원격 클러스터·복제 › 원격 복제: 원격 클러스터의 상태 카드, 원격으로 사본을 보내는 백업 작업, 원격 VM
+ * 보기(카드의 이름)다. 상태는 리더가 모은 것을 10초마다 다시 읽는다. 추가·고치기·지우기는 같은 항목의 원격 클러스터
+ * 탭(`RemotesManagePage`)에 있다.
  */
 export function RemotesPage() {
   const { t } = useTranslation();
@@ -51,17 +51,7 @@ export function RemotesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader
-        title={t("nav.replication")}
-        description={t("remotes.pageHint")}
-        actions={
-          admin && (
-            <Link to="/remotes/-manage" className="text-sm underline-offset-4 hover:underline">
-              {t("remotes.manage")}
-            </Link>
-          )
-        }
-      />
+      <PageHeader title={t("nav.replication")} description={t("remotes.pageHint")} />
       {!remotes.data ? (
         <ListPending error={remotes.error} />
       ) : remotes.data.length === 0 ? (

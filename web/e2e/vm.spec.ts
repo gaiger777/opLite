@@ -493,7 +493,7 @@ test("SDN is not set up: the empty state and the blocked SDN type", async ({ pag
 // 라우터·유동 IP(계획 66): 네트워크 탭의 보기이고, SDN 설정 전에는 빈 상태와 막힌 만들기다.
 test("routers and floating IPs before SDN is set up", async ({ page }) => {
   await signIn(page);
-  await openItem(page, "Networking", "Routers & public IPs");
+  await openItem(page, "Networking", "Routers & floating IPs");
   await expect(page).toHaveURL(/\/routers$/);
   await expect(page.getByText("No routers")).toBeVisible();
   await expect(
@@ -502,7 +502,7 @@ test("routers and floating IPs before SDN is set up", async ({ page }) => {
     ),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a router" })).toBeDisabled();
-  await openPageTab(page, "Routers & public IPs", "Floating IPs");
+  await openPageTab(page, "Routers & floating IPs", "Floating IPs");
   await expect(page).toHaveURL(/\/floating-ips$/);
   await expect(page.getByText("No floating IPs")).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a floating IP" })).toBeDisabled();

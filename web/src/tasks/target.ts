@@ -278,12 +278,12 @@ export function alertHref(subject: AlertSubject): string {
       return `/backups?q=${enc(subject.name)}`;
     case "backup_store":
       return `/backup-stores?open=${enc(subject.id)}`;
-    // 인증서·적용 묶음(계획 73): 설정 › 보안 › 인증서, 활동 › 감사 › 선언 묶음의 그 묶음
+    // 인증서·적용 묶음(계획 73): 관리 › 보안·인증서 › 인증서, 기록 › 코드로 관리(YAML)의 그 묶음
     case "certificate":
       return "/settings/certificates";
     case "apply_set":
       return `/apply-sets/${enc(subject.name)}`;
-    // 복구 계획(계획 76): 데이터 보호 › DR의 그 계획(개요 탭이 보호 상태·보고)
+    // 복구 계획(계획 76): 백업·복구 › DR(재해 복구)의 그 계획(개요 탭이 보호 상태·보고)
     case "recovery_plan":
       return `/dr-plans/${enc(subject.name)}`;
   }

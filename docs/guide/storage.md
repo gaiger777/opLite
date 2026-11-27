@@ -251,7 +251,7 @@ orbivisorctl ceph status                                     # health·검사·m
 orbivisorctl ceph osd list                                   # ID HOST DEVICE CLASS SIZE USED UP IN
 ```
 
-웹은 인프라 › **Ceph** 탭이다. Ceph가 없으면 빈 상태 안내가 보이고 admin은 "Ceph 설정 시작"으로 마법사(① init 노드와 망 — 노드 주소로 미리 채움, 위트니스·오프라인 노드
+웹은 스토리지 › **Ceph** 항목이다. Ceph가 없으면 빈 상태 안내가 보이고 admin은 "Ceph 설정 시작"으로 마법사(① init 노드와 망 — 노드 주소로 미리 채움, 위트니스·오프라인 노드
 막음 ② 만들기 진행(단계 목록, 실패하면 이유와 "다시 하기") ③ mon 더하기 ④ OSD — 노드마다 디스크 표 ⑤ 풀 ⑥ 클라이언트
 꾸러미, ③~⑥은 건너뛸 수 있음)를, 있으면 상태(health 배지와 검사, mon 정족수, mgr, 호스트별 OSD, PG 상태 막대, 사용량, 풀 표와
 Orbivisor 풀 링크, admin의 더하기·만들기 단추)를 10초마다 새로 읽어 보인다. 풀 화면은 관리 Ceph의 RBD 풀에 "Orbivisor Ceph"

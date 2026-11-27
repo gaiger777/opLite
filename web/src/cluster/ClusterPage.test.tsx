@@ -61,6 +61,10 @@ it("shows the CA and the members", async () => {
     "href",
     "/api/v1/cluster/ca",
   );
+  // 공인 인증서(ACME)는 관리 › 보안·인증서에 있다.
+  expect(
+    screen.getByRole("link", { name: "Administration › Security & certificates" }),
+  ).toHaveAttribute("href", "/settings/certificates");
   const table = screen.getByRole("table", { name: "Members" });
   expect(within(table).getByText("node-a").closest("tr")).toHaveTextContent("Leader");
   expect(within(table).getByText("node-b").closest("tr")).toHaveTextContent("(this node)");

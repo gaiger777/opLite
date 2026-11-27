@@ -283,13 +283,13 @@
       "images": "OS images",
       "isos": "ISO files",
       "imports": "Imports (OVA, ESXi)",
-      "vmware": "VMware migration",
+      "vmware": "VMware migration (copy while running)",
       "volumes": "Disks (volumes)",
       "securityGroups": "Firewall (security groups)",
-      "routing": "Routers & public IPs",
+      "routing": "Routers & floating IPs",
       "sdn": "SDN (virtual networks)",
       "topology": "Topology diagram",
-      "cluster": "Cluster (members, certificates)",
+      "cluster": "Cluster (members, CA)",
       "haGroups": "Automatic recovery (HA)",
       "haChecks": "Failure detection (HA checks)",
       "placement": "Placement rules & balancing",
@@ -315,7 +315,14 @@
     "search": "Find or run a command",
     "badgeAlerts": "{{n}} alerts ringing",
     "badgeFailedTasks": "{{n}} tasks failed in the last 24 hours",
-    "groupMenu": "{{group}} menu"
+    "groupMenu": "{{group}} menu",
+    "currentGroup": "current page",
+    "oldArea": {
+      "infra": "Infrastructure, infra",
+      "protect": "Protection, protect",
+      "activity": "Activity",
+      "settings": "Settings"
+    }
   },
   "header": {
     "language": "Language",
@@ -2043,6 +2050,7 @@
     "title": "Cluster {{name}}",
     "ca": "Certificate authority",
     "caNote": "Every node's HTTPS certificate is signed by the cluster CA. Import the CA into your browser to stop the certificate warning, and check that its fingerprint matches. Browsers show the SHA-256 fingerprint in uppercase hex, in pairs separated by colons or spaces; compare it with the hex after sha256: (letter case does not matter).",
+    "acmeHint": "To get or renew public certificates (ACME, Let's Encrypt) for the web UI, go to",
     "copyFingerprint": "Copy the CA fingerprint",
     "downloadCa": "Download the CA",
     "members": "Members",
@@ -2127,7 +2135,6 @@
       "token": "Enter an API token of the remote cluster.",
       "tokenAgain": "Enter the API token again: the URL or CA changed."
     },
-    "manage": "Manage remote clusters",
     "manageHint": "Add, change or remove the remote clusters this cluster can see. Their status and VMs are in the Remote replication tab.",
     "replicatingJobs": "Backup jobs that copy to remote clusters",
     "noReplicatingJobs": "No backup job copies to a remote cluster.",
@@ -4413,8 +4420,8 @@
       "removing": "removing",
       "saved": "Saved the SDN settings of {{name}}.",
       "noNode": "No node has physnet {{physnet}} ready",
-      "pickHint": "The name nodes link to a bridge under Nodes › node › SDN physical networks.",
-      "noneHint": "No node has a physical network yet. Add one on a node's page first (Nodes › node › SDN physical networks).",
+      "pickHint": "The name nodes link to a bridge under Cluster & availability › Nodes › a node's SDN physical networks.",
+      "noneHint": "No node has a physical network yet. Add one on a node's page first (Cluster & availability › Nodes › a node's SDN physical networks).",
       "vlanHint": "Optional, 1–4094. Without it the network is flat (untagged).",
       "mtuHint": "1280–9000. Defaults to 1500 (the physical network).",
       "errors": {
@@ -4549,7 +4556,7 @@
     "activeNow": "active",
     "standby": "standby",
     "noGateway": "No gateway node",
-    "gatewayError": "No gateway node has the physical network of {{network}} ready. The router's outside port stays off (no SNAT or floating IPs) until one has: set it under Nodes › node › SDN physical networks.",
+    "gatewayError": "No gateway node has the physical network of {{network}} ready. The router's outside port stays off (no SNAT or floating IPs) until one has: set it under Cluster & availability › Nodes › a node's SDN physical networks.",
     "liveError": "Could not read the active gateway from OVN: {{error}}",
     "hostingOutside": "Active now: {{node}}.",
     "upstreamHint": "These routes are not translated. The physical router needs them:",

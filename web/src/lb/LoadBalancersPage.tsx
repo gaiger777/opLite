@@ -114,7 +114,7 @@ export function HealthBar({ lb }: { lb: LoadBalancer }) {
 }
 
 /**
- * 인프라 › 네트워크 › 부하 분산(계획 67 §7): 목록(이름·VIP·바깥 VIP·리스너·멤버 건강 막대)과 서랍(리스너 표·멤버
+ * 네트워크 › 부하 분산(계획 67 §7): 목록(이름·VIP·바깥 VIP·리스너·멤버 건강 막대)과 서랍(리스너 표·멤버
  * 건강·보안 그룹 경고·바깥 VIP), 만들기·고치기 대화상자. SDN을 세우기 전에는 빈 상태와 안내만 보인다.
  */
 export function LoadBalancersPage() {
