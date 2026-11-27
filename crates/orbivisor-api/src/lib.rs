@@ -165,6 +165,8 @@ use crate::resources as r;
     servers((url = "/api/v1")),
     modifiers(&Security, &ManifestSchemas),
     security(("token" = []), ("session" = [])),
+    // 오류 본문 `details`에만 나오는 모양(계획 76 리뷰 2 — 웹이 타입으로 쓴다)
+    components(schemas(dr::PreflightProblem)),
 )]
 struct ApiDoc;
 
@@ -534,6 +536,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(dr::cancel_plan))
         .routes(routes!(dr::reprotect_plan))
         .routes(routes!(dr::fence_source))
+        .routes(routes!(dr::clear_fence))
         .routes(routes!(vm_exports::export_vm))
         .routes(routes!(r::list_vm_exports))
         .routes(routes!(r::get_vm_export, vm_exports::delete_export))

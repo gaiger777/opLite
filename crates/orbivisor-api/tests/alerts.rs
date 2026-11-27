@@ -2276,6 +2276,7 @@ async fn dr_run(env: &Env, plan: Uuid, plan_name: &str, name: &str, state: &str,
             max_parallel: 4,
             cleanup: None,
             allow_missing: false,
+            skip_vms: Vec::new(),
             point_in_time: None,
         },
     );

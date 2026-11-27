@@ -89,12 +89,16 @@ pub struct RestoreRequest {
     /// cloud-init DNS(계획 76 §3.3 — 복구 계획 IP 규칙의 `dns`). 주면 새 VM의 cloud-init `dns`를 이것으로 바꾼다.
     #[serde(default)]
     pub cloud_init_dns: Option<CloudInitDns>,
+    /// 새 VM에 처음부터 달 라벨(DR 엔진만 — 요청 본문에는 없다, 계획 76 리뷰 2)
+    #[serde(skip)]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl RestoreRequest {
     /// 복원 맵(계획 76 §3.3 — 기능 `restore-remap`)을 쓰는지
     fn remaps(&self) -> bool {
-        !self.networks.is_empty()
+        !self.labels.is_empty()
+            || !self.networks.is_empty()
             || !self.security_groups.is_empty()
             || self.cloud_init_networks.is_some()
             || self.cloud_init_dns.is_some()
@@ -867,6 +871,7 @@ pub(crate) async fn start_restore(
         security_groups: std::mem::take(&mut req.security_groups),
         cloud_init_networks: req.cloud_init_networks.take(),
         cloud_init_dns: req.cloud_init_dns.take(),
+        labels: std::mem::take(&mut req.labels),
     };
     remap
         .check(&backup.spec.vm_spec)

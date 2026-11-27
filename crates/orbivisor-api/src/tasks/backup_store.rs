@@ -1243,6 +1243,10 @@ pub(super) async fn restore(
     new.id = task.spec.target;
     new.spec.folder = folder;
     let strict = apply_remap(ctx, &mut new.spec, remap)?;
+    // 엔진이 준 라벨(DR 계획·실행)은 VM이 생기는 때부터 단다.
+    if let Some(r) = remap {
+        new.labels.extend(r.labels.clone());
+    }
     let (store_ref, m_ref, sn) = (&store, &m, &store_name);
     let blob = |n: &'static str| async move {
         store_ref

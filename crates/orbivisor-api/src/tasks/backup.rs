@@ -1103,6 +1103,10 @@ pub(super) async fn restore(
     // 폴더는 API가 정했다(백업한 VM의 폴더가 지워졌으면 루트).
     new.spec.folder = folder;
     let strict = apply_remap(ctx, &mut new.spec, remap)?;
+    // 엔진이 준 라벨(DR 계획·실행)은 VM이 생기는 때부터 단다.
+    if let Some(r) = remap {
+        new.labels.extend(r.labels.clone());
+    }
     if manifest.uefi_vars
         && let Some(state) = &ctx.config.state_dir
     {

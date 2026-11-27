@@ -6,9 +6,11 @@
 //!   이름·복구 지점의 복원 Task, 같은 VM의 시작 Task(실행이 시작된 뒤 만든 것 — 단계 시각이 아니라 실행 시작 시각으로 본다:
 //!   저장하지 못한 단계는 새 리더가 지금 시각으로 다시 들기 때문), 운영 쪽은 실행마다 정한 백업 이름(409 `name_taken`이면
 //!   그 백업)과 이미 이 클러스터로 가는 사본. 그래서 기록을 저장하기 전에 리더가 바뀌어도 같은 일을 두 번 하지 않는다.
-//! - 되살린 VM: 복원 Task를 내면 그 대상 id(새 VM id)를 단계에 적고, 그 VM이 생기면 라벨(`orbivisor.io/dr`·
-//!   `orbivisor.io/dr-test` = 계획)이 붙을 때까지 틱마다 단다(실행은 라벨이 붙어야 끝난다). 장애 조치가 끊은 시험의 VM도
-//!   (그 시험이 끝난 뒤에) 단다.
+//! - 되살린 VM: 복원 Task가 VM을 만들 때 라벨(`orbivisor.io/dr`·`orbivisor.io/dr-test` = 계획, `orbivisor.io/dr-run` = 실행
+//!   id)을 함께 단다(리뷰 2 — 라벨 없는 틈이 없다). 이미 낸 복원 Task는 실행 라벨로 찾는다(다른 계획·실행의 Task를 집지
+//!   않는다). 그 대상 id(새 VM id)를 단계에 적고, 라벨이 빠졌으면 틱마다 다시 단다(실행은 라벨이 붙어야 끝난다). 장애 조치가
+//!   끊은 시험의 VM도 (그 시험이 끝난 뒤에) 달고, 켜진 시험 VM은 곧 끈다. 실패한 복원이 남긴 VM(라이브 복원)은 다시 복원하기
+//!   전에 지운다(라이브 복원 취소 `discard`).
 //!   `ha`는 복원이 늘 뺀다. 시험 폴더 `dr-test/<plan>`는 없으면 만들고, 계획의 `folder`(장애 조치)가 없으면 복원 기본(이곳에
 //!   있는 백업한 VM의 폴더, 아니면 루트)에 둔다(경고 로그).
 //! - 거품 네트워크: 라우터·업링크 없는 SDN 네트워크. 서브넷은 본뜰 DR 네트워크(`like`)의 서브넷(유동 IP 풀·IPv6 알리기
@@ -39,9 +41,9 @@ use orbivisor_types::auth::Role;
 use orbivisor_types::backup::BackupSpec;
 use orbivisor_types::cloud_init::{CloudInitDns, CloudInitNet};
 use orbivisor_types::dr::{
-    self, DR_LABEL, DR_TEST_LABEL, DrAction, DrObservation, DrPhase, DrResult, DrRun, DrRunKind,
-    DrRunSpec, DrRunStatus, DrWait, ERR_NAME_TAKEN, LastTest, RecoveryPlanSpec, RecoveryPlanStatus,
-    SourceBackup, SourceObservation, TaskOutcome, VmObservation,
+    self, DR_LABEL, DR_RUN_LABEL, DR_TEST_LABEL, DrAction, DrObservation, DrPhase, DrResult, DrRun,
+    DrRunKind, DrRunSpec, DrRunStatus, DrWait, ERR_NAME_TAKEN, LastTest, RecoveryPlanSpec,
+    RecoveryPlanStatus, SourceBackup, SourceObservation, TaskOutcome, VmObservation,
 };
 use orbivisor_types::folder::{FolderKind, FolderSpec, parse_folder_path};
 use orbivisor_types::network::{NetworkSpec, SdnNet, Subnet};
@@ -151,9 +153,11 @@ async fn tick(state: &Arc<AppState>) {
             tracing::warn!(run = %run.name, error = %e, "DR run step failed");
         }
     }
-    // 장애 조치가 끊은 시험: 그때 돌던 복원 Task가 끝나 만든 VM에도 시험 라벨을 단다(뒷정리가 찾게).
+    // 장애 조치가 끊은 시험: 그때 돌던 복원 Task가 끝나 만든 VM에도 시험 라벨을 달고(뒷정리가 찾게), 켜진 시험 VM은 곧
+    // 끈다(장애 조치에 자원을 넘김 — 지우기는 장애 조치 뒤의 뒷정리, 리뷰 2).
     for run in runs.iter().filter(|r| r.status.preempted) {
         label_restored(cluster, run).await;
+        stop_preempted(state, run).await;
     }
     // 끝난 실행을 계획에 적지 못했으면(리더가 바뀜) 여기서 마저 한다.
     let Ok((_, plans)) = cluster.list::<RecoveryPlanSpec>() else {
@@ -234,6 +238,25 @@ async fn save(cluster: &Cluster, run: &DrRun, next: &mut DrRunStatus) -> bool {
                 let Ok(Some(fresh)) = cluster.get::<DrRunSpec>(run.id) else {
                     return false;
                 };
+                // 장애 조치가 이 시험을 끊었다(API가 끝난 상태로 씀): 이번 걸음이 낸 복원 Task·VM을 그 기록에 옮겨 적는다
+                // (리뷰 2 — 버리면 기록도 라벨도 없는 시험 VM이 남는다). 나머지는 끊은 상태 그대로.
+                if fresh.status.preempted && !base.preempted {
+                    let mut merged = fresh.status.clone();
+                    for (m, n) in merged.steps.iter_mut().zip(&next.steps) {
+                        if m.vm_id.is_none() && n.vm_id.is_some() {
+                            m.vm_id = n.vm_id;
+                            m.task = n.task;
+                            m.new_vm.clone_from(&n.new_vm);
+                        }
+                    }
+                    if merged == fresh.status {
+                        return false;
+                    }
+                    *next = merged;
+                    base = fresh.status;
+                    revision = fresh.revision;
+                    continue;
+                }
                 let mut same = fresh.status.clone();
                 same.cancel_requested = base.cancel_requested;
                 if same != base {
@@ -303,6 +326,9 @@ async fn observe(
         .flat_map(|s| s.task.into_iter().chain(s.copy_task))
     {
         if let Some(task) = cluster.get::<TaskSpec>(t).map_err(err)? {
+            if task.status.state == TaskState::Running {
+                obs.running_tasks.insert(t);
+            }
             obs.tasks
                 .insert(t, outcome(task.status.state, task.status.error.clone()));
         }
@@ -372,7 +398,10 @@ async fn observe(
     {
         match source.observe(&run.status).await {
             Ok(o) => obs.source = Some(o),
-            Err(e) => obs.source_error = Some(e),
+            Err((denied, e)) => {
+                obs.source_error = Some(e);
+                obs.source_denied = denied;
+            }
         }
     }
     Ok(obs)
@@ -409,6 +438,30 @@ async fn label_restored(cluster: &Cluster, run: &DrRun) {
     }
 }
 
+/// 끊은 시험이 만든 시험 VM(기록한 id, 시험 라벨이 이 계획) 가운데 켜진 것을 강제로 끈다(끄는 Task가 이미 있으면 그대로).
+async fn stop_preempted(state: &Arc<AppState>, run: &DrRun) {
+    let cluster = &state.cluster;
+    for id in run.status.steps.iter().filter_map(|s| s.vm_id) {
+        let Ok(Some(vm)) = cluster.get::<VmSpec>(id) else {
+            continue;
+        };
+        if vm.labels.get(DR_TEST_LABEL) != Some(&run.spec.plan_name) || is_stopped(&vm) {
+            continue;
+        }
+        let stopping = |t: &orbivisor_types::task::Task| {
+            t.spec.target == vm.id
+                && matches!(t.spec.op, TaskOp::VmStop | TaskOp::VmForceStop)
+                && !t.status.state.is_finished()
+        };
+        if matches!(task_since(cluster, None, stopping), Ok(Some(_))) {
+            continue;
+        }
+        if let Err(e) = power(state, &vm, "stop", StopMode::Force).await {
+            tracing::info!(vm = %vm.name, error = %e, "cannot stop the test VM of a preempted test yet; will retry");
+        }
+    }
+}
+
 // ---- 할 일 ----
 
 async fn act(
@@ -436,6 +489,9 @@ async fn act(
             .unwrap_or_else(failed),
         DrAction::Start { vm, .. } => Box::pin(start(state, run, vm)).await.unwrap_or_else(failed),
         DrAction::DeleteVm { vm, id, .. } => Box::pin(delete_vm(state, run, vm, *id))
+            .await
+            .unwrap_or_else(failed),
+        DrAction::DiscardVm { id, .. } => Box::pin(discard_vm(state, run, *id))
             .await
             .unwrap_or_else(failed),
         DrAction::DeleteNetwork { name, .. } => delete_network(state, run, name)
@@ -566,32 +622,51 @@ async fn restore(
         security_groups,
         ip,
         live,
+        label,
         ..
     } = action
     else {
         return Err("not a restore".into());
     };
     let cluster = &state.cluster;
+    let tag = run.id.to_string();
+    // 이 실행이 낸 복원 Task만(실행 라벨 — 다른 계획·실행이 같은 이름·사본으로 낸 Task는 집지 않는다, 리뷰 2)
     let same = |t: &orbivisor_types::task::Task| match &t.spec.op {
         TaskOp::BackupRestore {
-            backup: b, name: n, ..
+            backup: b,
+            name: n,
+            remap,
+            ..
         }
         | TaskOp::BackupLiveRestore {
-            backup: b, name: n, ..
-        } => b == backup && n == name,
+            backup: b,
+            name: n,
+            remap,
+            ..
+        } => {
+            b == backup
+                && n == name
+                && remap
+                    .as_ref()
+                    .is_some_and(|r| r.labels.get(DR_RUN_LABEL) == Some(&tag))
+        }
         _ => false,
     };
     if let Some(t) = task_since(cluster, Some(run), same)? {
         return Ok(restored(cluster, t));
     }
-    // 부분 실패 뒤 장애 조치를 다시 돌림: 지난번에 이 계획이 되살린 VM(장애 조치 라벨)은 그대로 둔다(`skipped`).
+    // 부분 실패 뒤 장애 조치를 다시 돌림: 지난번에 이 계획이 되살린 VM(장애 조치 라벨)은 다시 만들지 않는다 — 지난 실행에서
+    // `ready`였으면 건너뛰고, 아니면 이어 받아 켠다(리뷰 2).
     if run.spec.kind.is_failover()
         && let Some(vm) = cluster
             .get_by_name::<VmSpec>(name)
             .map_err(|e| e.to_string())?
         && vm.labels.get(DR_LABEL) == Some(&run.spec.plan_name)
     {
-        return Ok(DrResult::Done);
+        return Ok(DrResult::Existing {
+            vm: vm.id,
+            ready_before: ready_before(cluster, run, vm.id)?,
+        });
     }
     let Some(b) = obs.backups.iter().find(|b| b.id == *backup) else {
         return Err(format!("recovery point {backup} is gone"));
@@ -648,6 +723,12 @@ async fn restore(
             .collect(),
         cloud_init_networks,
         cloud_init_dns,
+        // VM이 생기는 때부터 계획·실행 라벨(리뷰 2 — 라벨 없는 틈이 없다)
+        labels: [
+            (label.0.clone(), label.1.clone()),
+            (DR_RUN_LABEL.to_string(), tag.clone()),
+        ]
+        .into(),
     };
     match start_restore(state, None, b, req).await {
         Ok(task) => Ok(DrResult::Restored {
@@ -656,6 +737,21 @@ async fn restore(
         }),
         Err(e) => Err(api_error(e)),
     }
+}
+
+/// VM `vm`이 이 계획의 지난 장애 조치 실행에서 `ready`였는지(되살린 것으로 셌는지)
+fn ready_before(cluster: &Cluster, run: &DrRun, vm: Uuid) -> Result<bool, String> {
+    let (_, runs) = cluster.list::<DrRunSpec>().map_err(|e| e.to_string())?;
+    Ok(runs
+        .iter()
+        .filter(|r| r.spec.plan == run.spec.plan && r.id != run.id && r.spec.kind.is_failover())
+        .flat_map(|r| &r.status.steps)
+        .any(|s| {
+            s.vm_id == Some(vm)
+                && (s.phase == DrPhase::Ready
+                    || (s.phase == DrPhase::Skipped
+                        && s.error.as_deref() == Some("already recovered by this plan")))
+        }))
 }
 
 /// 이미 낸 복원 Task와 그 대상 VM id
@@ -676,6 +772,10 @@ async fn start(state: &Arc<AppState>, run: &DrRun, name: &str) -> Result<DrResul
         .get_by_name::<VmSpec>(name)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("VM {name} is gone"))?;
+    // 이어 받은 VM이 이미 켜져 있다.
+    if vm.status.phase == VmPhase::Running {
+        return Ok(DrResult::Done);
+    }
     if let Some(t) = task_since(cluster, Some(run), |t| {
         t.spec.target == vm.id && t.spec.op == TaskOp::VmStart
     })? {
@@ -723,7 +823,41 @@ async fn delete_vm(
             run.spec.plan_name, run.spec.plan_name
         ));
     }
-    if !is_stopped(&vm) {
+    remove_vm(state, &vm).await
+}
+
+/// 실패한 복원이 남긴 VM(이 실행이 만든 것 — 실행 라벨 `orbivisor.io/dr-run`)을 다시 복원하기 전에 지운다(리뷰 2). 라이브
+/// 복원이 남긴 VM은 라이브 복원 취소(`discard` — 오버레이·헬퍼·대상 볼륨을 함께 치움)로, 그 밖은 끄고 지운 뒤 디스크도
+/// 지운다. 이미 없으면 `Done`. 상태 기계는 VM이 없어질 때까지 다시 부른다.
+async fn discard_vm(state: &Arc<AppState>, run: &DrRun, id: Uuid) -> Result<DrResult, String> {
+    let cluster = &state.cluster;
+    let Some(vm) = cluster.get::<VmSpec>(id).map_err(|e| e.to_string())? else {
+        return Ok(DrResult::Done);
+    };
+    if vm.labels.get(dr::DR_RUN_LABEL) != Some(&run.id.to_string()) {
+        return Err(format!(
+            "VM {} was not made by this run (no label {}={}); not deleting it",
+            vm.name,
+            dr::DR_RUN_LABEL,
+            run.id
+        ));
+    }
+    if let Some(lr) = &vm.status.live_restore {
+        if lr.cancel {
+            return Ok(DrResult::Done);
+        }
+        return crate::tasks::live_restore::request_cancel(cluster, vm.id)
+            .await
+            .map(DrResult::Task);
+    }
+    remove_vm(state, &vm).await
+}
+
+/// VM을 끄고(켜져 있으면 끄는 Task) 지운 뒤 그 디스크를 지운다.
+async fn remove_vm(state: &Arc<AppState>, vm: &Vm) -> Result<DrResult, String> {
+    let cluster = &state.cluster;
+    let name = vm.name.as_str();
+    if !is_stopped(vm) {
         let stopping = |t: &orbivisor_types::task::Task| {
             t.spec.target == vm.id
                 && matches!(t.spec.op, TaskOp::VmStop | TaskOp::VmForceStop)
@@ -732,7 +866,7 @@ async fn delete_vm(
         if let Some(t) = task_since(cluster, None, stopping)? {
             return Ok(DrResult::Task(t));
         }
-        return power(state, &vm, "stop", StopMode::Force).await;
+        return power(state, vm, "stop", StopMode::Force).await;
     }
     let volumes: Vec<String> = vm.spec.disks.iter().map(|d| d.volume.clone()).collect();
     crate::vms::delete_vm(
@@ -951,24 +1085,37 @@ pub(super) async fn settle(cluster: &Cluster, run: &DrRun) {
                 });
             }
         }
-        // 재해 장애 조치로 되살린 VM: 운영 쪽이 돌아오면 두 벌이 될 수 있다(fence-source가 비운다).
+        // 재해 장애 조치로 되살린 VM: 운영 쪽이 돌아오면 두 벌이 될 수 있다(fence-source·clear-fence가 비운다). 이 실행이
+        // 만들었거나 이어 받아 지금 있는 VM 모두(단계와 상관없이 — 켜지 못한 VM도 사람이 켤 수 있다, 리뷰 2), 운영 쪽 VM id
+        // (복구 지점 백업의 `spec.vm`)와 원격의 CA 지문과 함께.
         if run.spec.kind == DrRunKind::FailoverDisaster {
-            let recovered: Vec<String> = run
-                .status
-                .steps
-                .iter()
-                .filter(|s| {
-                    s.phase == DrPhase::Ready || (s.vm_id.is_some() && s.phase == DrPhase::TimedOut)
-                })
-                .map(|s| s.vm.clone())
-                .collect();
-            if !recovered.is_empty() {
-                let mut all = status.source_fence_pending.clone();
-                all.extend(recovered);
-                all.sort();
-                all.dedup();
-                status.source_fence_pending = all;
+            let ca = cluster
+                .get_by_name::<RemoteSpec>(&run.spec.plan_spec.source)
+                .ok()
+                .flatten()
+                .map(|r| r.spec.ca_fingerprint);
+            let mut all = status.source_fence_pending.clone();
+            for st in &run.status.steps {
+                let Some(id) = st.vm_id else { continue };
+                if !matches!(cluster.get::<VmSpec>(id), Ok(Some(_))) {
+                    continue;
+                }
+                let source_id = st
+                    .backup_id
+                    .and_then(|b| cluster.get::<BackupSpec>(b).ok().flatten())
+                    .map(|b| b.spec.vm);
+                let entry = dr::FencePending {
+                    vm: st.vm.clone(),
+                    source_id,
+                    ca_fingerprint: ca.clone(),
+                };
+                match all.iter_mut().find(|f| f.vm == entry.vm) {
+                    Some(f) => *f = entry,
+                    None => all.push(entry),
+                }
             }
+            all.sort_by(|a, b| a.vm.cmp(&b.vm));
+            status.source_fence_pending = all;
         }
         if status == plan.status {
             return;
@@ -1166,8 +1313,9 @@ impl SourceSide {
         Ok(found)
     }
 
-    /// 운영 쪽 관찰: VM이 꺼졌는지, 실행이 뜬 백업의 상태와 이 클러스터로 가는 사본. 하나라도 읽지 못하면 그 까닭(기다림).
-    async fn observe(&mut self, status: &DrRunStatus) -> Result<SourceObservation, String> {
+    /// 운영 쪽 관찰: VM이 꺼졌는지, 실행이 뜬 백업의 상태와 이 클러스터로 가는 사본. 하나라도 읽지 못하면 그 까닭(기다림)과
+    /// 거절(401·403 — 토큰이 만료·취소됨: 다시 해도 같다)인지.
+    async fn observe(&mut self, status: &DrRunStatus) -> Result<SourceObservation, (bool, String)> {
         let result: Result<SourceObservation, RemoteError> = async {
             let vms = self.get("/vms").await?;
             let mut out = SourceObservation::default();
@@ -1232,7 +1380,10 @@ impl SourceSide {
         .await;
         result.map_err(|e| {
             tracing::info!(error = %e, "cannot read the source cluster; waiting");
-            e.to_string()
+            (
+                matches!(e, RemoteError::Status(401 | 403, _)),
+                e.to_string(),
+            )
         })
     }
 
@@ -1262,6 +1413,10 @@ impl SourceSide {
             Ok(_) => DrResult::Done,
             Err((Some(409), code, _)) if code == "vm_running" || code == "already_running" => {
                 DrResult::Done
+            }
+            // 이 실행이 낸 운영 쪽 백업이 아직 돈다 등: 운영 쪽은 살아 있다 — 다시 한다(리뷰 2).
+            Err((Some(409), code, e)) if code == "vm_busy" => {
+                DrResult::Busy(format!("starting the source VM {vm}: {e}"))
             }
             Err(e) => classify(&format!("starting the source VM {vm}"), e),
         }

@@ -375,6 +375,19 @@ async fn plans_are_checked() {
     }))
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 한 VM은 한 계획에만(리뷰 2): 같은 원격의 db1을 다른 계획에 넣으면 409, 같은 계획을 고치는 것은 된다.
+    let got = post({
+        let mut q = plan("q");
+        q["spec"]["groups"] = json!([{ "name": "x", "vms": [ { "vm": "db1" } ] }]);
+        q
+    })
+    .await;
+    assert_error(&got, StatusCode::CONFLICT, "dr_vm_in_other_plan");
+    assert_eq!(got.1["details"], json!({ "vm": "db1", "plan": "p" }));
+    let (status, body) = admin
+        .put("/dr-plans/p", json!({ "spec": plan("p")["spec"] }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     // 모든 노드가 dr-plans를 알아야 쓴다(이름 검사·검증·키 찾기보다 먼저).
     set_dr(&env, false).await;
@@ -509,6 +522,7 @@ async fn finished_run(
             max_parallel: 4,
             cleanup: None,
             allow_missing: false,
+            skip_vms: Vec::new(),
             point_in_time: None,
         },
     );
@@ -856,14 +870,51 @@ async fn actions_check_the_request_and_make_run_records() {
         .await;
     assert_error(&got, StatusCode::BAD_REQUEST, "dr_missing_recovery_points");
     assert_eq!(got.1["details"]["vms"], json!(["db1", "web1"]));
+    // `skip_vms`(리뷰 2): 고른 VM만 건너뛴다 — 고르지 않은 VM에 그 시각의 사본이 없으면 그대로 400, 계획에 없는 이름도 400.
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier", "point_in_time": now() - 3600, "skip_vms": ["db1"] }),
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "dr_missing_recovery_points");
+    assert_eq!(got.1["details"]["vms"], json!(["web1"]));
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "disaster", "confirm": "web-tier", "skip_vms": ["nope"] }),
+        )
+        .await;
+    assert_eq!(got.0, StatusCode::BAD_REQUEST, "{}", got.1);
+    // 보고는 그 시각 기준으로 센다(웹의 대화상자).
+    let (_, at) = admin
+        .get(&format!(
+            "/dr-plans/web-tier/report?point_in_time={}",
+            now() - 3600
+        ))
+        .await;
+    assert_eq!(at["point_in_time"], now() - 3600, "{at}");
+    assert_eq!(at["protection"][1]["vm"], "web1");
+    assert_eq!(at["protection"][1]["issue"], "no-recovery-point", "{at}");
+    let (_, plain) = admin.get("/dr-plans/web-tier/report").await;
+    assert!(plain["protection"][1]["backup"].is_string(), "{plain}");
+    // 계획된 이전에 복구 지점 고르기는 400(막 뜬 사본을 쓴다)
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "planned", "confirm": "web-tier", "point_in_time": now() }),
+        )
+        .await;
+    assert_eq!(got.0, StatusCode::BAD_REQUEST, "{}", got.1);
     let (status, fo) = admin
         .post(
             "/dr-plans/web-tier/actions/failover",
-            json!({ "mode": "disaster", "confirm": "web-tier", "allow_missing": true }),
+            json!({ "mode": "disaster", "confirm": "web-tier", "skip_vms": ["db1"] }),
         )
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{fo}");
     assert_eq!(fo["spec"]["kind"], "failover-disaster");
+    assert_eq!(fo["spec"]["skip_vms"], json!(["db1"]));
     assert_eq!(fo["status"]["steps"][0]["phase"], "skipped");
     assert_eq!(fo["status"]["steps"][1]["phase"], "pending");
     finish(&env, &fo["id"], DrRunState::Partial).await;
@@ -989,6 +1040,48 @@ async fn planned_failovers_check_the_source_before_stopping_anything() {
         got.1
     );
     assert!(env.cluster.list::<DrRunSpec>().unwrap().1.is_empty());
+    // DR 쪽도 본다(리뷰 2): 운영 쪽 db1의 지금 NIC(prod-lan)가 이 클러스터에 없고, 이 클러스터에 이 계획이 되살리지 않은 web1이
+    // 있다.
+    let prod_admin = prod.admin().await;
+    let (status, body) = prod_admin
+        .post(
+            "/networks",
+            json!({ "name": "prod-lan", "spec": { "bridge": "vmbr7" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut db1 = common::vm_request("db1");
+    db1["spec"]["nics"] = json!([{ "network": "prod-lan", "model": "virtio" }]);
+    let (status, body) = prod_admin.post("/vms", db1).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin.post("/vms", common::vm_request("web1")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let got = admin
+        .post(
+            "/dr-plans/web-tier/actions/failover",
+            json!({ "mode": "planned", "confirm": "web-tier" }),
+        )
+        .await;
+    assert_error(&got, StatusCode::CONFLICT, "dr_planned_preflight");
+    let codes: Vec<(&str, Option<&str>)> = got.1["details"]["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["code"].as_str().unwrap(), p["vm"].as_str()))
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            ("no_remote_here", None),
+            ("no_backup_pool", Some("db1")),
+            ("vm_missing", Some("web1")),
+            ("no_receiving_pool", None),
+            ("dr_readiness", Some("db1")),
+            ("dr_name_taken", Some("web1")),
+        ],
+        "{}",
+        got.1
+    );
     // viewer 토큰이면 그것도 문제다(운영 쪽 복제는 admin).
     let viewer = prod.user("viewer", "viewer").await;
     let remote = env
@@ -1358,6 +1451,13 @@ async fn settled(env: &Env, name: &str) -> orbivisor_types::dr::RecoveryPlanStat
     plan_status(env, name)
 }
 
+fn fence_names(st: &orbivisor_types::dr::RecoveryPlanStatus) -> Vec<&str> {
+    st.source_fence_pending
+        .iter()
+        .map(|f| f.vm.as_str())
+        .collect()
+}
+
 fn plan_status(env: &Env, name: &str) -> orbivisor_types::dr::RecoveryPlanStatus {
     env.cluster
         .get_by_name::<RecoveryPlanSpec>(name)
@@ -1670,6 +1770,11 @@ async fn a_disaster_failover_uses_source_names_and_maps() {
     assert_eq!(done.status.steps[1].phase, DrPhase::Ready);
     let web = vm_named(&env, "web1").unwrap();
     assert_eq!(web.labels[DR_LABEL], "web-tier");
+    // 라벨은 복원 Task가 VM을 만들 때 함께 단다(실행 라벨과 함께 — 리뷰 2).
+    assert_eq!(
+        web.labels[orbivisor_types::dr::DR_RUN_LABEL],
+        done.id.to_string()
+    );
     assert_eq!(web.spec.folder, None);
     assert_eq!(web.spec.nics[0].network, "dr-lan");
     assert_eq!(
@@ -1681,7 +1786,21 @@ async fn a_disaster_failover_uses_source_names_and_maps() {
     let st = settled(&env, "web-tier").await;
     assert_eq!(st.run, None);
     assert!(st.last_test.is_none());
-    assert_eq!(st.source_fence_pending, ["web1"]);
+    assert_eq!(fence_names(&st), ["web1"]);
+    // 운영 쪽 VM id(복구 지점 백업의 `spec.vm`)와 원격의 CA 지문을 함께 적는다(리뷰 2).
+    let web_backup = env
+        .cluster
+        .get::<orbivisor_types::backup::BackupSpec>(done.status.steps[1].backup_id.unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        st.source_fence_pending[0].source_id,
+        Some(web_backup.spec.vm)
+    );
+    assert_eq!(
+        st.source_fence_pending[0].ca_fingerprint.as_deref(),
+        Some(CA)
+    );
     // 부분 실패 뒤 다시 돌리면 이 계획이 되살린 VM(web1)은 그대로 두고(`skipped`) 나머지만 다시 한다.
     let (status, again) = admin
         .post(
@@ -1908,6 +2027,10 @@ async fn a_failover_preempts_a_running_test() {
     let cut = run_of(&env, &test["id"]);
     assert_eq!(cut.status.state, DrRunState::Cancelled);
     assert!(cut.status.preempted);
+    assert_eq!(
+        cut.status.preempted_by.map(|r| r.to_string()),
+        fo["id"].as_str().map(str::to_string)
+    );
     assert!(cut.status.steps.iter().all(|s| s.phase.is_terminal()));
     assert_eq!(
         plan_status(&env, "web-tier").run.map(|r| r.to_string()),
@@ -1942,7 +2065,7 @@ async fn a_failover_preempts_a_running_test() {
     assert_eq!(vm_named(&env, "db1").unwrap().labels[DR_LABEL], "web-tier");
     // 재해 장애 조치로 되살린 VM은 운영 쪽에서 멈출 때까지 목록에 남는다.
     assert_eq!(
-        settled(&env, "web-tier").await.source_fence_pending,
+        fence_names(&settled(&env, "web-tier").await),
         ["db1", "web1"]
     );
 }
@@ -1986,8 +2109,25 @@ async fn fence_source_stops_the_recovered_vms_on_the_returned_source() {
         .get_by_name::<RecoveryPlanSpec>("web-tier")
         .unwrap()
         .unwrap();
+    // 운영 쪽에 web2(장애 조치 때와 다른 VM — 되돌리기로 새로 만든 것처럼)와 web1(id가 맞음)이 있다.
+    let (status, vm2) = prod_admin.post("/vms", common::vm_request("web2")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm2}");
+    let task = prod_admin.act("web2", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let web1_id: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
     let mut st = plan.status.clone();
-    st.source_fence_pending = vec!["db1".into(), "web1".into()];
+    let entry =
+        |vm: &str, id: Option<Uuid>, ca: Option<String>| orbivisor_types::dr::FencePending {
+            vm: vm.into(),
+            source_id: id,
+            ca_fingerprint: ca,
+        };
+    let ca = Some(prod.ca_fingerprint());
+    st.source_fence_pending = vec![
+        "db1".into(),
+        entry("web1", Some(web1_id), ca.clone()),
+        entry("web2", Some(Uuid::now_v7()), ca.clone()),
+    ];
     env.cluster
         .update_status::<RecoveryPlanSpec>(plan.id, &st)
         .await
@@ -1998,8 +2138,13 @@ async fn fence_source_stops_the_recovered_vms_on_the_returned_source() {
     assert_eq!(status, StatusCode::OK, "{got}");
     assert_eq!(got["pending"], json!([]), "{got}");
     assert_eq!(got["results"][0]["vm"], "db1");
-    assert_eq!(got["results"][0]["error"], "not on the source cluster");
+    assert_eq!(got["results"][0]["result"], "not_found");
+    assert_eq!(got["results"][1]["result"], "stopped");
     assert_eq!(got["results"][1]["ok"], true);
+    assert_eq!(got["results"][2]["result"], "different_vm", "{got}");
+    // 같은 이름의 다른 VM은 끄지 않는다.
+    let web2 = prod.cluster.get_by_name::<VmSpec>("web2").unwrap().unwrap();
+    assert_eq!(web2.spec.power, orbivisor_types::vm::PowerState::Running);
     let source_vm = prod.cluster.get_by_name::<VmSpec>("web1").unwrap().unwrap();
     assert_eq!(
         source_vm.spec.power,
@@ -2012,6 +2157,37 @@ async fn fence_source_stops_the_recovered_vms_on_the_returned_source() {
     );
     let (_, report) = admin.get("/dr-plans/web-tier/report").await;
     assert!(report.get("source_fence_pending").is_none(), "{report}");
+    // 원격이 장애 조치 때와 다른 클러스터를 가리키면 끄지 않고 목록에 둔다 — 운영자가 확인한 뒤 clear-fence로 비운다.
+    let mut st = plan_status(&env, "web-tier");
+    st.source_fence_pending = vec![entry("web2", None, Some("sha256:other".into()))];
+    env.cluster
+        .update_status::<RecoveryPlanSpec>(plan.id, &st)
+        .await
+        .unwrap();
+    let (status, got) = admin
+        .post("/dr-plans/web-tier/actions/fence-source", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["results"][0]["result"], "different_cluster", "{got}");
+    assert_eq!(got["pending"][0]["vm"], "web2", "{got}");
+    let viewer = env.user("viewer2", "viewer").await;
+    let (status, _) = viewer
+        .post("/dr-plans/web-tier/actions/clear-fence", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, cleared) = admin
+        .post("/dr-plans/web-tier/actions/clear-fence", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert!(
+        cleared["status"].get("source_fence_pending").is_none(),
+        "{cleared}"
+    );
+    assert!(
+        plan_status(&env, "web-tier")
+            .source_fence_pending
+            .is_empty()
+    );
 }
 
 /// 지난 시험이 남긴 시험 VM이 있으면 계획을 지우지 않는다(기록을 지우면 다시 찾지 못한다).

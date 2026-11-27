@@ -1378,7 +1378,12 @@ impl Engine {
                             "plan {}: the production cluster {} is reachable again and still runs VMs recovered here: {} — stop them there before both copies serve (POST /dr-plans/{}/actions/fence-source)\nPlan: {}",
                             p.name,
                             p.spec.source,
-                            p.status.source_fence_pending.join(", "),
+                            p.status
+                                .source_fence_pending
+                                .iter()
+                                .map(|f| f.vm.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
                             p.name,
                             plan_path(&p.name)
                         )
@@ -1480,6 +1485,7 @@ impl Engine {
             };
             let verb = match run.status.state {
                 DrRunState::Partial => "finished partially",
+                DrRunState::Cancelled => "was cancelled",
                 _ => "failed",
             };
             let mut detail = format!(
@@ -1502,6 +1508,7 @@ impl Engine {
             if bad.len() > 5 {
                 detail.push_str(&format!("\n- +{} more", bad.len() - 5));
             }
+            detail.push_str(&dr_run_warnings(run));
             detail.push_str(&format!(
                 "\nPlan: {}\nRun: /dr-runs/{}",
                 plan_path(&run.spec.plan_name),
@@ -1695,7 +1702,62 @@ fn plan_path(plan: &str) -> String {
     format!("/dr-plans/{plan}")
 }
 
-/// 아직 알리지 않은 `failed`·`partial`로 끝난 DR 실행(규칙을 만든 뒤 끝난 것)을 `notified`에 적고 돌려준다(끝난 차례).
+/// 끝난 DR 실행의 경고 줄(리뷰 2): 운영 쪽에서 꺼진 채 남은 VM(계획된 이전이 다시 켜지 못함), 더 오래된 복구 지점으로
+/// 되살린 VM(잃은 시간), 디스크를 다 옮기지 못한 라이브 복원
+fn dr_run_warnings(run: &DrRun) -> String {
+    let steps = &run.status.steps;
+    let mut out = String::new();
+    let left: Vec<String> = steps
+        .iter()
+        .filter_map(|s| {
+            let e = s.prepare.as_ref()?.restart_error.as_ref()?;
+            Some(format!("{} ({e})", s.vm))
+        })
+        .collect();
+    if !left.is_empty() {
+        out.push_str(&format!(
+            "\nsource VM left stopped: {} — start them on the source cluster",
+            left.join(", ")
+        ));
+    }
+    let older: Vec<String> = steps
+        .iter()
+        .filter_map(|s| Some(format!("{} ({} min older)", s.vm, s.lost_secs? / 60)))
+        .collect();
+    if !older.is_empty() {
+        out.push_str(&format!(
+            "\nrestored from an older recovery point: {}",
+            older.join(", ")
+        ));
+    }
+    let copies: Vec<&str> = steps
+        .iter()
+        .filter(|s| s.copy_error.is_some())
+        .map(|s| s.vm.as_str())
+        .collect();
+    if !copies.is_empty() {
+        out.push_str(&format!(
+            "\nlive restore did not finish copying the disks: {}",
+            copies.join(", ")
+        ));
+    }
+    out
+}
+
+/// 알릴 끝난 실행: `failed`·`partial`, 그리고 운영 VM을 꺼진 채 남긴 취소한 계획된 이전(리뷰 2)
+fn run_needs_alert(r: &DrRun) -> bool {
+    match r.status.state {
+        DrRunState::Failed | DrRunState::Partial => true,
+        DrRunState::Cancelled => r.status.steps.iter().any(|s| {
+            s.prepare
+                .as_ref()
+                .is_some_and(|p| p.restart_error.is_some())
+        }),
+        _ => false,
+    }
+}
+
+/// 아직 알리지 않은 끝난 DR 실행([`run_needs_alert`] — 규칙을 만든 뒤 끝난 것)을 `notified`에 적고 돌려준다(끝난 차례).
 /// 지운 실행은 잊는다.
 fn new_run_failures<'r>(
     notified: &mut BTreeMap<Uuid, i64>,
@@ -1705,7 +1767,7 @@ fn new_run_failures<'r>(
     notified.retain(|id, _| runs.iter().any(|r| r.id == *id));
     let mut out: Vec<&DrRun> = runs
         .iter()
-        .filter(|r| matches!(r.status.state, DrRunState::Failed | DrRunState::Partial))
+        .filter(|r| run_needs_alert(r))
         // 음수는 멈춤을 알린 표시다(끝난 실패는 따로 알린다).
         .filter(|r| notified.get(&r.id).is_none_or(|at| *at < 0))
         .filter_map(|r| {
@@ -1949,5 +2011,47 @@ mod tests {
         // 규칙을 만들기 전에 끝난 실행과 지운 작업은 보지 않는다.
         assert!(new_failures(&mut notified, &[job(3, 500, 1)], created).is_empty());
         assert!(!notified.contains_key(&Uuid::from_u128(1)));
+    }
+
+    /// 리뷰 2(계획 76): 운영 쪽에서 꺼진 채 남은 VM·오래된 사본·라이브 복사 실패를 알림 본문에 적고, 운영 VM을 꺼진 채 남긴
+    /// 취소한 계획된 이전도 알린다.
+    #[test]
+    fn dr_run_warnings_name_what_was_left_behind() {
+        let spec: orbivisor_types::dr::RecoveryPlanSpec = serde_json::from_value(json!({
+            "source": "prod", "pool": "dr",
+            "groups": [ { "name": "all", "vms": [ { "vm": "db1" }, { "vm": "web1" } ] } ]
+        }))
+        .unwrap();
+        let mut run: DrRun = Resource::new(
+            "r",
+            DrRunSpec {
+                plan: Uuid::nil(),
+                plan_name: "p".into(),
+                kind: DrRunKind::FailoverPlanned,
+                plan_spec: spec,
+                max_parallel: 4,
+                cleanup: None,
+                allow_missing: false,
+                skip_vms: Vec::new(),
+                point_in_time: None,
+            },
+        );
+        run.status = serde_json::from_value(json!({
+            "state": "cancelled", "started_at": 1, "finished_at": 2,
+            "steps": [
+                { "group": "all", "vm": "db1", "phase": "skipped", "at": 1,
+                  "prepare": { "stage": "backup", "stopped": true, "restarted": true, "restart_error": "HTTP 403" } },
+                { "group": "all", "vm": "web1", "phase": "ready", "at": 1, "lost_secs": 7200,
+                  "copy_error": "mirror broke" }
+            ]
+        }))
+        .unwrap();
+        assert!(run_needs_alert(&run));
+        let w = dr_run_warnings(&run);
+        assert!(w.contains("source VM left stopped: db1 (HTTP 403)"), "{w}");
+        assert!(w.contains("web1 (120 min older)"), "{w}");
+        assert!(w.contains("did not finish copying the disks: web1"), "{w}");
+        run.status.steps[0].prepare.as_mut().unwrap().restart_error = None;
+        assert!(!run_needs_alert(&run));
     }
 }
