@@ -1710,6 +1710,8 @@ async fn cancelling_a_test_cleans_up_after_it() {
             .any(|r| r.spec.kind == DrRunKind::Cleanup && r.status.state == DrRunState::Succeeded)
     })
     .await;
+    // 끝난 뒷정리를 계획에 적는 것(`status.run` 비우기)은 실행을 저장한 다음 걸음이다 — 멈추기 전에 기다린다.
+    let st = settled(&env, "web-tier").await;
     looper.shutdown().await;
     let cleanup = env
         .cluster
@@ -1727,7 +1729,6 @@ async fn cancelling_a_test_cleans_up_after_it() {
             .unwrap()
             .is_none()
     );
-    let st = settled(&env, "web-tier").await;
     assert_eq!(st.run, None);
     assert_eq!(st.last_test.unwrap().result, DrRunState::Cancelled);
 }
@@ -2060,14 +2061,14 @@ async fn a_failover_preempts_a_running_test() {
             .any(|r| r.spec.kind == DrRunKind::Cleanup && r.status.state == DrRunState::Succeeded)
     })
     .await;
+    // 끝난 뒷정리를 계획에 적는 것(`status.run` 비우기)은 실행을 저장한 다음 걸음이고 스케줄러를 멈추면 그 걸음이 끊길 수
+    // 있다 — 멈추기 전에 기다린다.
+    let st = settled(&env, "web-tier").await;
     looper.shutdown().await;
     assert!(vm_named(&env, "db1-drt").is_none());
     assert_eq!(vm_named(&env, "db1").unwrap().labels[DR_LABEL], "web-tier");
     // 재해 장애 조치로 되살린 VM은 운영 쪽에서 멈출 때까지 목록에 남는다.
-    assert_eq!(
-        fence_names(&settled(&env, "web-tier").await),
-        ["db1", "web1"]
-    );
+    assert_eq!(fence_names(&st), ["db1", "web1"]);
 }
 
 /// fence-source: 재해 뒤 돌아온 운영 쪽(두 번째 클러스터)의 그 VM을 강제로 끄고 원하는 상태를 stopped로 둔다. 운영 쪽에 없는
