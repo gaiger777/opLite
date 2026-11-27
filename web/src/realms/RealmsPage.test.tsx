@@ -493,7 +493,9 @@ it("creates an OIDC realm and shows the redirect URI to register", async () => {
   expect(
     within(dialog).getByText("Use https://host[:port][/path] without a query or fragment."),
   ).toBeVisible();
-  expect(within(dialog).getByLabelText("Client ID")).toHaveAccessibleDescription("Enter a value.");
+  expect(within(dialog).getByLabelText("Client ID")).toHaveAccessibleDescription(
+    expect.stringContaining("Enter a value."),
+  );
   expect(within(dialog).getByText("Include openid.")).toBeVisible();
   expect(within(dialog).getByLabelText("Groups claim")).toBeInvalid();
   await user.clear(within(dialog).getByLabelText("Issuer"));
@@ -689,4 +691,17 @@ it("tests an OIDC realm without asking for a user", async () => {
   expect(within(dialog).queryByText("No role: sign-in would be refused.")).not.toBeInTheDocument();
   // 본문 없이 부른다.
   expect(bodies).toEqual([""]);
+});
+
+it("explains an empty realm list and offers to create one", async () => {
+  realms([]);
+  const user = userEvent.setup();
+  renderPage(<RealmsPage />, { as: ADMIN });
+  const empty = (
+    await screen.findByText("No realms. Only local users can sign in.")
+  ).closest<HTMLElement>("[data-slot=empty-state]")!;
+  expect(empty).toHaveTextContent("Create one to let people sign in with company accounts.");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+  await user.click(within(empty).getByRole("button", { name: "Create a sign-in realm" }));
+  expect(await screen.findByRole("dialog", { name: "Create an LDAP realm" })).toBeInTheDocument();
 });

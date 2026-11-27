@@ -9,6 +9,7 @@ import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { usePermissions } from "@/auth/usePermissions";
 import { CopyButton } from "@/components/CopyButton";
+import { Diagram } from "@/help/Diagram";
 import { ClusterCpuSection } from "@/cpu/ClusterCpuSection";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
@@ -70,6 +71,8 @@ export function ClusterPage() {
     <div className="flex flex-col gap-6">
       <PageHeader
         title={t("cluster.title", { name })}
+        help="cluster"
+        intro={t("help.cluster.intro")}
         actions={
           perms.can("write", "join-token") && (
             <Button ref={opener} onClick={() => setIssuing(true)}>
@@ -88,6 +91,10 @@ export function ClusterPage() {
       <section className="flex flex-col gap-2">
         <h2 className="font-medium">{t("cluster.ca")}</h2>
         <p className="text-sm text-muted-foreground">{t("cluster.caNote")}</p>
+        <details className="text-sm text-muted-foreground">
+          <summary className="cursor-pointer">{t("cluster.caCheck")}</summary>
+          <p className="mt-1">{t("cluster.caCheckNote")}</p>
+        </details>
         <div className="flex flex-wrap items-center gap-2">
           <code className="rounded-md bg-muted px-2 py-1 text-xs break-all">{fingerprint}</code>
           <CopyButton text={fingerprint} label={t("cluster.copyFingerprint")} />
@@ -153,7 +160,10 @@ export function ClusterPage() {
             ))}
           </TableBody>
         </Table>
-        <p className="text-sm text-muted-foreground">{t("cluster.membersNote")}</p>
+        <div className="flex flex-wrap items-center gap-4">
+          <Diagram id="quorum" className="w-full max-w-xs" />
+          <p className="min-w-0 flex-1 text-sm text-muted-foreground">{t("cluster.membersNote")}</p>
+        </div>
       </section>
       <ClusterCpuSection />
       {issuing && (
@@ -196,7 +206,7 @@ function IssueDialog({
       onSubmit={submit}
     >
       <JoinSteps current="issue" />
-      <Field id="join-ttl" label={t("cluster.ttl")}>
+      <Field id="join-ttl" label={t("cluster.ttl")} help={t("help.cluster.ttl")}>
         <NativeSelect
           id="join-ttl"
           className="w-full"

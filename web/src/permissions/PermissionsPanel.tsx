@@ -14,6 +14,7 @@ import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -406,40 +407,54 @@ export function AddGrantDialog({
       onSubmit={submit}
     >
       {targets && (
-        <Field id="grant-target" label={t("permissions.target")}>
-          <NativeSelect
-            id="grant-target"
-            className="w-full"
-            value={targetIndex}
-            onChange={(e) => setTargetIndex(Number(e.target.value))}
-          >
-            {targets.map((c, i) => (
-              <NativeSelectOption key={i} value={i}>
-                {c.label}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        <Field
+          id="grant-target"
+          label={t("permissions.target")}
+          help={t("help.permissions.target")}
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="grant-target"
+              className="w-full"
+              value={targetIndex}
+              onChange={(e) => setTargetIndex(Number(e.target.value))}
+              {...a11y}
+            >
+              {targets.map((c, i) => (
+                <NativeSelectOption key={i} value={i}>
+                  {c.label}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          )}
         </Field>
       )}
-      <Field id="grant-kind" label={t("permissions.principalKind")}>
-        <NativeSelect
-          id="grant-kind"
-          className="w-full"
-          value={kind}
-          onChange={(e) => {
-            setKind(e.target.value as PrincipalRef["type"]);
-            setPrincipal("");
-          }}
-        >
-          <NativeSelectOption value="user">{t("permissions.user")}</NativeSelectOption>
-          <NativeSelectOption value="group">{t("permissions.group")}</NativeSelectOption>
-        </NativeSelect>
+      <Field
+        id="grant-kind"
+        label={t("permissions.principalKind")}
+        help={t("help.permissions.principalKind")}
+      >
+        {(a11y) => (
+          <NativeSelect
+            id="grant-kind"
+            className="w-full"
+            value={kind}
+            onChange={(e) => {
+              setKind(e.target.value as PrincipalRef["type"]);
+              setPrincipal("");
+            }}
+            {...a11y}
+          >
+            <NativeSelectOption value="user">{t("permissions.user")}</NativeSelectOption>
+            <NativeSelectOption value="group">{t("permissions.group")}</NativeSelectOption>
+          </NativeSelect>
+        )}
       </Field>
       <Field
         id="grant-principal"
         label={t(kind === "user" ? "permissions.user" : "permissions.group")}
         error={error}
-        help={typed ? t("permissions.typedHint") : undefined}
+        help={typed ? t("permissions.typedHint") : t("help.permissions.principal")}
       >
         {(a11y) =>
           typed ? (
@@ -483,6 +498,8 @@ export function AddGrantDialog({
         id="grant-role"
         label={t("permissions.role")}
         error={roles.data && offered.length === 0 ? "permissions.noGrantableRole" : undefined}
+        help={t("help.permissions.role")}
+        info="roles.page"
       >
         {(a11y) => (
           <NativeSelect
@@ -509,6 +526,11 @@ export function AddGrantDialog({
             onCheckedChange={(v) => setPropagate(v === true)}
           />
           <Label htmlFor="grant-propagate">{t("permissions.propagate")}</Label>
+          <InfoButton
+            topic="permissionsPropagate"
+            label={t("permissions.propagate")}
+            line={t("help.permissions.propagate")}
+          />
         </div>
       )}
     </FormDialog>

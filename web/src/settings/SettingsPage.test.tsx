@@ -214,7 +214,7 @@ it("lets admins pick enterprise only with an active subscription", async () => {
   await vi.waitFor(() => expect(queryClient.getQueryData(SUBSCRIPTION_KEY)).toBeDefined());
   expect(screen.getByRole("option", { name: "Enterprise" })).toBeDisabled();
   expect(screen.getByLabelText("Update channel")).toHaveAccessibleDescription(
-    /Enterprise needs an active subscription\./,
+    /Enterprise needs an active subscription key\./,
   );
   unmount();
 
@@ -289,10 +289,10 @@ it("shows the report before turning telemetry on", async () => {
     }),
   );
   renderPage(<SettingsPage />);
-  const section = await screen.findByRole("region", { name: "Telemetry" });
+  const section = await screen.findByRole("region", { name: "Usage reports (telemetry)" });
   expect(within(section).getByText("Off")).toBeInTheDocument();
   expect(
-    within(section).getByText("Not set (the build's default endpoint is used if it has one)"),
+    within(section).getByText("Not set (the build's default address is used if it has one)"),
   ).toBeInTheDocument();
   expect(within(section).getByText("Never")).toBeInTheDocument();
 
@@ -314,7 +314,9 @@ it("shows the report before turning telemetry on", async () => {
   expect(within(section).getByText("0a1b2c3d-0000-4000-8000-000000000001")).toBeInTheDocument();
   expect(within(section).getByRole("button", { name: "Turn off" })).toBeInTheDocument();
   await vi.waitFor(() =>
-    expect(within(section).getByRole("heading", { name: "Telemetry" })).toHaveFocus(),
+    expect(
+      within(section).getByRole("heading", { name: "Usage reports (telemetry)" }),
+    ).toHaveFocus(),
   );
 });
 
@@ -359,7 +361,7 @@ it("turns telemetry off, sets the endpoint and makes a new report id", async () 
     }),
   );
   renderPage(<SettingsPage />);
-  const section = await screen.findByRole("region", { name: "Telemetry" });
+  const section = await screen.findByRole("region", { name: "Usage reports (telemetry)" });
   expect(within(section).getByText("On")).toBeInTheDocument();
   expect(within(section).getByText("https://t.example/r")).toBeInTheDocument();
   expect(within(section).getByText("HTTP 503")).toBeInTheDocument();
@@ -369,15 +371,15 @@ it("turns telemetry off, sets the endpoint and makes a new report id", async () 
   expect(await screen.findByText("Telemetry turned off.")).toBeInTheDocument();
   expect(within(section).getByText("Off")).toBeInTheDocument();
   // 누른 버튼이 사라졌으므로 포커스는 그 부분의 제목으로 간다.
-  expect(within(section).getByRole("heading", { name: "Telemetry" })).toHaveFocus();
+  expect(within(section).getByRole("heading", { name: "Usage reports (telemetry)" })).toHaveFocus();
 
-  const endpoint = within(section).getByLabelText("Endpoint");
+  const endpoint = within(section).getByLabelText("Report address");
   expect(endpoint).toHaveValue("https://t.example/r");
   await userEvent.clear(endpoint);
-  await userEvent.click(within(section).getByRole("button", { name: "Save endpoint" }));
+  await userEvent.click(within(section).getByRole("button", { name: "Save address" }));
   await vi.waitFor(() =>
     expect(
-      within(section).getByText("Not set (the build's default endpoint is used if it has one)"),
+      within(section).getByText("Not set (the build's default address is used if it has one)"),
     ).toBeInTheDocument(),
   );
 
@@ -404,7 +406,7 @@ it("says when telemetry needs an endpoint", async () => {
     ),
   );
   renderPage(<SettingsPage />);
-  const section = await screen.findByRole("region", { name: "Telemetry" });
+  const section = await screen.findByRole("region", { name: "Usage reports (telemetry)" });
   await userEvent.click(within(section).getByRole("button", { name: "Turn on…" }));
   const dialog = await screen.findByRole("dialog", { name: "Turn on telemetry" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Turn on" }));
@@ -432,10 +434,15 @@ it("shows subscription and telemetry read-only to everyone but admins", async ()
   unmount();
 
   renderPage(<SettingsPage />, { as: operator });
-  const telemetry = await screen.findByRole("region", { name: "Telemetry" });
+  const telemetry = await screen.findByRole("region", { name: "Usage reports (telemetry)" });
   expect(within(telemetry).getByText("On")).toBeInTheDocument();
-  expect(within(telemetry).queryByLabelText("Endpoint")).not.toBeInTheDocument();
-  expect(within(telemetry).queryByRole("button")).not.toBeInTheDocument();
+  expect(within(telemetry).queryByLabelText("Report address")).not.toBeInTheDocument();
+  // 도움말 ⓘ 말고는 단추가 없다.
+  expect(
+    within(telemetry)
+      .queryAllByRole("button")
+      .filter((b) => !b.hasAttribute("data-info-button")),
+  ).toHaveLength(0);
 });
 
 it("sends the endpoint typed but not saved when turning telemetry on", async () => {
@@ -454,8 +461,8 @@ it("sends the endpoint typed but not saved when turning telemetry on", async () 
     }),
   );
   renderPage(<SettingsPage />);
-  const section = await screen.findByRole("region", { name: "Telemetry" });
-  await userEvent.type(within(section).getByLabelText("Endpoint"), " https://t.example/r ");
+  const section = await screen.findByRole("region", { name: "Usage reports (telemetry)" });
+  await userEvent.type(within(section).getByLabelText("Report address"), " https://t.example/r ");
   await userEvent.click(within(section).getByRole("button", { name: "Turn on…" }));
   const dialog = await screen.findByRole("dialog", { name: "Turn on telemetry" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Turn on" }));
@@ -541,7 +548,7 @@ it("says why the telemetry report could not be shown", async () => {
     ),
   );
   renderPage(<SettingsPage />);
-  const section = await screen.findByRole("region", { name: "Telemetry" });
+  const section = await screen.findByRole("region", { name: "Usage reports (telemetry)" });
   await userEvent.click(within(section).getByRole("button", { name: "Turn on…" }));
   expect(await within(section).findByRole("alert")).toHaveTextContent(
     "You do not have permission to do this.",
@@ -567,7 +574,11 @@ it("changes the shutdown policy and shows the default when none is saved", async
   const policy = await screen.findByLabelText("Policy");
   // 기본(conditional)은 저장하지 않으므로 없으면 기본이다.
   expect(policy).toHaveValue("conditional");
-  expect(screen.getByText("Freeze on reboot, fail over on power off.")).toBeInTheDocument();
+  expect(
+    screen.getByText(
+      /^On reboot, pause \(start again on the same node when it returns\); on power off, start on another node\./,
+    ),
+  ).toBeInTheDocument();
   const save = screen.getByRole("button", { name: "Save policy" });
   expect(save).toBeDisabled();
   await userEvent.selectOptions(policy, "migrate");
@@ -623,7 +634,7 @@ it("reserves HA capacity and sets the concurrent starts", async () => {
   // 저장하지 않은 기본: 예약 없음, 동시 시작 4
   const reserve = await screen.findByLabelText("Capacity reserved for HA recovery");
   expect(reserve).toHaveValue("none");
-  const concurrency = screen.getByLabelText("Concurrent starts per target node");
+  const concurrency = screen.getByLabelText("VMs started at once per node during recovery");
   expect(concurrency).toHaveValue(4);
   const save = screen.getByRole("button", { name: "Save HA capacity" });
   expect(save).toBeDisabled();

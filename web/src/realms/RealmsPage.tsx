@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FlaskConical, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Building2, FlaskConical, Pencil, Plus, Trash2, X } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -9,9 +9,11 @@ import type { Role } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CopyButton } from "@/components/CopyButton";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
@@ -77,7 +79,7 @@ export function RealmsPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.realms")} />
+        <PageHeader title={t("nav.realms")} help="realms" intro={t("help.realms.intro")} />
         <p className="text-sm text-muted-foreground">{t("realms.adminOnly")}</p>
       </div>
     );
@@ -89,6 +91,8 @@ export function RealmsPage() {
       <PageHeader
         id="realms-title"
         title={t("nav.realms")}
+        help="realms"
+        intro={t("help.realms.intro")}
         actions={
           <Button
             disabled={!realms.isSuccess}
@@ -102,73 +106,92 @@ export function RealmsPage() {
           </Button>
         }
       />
-      <p className="text-sm text-muted-foreground">{t("realms.pageHint")}</p>
-      <Table aria-labelledby="realms-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("realms.display")}</TableHead>
-            <TableHead>{t("realms.kind")}</TableHead>
-            <TableHead>{t("realms.url")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {list.length === 0 && (
-            <TableMessage colSpan={5} query={realms} empty={t("realms.empty")} />
-          )}
-          {list.map((realm) => (
-            <TableRow key={realm.id}>
-              <TableCell className="font-medium">{realm.name}</TableCell>
-              <TableCell>{realm.display ?? "—"}</TableCell>
-              <TableCell>{t(`realms.kinds.${realm.backend.kind}`)}</TableCell>
-              <TableCell className="font-mono text-xs">
-                {realm.backend.kind === "ldap" ? realm.backend.url : realm.backend.issuer}
-              </TableCell>
-              <TableCell className="text-right whitespace-nowrap">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  aria-label={t("realms.testNamed", { name: realm.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDialog({ kind: "test", realm });
-                  }}
-                >
-                  <FlaskConical />
-                  {t("realms.test")}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  className="ml-2"
-                  aria-label={t("realms.editNamed", { name: realm.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDialog({ kind: "edit", realm });
-                  }}
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("common.deleteNamed", { name: realm.name })}
-                  onClick={(e) => {
-                    opener.current = e.currentTarget;
-                    setDeleting(realm);
-                    setDeleteOpen(true);
-                  }}
-                >
-                  <Trash2 />
-                </Button>
-              </TableCell>
+      {realms.isSuccess && list.length === 0 ? (
+        <EmptyState
+          icon={Building2}
+          title={t("realms.empty")}
+          description={t("help.realms.empty")}
+          help="realms.page"
+          action={
+            <Button
+              onClick={(e) => {
+                opener.current = e.currentTarget;
+                setDialog({ kind: "create" });
+              }}
+            >
+              <Plus />
+              {t("help.realms.create")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="realms-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("realms.display")}</TableHead>
+              <TableHead>{t("realms.kind")}</TableHead>
+              <TableHead>{t("realms.url")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {list.length === 0 && (
+              <TableMessage colSpan={5} query={realms} empty={t("realms.empty")} />
+            )}
+            {list.map((realm) => (
+              <TableRow key={realm.id}>
+                <TableCell className="font-medium">{realm.name}</TableCell>
+                <TableCell>{realm.display ?? "—"}</TableCell>
+                <TableCell>{t(`realms.kinds.${realm.backend.kind}`)}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {realm.backend.kind === "ldap" ? realm.backend.url : realm.backend.issuer}
+                </TableCell>
+                <TableCell className="text-right whitespace-nowrap">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-label={t("realms.testNamed", { name: realm.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDialog({ kind: "test", realm });
+                    }}
+                  >
+                    <FlaskConical />
+                    {t("realms.test")}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="ml-2"
+                    aria-label={t("realms.editNamed", { name: realm.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDialog({ kind: "edit", realm });
+                    }}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={t("common.deleteNamed", { name: realm.name })}
+                    onClick={(e) => {
+                      opener.current = e.currentTarget;
+                      setDeleting(realm);
+                      setDeleteOpen(true);
+                    }}
+                  >
+                    <Trash2 />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {(dialog?.kind === "create" || dialog?.kind === "edit") && (
         <RealmDialog
           realm={dialog.kind === "edit" ? dialog.realm : null}
@@ -258,8 +281,8 @@ function RealmDialog({
     await onDone();
   }
 
-  const text = (id: string, key: keyof RealmForm, label: string, hint?: string) => (
-    <Field id={id} label={label} error={errors[key]} help={hint}>
+  const text = (id: string, key: keyof RealmForm, label: string, hint?: string, info?: string) => (
+    <Field id={id} label={label} error={errors[key]} help={hint} info={info}>
       {(a11y) => (
         <Input
           id={id}
@@ -290,22 +313,35 @@ function RealmDialog({
       <div className="-mx-1 flex max-h-[60svh] flex-col gap-4 overflow-y-auto px-1">
         {/* 종류는 만들 때만 고른다. */}
         {!realm && (
-          <Field id="realm-kind" label={t("realms.kind")}>
-            <NativeSelect
-              id="realm-kind"
-              className="w-full"
-              value={form.kind}
-              onChange={(e) => {
-                change({ kind: e.target.value as RealmForm["kind"] });
-                setErrors({});
-              }}
-            >
-              <NativeSelectOption value="ldap">{t("realms.kinds.ldap")}</NativeSelectOption>
-              <NativeSelectOption value="oidc">{t("realms.kinds.oidc")}</NativeSelectOption>
-            </NativeSelect>
+          <Field
+            id="realm-kind"
+            label={t("realms.kind")}
+            help={t("help.realms.kind")}
+            info="realms.kind"
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="realm-kind"
+                className="w-full"
+                value={form.kind}
+                onChange={(e) => {
+                  change({ kind: e.target.value as RealmForm["kind"] });
+                  setErrors({});
+                }}
+                {...a11y}
+              >
+                <NativeSelectOption value="ldap">{t("realms.kinds.ldap")}</NativeSelectOption>
+                <NativeSelectOption value="oidc">{t("realms.kinds.oidc")}</NativeSelectOption>
+              </NativeSelect>
+            )}
           </Field>
         )}
-        <Field id="realm-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="realm-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.realms.name")}
+        >
           {(a11y) => (
             <Input
               id="realm-name"
@@ -321,7 +357,7 @@ function RealmDialog({
         {oidc ? (
           <>
             {text("realm-issuer", "issuer", t("realms.issuer"), t("realms.issuerHint"))}
-            {text("realm-client-id", "clientId", t("realms.clientId"))}
+            {text("realm-client-id", "clientId", t("realms.clientId"), t("help.realms.clientId"))}
             <Field
               id="realm-client-secret"
               label={t("realms.clientSecret")}
@@ -351,7 +387,12 @@ function RealmDialog({
               </div>
             )}
             {text("realm-scopes", "scopes", t("realms.scopes"), t("realms.scopesHint"))}
-            {text("realm-username-claim", "usernameClaim", t("realms.usernameClaim"))}
+            {text(
+              "realm-username-claim",
+              "usernameClaim",
+              t("realms.usernameClaim"),
+              t("help.realms.usernameClaim"),
+            )}
             {text(
               "realm-groups-claim",
               "groupsClaim",
@@ -381,13 +422,13 @@ function RealmDialog({
         ) : (
           <>
             {text("realm-url", "url", t("realms.url"), t("realms.urlHint"))}
-            {text("realm-base-dn", "baseDn", t("realms.baseDn"))}
+            {text("realm-base-dn", "baseDn", t("realms.baseDn"), t("help.realms.baseDn"))}
             {text("realm-bind-dn", "bindDn", t("realms.bindDn"), t("realms.bindDnHint"))}
             <Field
               id="realm-bind-password"
               label={t("realms.bindPassword")}
               error={errors.bindPassword}
-              help={saved ? t("realms.bindPasswordSaved") : undefined}
+              help={saved ? t("realms.bindPasswordSaved") : t("help.realms.bindPassword")}
             >
               {(a11y) => (
                 <Input
@@ -416,8 +457,14 @@ function RealmDialog({
               "userFilter",
               t("realms.userFilter"),
               t("realms.userFilterHint"),
+              "realms.userFilter",
             )}
-            {text("realm-group-attr", "groupAttr", t("realms.groupAttr"))}
+            {text(
+              "realm-group-attr",
+              "groupAttr",
+              t("realms.groupAttr"),
+              t("help.realms.groupAttr"),
+            )}
           </>
         )}
         <Field
@@ -438,7 +485,12 @@ function RealmDialog({
             />
           )}
         </Field>
-        <Field id="realm-timeout" label={t("realms.timeout")} error={errors.timeout}>
+        <Field
+          id="realm-timeout"
+          label={t("realms.timeout")}
+          error={errors.timeout}
+          help={t("help.realms.timeout")}
+        >
           {(a11y) => (
             <Input
               id="realm-timeout"
@@ -450,7 +502,14 @@ function RealmDialog({
           )}
         </Field>
         <fieldset className="flex flex-col gap-2">
-          <legend className="mb-1.5 text-sm font-medium">{t("realms.groups")}</legend>
+          <legend className="mb-1.5 flex items-center gap-1 text-sm font-medium">
+            {t("realms.groups")}
+            <InfoButton
+              topic="realms.groups"
+              label={t("realms.groups")}
+              line={t(oidc ? "realms.oidcGroupsHint" : "realms.groupsHint")}
+            />
+          </legend>
           <p className="text-xs text-muted-foreground">
             {t(oidc ? "realms.oidcGroupsHint" : "realms.groupsHint")}
           </p>
@@ -519,16 +578,24 @@ function RealmDialog({
             {t("realms.addGroup")}
           </Button>
         </fieldset>
-        <Field id="realm-default-role" label={t("realms.defaultRole")}>
-          <NativeSelect
-            id="realm-default-role"
-            className="w-full"
-            value={form.defaultRole}
-            onChange={(e) => change({ defaultRole: e.target.value as Role | "" })}
-          >
-            <NativeSelectOption value="">{t("realms.noDefaultRole")}</NativeSelectOption>
-            <RoleOptions />
-          </NativeSelect>
+        <Field
+          id="realm-default-role"
+          label={t("realms.defaultRole")}
+          help={t("help.realms.defaultRole")}
+          info="realms.defaultRole"
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="realm-default-role"
+              className="w-full"
+              value={form.defaultRole}
+              onChange={(e) => change({ defaultRole: e.target.value as Role | "" })}
+              {...a11y}
+            >
+              <NativeSelectOption value="">{t("realms.noDefaultRole")}</NativeSelectOption>
+              <RoleOptions />
+            </NativeSelect>
+          )}
         </Field>
       </div>
     </FormDialog>
@@ -594,23 +661,37 @@ function TestDialog({
           )}
           {!oidc && (
             <fieldset disabled={busy} className="grid gap-4 sm:grid-cols-2">
-              <Field id="realm-test-username" label={t("login.username")}>
-                <Input
-                  id="realm-test-username"
-                  autoComplete="off"
-                  required
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                />
+              <Field
+                id="realm-test-username"
+                label={t("login.username")}
+                help={t("help.realms.testUser")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="realm-test-username"
+                    autoComplete="off"
+                    required
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    {...a11y}
+                  />
+                )}
               </Field>
-              <Field id="realm-test-password" label={t("login.password")}>
-                <Input
-                  id="realm-test-password"
-                  type="password"
-                  autoComplete="off"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
+              <Field
+                id="realm-test-password"
+                label={t("login.password")}
+                help={t("help.realms.testPassword")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="realm-test-password"
+                    type="password"
+                    autoComplete="off"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    {...a11y}
+                  />
+                )}
               </Field>
             </fieldset>
           )}

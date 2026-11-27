@@ -112,7 +112,9 @@ it("does not ask a witness for history", async () => {
   // 기록을 물으면 처리하지 않은 요청으로 실패한다.
   mockLists({ node: [{ ...NODE, spec: { ...NODE.spec, witness: true } }], vm: [] });
   renderPage(<NodeDetailPage />, at);
-  expect(await screen.findByText("Witness nodes keep no metrics history.")).toBeInTheDocument();
+  expect(
+    await screen.findByText("Vote-only nodes (witnesses) keep no metrics history."),
+  ).toBeInTheDocument();
   expect(screen.queryByRole("radiogroup")).not.toBeInTheDocument();
 });
 

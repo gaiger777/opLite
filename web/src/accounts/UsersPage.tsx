@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { MoreHorizontal, Plus } from "lucide-react";
+import { MoreHorizontal, Plus, UserRound } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -11,6 +11,7 @@ import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field, type FieldA11y } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
@@ -77,7 +78,7 @@ export function UsersPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.users")} />
+        <PageHeader title={t("nav.users")} help="users" intro={t("help.users.intro")} />
         <p className="text-sm text-muted-foreground">{t("users.adminOnly")}</p>
       </div>
     );
@@ -88,6 +89,8 @@ export function UsersPage() {
       <PageHeader
         id="users-title"
         title={t("nav.users")}
+        help="users"
+        intro={t("help.users.intro")}
         actions={
           <Button onClick={() => setDialog({ kind: "create" })}>
             <Plus />
@@ -95,91 +98,106 @@ export function UsersPage() {
           </Button>
         }
       />
-      <Table aria-labelledby="users-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("users.role")}</TableHead>
-            <TableHead>{t("users.realm")}</TableHead>
-            <TableHead>{t("users.twoFactor")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(users.data ?? []).length === 0 && (
-            <TableMessage colSpan={5} query={users} empty={t("users.empty")} />
-          )}
-          {(users.data ?? []).map((user) => {
-            // 자기 비밀번호는 현재 비밀번호가 필요하므로 계정 메뉴에서 바꾼다. 자기 자신은 지울 수 없다.
-            // 자기 역할도 바꾸지 않는다(낮추면 이 화면의 권한이 옛 역할로 남는다).
-            const self = user.id === me.user;
-            return (
-              <TableRow key={user.id}>
-                <TableCell className="font-medium">
-                  {user.name}
-                  {self && (
-                    <span className="ml-2 text-xs text-muted-foreground">{t("users.you")}</span>
-                  )}
-                </TableCell>
-                <TableCell>{t(`roles.${user.role}`)}</TableCell>
-                <TableCell>{user.realm ?? "local"}</TableCell>
-                <TableCell>{user.two_factor ? t("users.twoFactorOn") : "—"}</TableCell>
-                <TableCell className="text-right">
-                  <DropdownMenu modal={false}>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("vms.actionsFor", { name: user.name })}
-                        onPointerDown={rememberTrigger}
-                        onKeyDown={rememberTrigger}
-                      >
-                        <MoreHorizontal />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <ReasonMenuItem
-                        reason={self ? "users.reason.selfRole" : null}
-                        onSelect={() => setDialog({ kind: "role", user })}
-                      >
-                        {t("users.changeRole")}
-                      </ReasonMenuItem>
-                      {/* 외부 사용자의 비밀번호는 영역의 디렉터리가 맡는다. */}
-                      {!user.realm && (
-                        <ReasonMenuItem
-                          reason={self ? "users.reason.selfPassword" : null}
-                          onSelect={() => setDialog({ kind: "password", user })}
+      {users.isSuccess && users.data.length === 0 ? (
+        <EmptyState
+          icon={UserRound}
+          title={t("users.empty")}
+          description={t("help.users.empty")}
+          help="users.page"
+          action={
+            <Button onClick={() => setDialog({ kind: "create" })}>
+              <Plus />
+              {t("users.createTitle")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="users-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("users.role")}</TableHead>
+              <TableHead>{t("users.realm")}</TableHead>
+              <TableHead>{t("users.twoFactor")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {(users.data ?? []).length === 0 && (
+              <TableMessage colSpan={5} query={users} empty={t("users.empty")} />
+            )}
+            {(users.data ?? []).map((user) => {
+              // 자기 비밀번호는 현재 비밀번호가 필요하므로 계정 메뉴에서 바꾼다. 자기 자신은 지울 수 없다.
+              // 자기 역할도 바꾸지 않는다(낮추면 이 화면의 권한이 옛 역할로 남는다).
+              const self = user.id === me.user;
+              return (
+                <TableRow key={user.id}>
+                  <TableCell className="font-medium">
+                    {user.name}
+                    {self && (
+                      <span className="ml-2 text-xs text-muted-foreground">{t("users.you")}</span>
+                    )}
+                  </TableCell>
+                  <TableCell>{t(`roles.${user.role}`)}</TableCell>
+                  <TableCell>{user.realm ?? "local"}</TableCell>
+                  <TableCell>{user.two_factor ? t("users.twoFactorOn") : "—"}</TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu modal={false}>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t("vms.actionsFor", { name: user.name })}
+                          onPointerDown={rememberTrigger}
+                          onKeyDown={rememberTrigger}
                         >
-                          {t("users.resetPassword")}
-                        </ReasonMenuItem>
-                      )}
-                      {/* 자기 2FA는 설정 › 2단계 인증에서 바꾼다(서버도 409 cannot_reset_self). */}
-                      {user.two_factor && !self && (
+                          <MoreHorizontal />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
                         <ReasonMenuItem
-                          reason={null}
-                          onSelect={() => setDialog({ kind: "reset2fa", user })}
+                          reason={self ? "users.reason.selfRole" : null}
+                          onSelect={() => setDialog({ kind: "role", user })}
                         >
-                          {t("users.reset2fa")}
+                          {t("users.changeRole")}
                         </ReasonMenuItem>
-                      )}
-                      <DropdownMenuSeparator />
-                      <ReasonMenuItem
-                        variant="destructive"
-                        reason={self ? "users.reason.selfDelete" : null}
-                        onSelect={() => setDialog({ kind: "delete", user })}
-                      >
-                        {t("common.delete")}
-                      </ReasonMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </TableCell>
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+                        {/* 외부 사용자의 비밀번호는 영역의 디렉터리가 맡는다. */}
+                        {!user.realm && (
+                          <ReasonMenuItem
+                            reason={self ? "users.reason.selfPassword" : null}
+                            onSelect={() => setDialog({ kind: "password", user })}
+                          >
+                            {t("users.resetPassword")}
+                          </ReasonMenuItem>
+                        )}
+                        {/* 자기 2FA는 설정 › 2단계 인증에서 바꾼다(서버도 409 cannot_reset_self). */}
+                        {user.two_factor && !self && (
+                          <ReasonMenuItem
+                            reason={null}
+                            onSelect={() => setDialog({ kind: "reset2fa", user })}
+                          >
+                            {t("users.reset2fa")}
+                          </ReasonMenuItem>
+                        )}
+                        <DropdownMenuSeparator />
+                        <ReasonMenuItem
+                          variant="destructive"
+                          reason={self ? "users.reason.selfDelete" : null}
+                          onSelect={() => setDialog({ kind: "delete", user })}
+                        >
+                          {t("common.delete")}
+                        </ReasonMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       <p className="text-sm text-muted-foreground">{t("users.selfNote")}</p>
       {dialog?.kind === "create" && <CreateUserDialog onClose={close} onDone={changed} />}
       {dialog?.kind === "role" && (
@@ -284,7 +302,12 @@ function CreateUserDialog({ onClose, onDone }: { onClose(): void; onDone(): Prom
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="user-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="user-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.users.name")}
+      >
         {(a11y) => (
           <Input
             id="user-name"

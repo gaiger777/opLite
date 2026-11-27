@@ -1,4 +1,3 @@
-import { Layers } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -53,7 +52,8 @@ export function ApplySetsPage() {
       <PageHeader
         id="apply-sets-title"
         title={t("nav.applySets")}
-        description={t("declarative.sets.pageHint")}
+        help="applySets"
+        intro={t("declarative.sets.intro")}
       />
       {!readable ? (
         <p className="text-sm text-muted-foreground">{t("nav.noAccess")}</p>
@@ -61,9 +61,10 @@ export function ApplySetsPage() {
         <ListPending error={sets.error} />
       ) : items.length === 0 ? (
         <EmptyState
-          icon={Layers}
+          diagram="declarativeApply"
           title={t("declarative.sets.empty")}
           description={t("declarative.sets.emptyHint")}
+          help="applySets.page"
         />
       ) : (
         <div className="overflow-x-auto">

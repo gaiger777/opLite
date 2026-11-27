@@ -473,7 +473,12 @@ export function NodesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <PageHeader id="nodes-title" title={t("nav.nodes")} description={t("nodes.joinNote")} />
+      <PageHeader
+        id="nodes-title"
+        title={t("nav.nodes")}
+        help="nodes"
+        intro={t("help.nodes.intro")}
+      />
       <DataTable
         id="nodes"
         rows={nodes.data ?? []}

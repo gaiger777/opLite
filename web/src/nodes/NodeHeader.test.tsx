@@ -83,13 +83,13 @@ it("edits labels from the header menu and undoes the change", async () => {
   );
   renderPage(<NodeDetailPage />, at);
   await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
-  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit labels" }));
-  const dialog = await screen.findByRole("dialog", { name: "Labels of node-b" });
-  const input = within(dialog).getByLabelText("Labels");
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit tags" }));
+  const dialog = await screen.findByRole("dialog", { name: "Tags of node-b" });
+  const input = within(dialog).getByLabelText("Tags");
   await userEvent.clear(input);
   await userEvent.type(input, "zone=rack-b");
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await screen.findByText("Labels of node-b saved.")).toBeInTheDocument();
+  expect(await screen.findByText("Tags of node-b saved.")).toBeInTheDocument();
   // sonner 단추는 pointer capture를 쓰므로(jsdom에 없음) 클릭만 보낸다.
   fireEvent.click(screen.getByRole("button", { name: "Undo" }));
   expect(await screen.findByText("Undone.")).toBeInTheDocument();
@@ -135,6 +135,6 @@ it("offers only the read-only dialogs to viewers", async () => {
   });
   await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
   expect(await screen.findByRole("menuitem", { name: /interfaces/i })).toBeInTheDocument();
-  expect(screen.queryByRole("menuitem", { name: "Edit labels" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Edit tags" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Enter maintenance" })).not.toBeInTheDocument();
 });

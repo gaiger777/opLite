@@ -75,7 +75,7 @@ it("lists nodes with their state, capacity and VMs", async () => {
   // VXLAN 패킷을 주고받는 주소. 정하지 못한 노드는 없다.
   const underlayColumn = within(table)
     .getAllByRole("columnheader")
-    .findIndex((h) => h.textContent === "Underlay address");
+    .findIndex((h) => h.textContent === "Node-to-node address");
   expect(within(b).getAllByRole("cell")[underlayColumn]).toHaveTextContent("fd00::2");
   expect(within(a).getAllByRole("cell")[underlayColumn]).toHaveTextContent("—");
 });
@@ -87,9 +87,9 @@ it("marks witness nodes", async () => {
   renderPage(<NodesPage />);
   const table = await screen.findByRole("table", { name: "Nodes" });
   const w = (await within(table).findByText("node-w")).closest("tr")!;
-  expect(within(w).getByText("Witness")).toBeInTheDocument();
+  expect(within(w).getByText("Vote-only node")).toBeInTheDocument();
   const a = within(table).getByText("node-a").closest("tr")!;
-  expect(within(a).queryByText("Witness")).not.toBeInTheDocument();
+  expect(within(a).queryByText("Vote-only node")).not.toBeInTheDocument();
 });
 
 it("shows how each node fences", async () => {
@@ -115,14 +115,16 @@ it("shows how each node fences", async () => {
   const a = (await within(table).findByText("node-a")).closest("tr")!;
   const column = within(table)
     .getAllByRole("columnheader")
-    .findIndex((h) => h.textContent === "Fencing");
-  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent("WatchdogRecovers after 22 s");
-  expect(within(a).queryByText("Power fence unreachable")).not.toBeInTheDocument();
+    .findIndex((h) => h.textContent === "Forced reboot on failure");
+  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent(
+    "WatchdogRestarts on another node after 22 s",
+  );
+  expect(within(a).queryByText("Power-off device unreachable")).not.toBeInTheDocument();
   // 펜싱이 꺼진 노드는 `ha`가 없다.
   const b = within(table).getByText("node-b").closest("tr")!;
   expect(within(b).getAllByRole("cell")[column]).toHaveTextContent("—");
   // 읽지 못한 까닭은 title이 아니라 글로 보인다(계획 77-1 리뷰 I5).
-  expect(within(b).getByText("Power fence unreachable")).not.toHaveAttribute("title");
+  expect(within(b).getByText("Power-off device unreachable")).not.toHaveAttribute("title");
   expect(within(b).getByText("ipmi: connection timed out")).toBeVisible();
 });
 
@@ -141,8 +143,8 @@ it("shows what each node can hotplug", async () => {
   const cell = (name: string) =>
     within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column];
   expect(await within(table).findByText("node-a")).toBeInTheDocument();
-  expect(cell("node-a")).toHaveTextContent("qemu-kvmHotplug: vCPU yes, memory yes");
-  expect(cell("node-b")).toHaveTextContent("Hotplug: vCPU no, memory no");
+  expect(cell("node-a")).toHaveTextContent("qemu-kvmAdd while running: vCPU yes, memory yes");
+  expect(cell("node-b")).toHaveTextContent("Add while running: vCPU no, memory no");
   expect(cell("node-c")).toHaveTextContent(/^qemu-kvm$/);
 });
 
@@ -850,14 +852,14 @@ it("edits node labels with the revision of the node when saving", async () => {
   await within(table).findByText("node-b");
   const labelsColumn = within(table)
     .getAllByRole("columnheader")
-    .findIndex((h) => h.textContent === "Labels");
+    .findIndex((h) => h.textContent === "Tags");
   const row = (name: string) => within(table).getByText(name).closest("tr")!;
   expect(within(row("node-b")).getAllByRole("cell")[labelsColumn]).toHaveTextContent("zone=rack-a");
   expect(within(row("node-a")).getAllByRole("cell")[labelsColumn]).toHaveTextContent("—");
   await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
-  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit labels" }));
-  const dialog = await screen.findByRole("dialog", { name: "Labels of node-b" });
-  const input = within(dialog).getByLabelText("Labels");
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit tags" }));
+  const dialog = await screen.findByRole("dialog", { name: "Tags of node-b" });
+  const input = within(dialog).getByLabelText("Tags");
   expect(input).toHaveValue("zone=rack-a");
   expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
   await userEvent.type(input, ", ssd");
@@ -873,7 +875,7 @@ it("edits node labels with the revision of the node when saving", async () => {
     );
   });
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await screen.findByText("Labels of node-b saved.")).toBeInTheDocument();
+  expect(await screen.findByText("Tags of node-b saved.")).toBeInTheDocument();
   expect(sent).toEqual([
     { ifMatch: "9", body: { labels: { zone: "rack-a", ssd: "true" }, spec: DOWN.spec } },
   ]);
@@ -898,9 +900,9 @@ it("does not overwrite node labels changed while the dialog was open", async () 
   const table = await screen.findByRole("table", { name: "Nodes" });
   await within(table).findByText("node-b");
   await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
-  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit labels" }));
-  const dialog = await screen.findByRole("dialog", { name: "Labels of node-b" });
-  await userEvent.type(within(dialog).getByLabelText("Labels"), ", ssd=true");
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Edit tags" }));
+  const dialog = await screen.findByRole("dialog", { name: "Tags of node-b" });
+  await userEvent.type(within(dialog).getByLabelText("Tags"), ", ssd=true");
   // 대화 상자를 연 사이 다른 곳에서 레이블을 바꿨다.
   const relabeled = { ...labeled, revision: 9, labels: { zone: "rack-b" } };
   act(() => {
@@ -947,7 +949,7 @@ it("marks a frozen node and unfreezes it", async () => {
   expect((await within(table).findByText("node-b")).closest("tr")).toHaveTextContent("Frozen");
   expect(within(table).getByText("node-a").closest("tr")).not.toHaveTextContent("Frozen");
   await userEvent.click(screen.getByRole("button", { name: "Actions for node-a" }));
-  expect(await screen.findByRole("menuitem", { name: "Edit labels" })).toBeInTheDocument();
+  expect(await screen.findByRole("menuitem", { name: "Edit tags" })).toBeInTheDocument();
   expect(screen.queryByRole("menuitem", { name: "Unfreeze" })).not.toBeInTheDocument();
   await userEvent.keyboard("{Escape}");
   await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
@@ -1006,12 +1008,18 @@ it("sets up power-off fencing for a node, then tests it", async () => {
   await within(table).findByText("node-w");
   // 위트니스는 HA VM을 돌리지 않아 펜싱하지 않는다.
   await userEvent.click(screen.getByRole("button", { name: "Actions for node-w" }));
-  expect(await screen.findByRole("menuitem", { name: "Edit labels" })).toBeInTheDocument();
-  expect(screen.queryByRole("menuitem", { name: "Power-off fencing…" })).not.toBeInTheDocument();
+  expect(await screen.findByRole("menuitem", { name: "Edit tags" })).toBeInTheDocument();
+  expect(
+    screen.queryByRole("menuitem", { name: "Force-isolate failed node…" }),
+  ).not.toBeInTheDocument();
   await userEvent.keyboard("{Escape}");
   await userEvent.click(screen.getByRole("button", { name: "Actions for node-b" }));
-  await userEvent.click(await screen.findByRole("menuitem", { name: "Power-off fencing…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Power-off fencing of node-b" });
+  await userEvent.click(
+    await screen.findByRole("menuitem", { name: "Force-isolate failed node…" }),
+  );
+  const dialog = await screen.findByRole("dialog", {
+    name: "Force-isolate node-b when it fails (power off)",
+  });
   expect(await within(dialog).findByText(/No methods/)).toBeInTheDocument();
   expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
   // 저장된 설정이 없으면 시험·지우기가 없다.
@@ -1031,7 +1039,9 @@ it("sets up power-off fencing for a node, then tests it", async () => {
   await userEvent.type(within(second).getByLabelText("Status command"), "pdu status b");
   await userEvent.click(within(second).getByRole("button", { name: "Move method 2 up" }));
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
-  expect(await screen.findByText("Saved the power-off fencing of node-b.")).toBeInTheDocument();
+  expect(
+    await screen.findByText("Saved the failed-node force-isolation of node-b."),
+  ).toBeInTheDocument();
   expect(put).toEqual([
     {
       ifMatch: null,
@@ -1098,8 +1108,12 @@ it("keeps the saved password and removes power-off fencing", async () => {
   renderPage(<NodesPage />);
   await screen.findByRole("table", { name: "Nodes" });
   await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
-  await userEvent.click(await screen.findByRole("menuitem", { name: "Power-off fencing…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Power-off fencing of node-b" });
+  await userEvent.click(
+    await screen.findByRole("menuitem", { name: "Force-isolate failed node…" }),
+  );
+  const dialog = await screen.findByRole("dialog", {
+    name: "Force-isolate node-b when it fails (power off)",
+  });
   expect(await within(dialog).findByLabelText("BMC URL")).toHaveValue("https://bmc-b");
   await userEvent.click(within(dialog).getByRole("button", { name: "Test" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
@@ -1146,8 +1160,10 @@ it("keeps the saved password and removes power-off fencing", async () => {
       ],
     },
   });
-  await userEvent.click(within(dialog).getByRole("button", { name: "Remove fencing" }));
-  expect(await screen.findByText("Removed the power-off fencing of node-b.")).toBeInTheDocument();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Remove force-isolation" }));
+  expect(
+    await screen.findByText("Removed the failed-node force-isolation of node-b."),
+  ).toBeInTheDocument();
   expect(deleted).toEqual(["8"]);
   expect(within(dialog).getByText(/No methods/)).toBeInTheDocument();
 });
@@ -1174,7 +1190,7 @@ it("shows the Ceph daemons of each node and opens its disks", async () => {
   expect(cell("node-w")).toHaveTextContent("—");
   // 위트니스에는 디스크 메뉴가 없다.
   await user.click(screen.getByRole("button", { name: "Actions for node-w" }));
-  expect(await screen.findByRole("menuitem", { name: "Edit labels" })).toBeInTheDocument();
+  expect(await screen.findByRole("menuitem", { name: "Edit tags" })).toBeInTheDocument();
   expect(screen.queryByRole("menuitem", { name: "Disks…" })).not.toBeInTheDocument();
   await user.keyboard("{Escape}");
   await user.click(screen.getByRole("button", { name: "Actions for node-a" }));

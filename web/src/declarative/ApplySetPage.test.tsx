@@ -225,3 +225,15 @@ it("exports the set's manifests as YAML to copy or download", async () => {
   expect(within(dialog).getByRole("button", { name: "Copy the YAML" })).toBeInTheDocument();
   expect(within(dialog).getByRole("button", { name: "Download" })).toBeInTheDocument();
 });
+
+it("explains apply sets with a picture and the first steps when there are none", async () => {
+  mockLists({});
+  server.use(http.get(apiUrl("/apply-sets"), () => HttpResponse.json({ revision: 1, items: [] })));
+  renderPage(<ApplySetsPage />, { path: "/apply-sets" });
+  const empty = (await screen.findByText("No apply sets.")).closest<HTMLElement>(
+    "[data-slot=empty-state]",
+  )!;
+  expect(empty).toHaveTextContent("orbivisorctl apply --set name -f folder");
+  expect(empty.querySelector("[data-slot=diagram]")).not.toBeNull();
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});

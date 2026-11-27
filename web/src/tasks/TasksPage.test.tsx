@@ -311,3 +311,13 @@ it("names Ceph tasks by their node and shows their stage", async () => {
   expect(rows[5]).toHaveTextContent("Add a Ceph monitor on node-b");
   expect(rows[5]).toHaveTextContent("Waiting for quorum");
 });
+
+it("explains an empty task list", async () => {
+  mockLists({ task: [] });
+  renderPage(<TasksPage />);
+  const empty = (
+    await screen.findByText(/its progress and result collect here/)
+  ).closest<HTMLElement>("[data-slot=empty-state]")!;
+  expect(empty).toHaveTextContent("No tasks.");
+  expect(within(empty).getByRole("button", { name: "Learn more" })).toBeInTheDocument();
+});

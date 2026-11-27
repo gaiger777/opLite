@@ -52,7 +52,7 @@ export function CreateFolderDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="folder-name" label={t("common.name")} error={error}>
+      <Field id="folder-name" label={t("common.name")} error={error} help={t("help.folders.name")}>
         {(a11y) => (
           <Input
             id="folder-name"
@@ -94,7 +94,12 @@ export function RenameFolderDialog({ folder, onClose }: { folder: Folder; onClos
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="folder-rename" label={t("common.name")} error={error}>
+      <Field
+        id="folder-rename"
+        label={t("common.name")}
+        error={error}
+        help={t("help.folders.name")}
+      >
         {(a11y) => (
           <Input
             id="folder-rename"

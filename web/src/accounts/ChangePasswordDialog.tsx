@@ -73,7 +73,12 @@ export function ChangePasswordDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="current-password" label={t("accounts.currentPassword")} error={errors.current}>
+      <Field
+        id="current-password"
+        label={t("accounts.currentPassword")}
+        error={errors.current}
+        help={t("help.accounts.current")}
+      >
         {(a11y) => (
           <Input
             ref={currentInput}

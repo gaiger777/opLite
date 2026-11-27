@@ -59,7 +59,7 @@ export function SettingsPage() {
 
   return (
     <div className="flex max-w-xl flex-col gap-6">
-      <PageHeader title={t("nav.settings")} />
+      <PageHeader title={t("nav.settings")} help="settings" intro={t("help.settings.intro")} />
       <form noValidate onSubmit={(e) => void save(e)} className="flex flex-col gap-4">
         <h2 className="font-medium">{t("settings.updates")}</h2>
         {error && (
@@ -70,6 +70,7 @@ export function SettingsPage() {
         <Field
           id="settings-channel"
           label={t("settings.channel")}
+          info="settings.channel"
           help={
             subscribed
               ? t("settings.channelHint")

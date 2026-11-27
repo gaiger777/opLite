@@ -37,11 +37,11 @@ it("turns the Prometheus endpoint on and off", async () => {
   const section = await screen.findByRole("region", { name: "Prometheus" });
   expect(within(section).getByText("Off")).toBeInTheDocument();
   expect(within(section).getByText(`${window.location.origin}/api/v1/metrics`)).toBeInTheDocument();
-  expect(within(section).getByLabelText("Example scrape configuration")).toHaveTextContent(
-    "metrics_path: /api/v1/metrics",
-  );
   expect(
-    within(section).getByRole("button", { name: "Copy example scrape configuration" }),
+    within(section).getByLabelText("Example Prometheus configuration (scrape_configs)"),
+  ).toHaveTextContent("metrics_path: /api/v1/metrics");
+  expect(
+    within(section).getByRole("button", { name: "Copy example Prometheus configuration" }),
   ).toBeInTheDocument();
   await user.click(within(section).getByRole("button", { name: "Turn on Prometheus endpoint" }));
   expect(await screen.findByText("The Prometheus endpoint is on.")).toBeInTheDocument();

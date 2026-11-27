@@ -44,15 +44,23 @@ export function FolderSelect({
     return null;
   }
   return (
-    <Field id={id} label={t("folders.folder")}>
-      <NativeSelect id={id} className="w-full" value={value} onChange={(e) => set(e.target.value)}>
-        {options.root && <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>}
-        {options.inside.map((f) => (
-          <NativeSelectOption key={f.id} value={f.id}>
-            {f.path}
-          </NativeSelectOption>
-        ))}
-      </NativeSelect>
+    <Field id={id} label={t("folders.folder")} help={t("help.folders.folder")}>
+      {(a11y) => (
+        <NativeSelect
+          id={id}
+          className="w-full"
+          value={value}
+          onChange={(e) => set(e.target.value)}
+          {...a11y}
+        >
+          {options.root && <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>}
+          {options.inside.map((f) => (
+            <NativeSelectOption key={f.id} value={f.id}>
+              {f.path}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      )}
     </Field>
   );
 }

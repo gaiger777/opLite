@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { FileSearch, RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -8,6 +8,7 @@ import type { AuditEntry } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { focusBack } from "@/components/focusBack";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import {
@@ -63,7 +64,7 @@ export function AuditPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title={t("nav.audit")} />
+        <PageHeader title={t("nav.audit")} help="audit" intro={t("help.audit.intro")} />
         <p className="text-sm text-muted-foreground">{t("audit.adminOnly")}</p>
       </div>
     );
@@ -140,6 +141,8 @@ export function AuditPage() {
       <PageHeader
         id="audit-title"
         title={t("nav.audit")}
+        help="audit"
+        intro={t("help.audit.intro")}
         actions={
           <Button
             variant="outline"
@@ -223,6 +226,14 @@ export function AuditPage() {
         rowId={(entry) => entry.id}
         query={audit}
         empty={t("audit.empty")}
+        emptyState={
+          <EmptyState
+            icon={FileSearch}
+            title={t("audit.empty")}
+            description={t("help.audit.empty")}
+            help="audit.page"
+          />
+        }
         labelledBy="audit-title"
         keys
         rowProps={(entry) => ({

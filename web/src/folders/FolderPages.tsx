@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { FolderPlus, Plus } from "lucide-react";
+import { FolderOpen, FolderPlus, Plus } from "lucide-react";
 import { Suspense, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
@@ -10,6 +10,7 @@ import { objectTarget, type Target } from "@/auth/permissions";
 import { usePermissions } from "@/auth/usePermissions";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
+import { EmptyState } from "@/components/EmptyState";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { ViewToggle } from "@/layout/PageTabs";
@@ -211,6 +212,14 @@ export function FolderMembers({
         rowName={(item) => item.name}
         query={list}
         empty={t("folders.emptyFolder")}
+        emptyState={
+          <EmptyState
+            icon={FolderOpen}
+            title={t("folders.emptyFolder")}
+            description={t("help.folders.empty")}
+            help="folders.page"
+          />
+        }
         labelledBy={labelledBy}
         state={state}
         search={(item) => item.name}
@@ -305,6 +314,8 @@ export function FolderViewPage({ kind }: { kind: FolderKind }) {
       <PageHeader
         id="folder-view-title"
         title={t(`nav.${kind}Folders`)}
+        help="folders"
+        intro={t("help.folders.intro")}
         actions={
           <>
             <ViewToggle />

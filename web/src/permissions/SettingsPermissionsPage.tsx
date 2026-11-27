@@ -1,6 +1,6 @@
 // 설정 › 권한·역할·그룹(계획 62 설계 §13 웹): 모든 grant 표, 사용자 정의 역할(권한 체크 표), 로컬 그룹과 외부 그룹 연결.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Pencil, Plus, ShieldCheck, Trash2, Users } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -13,8 +13,10 @@ import { PRIVILEGES, type Privilege, type Target } from "@/auth/permissions";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { InfoButton } from "@/components/InfoButton";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
@@ -127,7 +129,8 @@ export function GrantsPage() {
       <PageHeader
         id="grants-title"
         title={t("nav.permissions")}
-        description={t("permissions.pageHint")}
+        help="permissions"
+        intro={t("help.permissions.intro")}
         actions={
           <Button onClick={() => setAdding(true)}>
             <Plus />
@@ -135,54 +138,69 @@ export function GrantsPage() {
           </Button>
         }
       />
-      <Table aria-labelledby="grants-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("permissions.principal")}</TableHead>
-            <TableHead>{t("permissions.role")}</TableHead>
-            <TableHead>{t("permissions.target")}</TableHead>
-            <TableHead>{t("permissions.propagateShort")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(grants.data ?? []).length === 0 && (
-            <TableMessage colSpan={5} query={grants} empty={t("permissions.emptyAll")} />
-          )}
-          {(grants.data ?? []).map((g) => {
-            const who = principalName(g.spec.principal, names);
-            return (
-              <TableRow key={g.id}>
-                <TableCell className="font-medium">
-                  {who}
-                  {g.spec.principal.type === "group" && (
-                    <span className="ml-2 text-xs text-muted-foreground">
-                      {t("permissions.group")}
-                    </span>
-                  )}
-                </TableCell>
-                <TableCell>{roleName(g.spec.role, roles.data, t)}</TableCell>
-                <TableCell>{targetLabel(g.spec.target, paths, objectName, t)}</TableCell>
-                <TableCell>
-                  {g.spec.propagate === false ? t("common.no") : t("common.yes")}
-                </TableCell>
-                <TableCell className="text-right">
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={t("permissions.removeNamed", { name: who })}
-                    onClick={() => setRemoving(g)}
-                  >
-                    <Trash2 />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+      {grants.isSuccess && grants.data.length === 0 ? (
+        <EmptyState
+          icon={ShieldCheck}
+          title={t("permissions.emptyAll")}
+          description={t("help.permissions.empty")}
+          help="permissions.page"
+          action={
+            <Button onClick={() => setAdding(true)}>
+              <Plus />
+              {t("permissions.add")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="grants-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("permissions.principal")}</TableHead>
+              <TableHead>{t("permissions.role")}</TableHead>
+              <TableHead>{t("permissions.target")}</TableHead>
+              <TableHead>{t("permissions.propagateShort")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {(grants.data ?? []).length === 0 && (
+              <TableMessage colSpan={5} query={grants} empty={t("permissions.emptyAll")} />
+            )}
+            {(grants.data ?? []).map((g) => {
+              const who = principalName(g.spec.principal, names);
+              return (
+                <TableRow key={g.id}>
+                  <TableCell className="font-medium">
+                    {who}
+                    {g.spec.principal.type === "group" && (
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {t("permissions.group")}
+                      </span>
+                    )}
+                  </TableCell>
+                  <TableCell>{roleName(g.spec.role, roles.data, t)}</TableCell>
+                  <TableCell>{targetLabel(g.spec.target, paths, objectName, t)}</TableCell>
+                  <TableCell>
+                    {g.spec.propagate === false ? t("common.no") : t("common.yes")}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("permissions.removeNamed", { name: who })}
+                      onClick={() => setRemoving(g)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
       {adding && (
         <AddGrantDialog
           target={{ type: "root" }}
@@ -246,7 +264,8 @@ export function RolesPage() {
       <PageHeader
         id="roles-title"
         title={t("nav.roles")}
-        description={t("roleEditor.pageHint")}
+        help="roles"
+        intro={t("help.roles.intro")}
         actions={
           <Button onClick={() => setEditing("new")}>
             <Plus />
@@ -254,61 +273,76 @@ export function RolesPage() {
           </Button>
         }
       />
-      <Table aria-labelledby="roles-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("roleEditor.privileges")}</TableHead>
-            <TableHead>{t("roleEditor.description")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(roles.data ?? []).length === 0 && (
-            <TableMessage colSpan={4} query={roles} empty={t("roleEditor.empty")} />
-          )}
-          {(roles.data ?? []).map((role) => (
-            <TableRow key={role.id ?? role.name}>
-              <TableCell className="font-medium">
-                {role.builtin ? t(`roles.${role.name}`) : role.name}
-                {role.builtin && (
-                  <span className="ml-2 text-xs text-muted-foreground">
-                    {t("roleEditor.builtin")}
-                  </span>
-                )}
-              </TableCell>
-              <TableCell className="max-w-md text-xs break-words">
-                {role.privileges.join(", ")}
-              </TableCell>
-              <TableCell className="text-sm">{role.description}</TableCell>
-              <TableCell className="text-right whitespace-nowrap">
-                {!role.builtin && (
-                  <>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("roleEditor.editNamed", { name: role.name })}
-                      onClick={() => setEditing(role)}
-                    >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("common.deleteNamed", { name: role.name })}
-                      onClick={() => setRemoving(role)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </>
-                )}
-              </TableCell>
+      {roles.isSuccess && roles.data.length === 0 ? (
+        <EmptyState
+          icon={ShieldCheck}
+          title={t("roleEditor.empty")}
+          description={t("help.roles.empty")}
+          help="roles.page"
+          action={
+            <Button onClick={() => setEditing("new")}>
+              <Plus />
+              {t("roleEditor.createTitle")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="roles-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("roleEditor.privileges")}</TableHead>
+              <TableHead>{t("roleEditor.description")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {(roles.data ?? []).length === 0 && (
+              <TableMessage colSpan={4} query={roles} empty={t("roleEditor.empty")} />
+            )}
+            {(roles.data ?? []).map((role) => (
+              <TableRow key={role.id ?? role.name}>
+                <TableCell className="font-medium">
+                  {role.builtin ? t(`roles.${role.name}`) : role.name}
+                  {role.builtin && (
+                    <span className="ml-2 text-xs text-muted-foreground">
+                      {t("roleEditor.builtin")}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell className="max-w-md text-xs break-words">
+                  {role.privileges.join(", ")}
+                </TableCell>
+                <TableCell className="text-sm">{role.description}</TableCell>
+                <TableCell className="text-right whitespace-nowrap">
+                  {!role.builtin && (
+                    <>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("roleEditor.editNamed", { name: role.name })}
+                        onClick={() => setEditing(role)}
+                      >
+                        <Pencil />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("common.deleteNamed", { name: role.name })}
+                        onClick={() => setRemoving(role)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </>
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {editing && (
         <RoleDialog
           role={editing === "new" ? null : editing}
@@ -399,7 +433,12 @@ function RoleDialog({
       onSubmit={submit}
     >
       {!role && (
-        <Field id="role-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="role-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.roles.name")}
+        >
           {(a11y) => (
             <Input
               id="role-name"
@@ -411,16 +450,26 @@ function RoleDialog({
           )}
         </Field>
       )}
-      <Field id="role-description" label={t("roleEditor.description")}>
-        <Input
-          id="role-description"
-          autoComplete="off"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
+      <Field
+        id="role-description"
+        label={t("roleEditor.description")}
+        help={t("help.roles.description")}
+      >
+        {(a11y) => (
+          <Input
+            id="role-description"
+            autoComplete="off"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            {...a11y}
+          />
+        )}
       </Field>
       <fieldset className="flex flex-col gap-3">
-        <legend className="mb-2 text-sm font-medium">{t("roleEditor.privileges")}</legend>
+        <legend className="mb-2 flex items-center gap-1 text-sm font-medium">
+          {t("roleEditor.privileges")}
+          <InfoButton topic="roles.page" label={t("roleEditor.privileges")} />
+        </legend>
         {errors.privileges && (
           <p role="alert" className="text-xs text-destructive">
             {t(errors.privileges)}
@@ -478,7 +527,8 @@ export function GroupsPage() {
       <PageHeader
         id="groups-title"
         title={t("nav.groups")}
-        description={t("groupEditor.pageHint")}
+        help="groups"
+        intro={t("help.groups.intro")}
         actions={
           <Button onClick={() => setEditing("new")}>
             <Plus />
@@ -486,58 +536,74 @@ export function GroupsPage() {
           </Button>
         }
       />
-      <Table aria-labelledby="groups-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("groupEditor.members")}</TableHead>
-            <TableHead>{t("groupEditor.external")}</TableHead>
-            <TableHead>
-              <span className="sr-only">{t("vms.actions")}</span>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(groups.data ?? []).length === 0 && (
-            <TableMessage colSpan={4} query={groups} empty={t("groupEditor.empty")} />
-          )}
-          {(groups.data ?? []).map((g) => (
-            <TableRow key={g.id}>
-              <TableCell className="font-medium">
-                {g.name}
-                {g.spec.description && (
-                  <div className="text-xs text-muted-foreground">{g.spec.description}</div>
-                )}
-              </TableCell>
-              <TableCell className="text-sm">
-                {(g.spec.members ?? []).map((id) => userName.get(id) ?? id.slice(-8)).join(", ") ||
-                  "—"}
-              </TableCell>
-              <TableCell className="text-sm">
-                {(g.spec.external ?? []).map((e) => `${e.realm}: ${e.group}`).join(", ") || "—"}
-              </TableCell>
-              <TableCell className="text-right whitespace-nowrap">
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("groupEditor.editNamed", { name: g.name })}
-                  onClick={() => setEditing(g)}
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("common.deleteNamed", { name: g.name })}
-                  onClick={() => setRemoving(g)}
-                >
-                  <Trash2 />
-                </Button>
-              </TableCell>
+      {groups.isSuccess && groups.data.length === 0 ? (
+        <EmptyState
+          icon={Users}
+          title={t("groupEditor.empty")}
+          description={t("help.groups.empty")}
+          help="groups.page"
+          action={
+            <Button onClick={() => setEditing("new")}>
+              <Plus />
+              {t("groupEditor.createTitle")}
+            </Button>
+          }
+        />
+      ) : (
+        <Table aria-labelledby="groups-title">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("groupEditor.members")}</TableHead>
+              <TableHead>{t("groupEditor.external")}</TableHead>
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {(groups.data ?? []).length === 0 && (
+              <TableMessage colSpan={4} query={groups} empty={t("groupEditor.empty")} />
+            )}
+            {(groups.data ?? []).map((g) => (
+              <TableRow key={g.id}>
+                <TableCell className="font-medium">
+                  {g.name}
+                  {g.spec.description && (
+                    <div className="text-xs text-muted-foreground">{g.spec.description}</div>
+                  )}
+                </TableCell>
+                <TableCell className="text-sm">
+                  {(g.spec.members ?? [])
+                    .map((id) => userName.get(id) ?? id.slice(-8))
+                    .join(", ") || "—"}
+                </TableCell>
+                <TableCell className="text-sm">
+                  {(g.spec.external ?? []).map((e) => `${e.realm}: ${e.group}`).join(", ") || "—"}
+                </TableCell>
+                <TableCell className="text-right whitespace-nowrap">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={t("groupEditor.editNamed", { name: g.name })}
+                    onClick={() => setEditing(g)}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={t("common.deleteNamed", { name: g.name })}
+                    onClick={() => setRemoving(g)}
+                  >
+                    <Trash2 />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
       {editing && (
         <GroupDialog
           group={editing === "new" ? null : editing}
@@ -641,7 +707,12 @@ function GroupDialog({
       onSubmit={submit}
     >
       {!group && (
-        <Field id="group-name" label={t("common.name")} error={errors.name}>
+        <Field
+          id="group-name"
+          label={t("common.name")}
+          error={errors.name}
+          help={t("help.groups.name")}
+        >
           {(a11y) => (
             <Input
               id="group-name"
@@ -653,13 +724,20 @@ function GroupDialog({
           )}
         </Field>
       )}
-      <Field id="group-description" label={t("roleEditor.description")}>
-        <Input
-          id="group-description"
-          autoComplete="off"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
+      <Field
+        id="group-description"
+        label={t("roleEditor.description")}
+        help={t("help.groups.description")}
+      >
+        {(a11y) => (
+          <Input
+            id="group-description"
+            autoComplete="off"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            {...a11y}
+          />
+        )}
       </Field>
       <fieldset className="flex flex-col gap-1.5">
         <legend className="mb-1 text-sm font-medium">{t("groupEditor.members")}</legend>

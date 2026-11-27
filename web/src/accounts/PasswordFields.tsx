@@ -39,7 +39,12 @@ export function PasswordFields({
           />
         )}
       </Field>
-      <Field id={`${id}-confirm`} label={t("accounts.confirmPassword")} error={errors.confirm}>
+      <Field
+        id={`${id}-confirm`}
+        label={t("accounts.confirmPassword")}
+        error={errors.confirm}
+        help={t("help.accounts.confirm")}
+      >
         {(a11y) => (
           <Input
             id={`${id}-confirm`}

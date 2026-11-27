@@ -10,7 +10,11 @@ export function SubscriptionPage() {
   const perms = usePermissions();
   return (
     <div className="flex max-w-xl flex-col gap-6">
-      <PageHeader title={t("nav.subscription")} />
+      <PageHeader
+        title={t("nav.subscription")}
+        help="subscription"
+        intro={t("help.subscription.intro")}
+      />
       <SubscriptionSection write={perms.can("write", "settings")} />
     </div>
   );

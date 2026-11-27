@@ -1,4 +1,5 @@
 import { hashKey, useQueryClient } from "@tanstack/react-query";
+import { ListChecks } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -6,6 +7,7 @@ import { Link } from "react-router";
 import { listKey, useList } from "@/api/live";
 import type { Task } from "@/api/types";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { StatusChip, type StatusTone } from "@/components/StatusChip";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -249,6 +251,8 @@ export function TasksPage() {
       <PageHeader
         id="tasks-title"
         title={t("nav.tasks")}
+        help="tasks"
+        intro={t("help.tasks.intro")}
         actions={
           <div className="flex items-center gap-2">
             <Checkbox
@@ -263,12 +267,21 @@ export function TasksPage() {
           </div>
         }
       />
-      <TaskTable
-        tasks={pager.pageItems}
-        labelledBy="tasks-title"
-        keys
-        empty={failedOnly ? t("tasks.emptyFailed") : undefined}
-      />
+      {tasks.isSuccess && tasks.data.length === 0 ? (
+        <EmptyState
+          icon={ListChecks}
+          title={t("tasks.empty")}
+          description={t("help.tasks.empty")}
+          help="tasks.page"
+        />
+      ) : (
+        <TaskTable
+          tasks={pager.pageItems}
+          labelledBy="tasks-title"
+          keys
+          empty={failedOnly ? t("tasks.emptyFailed") : undefined}
+        />
+      )}
       <Pager {...pager} pageSize={TASK_PAGE_SIZE} total={shown.length} />
     </div>
   );
