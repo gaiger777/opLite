@@ -1,7 +1,9 @@
-// 오른쪽 고정 요약·검사(계획 77-5 — 진단 §4.3, EC2 요약 판·vSphere 호환성 판): 이름·폴더·놓일 노드(자동이면 서버 미리
-// 확인이 고른 노드)와 그 노드의 여유 막대(이미 쓴 것 + 이 VM, 실제보다 많이 나눠 주면 경고), 서버 확인 상태와 문제(누르면 그
-// 칸), 만든 뒤 켜기, 고급 설정·요청 보기(JSON·CLI) 서랍, 만들기 단추(늘 보임 — 막는 문제가 있으면 누를 때 보이고 그 칸으로).
-// 1280px 밑에서는 그림 아래에 오고 만들기 줄은 아래 고정 띠다.
+// 오른쪽 고정 요약·검사(계획 77-5 — 진단 §4.3, EC2 요약 판·vSphere 호환성 판): 이름·폴더, 배치 칸(놓일 노드 — 자동이면 서버
+// 미리 확인이 고른 노드 — 와 그 노드의 여유 막대: 이미 쓴 것 + 이 VM, 실제보다 많이 나눠 주면 경고), 펌웨어·보안 한 줄, 서버
+// 확인 상태와 문제(누르면 그 칸 — 서랍에서만 고치는 칸이면 서랍을 열고 그 칸), 만든 뒤 켜기와 만들기 단추(늘 보임 — 막는 문제가
+// 있으면 누를 때 보이고 그 칸으로). 고급 설정·요청 보기(JSON·CLI) 단추는 화면 머리줄에 있다. 1280px 밑에서는 이름·폴더가 그림
+// 위로 가고 요약은 그림 아래, 만들기 줄은 페이지 아래 고정 띠다.
+import { MapPin, ShieldCheck } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -19,18 +21,26 @@ import { serverErrorMessage } from "@/i18n/errors";
 import { formatBytes, formatMib } from "@/lib/format";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 import { cn } from "@/lib/utils";
+import { SlotBox } from "@/vmBuilder/Chassis";
 import { useBuilder } from "@/vmBuilder/context";
 import { partLabel, problemSlot, problemText, type Thing } from "@/vmBuilder/labels";
 import { cliText } from "@/vmBuilder/model/cli";
 import { parts } from "@/vmBuilder/model/parts";
-import type { Problem } from "@/vmBuilder/model/problems";
+import { inDrawer, type Problem } from "@/vmBuilder/model/problems";
 import { jsonText, requests } from "@/vmBuilder/model/requests";
 import { type Bar, nodeRoom, percent, targetNode } from "@/vmBuilder/model/room";
 import { setName } from "@/vmBuilder/model/state";
 import type { ServerCheck } from "@/vmBuilder/useServerCheck";
 
-/** 문제의 칸으로 초점(이름 칸이면 입력) */
-export function focusProblem(p: Problem) {
+/**
+ * 문제의 칸으로 초점(이름 칸이면 입력). 고급 서랍에서만 고치는 칸의 문제(보안 부팅·예약 스냅샷·복제·NUMA·부팅 순번 등)는
+ * `openAdvanced`로 서랍을 열고 그 칸으로 간다(계획 77-5 리뷰 I4).
+ */
+export function focusProblem(p: Problem, openAdvanced?: (focusInvalid: boolean) => void) {
+  if (openAdvanced && (p.field ? inDrawer(p.field) : p.at === "replication")) {
+    openAdvanced(true);
+    return;
+  }
   const at = problemSlot(p.at);
   const el = document.getElementById(at === "name" ? "vb-name" : `vb-${at}`);
   el?.scrollIntoView?.({ block: "nearest" });
@@ -40,23 +50,57 @@ export function focusProblem(p: Problem) {
 /** 요약에 바로 보이는 문제 수(나머지는 "n개 더" — 요약이 한 화면을 넘지 않게) */
 const SHOWN = 3;
 
+/** 이름과 폴더(넓은 화면은 요약 맨 위, 좁은 화면은 그림 위 — 고정 띠에 가리지 않게) */
+export function NameFields() {
+  const { t } = useTranslation();
+  const b = useBuilder();
+  const v = b.s.values;
+  const nameProblem = b.showName ? b.list.find((p) => p.at === "name") : undefined;
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <Field
+        id="vb-name"
+        label={t("common.name")}
+        error={nameProblem && (nameProblem.message ?? nameProblem.key)}
+        errorValues={nameProblem?.values as Record<string, string> | undefined}
+        help={t("vmBuilder.help.name")}
+      >
+        {(a11y) => (
+          <Input
+            id="vb-name"
+            value={v.name}
+            disabled={b.busy}
+            autoComplete="off"
+            onChange={(e) => b.set(setName(b.s, e.target.value))}
+            onBlur={() => v.name !== "" && b.touch()}
+            {...a11y}
+          />
+        )}
+      </Field>
+      <FolderSelect />
+    </div>
+  );
+}
+
 export function Summary({
   server,
   failure,
   blocked,
   onCreate,
+  narrow,
 }: {
   server: ServerCheck;
   failure: string | null;
   /** 만들기를 막은 첫 문제(만들기를 누른 뒤에만) */
   blocked: Problem | null;
   onCreate(): void;
+  /** 1280px 밑: 이름·폴더는 그림 위, 만들기 띠는 페이지 아래(`CreateBar`를 페이지가 그림) */
+  narrow: boolean;
 }) {
   const { t } = useTranslation();
   const b = useBuilder();
   const dnd = useDnd();
   const [all, setAll] = useState(false);
-  const [code, setCode] = useState(false);
   const check = server.check;
   const count = check?.problems.length ?? 0;
   // 서버 확인 결과가 바뀌면 알림 줄에 읽는다(초점은 옮기지 않음 — 계획 71 설계 §11).
@@ -77,39 +121,46 @@ export function Summary({
         : server.status === "off" && v.name === ""
           ? t("vmBuilder.check.needName")
           : t(`vmBuilder.check.${server.status}`);
-  const nameProblem = b.showName ? b.list.find((p) => p.at === "name") : undefined;
   const shown = all ? b.list : b.list.slice(0, SHOWN);
+  const security = [
+    v.firmware === "uefi" ? "UEFI" : "BIOS",
+    v.secureBoot && t("vmBuilder.pic.secureBoot"),
+    v.tpm && "TPM",
+    v.guestAgent && t("vmBuilder.pic.agent"),
+  ].filter(Boolean);
 
   return (
     <aside
       aria-label={t("vmBuilder.page.side")}
-      className="vb-col flex min-w-0 flex-col gap-3 rounded-lg border bg-card p-3"
+      className="vb-col vb-side flex min-w-0 flex-col gap-2.5 rounded-lg border bg-card p-3"
     >
-      <Field
-        id="vb-name"
-        label={t("common.name")}
-        error={nameProblem && (nameProblem.message ?? nameProblem.key)}
-        errorValues={nameProblem?.values as Record<string, string> | undefined}
-        help={t("vmBuilder.help.name")}
+      {!narrow && <NameFields />}
+      <SlotBox
+        id="placement"
+        icon={<MapPin aria-hidden className="size-3.5" />}
+        info={{ topic: "vmForm.placement", line: t("vmBuilder.slotInfo.placement") }}
       >
-        {(a11y) => (
-          <Input
-            id="vb-name"
-            value={v.name}
-            disabled={b.busy}
-            autoComplete="off"
-            onChange={(e) => b.set(setName(b.s, e.target.value))}
-            onBlur={() => v.name !== "" && b.touch()}
-            {...a11y}
-          />
-        )}
-      </Field>
-      <div className="grid grid-cols-2 gap-2">
-        <FolderSelect />
         <NodeSelect />
+        <Room />
+      </SlotBox>
+      <div className="flex min-w-0 items-center gap-1.5 text-xs">
+        <ShieldCheck aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="sr-only">{t("vmBuilder.pic.security")}: </span>
+        <span className="min-w-0 truncate" title={t("vmBuilder.pic.security")}>
+          {security.join(" · ")}
+        </span>
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="ml-auto h-auto shrink-0 p-0 text-xs"
+          onClick={() => b.openAdvanced()}
+        >
+          {t("vmBuilder.pic.inAdvanced")}
+        </Button>
       </div>
-      <Room />
-      <section aria-labelledby="vb-checks" className="flex flex-col gap-1">
+      {/* 1280px 이상은 검사 결과만 요약 안에서 스크롤한다(만들기 띠와 그림은 그대로 — 리뷰 I5). */}
+      <section aria-labelledby="vb-checks" className="vb-checks flex flex-col gap-1">
         <h2 id="vb-checks" className="text-xs font-medium text-muted-foreground">
           {t("vmBuilder.check.title")}
         </h2>
@@ -149,17 +200,20 @@ export function Summary({
           </p>
         )}
         {b.list.length > 0 && (
-          <ul className="flex flex-col" aria-label={t("vmBuilder.check.list")}>
+          <ul
+            className={cn("flex flex-col", all && "max-h-48 overflow-y-auto")}
+            aria-label={t("vmBuilder.check.list")}
+          >
             {shown.map((p, i) => (
               <li key={i}>
                 <button
                   type="button"
                   data-level={p.level}
                   className="w-full rounded-md px-1 py-0.5 text-left text-xs break-words hover:bg-muted"
-                  onClick={() => focusProblem(p)}
+                  onClick={() => focusProblem(p, b.openAdvanced)}
                 >
                   <span className="font-medium">{t(`vmBuilder.check.${p.level}`)}</span>{" "}
-                  {problemText(t, p)}
+                  <Short text={problemText(t, p)} />
                 </button>
               </li>
             ))}
@@ -179,20 +233,48 @@ export function Summary({
           </Button>
         )}
       </section>
-      <div className="flex flex-wrap gap-2">
-        <Button type="button" variant="outline" size="sm" onClick={b.openAdvanced}>
-          {t("vmBuilder.page.advanced")}
-        </Button>
-        <Button type="button" variant="outline" size="sm" onClick={() => setCode(true)}>
-          {t("vmBuilder.page.code")}
-        </Button>
-      </div>
-      <div className="vb-bar mt-auto flex flex-col gap-2 border-t bg-card pt-3">
-        {failure && (
-          <p role="alert" className="text-sm text-destructive">
-            {failure}
-          </p>
-        )}
+      {!narrow && <CreateBar failure={failure} blocked={blocked} onCreate={onCreate} />}
+    </aside>
+  );
+}
+
+/** 긴 글(서버의 영어 원문 오류 등)은 두 줄까지 — 넘으면 "자세히"로 펼친다(문제 단추 안이라 펼침 단추는 따로 두지 않고 title로). */
+function Short({ text }: { text: string }) {
+  return (
+    <span className="vb-clamp" title={text}>
+      {text}
+    </span>
+  );
+}
+
+/** 만들기 줄: 실패 알림, 만든 뒤 켜기, 만들기 단추, 막은 까닭(누르면 그 칸). 넓은 화면은 요약 맨 아래, 좁은 화면은 페이지 아래 고정 띠 */
+export function CreateBar({
+  failure,
+  blocked,
+  onCreate,
+  fixed = false,
+}: {
+  failure: string | null;
+  blocked: Problem | null;
+  onCreate(): void;
+  fixed?: boolean;
+}) {
+  const { t } = useTranslation();
+  const b = useBuilder();
+  const v = b.s.values;
+  return (
+    <div
+      className={cn(
+        "vb-bar flex flex-col gap-2 border-t bg-card pt-3",
+        fixed ? "vb-bar-page px-3" : "mt-auto",
+      )}
+    >
+      {failure && (
+        <p role="alert" className="text-sm text-destructive">
+          {failure}
+        </p>
+      )}
+      <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Checkbox
             id="vb-start"
@@ -202,21 +284,25 @@ export function Summary({
           />
           <Label htmlFor="vb-start">{t("vmForm.startAfter")}</Label>
         </div>
-        <Button type="button" disabled={b.busy} onClick={onCreate}>
+        <Button
+          type="button"
+          className={cn(!fixed && "flex-1")}
+          disabled={b.busy}
+          onClick={onCreate}
+        >
           {b.busy ? t("vmBuilder.page.creating") : t("common.create")}
         </Button>
-        {blocked && (
-          <button
-            type="button"
-            className="text-left text-xs text-destructive underline"
-            onClick={() => focusProblem(blocked)}
-          >
-            {t("vmBuilder.page.blocked", { reason: problemText(t, blocked) })}
-          </button>
-        )}
       </div>
-      {code && <CodeSheet onClose={() => setCode(false)} />}
-    </aside>
+      {blocked && (
+        <button
+          type="button"
+          className="text-left text-xs text-destructive underline"
+          onClick={() => focusProblem(blocked, b.openAdvanced)}
+        >
+          {t("vmBuilder.page.blocked", { reason: problemText(t, blocked) })}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -228,11 +314,13 @@ function FolderSelect() {
   const v = b.s.values;
   const current = list.some((p) => p.kind === "folder" && p.folder === v.folder);
   return (
-    <div className="flex min-w-0 flex-col gap-1.5">
-      <Label htmlFor="vb-folder">{t("folders.folder")}</Label>
+    <div className="flex min-w-0 items-center gap-2">
+      <Label htmlFor="vb-folder" className="shrink-0">
+        {t("folders.folder")}
+      </Label>
       <NativeSelect
         id="vb-folder"
-        className="w-full"
+        className="w-full min-w-0"
         disabled={b.busy}
         value={v.folder}
         onChange={(e) => {
@@ -274,8 +362,10 @@ function NodeSelect() {
       ? `node:${b.s.values.node}`
       : "auto";
   return (
-    <div className="flex min-w-0 flex-col gap-1.5">
-      <Label htmlFor="vb-node">{t("common.node")}</Label>
+    <div className="flex min-w-0 flex-col">
+      <Label htmlFor="vb-node" className="sr-only">
+        {t("common.node")}
+      </Label>
       <NativeSelect
         id="vb-node"
         className="w-full"
@@ -307,6 +397,18 @@ function Room() {
   if (!at) {
     return null;
   }
+  if (at.node === null) {
+    // 서버가 답했는데 노드가 없다: 막대 대신 까닭(어림 노드를 보이지 않는다)
+    return (
+      <p className="text-xs" data-level={at.other ? undefined : "warn"}>
+        {at.other
+          ? t("vmBuilder.room.other")
+          : b.s.values.start
+            ? t("vmBuilder.room.none")
+            : t("vmBuilder.room.noneOff")}
+      </p>
+    );
+  }
   const room = nodeRoom(b.s, b.ctx, at.node);
   const over = room.cpu.used + room.cpu.add > room.cpu.total;
   return (
@@ -336,7 +438,11 @@ function Room() {
       )}
       {room.disk && (
         <Meter
-          label={t("vmBuilder.room.disk", { pool: room.disk.pool })}
+          label={
+            room.disk.others > 0
+              ? t("vmBuilder.room.diskMore", { pool: room.disk.pool, count: room.disk.others })
+              : t("vmBuilder.room.disk", { pool: room.disk.pool })
+          }
           bar={room.disk}
           text={t("vmBuilder.room.text", {
             used: formatBytes(room.disk.used + room.disk.add),
@@ -385,7 +491,7 @@ function Meter({ label, bar, text }: { label: string; bar: Bar; text: string }) 
 const TABS = ["json", "cli"] as const;
 
 /** 보낼 요청 그대로(JSON·CLI, 복사) — 오른쪽 서랍 */
-function CodeSheet({ onClose }: { onClose(): void }) {
+export function CodeSheet({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const b = useBuilder();
   const { user } = usePrincipal();

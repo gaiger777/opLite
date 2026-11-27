@@ -18,8 +18,8 @@ export interface BuilderApi {
   showName: boolean;
   /** 지금 값에 대한 서버 미리 확인의 답(없거나 지난 것이면 null) */
   check: VmCheck | null;
-  /** 고급 설정 서랍을 연다. */
-  openAdvanced(): void;
+  /** 고급 설정 서랍을 연다(`focusInvalid`면 오류를 보이고 첫 틀린 칸으로 — 서랍에서 고치는 문제를 눌렀을 때). */
+  openAdvanced(focusInvalid?: boolean): void;
   /** 놓기·빼기·순서 바꾸기(되돌리기에 쌓음). 알림 줄 끝에 붙일 글을 돌려준다. */
   put(thing: Thing, slot: string): string | undefined;
   /** 살피기의 칸 고치기(쌓지 않음) */

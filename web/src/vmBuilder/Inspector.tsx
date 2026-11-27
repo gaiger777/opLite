@@ -468,7 +468,7 @@ export function Inspector() {
           variant="link"
           size="sm"
           className="self-start px-0"
-          onClick={b.openAdvanced}
+          onClick={() => b.openAdvanced()}
         >
           {i("editInForm")}
         </Button>

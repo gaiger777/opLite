@@ -11,14 +11,16 @@ import {
   Server,
   Square,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
 import { formatMib } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useBuilder } from "@/vmBuilder/context";
+import { parts } from "@/vmBuilder/model/parts";
 import {
+  noDiskReason,
   type Purpose,
   PURPOSE_SIZE,
   PURPOSES,
@@ -40,28 +42,63 @@ const ICON: Record<Purpose, LucideIcon> = {
 
 export function Purposes({
   state,
+  loading,
+  last,
   onChoose,
 }: {
   /** 처음 틀(막힌 카드를 셈) */
   state: BuilderState;
+  /** 풀·볼륨·네트워크·VM을 다 읽기 전(카드를 누르면 기본 부품이 빠지므로 누를 수 없음) */
+  loading: boolean;
+  /** 지난번에 고른 카드("바꾸기"로 돌아오면 그 카드에 초점) */
+  last: Purpose | null;
   onChoose(p: Purpose, template?: string): void;
 }) {
   const { t } = useTranslation();
   const b = useBuilder();
   const [picking, setPicking] = useState(false);
+  const list = useRef<HTMLUListElement>(null);
+  // "바꾸기"로 돌아오면 지난 카드(없으면 첫 카드)에 초점 — 읽은 뒤에(누를 수 있을 때)
+  const focused = useRef(false);
+  useEffect(() => {
+    if (focused.current || loading || !last) {
+      return;
+    }
+    focused.current = true;
+    list.current?.querySelector<HTMLElement>(`[data-purpose="${last}"]:not(:disabled)`)?.focus();
+  }, [loading, last]);
   const p = (key: string, values?: Record<string, unknown>) =>
     t(`vmBuilder.purpose.${key}`, values);
+  // 이 폴더에도 다른 폴더에도 VM을 만들 권한이 없다(만들기를 눌러 403을 받기 전에 알림 — 리뷰 S5)
+  const cannot = !parts(state, b.ctx).some((x) => x.kind === "folder");
+  const noDisk = loading ? undefined : noDiskReason(state, b.ctx);
   return (
-    <section aria-labelledby="vb-purpose" className="flex flex-col gap-3">
+    <section
+      aria-labelledby="vb-purpose"
+      aria-busy={loading || undefined}
+      className="flex flex-col gap-3"
+    >
       <h2 id="vb-purpose" className="text-base font-medium">
         {p("question")}
       </h2>
       <p className="text-sm text-muted-foreground">{p("intro")}</p>
-      <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {cannot && !loading && (
+        <p role="alert" className="text-sm" data-level="warn">
+          {p("noPermission")}
+        </p>
+      )}
+      {loading && <p className="text-sm text-muted-foreground">{p("loading")}</p>}
+      <ul ref={list} className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {PURPOSES.map((id) => {
           const Icon = ICON[id];
           const size = PURPOSE_SIZE[id];
-          const blocked = purposeBlocked(id, state, b.ctx);
+          const blocked = loading ? undefined : purposeBlocked(id, state, b.ctx);
+          const disks =
+            size && size.disks.length > 0
+              ? noDisk
+                ? p(`noDisk.${noDisk}`)
+                : p("disks", { disks: size.disks.map((g) => `${g} GiB`).join(" + ") })
+              : "";
           const body = (
             <>
               <span
@@ -73,13 +110,11 @@ export function Purposes({
               <span className="flex min-w-0 flex-col gap-0.5">
                 <span className="font-medium">{p(`${id}.title`)}</span>
                 <span className="text-xs text-muted-foreground">{p(`${id}.text`)}</span>
-                {size && size.disks.length + size.cores > 0 && id !== "blank" && (
+                {size && id !== "blank" && (
                   <span className="text-xs">
-                    {p("size", {
-                      cores: size.cores,
-                      memory: formatMib(size.memory),
-                      disks: size.disks.map((g) => `${g} GiB`).join(" + "),
-                    })}
+                    {[p("size", { cores: size.cores, memory: formatMib(size.memory) }), disks]
+                      .filter(Boolean)
+                      .join(" · ")}
                   </span>
                 )}
                 {blocked && (
@@ -95,14 +130,15 @@ export function Purposes({
           return (
             <li key={id}>
               {id === "image" ? (
-                <Link to="/images" className={card}>
+                <Link to="/images" className={card} data-purpose={id}>
                   {body}
                 </Link>
               ) : (
                 <button
                   type="button"
                   className={cn(card, id === "template" && picking && "border-brand")}
-                  disabled={!!blocked}
+                  data-purpose={id}
+                  disabled={!!blocked || loading}
                   aria-expanded={id === "template" ? picking : undefined}
                   onClick={() => (id === "template" ? setPicking(!picking) : onChoose(id))}
                 >

@@ -28,6 +28,33 @@ export interface Problem {
   message?: string;
   level: "error" | "warn";
   source: "browser" | "server";
+  /** 폼 오류 열쇠(`validate()`의 칸 — 브라우저 문제만). 그림에 없는 칸이면 고급 서랍에서 고친다(`inDrawer`). */
+  field?: string;
+}
+
+/**
+ * 폼 칸 `field`(오류 열쇠)를 고급 서랍에서만 고치는지. 그림·그림 위 카드가 고치는 칸(이름·vCPU·메모리·디스크 볼륨·풀·크기,
+ * NIC 보안 그룹·주소·MAC, CD 수, 첫 부팅)이 아니면 서랍이다(보안 부팅·vTPM·예약 스냅샷·복제·최대 vCPU/메모리·NUMA·
+ * CPU 플래그·HA 세부·부팅 순번·QoS 등).
+ */
+export function inDrawer(field: string): boolean {
+  const [head = "", , sub = ""] = field.split(".");
+  switch (head) {
+    case "name":
+    case "cores":
+    case "sockets":
+    case "memory":
+    case "ci":
+      return false;
+    case "disks":
+      return !["volume", "pool", "size"].includes(sub);
+    case "nics":
+      return !["securityGroups", "ips", "mac"].includes(sub);
+    case "cdroms":
+      return sub === "bootOrder";
+    default:
+      return true;
+  }
 }
 
 /** 폼 오류 열쇠(`validate()`)의 칸 */
@@ -95,7 +122,7 @@ export function browserProblems(s: BuilderState, ctx: BuilderCtx): Problem[] {
     sdnOf(s, ctx),
   );
   for (const [key, msg] of Object.entries(errors)) {
-    out.push({ at: areaOf(key), key: msg, level: "error", source: "browser" });
+    out.push({ at: areaOf(key), key: msg, level: "error", source: "browser", field: key });
   }
   if (v.name !== "" && ctx.vms.some((x) => x.name === v.name)) {
     add({
@@ -239,8 +266,38 @@ export function browserProblems(s: BuilderState, ctx: BuilderCtx): Problem[] {
   }
   if (v.disks.length === 0 && v.cdroms.length === 0) {
     add({ at: "disks", key: "vmBuilder.warn.noBoot", level: "warn", source: "browser" });
+  } else if (needsOs(s)) {
+    add({ at: "disks", key: "vmBuilder.warn.noOs", level: "warn", source: "browser" });
+  }
+  // 용도 카드가 약속한 것을 붙이지 못함(고치면 사라짐)
+  for (const m of s.missed ?? []) {
+    if (m === "os" && s.preset === "blank" && !template) {
+      add({ at: "vm", key: "vmBuilder.warn.missedOs", level: "warn", source: "browser" });
+    } else if (m === "disk" && v.disks.length === 0) {
+      add({ at: "disks", key: "vmBuilder.warn.missedDisk", level: "warn", source: "browser" });
+    } else if (
+      m === "nic" &&
+      v.nics.length > 0 &&
+      v.nics.every((n) => n.network === USER_NETWORK)
+    ) {
+      add({ at: "nics", key: "vmBuilder.warn.missedNic", level: "warn", source: "browser" });
+    }
   }
   return out;
+}
+
+/**
+ * 부팅할 OS가 없다: 빈 VM 바탕에 디스크나 CD가 있지만 디스크는 모두 새 빈 볼륨이고 CD에도 ISO가 없다(템플릿 바탕·있는
+ * 볼륨은 OS가 있다고 본다).
+ */
+export function needsOs(s: BuilderState): boolean {
+  const v = s.values;
+  return (
+    s.base.kind === "blank" &&
+    v.disks.length + v.cdroms.length > 0 &&
+    v.disks.every((d) => d.kind === "new") &&
+    v.cdroms.every((c) => c.iso === "")
+  );
 }
 
 /** 서버 미리 확인의 문제(그대로) */

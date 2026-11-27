@@ -594,8 +594,9 @@ it("defaults a new VM to the cluster model and sends its CPU flags", async () =>
   openCreate();
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "web");
+  // 클러스터 기준이 있으면 새 VM은 `cluster`로 시작한다 — 서랍을 열지 않아도(그림의 CPU 줄, 리뷰 77-5 C2).
+  await waitFor(() => expect(screen.getByText("2 vCPU · 2 GiB · CPU cluster")).toBeInTheDocument());
   await advanced(user);
-  // 클러스터 기준이 있으면 새 VM은 `cluster`로 시작한다.
   await waitFor(() => expect(screen.getByLabelText("CPU model")).toHaveValue("cluster"));
   expect(screen.getByText(/The cluster baseline is now Skylake-Server-v5/)).toBeInTheDocument();
   const flags = screen.getByLabelText("CPU flags", { selector: "input" });

@@ -1,7 +1,7 @@
 // 고급 설정 서랍(계획 77-5 — 진단 §4.3 "고급은 오른쪽 서랍 하나"): CPU 모델·플래그·최대 vCPU/메모리·펌웨어·머신·NUMA·
 // 전용 CPU·hugepages·재시작 정책·노드 고정·HA 세부(GeneralSection의 고급), 보안 부팅·vTPM·게스트 에이전트, 장치 세부
 // (디스크·NIC — QoS·MAC·부팅 순번·CD), 첫 부팅 세부(cloud-init), 부팅 순서, 예약 스냅샷, 복제. 칸은 VM 고치기 폼의 섹션 그대로(칸 설명·ⓘ도). 기본값은 손대지 않아도 된다.
-// 오류는 이 서랍의 칸을 떠난 뒤나 만들기를 누른 뒤에만 보인다. 템플릿 바탕은 배포가 이 칸들을 싣지 못한다고 알린다.
+// 오류는 이 서랍의 칸을 떠난 뒤나 만들기를 누른 뒤에만 보인다(서랍에서 고치는 문제를 눌러 열면 곧 보이고 그 칸으로). 템플릿 바탕은 배포가 이 칸들을 싣지 못한다고 알린다.
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -32,7 +32,16 @@ import { ScheduleSection } from "@/vms/form/ScheduleSection";
 import { firstLocalDisk } from "@/vms/replication";
 import { formSnapshotSupport } from "@/vms/snapshots";
 
-export function Advanced({ onClose, attempted }: { onClose(): void; attempted: boolean }) {
+export function Advanced({
+  onClose,
+  attempted,
+  focusInvalid = false,
+}: {
+  onClose(): void;
+  attempted: boolean;
+  /** 문제를 눌러 열었다: 오류를 보이고 첫 틀린 칸에 초점을 준다(계획 77-5 리뷰 I4). */
+  focusInvalid?: boolean;
+}) {
   const { t } = useTranslation();
   const b = useBuilder();
   const v = b.s.values;
@@ -45,7 +54,7 @@ export function Advanced({ onClose, attempted }: { onClose(): void; attempted: b
     ctx.volumes.map((x) => x.name),
     sdn,
   );
-  const errors = attempted || left ? found : {};
+  const errors = attempted || left || focusInvalid ? found : {};
   const change = (patch: Partial<VmFormValues>) => b.edit(patch);
   const nodes = ctx.nodes ?? undefined;
   const noReplica =
@@ -82,6 +91,16 @@ export function Advanced({ onClose, attempted }: { onClose(): void; attempted: b
       <SheetContent
         side="right"
         className="w-full gap-0 overflow-y-auto p-0 sm:max-w-2xl"
+        onOpenAutoFocus={(e) => {
+          const bad =
+            focusInvalid &&
+            document.querySelector<HTMLElement>('[data-slot="sheet-content"] [aria-invalid=true]');
+          if (bad) {
+            e.preventDefault();
+            bad.scrollIntoView?.({ block: "center" });
+            bad.focus();
+          }
+        }}
         onBlurCapture={(e) => {
           if ((e.target as Element).matches?.("input, select, textarea")) {
             setLeft(true);

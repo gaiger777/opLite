@@ -30,7 +30,7 @@ export interface NavItem {
   pages: NavPage[];
   folder?: { to: string; key: string };
   match?: string[];
-  /** 아래 경로가 리소스가 아니라 같은 화면의 다른 모양이다(만들기 화면의 빌더 `/vms/-new/builder`) */
+  /** 아래 경로가 리소스가 아니라 같은 화면으로 넘기는 옛 주소다(옛 빌더 주소 `/vms/-new/builder` → `/vms/-new`) */
   leaf?: boolean;
   /** 사이드바 항목 옆 숫자 */
   badge?: "alerts" | "failedTasks";

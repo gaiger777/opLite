@@ -13,12 +13,12 @@ import {
   Network,
   Pencil,
   Plus,
-  ShieldCheck,
   TriangleAlert,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { InfoButton } from "@/components/InfoButton";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -37,16 +37,18 @@ import { Inspector } from "@/vmBuilder/Inspector";
 import { blockLabel, problemSlot, problemText, slotLabel, type Thing } from "@/vmBuilder/labels";
 import { accepts } from "@/vmBuilder/model/accepts";
 import { memoryFit } from "@/vmBuilder/model/parts";
-import type { Problem } from "@/vmBuilder/model/problems";
+import { needsOs, type Problem } from "@/vmBuilder/model/problems";
+import { OsPicker } from "@/vmBuilder/OsPicker";
 import { defaultNetwork, defaultPool } from "@/vmBuilder/model/purposes";
 import type { Block, ListKind } from "@/vmBuilder/model/slots";
 import { formOnly } from "@/vmBuilder/model/state";
 import { MAX_CDROMS } from "@/vms/form";
 
-/** 칸 하나: 놓을 자리, 제목(아이콘), 비었을 때 안내, 그 칸의 문제 */
-function SlotBox({
+/** 칸 하나: 놓을 자리, 제목(아이콘·ⓘ), 비었을 때 안내, 그 칸의 문제 */
+export function SlotBox({
   id,
   icon,
+  info,
   empty,
   add,
   children,
@@ -56,6 +58,8 @@ function SlotBox({
 }: {
   id: string;
   icon?: ReactNode;
+  /** 제목 옆 ⓘ(도움말 주제와 한 줄 설명) */
+  info?: { topic: string; line: string };
   /** 비었을 때 안내(없으면 안내 없음) */
   empty?: boolean;
   /** 제목 줄의 "+" 단추(기본 부품 붙이기) */
@@ -97,7 +101,8 @@ function SlotBox({
           {icon}
           <span className="truncate">{label}</span>
         </h3>
-        <span className="flex shrink-0 items-center">
+        {info && <InfoButton topic={info.topic} label={label} line={info.line} />}
+        <span className="ml-auto flex shrink-0 items-center">
           {add}
           {inspect && (
             <Button
@@ -137,21 +142,41 @@ function SlotBox({
 const level = (list: readonly Problem[]) =>
   list.some((p) => p.level === "error") ? "error" : list.length > 0 ? "warn" : undefined;
 
+/** 이보다 긴 문제 글(서버의 원문 오류 등)은 두 줄로 줄이고 "자세히"로 펼친다(그림이 넘치지 않게). */
+const LONG = 110;
+
 function Problems({ list }: { list: readonly Problem[] }) {
+  return list.map((p, i) => <ProblemLine key={i} p={p} />);
+}
+
+function ProblemLine({ p }: { p: Problem }) {
   const { t } = useTranslation();
-  return list.map((p, i) => (
-    <p key={i} className="flex items-start gap-1 text-xs" data-level={p.level}>
+  const [open, setOpen] = useState(false);
+  const text = problemText(t, p);
+  const long = text.length > LONG;
+  return (
+    <p className="flex items-start gap-1 text-xs" data-level={p.level}>
       {p.level === "error" ? (
         <CircleX aria-hidden className="size-3.5 shrink-0" />
       ) : (
         <TriangleAlert aria-hidden className="size-3.5 shrink-0" />
       )}
-      <span>
+      <span className="min-w-0 break-words">
         <span className="sr-only">{t(`vmBuilder.check.${p.level}`)}: </span>
-        {problemText(t, p)}
+        <span className={cn(long && !open && "vb-clamp")}>{text}</span>
+        {long && (
+          <button
+            type="button"
+            aria-expanded={open}
+            className="underline"
+            onClick={() => setOpen(!open)}
+          >
+            {open ? t("vmBuilder.check.less") : t("vmBuilder.check.detail")}
+          </button>
+        )}
       </span>
     </p>
-  ));
+  );
 }
 
 /** "+" 단추: 칸 이름을 읽는 작은 단추 */
@@ -287,7 +312,6 @@ export function Chassis({ narrow }: { narrow: boolean }) {
   const holdingBlock =
     (dnd.state.phase === "dragging" || dnd.state.phase === "picked") &&
     (dnd.state.item as Thing).kind === "block";
-  const node = b.ctx.nodes?.find((n) => n.id === v.node);
   const template = b.s.base.kind === "template";
   // 그림 위 칩(설계 §8.6): 템플릿 바탕이면 놓을 때 비운 칸, 아니면 고급에서 고친 칸
   const carried = template ? (b.s.cleared ?? []) : formOnly(v);
@@ -314,12 +338,6 @@ export function Chassis({ narrow }: { narrow: boolean }) {
       dnd.announce(t("vmBuilder.page.count.cdroms", { count: v.cdroms.length + 1 }));
     }
   };
-  const security = [
-    v.firmware === "uefi" ? "UEFI" : "BIOS",
-    v.secureBoot && t("vmBuilder.pic.secureBoot"),
-    v.tpm && "TPM",
-    v.guestAgent && t("vmBuilder.pic.agent"),
-  ].filter(Boolean);
 
   return (
     <section
@@ -327,6 +345,18 @@ export function Chassis({ narrow }: { narrow: boolean }) {
       className="vb-col relative flex min-w-0 flex-col gap-2"
     >
       <h2 className="sr-only">{t("vmBuilder.pic.title")}</h2>
+      {needsOs(b.s) && b.selected !== "os" && (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="self-start"
+          onClick={() => b.select("os")}
+        >
+          <Disc aria-hidden />
+          {t("vmBuilder.os.open")}
+        </Button>
+      )}
       {carried.length > 0 && (
         <p className="self-start rounded-full border bg-muted px-3 py-1 text-xs">
           {t(template ? "vmBuilder.page.formCleared" : "vmBuilder.page.formOnly", {
@@ -395,7 +425,12 @@ export function Chassis({ narrow }: { narrow: boolean }) {
             className="vb-port vb-port-r"
             add={<AddButton label={t("vmBuilder.pic.addNic")} onClick={() => addPart("nics")} />}
           />
-          <SlotBox id="cloudInit" plain empty={!v.cloudInit.enabled}>
+          <SlotBox
+            id="cloudInit"
+            plain
+            empty={!v.cloudInit.enabled}
+            info={{ topic: "vmForm.cloudInit", line: t("vmBuilder.slotInfo.cloudInit") }}
+          >
             {v.cloudInit.enabled && (
               <p className="text-sm">
                 {v.cloudInit.user || t("vmBuilder.page.ciOn")}
@@ -403,40 +438,18 @@ export function Chassis({ narrow }: { narrow: boolean }) {
               </p>
             )}
           </SlotBox>
-          <SlotBox id="protection" plain empty={!v.ha}>
+          <SlotBox
+            id="protection"
+            plain
+            empty={!v.ha}
+            info={{ topic: "vmForm.ha", line: t("vmBuilder.slotInfo.protection") }}
+          >
             {v.ha && (
               <p className="text-sm">
                 {v.haGroup ? `${t("vmBuilder.part.ha")} · ${v.haGroup}` : t("vmBuilder.part.ha")}
               </p>
             )}
           </SlotBox>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <SlotBox id="placement">
-          <p className="truncate text-sm">
-            {b.s.zone
-              ? t("vmBuilder.part.zone", { name: b.s.zone.value })
-              : node
-                ? node.name
-                : t("vmBuilder.part.auto")}
-          </p>
-        </SlotBox>
-        <div className="flex min-w-0 flex-col gap-1.5 rounded-lg border bg-card p-2">
-          <h3 className="flex min-h-7 items-center gap-1.5 text-xs font-medium text-muted-foreground">
-            <ShieldCheck aria-hidden className="size-3.5" />
-            {t("vmBuilder.pic.security")}
-          </h3>
-          <p className="truncate text-sm">{security.join(" · ")}</p>
-          <Button
-            type="button"
-            variant="link"
-            size="sm"
-            className="h-auto self-start p-0 text-xs"
-            onClick={b.openAdvanced}
-          >
-            {t("vmBuilder.pic.inAdvanced")}
-          </Button>
         </div>
       </div>
       {holdingBlock && <SlotBox id="trash" inspect={false} empty />}
@@ -446,7 +459,7 @@ export function Chassis({ narrow }: { narrow: boolean }) {
             !narrow && "absolute top-0 right-0 z-10 max-h-full w-80 overflow-y-auto shadow-lg",
           )}
         >
-          <Inspector />
+          {b.selected === "os" ? <OsPicker /> : <Inspector />}
         </div>
       )}
     </section>

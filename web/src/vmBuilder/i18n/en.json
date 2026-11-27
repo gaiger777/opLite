@@ -37,7 +37,11 @@
       "quotaMemory": "This VM would go over the memory quota of {{path}}.",
       "quotaDisk": "This VM would go over the disk quota of {{path}}.",
       "userData": "Your own user-data replaces the generated one: user, password and SSH keys are not used.",
-      "noBoot": "The VM has no disk or CD drive to boot from."
+      "noBoot": "The VM has no disk or CD drive to boot from.",
+      "noOs": "Nothing to boot an OS from — attach an image or an ISO (the disks are empty and no CD has an ISO).",
+      "missedOs": "Could not apply the OS settings of the chosen use — this is a blank VM.",
+      "missedDisk": "No pool you may use, so no disk was attached.",
+      "missedNic": "No network you may use, so the NIC is on user (NAT)."
     },
     "problem": {
       "nameTaken": "A VM named {{name}} already exists."
@@ -265,26 +269,28 @@
       "needName": "Enter a name and the server checks whether the VM can be created.",
       "title": "Checks",
       "more": "Show {{count}} more",
-      "fewer": "Show fewer"
+      "fewer": "Show fewer",
+      "detail": "More",
+      "less": "Less"
     },
     "help": {
       "name": "Name shown in lists and screens: 1–63 lowercase letters, digits or -. It can't be changed later."
     },
     "purpose": {
       "question": "What will this VM run?",
-      "intro": "Pick a use and the VM picture fills with fitting CPU, memory, disks and network. You can change anything on the next screen.",
+      "intro": "Pick a use and the VM picture fills with fitting CPU, memory, disks and network. The disks start empty, so on the next screen you pick the OS (a template or image, or an installer ISO). You can change anything later.",
       "chosen": "Use: {{name}}",
       "change": "Change",
-      "size": "{{cores}} vCPU · {{memory}} · disk {{disks}}",
+      "size": "{{cores}} vCPU · {{memory}}",
       "pickTemplate": "Pick a template to deploy",
       "noTemplates": "No templates yet — turn a VM into a template and it shows here.",
       "linux": {
         "title": "Linux server",
-        "text": "A general server such as Ubuntu or Rocky. First-boot setup and the guest agent are on."
+        "text": "A general server such as Ubuntu or Rocky. On the next screen you pick a template (image) or an installer ISO. First-boot setup and the guest agent are on."
       },
       "web": {
         "title": "Web server",
-        "text": "A small web or API server. Like a Linux server, with one network."
+        "text": "A small web or API server: smaller than a Linux server (1 vCPU, 2 GiB), and a security group that opens 80/443 goes on the NIC if there is one."
       },
       "database": {
         "title": "Database",
@@ -292,7 +298,7 @@
       },
       "windows": {
         "title": "Windows 11 or Server",
-        "text": "UEFI, Secure Boot and TPM on, with devices the Windows installer knows (SATA, e1000e)."
+        "text": "UEFI, Secure Boot and TPM on, with devices the Windows installer knows (SATA, e1000e). A CD drive for the installer ISO boots first."
       },
       "iso": {
         "title": "Install from ISO",
@@ -309,7 +315,18 @@
       "blank": {
         "title": "Blank VM",
         "text": "A VM with nothing attached. Add each part yourself (for experts)."
-      }
+      },
+      "disks": "disk {{disks}}",
+      "noDisk": {
+        "perm": "no disk (no pool permission)",
+        "none": "no disk (no usable pool)"
+      },
+      "loading": "Reading pools, networks and templates…",
+      "noPermission": "You have no folder where you may create VMs. You can look around, but Create will be refused — ask an administrator for vm.create.",
+      "started": "Starting as {{name}}.",
+      "templateGone": "The template in the address does not exist (deleted, or not a template). Pick a use again.",
+      "blocked": "Cannot start as {{name}}: {{reason}}",
+      "windowsArm": "This cluster has only Arm (virt) nodes, so it cannot create Windows VMs."
     },
     "pic": {
       "title": "VM picture",
@@ -342,21 +359,49 @@
       }
     },
     "room": {
-      "chosen": "Room on the chosen node {{node}}",
-      "server": "Room on {{node}}, where it would run (server estimate)",
-      "guess": "Room on {{node}}, where it would likely run",
+      "chosen": "Room on {{node}}",
+      "server": "Room on {{node}} (server's pick)",
+      "guess": "Room on {{node}} (estimate)",
       "cpu": "vCPUs",
       "memory": "Memory",
       "disk": "Disk ({{pool}})",
       "cpuText": "{{used}}/{{total}} (+{{add}})",
       "text": "{{used}}/{{total}} (+{{add}})",
-      "overcommit": "Hands out more vCPUs than the node has threads ({{pct}}%) — it can slow down when all are busy (overcommit)."
+      "overcommit": "Hands out more vCPUs than the node has threads ({{pct}}%) — it can slow down when all are busy (overcommit).",
+      "none": "No node can take this VM now (reason below).",
+      "noneOff": "No node could start it now (creating it stopped still works).",
+      "other": "The server did not pick a node because of another problem — fix it to see the node.",
+      "diskMore_one": "Disk ({{pool}} and {{count}} more pool)",
+      "diskMore_other": "Disk ({{pool}} and {{count}} more pools)"
     },
     "advanced": {
       "title": "Advanced settings",
       "text": "If unsure, leave these as they are — the defaults work well. Each field's ⓘ explains it.",
       "template": "A template deployment cannot carry these settings (it uses the template's values). Change them after creating, in Edit VM.",
       "cpu": "CPU, memory, firmware, placement and HA"
+    },
+    "slotInfo": {
+      "placement": "The node the VM runs on. Automatic lets the server pick a node with room; you can also pick a node or a failure zone.",
+      "cloudInit": "First-boot setup (cloud-init): puts the account, SSH keys and addresses in on the first start. Used with cloud images and templates.",
+      "protection": "High availability (HA): if the node stops, the VM starts again on another node."
+    },
+    "os": {
+      "title": "Pick the OS",
+      "open": "Pick the OS (image or ISO)",
+      "text": "The disks are empty. Start from a template (images downloaded in the image library included — the disk is copied from that image), or put an installer ISO in the CD drive (the CD boots first).",
+      "windowsText": "Put the Windows installer ISO in the CD drive (it boots first). The disk and NIC driver ISO (virtio-win) can go in a second CD, if you want.",
+      "templates": "From a template or image",
+      "noTemplates": "No templates — download an image in the image library and it becomes a template.",
+      "iso": "Installer ISO (CD)",
+      "installIso": "Windows installer ISO",
+      "driversIso": "Driver ISO (virtio-win, optional)",
+      "noIsos": "No ISOs — upload one in ISO files.",
+      "done": "Done",
+      "later": "Pick later",
+      "library": "Open the image library",
+      "fromTemplate": "Creating from template {{name}}.",
+      "inserted": "Put ISO {{name}} in the CD drive.",
+      "close": "Close the OS picker"
     }
   }
 }

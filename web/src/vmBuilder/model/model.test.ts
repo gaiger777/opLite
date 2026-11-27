@@ -695,7 +695,7 @@ describe("problems", () => {
   it("starts with a name error and a boot warning", () => {
     const list = problems(initialState("q35"), ctx);
     expect(list).toEqual([
-      { at: "name", key: "vmForm.errors.name", level: "error", source: "browser" },
+      { at: "name", key: "vmForm.errors.name", level: "error", source: "browser", field: "name" },
       { at: "disks", key: "vmBuilder.warn.noBoot", level: "warn", source: "browser" },
     ]);
     expect(blocking(list)?.at).toBe("name");
@@ -717,6 +717,8 @@ describe("problems", () => {
       ["disks.0", "vmBuilder.reason.gone"],
       ["nics.0", "vmBuilder.reason.gone"],
       ["nics.0", "vmBuilder.reason.gone"],
+      // 새 빈 디스크뿐이고 CD도 없다
+      ["disks", "vmBuilder.warn.noOs"],
     ]);
     expect(worst(list, "nics")).toBe("error");
     expect(worst(list, "compute")).toBeNull();
