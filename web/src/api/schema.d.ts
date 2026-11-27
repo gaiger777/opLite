@@ -5995,6 +5995,8 @@ export interface components {
             method: string;
             /** @description 적은 노드의 이름 */
             node: string;
+            /** @description 응답 상태만으로는 알 수 없는 결과(계획 77-7 — 핸들러가 적는다). 없으면 상태대로다(옛 노드의 항목도). */
+            outcome?: components["schemas"]["AuditOutcome"];
             /** @description 쿼리를 뺀 경로(`/api/v1` 아래) */
             path: string;
             role?: components["schemas"]["Role"] | null;
@@ -6005,6 +6007,11 @@ export interface components {
             status: number;
             target?: components["schemas"]["AuditTarget"] | null;
             /**
+             * Format: uuid
+             * @description 이 요청이 시작한 Task(202 — 일의 결과는 Task에 남는다). 여럿이면 처음 것.
+             */
+            task?: string;
+            /**
              * Format: int64
              * @description 유닉스 밀리초
              */
@@ -6014,6 +6021,11 @@ export interface components {
             /** Format: uuid */
             user_id?: string | null;
         };
+        /**
+         * @description 상태 번호와 다른 결과
+         * @enum {string}
+         */
+        AuditOutcome: "dry_run" | "failed";
         /** @description `GET /audit`의 응답: 모든 노드의 항목을 합친 것 */
         AuditResponse: {
             /** @description 감사 로그를 끈 노드의 이름(정렬) */
@@ -12890,6 +12902,11 @@ export interface components {
         /** @description 내보낸 매니페스트와 그때의 revision */
         ManifestList: {
             documents: components["schemas"]["Manifest"][];
+            /**
+             * @description `documents`와 같은 차례의 리소스 id(계획 77-7 — 화면이 이름이 바뀐 리소스를 묶음의 id로 짝짓는다). 파일에는 쓰지
+             *     않는다. 옛 노드는 없다.
+             */
+            ids?: string[];
             /** Format: int64 */
             revision: number;
         };

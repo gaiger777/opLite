@@ -25,7 +25,9 @@ use axum::response::Response;
 use orbivisor_cluster::ChangeContext;
 use orbivisor_cluster::types::NodeId;
 use orbivisor_peer::AuditSource;
-use orbivisor_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditResponse, AuditTarget};
+use orbivisor_types::audit::{
+    AuditAuth, AuditEntry, AuditOutcome, AuditQuery, AuditResponse, AuditTarget,
+};
 use orbivisor_types::history::{Actor, ActorAuth, ChangeMeta, ChangeSource, clean_reason};
 use orbivisor_types::node::NodeSpec;
 use serde::Deserialize;
@@ -389,6 +391,13 @@ pub(crate) fn requester() -> Option<Uuid> {
         .flatten()
 }
 
+/// 지금 요청이 Task를 만들었다(처음 것만 감사 항목에 — 결과는 Task에). 요청 밖이면 아무것도 하지 않는다.
+pub(crate) fn note_task(id: Uuid) {
+    let _ = REQUEST.try_with(|slot| {
+        slot.0.lock().unwrap().task.get_or_insert(id);
+    });
+}
+
 /// 지금 요청을 보낸 주체(바꾸는 API 요청 안에서만, 인증 뒤). 요청 밖이면 None
 pub(crate) fn principal() -> Option<Principal> {
     REQUEST
@@ -402,6 +411,10 @@ struct SlotData {
     principal: Option<Principal>,
     auth: Option<AuditAuth>,
     detail: Option<String>,
+    /// 상태 번호와 다른 결과(미리 보기·302 실패)
+    outcome: Option<AuditOutcome>,
+    /// 이 요청이 만든 처음 Task
+    task: Option<Uuid>,
     /// 이 요청이 쓰는 것의 출처(계획 73 — 설정 이력). 주체를 알면 사용자를 채운다.
     change: Option<ChangeContext>,
     /// `Orbivisor-Client`가 있었다(없고 세션이면 출처는 웹)
@@ -508,6 +521,22 @@ impl AuditNote {
         }
     }
 
+    /// 미리 보기(`dry_run`)였다 — 아무것도 바꾸지 않았다.
+    pub(crate) fn dry_run(&self) {
+        self.outcome(AuditOutcome::DryRun);
+    }
+
+    /// 응답은 성공 꼴(302)이지만 실패했다(OIDC 콜백).
+    pub(crate) fn failed(&self) {
+        self.outcome(AuditOutcome::Failed);
+    }
+
+    fn outcome(&self, outcome: AuditOutcome) {
+        if let Some(slot) = &self.0 {
+            slot.0.lock().unwrap().outcome = Some(outcome);
+        }
+    }
+
     /// 요청의 주체(로그인·로그아웃처럼 인증 추출기를 쓰지 않는 핸들러)
     pub(crate) fn principal(&self, principal: Principal, auth: AuditAuth) {
         if let Some(slot) = &self.0 {
@@ -601,6 +630,8 @@ pub(crate) async fn layer(
         status: response.status().as_u16(),
         duration_ms: start.elapsed().as_millis() as u64,
         detail: data.detail,
+        outcome: data.outcome,
+        task: data.task,
     });
     response
 }
@@ -639,6 +670,8 @@ pub(crate) fn record_stream(
         status,
         duration_ms: started.elapsed().as_millis() as u64,
         detail: Some(detail),
+        outcome: None,
+        task: None,
     });
 }
 
@@ -729,6 +762,8 @@ fn write_dropped(writer: &mut Writer, dropped: &AtomicU64, node: &str) {
         status: 0,
         duration_ms: 0,
         detail: Some(format!("{n} entries dropped")),
+        outcome: None,
+        task: None,
     });
 }
 
@@ -751,6 +786,8 @@ pub fn system_entry(action: &str, target: AuditTarget, detail: impl Into<String>
         status: 0,
         duration_ms: 0,
         detail: Some(detail.into()),
+        outcome: None,
+        task: None,
     }
 }
 
@@ -843,6 +880,8 @@ fn suppressed_entry(s: Suppressed) -> AuditEntry {
             "{} unauthenticated requests not recorded since {since}",
             s.count
         )),
+        outcome: None,
+        task: None,
     }
 }
 
@@ -1155,6 +1194,8 @@ mod tests {
             status: 201,
             duration_ms: 3,
             detail: None,
+            outcome: None,
+            task: None,
         }
     }
 

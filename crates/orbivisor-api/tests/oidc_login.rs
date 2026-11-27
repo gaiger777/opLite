@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::idp::{CLIENT_ID, Idp, SUBJECT};
 use common::{ADMIN_PASSWORD, Env, WAIT};
 use orbivisor_api::oidc::{LoginState, state_key, unix_now};
-use orbivisor_types::audit::{AuditEntry, AuditQuery};
+use orbivisor_types::audit::{AuditEntry, AuditOutcome, AuditQuery};
 use orbivisor_types::auth::{Role, UserSpec};
 use orbivisor_types::cluster::ClusterSpec;
 use reqwest::StatusCode;
@@ -798,8 +798,16 @@ async fn callbacks_are_audited() {
     let ok = detail("realm=okta username=alice");
     assert_eq!(ok.user.as_deref(), Some("alice@okta"));
     assert_eq!(ok.status, 302);
+    assert_eq!(ok.outcome, None);
     assert_eq!(detail("realm=okta error=no_role").user, None);
     assert_eq!(detail("realm=<unknown> error=sso_failed").user, None);
+    // 실패도 302(로그인 화면으로)라 결과를 따로 적는다(계획 77-7).
+    for failed in [
+        "realm=okta error=no_role",
+        "realm=<unknown> error=sso_failed",
+    ] {
+        assert_eq!(detail(failed).outcome, Some(AuditOutcome::Failed));
+    }
     // 경로는 쿼리를 뺀 것이다. start는 적지 않는다. 코드·state·쿠키·토큰은 어디에도 남지 않는다.
     assert!(
         found.iter().all(|e| e.path == "/auth/oidc/callback"),

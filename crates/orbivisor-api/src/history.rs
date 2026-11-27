@@ -1066,6 +1066,7 @@ async fn finish(
 ) -> Result<Response, ApiError> {
     let stored = state.plans.keep(plan);
     if dry_run {
+        audit.dry_run();
         return Ok(Json::<PlanView>(stored.view.clone()).into_response());
     }
     let started: ApplyStarted = start(state, &stored).await?;

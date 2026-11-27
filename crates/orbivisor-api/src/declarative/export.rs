@@ -38,6 +38,10 @@ pub struct ManifestQuery {
 pub struct ManifestList {
     pub revision: u64,
     pub documents: Vec<Manifest>,
+    /// `documents`와 같은 차례의 리소스 id(계획 77-7 — 화면이 이름이 바뀐 리소스를 묶음의 id로 짝짓는다). 파일에는 쓰지
+    /// 않는다. 옛 노드는 없다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<Uuid>,
 }
 
 /// 종류 이름(`vm`·`floating-ip` 또는 `Vm`·`FloatingIp`)
@@ -111,6 +115,7 @@ pub(crate) fn list(
     };
     let world = World::load(&state.cluster)?;
     let mut documents = Vec::new();
+    let mut ids = Vec::new();
     for kind in ORDER.into_iter().filter(|k| kinds.contains(k)) {
         for ((k, _), live) in world.objects.iter().filter(|((k, _), _)| *k == kind) {
             if members
@@ -138,11 +143,13 @@ pub(crate) fn list(
                 }
             }
             documents.push(m);
+            ids.push(live.id);
         }
     }
     Ok(ManifestList {
         revision: world.revision,
         documents,
+        ids,
     })
 }
 
