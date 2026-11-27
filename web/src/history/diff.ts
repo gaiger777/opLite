@@ -11,17 +11,6 @@ export function secretMark(value: unknown): string | null {
   return keys.length === 1 && typeof mark === "string" ? mark : null;
 }
 
-/** 값 하나를 짧은 글로: 문자열은 그대로, 나머지는 한 줄 JSON, 없음은 null(부르는 쪽이 "—"를 그린다) */
-export function shortValue(value: unknown): string | null {
-  if (value === undefined) {
-    return null;
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  return JSON.stringify(value);
-}
-
 /** 값 안의 비밀 표시를 찾는다(전체 spec 펼침의 안내 — 비밀은 되돌리지 않는다) */
 export function hasSecret(value: unknown): boolean {
   if (secretMark(value) !== null) {

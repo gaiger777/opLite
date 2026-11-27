@@ -7,7 +7,7 @@ mod common;
 use std::time::Instant;
 
 use common::{ADMIN_PASSWORD, Env, WAIT};
-use orbivisor_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditTarget};
+use orbivisor_types::audit::{AuditAuth, AuditEntry, AuditOutcome, AuditQuery, AuditTarget};
 use orbivisor_types::auth::Role;
 use orbivisor_types::subscription::{Level, LicensePayload, decode_private_key, sign};
 use reqwest::StatusCode;
@@ -85,6 +85,31 @@ async fn a_changing_request_is_recorded_with_who_and_what() {
     assert_eq!(deleted.path, "/users/carol");
     assert_eq!(deleted.target, target("users", "carol"));
     assert_eq!(deleted.user.as_deref(), Some("admin"));
+}
+
+/// 미리 보기(`dry_run` 200)는 결과 `dry_run`, Task를 시작한 요청(202)은 그 Task id를 적는다(계획 77-7).
+#[tokio::test]
+async fn a_dry_run_and_a_started_task_are_told_apart() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let body = json!({ "documents": [{
+        "apiVersion": "orbivisor.io/v1", "kind": "Folder",
+        "metadata": { "name": "prod" }, "spec": { "kind": "vm" },
+    }] });
+    let (status, plan) = admin.post("/apply?dry_run=true", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let preview = entry(&env, "POST /apply", 200).await;
+    assert_eq!(preview.outcome, Some(AuditOutcome::DryRun));
+    assert_eq!(preview.task, None);
+
+    let (status, started) = admin.post("/apply", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let applied = entry(&env, "POST /apply", 202).await;
+    assert_eq!(applied.outcome, None);
+    assert_eq!(
+        applied.task.map(|id| id.to_string()),
+        started["task"]["id"].as_str().map(String::from)
+    );
 }
 
 #[tokio::test]
@@ -343,6 +368,8 @@ fn seeded(time: u64, user: &str, path: &str) -> AuditEntry {
         status: 202,
         duration_ms: 4,
         detail: None,
+        outcome: None,
+        task: None,
     }
 }
 

@@ -18,9 +18,10 @@ import {
   useResourceHistory,
 } from "@/history/api";
 import { ChangeTable } from "@/history/ChangeTable";
+import { kindName } from "@/history/describe";
 import { hasSecret } from "@/history/diff";
 import { RestoreDialog } from "@/history/RestoreDialog";
-import { EntryLine } from "@/history/EntryLine";
+import { EntryLine, SourceChip, useEntryName } from "@/history/EntryLine";
 import { formatTime } from "@/lib/format";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -51,7 +52,14 @@ export function ChangeDetail({ entry }: { entry: HistoryEntry }) {
       <dl className="flex flex-col gap-1">
         <Row label={t("history.when")}>{formatTime(new Date(entry.at_ms), i18n.language)}</Row>
         <Row label={t("history.who")}>{actorName(entry.actor)}</Row>
-        <Row label={t("history.source")}>{t(`history.sources.${entry.source}`)}</Row>
+        <Row label={t("history.source")}>
+          <span className="inline-flex flex-wrap items-center gap-2">
+            <SourceChip source={entry.source} />
+            <span className="text-xs text-muted-foreground">
+              {t(`history.sourceHints.${entry.source}`)}
+            </span>
+          </span>
+        </Row>
         <Row label={t("history.revision")}>{entry.revision}</Row>
         {entry.reason && <Row label={t("history.reason")}>{entry.reason}</Row>}
         {entry.restored_from !== undefined && (
@@ -67,10 +75,13 @@ export function ChangeDetail({ entry }: { entry: HistoryEntry }) {
         )}
       </dl>
       {restore && (
-        <div>
+        <div className="flex flex-col items-start gap-1">
           <Button size="sm" onClick={() => setRestoring(true)}>
             {t(entry.op === "delete" ? "history.restore.recreateOpen" : "history.restore.open")}
           </Button>
+          <p className="text-xs text-muted-foreground">
+            {t(entry.op === "delete" ? "history.recreateHint" : "history.restoreHint")}
+          </p>
         </div>
       )}
       <div className="flex flex-wrap items-end gap-2">
@@ -112,11 +123,12 @@ export function ChangeDetail({ entry }: { entry: HistoryEntry }) {
 /** 설정 기록 화면에서 줄을 누르면 여는 오른쪽 서랍 */
 export function ChangeDrawer({ entry, onClose }: { entry: HistoryEntry; onClose(): void }) {
   const { t } = useTranslation();
+  const name = useEntryName(entry);
   return (
     <Sheet open onOpenChange={(open) => !open && onClose()}>
       <SheetContent className="w-full overflow-y-auto sm:max-w-2xl">
         <SheetTitle className="px-4 pt-4 text-lg break-all">
-          {t("history.drawerTitle", { kind: entry.kind, name: entry.name })}
+          {t("history.drawerTitle", { kind: kindName(entry.kind, t), name })}
         </SheetTitle>
         <SheetDescription className="px-4">
           {t(`history.ops.${entry.op}`)} · {t("history.revisionN", { revision: entry.revision })}

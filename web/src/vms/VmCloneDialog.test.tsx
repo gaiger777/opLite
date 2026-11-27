@@ -392,7 +392,7 @@ it("hides cloning from viewers", async () => {
   // viewer의 케밥에는 읽기 항목(설정 기록·YAML 내보내기, 계획 73)만 있다.
   await user.click(screen.getByRole("button", { name: "Actions for db" }));
   expect(screen.getAllByRole("menuitem").map((m) => m.textContent)).toEqual([
-    "Config history…",
+    "Change history…",
     "Export as YAML",
   ]);
   expect(screen.queryByRole("menuitem", { name: "Clone" })).not.toBeInTheDocument();

@@ -202,6 +202,10 @@ async fn apply_creates_in_order_and_reapplying_changes_nothing() {
     assert_eq!(vm_doc["state"], "stopped");
     assert!(vm_doc["spec"].get("folder").is_none(), "{vm_doc}");
     assert!(vm_doc["spec"]["nics"][0]["mac"].is_string(), "{vm_doc}");
+    // 문서와 같은 차례의 id(화면이 이름이 바뀐 리소스를 짝짓는다 — 계획 77-7)
+    let vm_at = docs.iter().position(|d| d["kind"] == "Vm").unwrap();
+    assert_eq!(exported["ids"][vm_at], vm.id.to_string(), "{exported}");
+    assert_eq!(exported["ids"].as_array().unwrap().len(), 4, "{exported}");
     let plan = dry_run(&admin, json!({ "documents": docs, "apply_set": "web" })).await;
     assert_eq!(summary(&plan), [0, 0, 0, 4, 0], "{plan}");
     // 하나만 읽기

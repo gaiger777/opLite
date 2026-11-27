@@ -32,6 +32,10 @@ export const TIMELINE: HistoryEntry[] = [
     source: "apply",
     actor: { user: "ci", auth: { kind: "token", name: "gitops" } },
     changed: ["vcpus", "labels.tier", "nics", "disks", "cloud_init.password"],
+    values: [
+      { path: "vcpus", op: "replace", old: 2, new: 4 },
+      { path: "labels.tier", op: "add", new: "web" },
+    ],
   }),
   entry(60, { at_ms: AT - DAY - 3_600_000, op: "create", changed: [], source: "cli" }),
 ];
@@ -95,13 +99,23 @@ export function applySet(name: string, extra: Partial<ApplySet["status"]> = {}):
       applied_revision: 70,
       last_error: null as unknown as string,
       objects: [
-        { kind: "vm", id: WEB_ID, name: "web", revision: 70, declared: {} },
+        {
+          kind: "vm",
+          id: WEB_ID,
+          name: "web",
+          revision: 70,
+          declared: {
+            metadata: { labels: { tier: "web" } },
+            spec: { memory_mib: 4096, vcpus: 2, cloud_init: { password: { $secret: "set" } } },
+            state: "running",
+          },
+        },
         {
           kind: "network",
           id: "019a0f3c-0000-7000-8073-000000000002",
           name: "lan",
           revision: 65,
-          declared: {},
+          declared: { spec: { bridge: "br0" } },
         },
       ],
       drift: { checked_at: AT, revision: 90, items: [] },
@@ -132,6 +146,28 @@ export const DRIFTED = applySet("web-prod", {
     ],
   },
 });
+
+/** `DRIFTED`·`applySet()`의 리소스가 지금 가진 매니페스트(web은 메모리·vCPU를 화면에서 바꿈) */
+export const LIVE_MANIFESTS = [
+  {
+    apiVersion: "orbivisor.io/v1",
+    kind: "Vm",
+    metadata: { name: "web", labels: { tier: "web", "orbivisor.io/apply-set": "web-prod" } },
+    spec: {
+      memory_mib: 8192,
+      vcpus: 4,
+      cloud_init: { password: { secretRef: "web-pw" } },
+      nics: [{ network: "lan", mac: "52:54:00:00:00:01" }],
+    },
+    state: "running",
+  },
+  {
+    apiVersion: "orbivisor.io/v1",
+    kind: "Network",
+    metadata: { name: "lan" },
+    spec: { bridge: "br0" },
+  },
+] as const;
 
 export function account(name: string, extra: Partial<AcmeAccount["status"]> = {}): AcmeAccount {
   return {

@@ -52,18 +52,26 @@ it("groups the timeline by day with source chips, reasons and changed fields, an
   const first = within(days[0]!.closest("section")!).getAllByRole("button");
   expect(first).toHaveLength(1);
   expect(first[0]).toHaveTextContent("Changed");
-  expect(first[0]).toHaveTextContent("vm web");
+  expect(first[0]).toHaveTextContent("VM web");
   expect(first[0]).toHaveTextContent("admin");
-  expect(first[0]).toHaveTextContent("Web");
+  expect(first[0]).toHaveTextContent("Web UI");
+  // 전·후 값이 없는 옛 줄은 칸 이름만(계획 77-7)
+  expect(first[0]).toHaveTextContent("memory changed");
   expect(first[0]).toHaveTextContent("“more memory for the sale”");
   const second = within(days[1]!.closest("section")!).getAllByRole("button");
   expect(second.map((b) => b.textContent)).toEqual([
     expect.stringContaining("ci (gitops)"),
     expect.stringContaining("Created"),
   ]);
-  // 바뀐 칸은 셋만, 나머지는 수
-  expect(second[0]).toHaveTextContent("vcpus, labels.tier, nics +2 more");
-  expect(second[0]).toHaveTextContent("Apply");
+  // 바뀐 칸은 셋만 사람 말로(서버가 준 전·후 값은 함께), 나머지는 수
+  expect(second[0]).toHaveTextContent(
+    "vCPUs 2 → 4 · label tier: web · network cards (NICs) changed · and 2 more",
+  );
+  expect(second[0]).toHaveTextContent("YAML apply");
+  expect(within(second[0]!).getByText("YAML apply").closest("[title]")).toHaveAttribute(
+    "title",
+    "Changed by applying YAML files with orbivisorctl apply",
+  );
   expect(queries[0]!.get("limit")).toBe("100");
   expect(queries[0]!.get("since")).not.toBeNull();
   await expectNoAxeViolations(container);
@@ -100,19 +108,21 @@ it("opens a drawer with the before/after table, secret marks and a live comparis
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
   const table = await within(drawer).findByRole("table", { name: "Changed fields of web" });
   const rows = within(table).getAllByRole("row");
-  expect(rows[1]).toHaveTextContent("memory_mib");
-  expect(rows[1]).toHaveTextContent("4096");
-  expect(rows[1]).toHaveTextContent("8192");
+  // 칸은 사람 말 이름(원래 경로는 작게), 크기는 단위로
+  expect(rows[1]).toHaveTextContent("memorymemory_mib");
+  expect(rows[1]).toHaveTextContent("4 GiB");
+  expect(rows[1]).toHaveTextContent("8 GiB");
+  expect(drawer).toHaveTextContent("SourceWeb UIA person changed it in the web UI");
   // 비밀은 표시만
   expect(rows[2]).toHaveTextContent("(secret set)");
   expect(rows[2]).toHaveTextContent("(secret changed)");
   expect(drawer).toHaveTextContent("more memory for the sale");
   await user.selectOptions(within(drawer).getByLabelText("Compare with"), "live");
-  expect(await within(drawer).findByText("vcpus")).toBeInTheDocument();
-  await user.click(within(drawer).getByText("Full configuration at this revision"));
+  expect(await within(drawer).findByText("vCPUs")).toBeInTheDocument();
+  await user.click(within(drawer).getByText("Full configuration at this record"));
   expect(within(drawer).getByText(/Secrets are not kept/)).toBeInTheDocument();
 });
 
@@ -139,13 +149,15 @@ it("restores a revision after showing the server's plan and applies that plan", 
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
-  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore these values…" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "Restore web to its values at record #81?",
+  });
   expect(await within(dialog).findByText(/1 to change/)).toBeInTheDocument();
   expect(dialog).toHaveTextContent("secrets are not restored; the current password stays");
-  expect(within(dialog).getByRole("table", { name: "Changed fields of Vm web" })).toHaveTextContent(
-    "8192",
+  expect(within(dialog).getByRole("table", { name: "Changed fields of VM web" })).toHaveTextContent(
+    "8 GiB",
   );
   expect(restores).toEqual([{ revision: 81, dry_run: true }]);
   await user.click(within(dialog).getByRole("button", { name: "Restore" }));
@@ -187,13 +199,13 @@ it("keeps Restore off for a blocked plan and explains a cluster upgrade", async 
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
-  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore these values…" }));
   let dialog = await screen.findByRole("dialog", { name: /^Restore web/ });
   expect(await within(dialog).findByText(/volume web-disk0 is gone/)).toBeInTheDocument();
   expect(within(dialog).getByRole("button", { name: "Restore" })).toBeDisabled();
   await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
-  await user.click(within(drawer).getByRole("button", { name: "Restore this revision…" }));
+  await user.click(within(drawer).getByRole("button", { name: "Restore these values…" }));
   dialog = await screen.findByRole("dialog", { name: /^Restore web/ });
   expect(
     await within(dialog).findByText("The cluster is being upgraded: node b lacks config-history"),
@@ -219,11 +231,13 @@ it("asks for a new name when recreating a deleted resource whose name is taken",
   );
   renderPage(<HistoryPage />, { path: "/history" });
   await user.click(await screen.findByRole("button", { name: /Deleted/ }));
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
   await user.click(
-    await within(drawer).findByRole("button", { name: "Recreate from this revision…" }),
+    await within(drawer).findByRole("button", { name: "Recreate with these values…" }),
   );
-  const dialog = await screen.findByRole("dialog", { name: "Recreate web from revision 90?" });
+  const dialog = await screen.findByRole("dialog", {
+    name: "Recreate web with its values at record #90?",
+  });
   await user.type(await within(dialog).findByLabelText("New name"), "web-old");
   await user.click(within(dialog).getByRole("button", { name: "Plan again" }));
   expect(await within(dialog).findByText(/1 to create/)).toBeInTheDocument();
@@ -241,10 +255,10 @@ it("hides restoring from viewers", async () => {
     screen.queryByRole("button", { name: "Restore to a point in time…" }),
   ).not.toBeInTheDocument();
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
   await within(drawer).findByRole("table", { name: "Changed fields of web" });
   expect(
-    within(drawer).queryByRole("button", { name: "Restore this revision…" }),
+    within(drawer).queryByRole("button", { name: "Restore these values…" }),
   ).not.toBeInTheDocument();
 });
 
@@ -282,7 +296,7 @@ it("plans a point-in-time restore and allows data loss only on its own", async (
   expect(dataLoss).toBeEnabled();
   await user.click(dataLoss);
   await user.selectOptions(within(dialog).getByLabelText("Point in time by"), "revision");
-  await user.type(within(dialog).getByLabelText("Revision"), "70");
+  await user.type(within(dialog).getByLabelText("Record number"), "70");
   await user.click(preview);
   expect(
     await within(dialog).findByText(/1 to create, 1 to change, 1 to delete/),
@@ -366,9 +380,11 @@ it("plans again when the restore plan went stale or is gone, and applies the new
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
-  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore these values…" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "Restore web to its values at record #81?",
+  });
   await within(dialog).findByText(/1 to change/);
   await user.click(within(dialog).getByRole("button", { name: "Restore" }));
   expect(
@@ -450,17 +466,21 @@ it("explains that restoring replaces the whole spec and shows removed fields goi
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
-  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore these values…" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "Restore web to its values at record #81?",
+  });
   expect(dialog).toHaveTextContent(
-    "Every field goes back to that revision — fields it left at their defaults are reset; secrets added since stay.",
+    "Every field goes back to its value then — fields left at their defaults are reset; secrets added since stay.",
   );
-  const table = await within(dialog).findByRole("table", { name: "Changed fields of Vm web" });
+  const table = await within(dialog).findByRole("table", { name: "Changed fields of VM web" });
   const row = within(table).getByRole("row", { name: /max_memory_mib/ });
-  expect(row).toHaveTextContent("16384");
+  expect(row).toHaveTextContent("16 GiB");
   expect(row).toHaveTextContent("→ default");
-  expect(within(table).getByRole("row", { name: /^memory_mib/ })).not.toHaveTextContent("default");
+  expect(within(table).getByRole("row", { name: /^memory\s?memory_mib/ })).not.toHaveTextContent(
+    "default",
+  );
 });
 
 it("offers to take over a Terraform-managed resource and plans with force_conflicts", async () => {
@@ -499,9 +519,11 @@ it("offers to take over a Terraform-managed resource and plans with force_confli
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
-  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore these values…" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "Restore web to its values at record #81?",
+  });
   const force = await within(dialog).findByRole("checkbox", {
     name: "Take over from Terraform and restore anyway",
   });
@@ -541,9 +563,21 @@ it("does not offer the Terraform takeover for other blocks", async () => {
   renderPage(<HistoryPage />, { path: "/history" });
   const [first] = await screen.findAllByRole("button", { name: /more memory/ });
   await user.click(first!);
-  const drawer = await screen.findByRole("dialog", { name: "vm web" });
-  await user.click(await within(drawer).findByRole("button", { name: "Restore this revision…" }));
-  const dialog = await screen.findByRole("dialog", { name: "Restore web to revision 81?" });
+  const drawer = await screen.findByRole("dialog", { name: "VM web" });
+  await user.click(await within(drawer).findByRole("button", { name: "Restore these values…" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "Restore web to its values at record #81?",
+  });
   await within(dialog).findByText(/no vm.config/);
   expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+});
+
+it("names a folder by its display name, not its id", async () => {
+  const FOLDER = "019a0f3c-0000-7000-8062-000000000001";
+  mockLists({ folder: [{ id: FOLDER, name: FOLDER, spec: { name: "prod", kind: "vm" } }] });
+  mockTimeline([entry(5, { kind: "folder", id: FOLDER, name: FOLDER, op: "create" })]);
+  renderPage(<HistoryPage />, { path: "/history" });
+  const line = await screen.findByRole("button", { name: /Created/ });
+  await waitFor(() => expect(line).toHaveTextContent("prod"));
+  expect(line).not.toHaveTextContent(FOLDER);
 });

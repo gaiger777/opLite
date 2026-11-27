@@ -181,6 +181,7 @@ pub(crate) async fn create_task_with_id(
     task.name = task.id.to_string();
     label_task(cluster, &mut task);
     task.revision = cluster.create(&task).await?;
+    crate::audit::note_task(task.id);
     Ok(task)
 }
 

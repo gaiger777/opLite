@@ -35,7 +35,7 @@ use crate::audit::{AuditNote, parse_time};
 use crate::auth::{Action, Principal};
 use crate::authz::Owners;
 use crate::cluster::require_feature;
-use crate::declarative::diff::{Change, diff};
+use crate::declarative::diff::{Change, ChangeOp, diff};
 use crate::declarative::kinds::{Live, World, adapter};
 use crate::declarative::plan::{self, StoredPlan, summarize};
 use crate::declarative::{
@@ -51,6 +51,10 @@ const MAX_LIMIT: usize = 1_000;
 const MAX_SCAN: usize = 50_000;
 /// 줄마다 보이는 바뀐 경로 수
 const MAX_CHANGED: usize = 20;
+/// 줄마다 전·후 값을 함께 보이는 칸 수(계획 77-7 — "메모리 4096 → 8192"처럼 목록에서 바로 읽게)
+const MAX_VALUES: usize = 3;
+/// 전·후 값을 함께 보이는 글의 최대 바이트(긴 글·목록·객체는 경로만)
+const MAX_VALUE_BYTES: usize = 64;
 /// 관찰 노드가 구성원에게 묻는 시간
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -231,6 +235,9 @@ pub struct HistoryEntry {
     /// 앞 줄과 견줘 바뀐 칸(최대 20개 — 레이블은 `labels.<열쇠>`). 만들기·지우기는 비어 있다.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub changed: Vec<String>,
+    /// `changed` 앞쪽의 짧은 값 칸(숫자·참거짓·짧은 글 — 최대 3개)의 전·후(계획 77-7). 옛 서버는 주지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<Change>,
 }
 
 /// 이력 줄 목록(새것부터)
@@ -257,32 +264,63 @@ pub struct HistoryDetail {
     pub diff: Vec<Change>,
 }
 
-/// 바뀐 경로(spec 칸 + 레이블)
-fn changed(prev: Option<&HistoryRecord>, rec: &HistoryRecord) -> Vec<String> {
-    let Some(prev) = prev else {
-        return Vec::new();
-    };
-    if rec.op != HistoryOp::Update {
-        return Vec::new();
+/// 짧은 값(없음·숫자·참거짓·짧은 글)인지 — 목록 줄에 전·후를 그대로 보일 수 있는 것
+fn short_value(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null | Value::Bool(_) | Value::Number(_)) => true,
+        Some(Value::String(s)) => s.len() <= MAX_VALUE_BYTES,
+        _ => false,
     }
-    let mut out: Vec<String> = diff(&prev.spec, &rec.spec)
-        .into_iter()
-        .map(|c| c.path)
-        .collect();
-    let keys: BTreeSet<&String> = prev.labels.keys().chain(rec.labels.keys()).collect();
-    for k in keys {
-        if prev.labels.get(k) != rec.labels.get(k) {
-            out.push(format!("labels.{k}"));
-        }
-    }
-    if prev.name != rec.name {
-        out.insert(0, "name".into());
-    }
-    out.truncate(MAX_CHANGED);
-    out
 }
 
-fn entry(rec: &HistoryRecord, changed: Vec<String>) -> HistoryEntry {
+/// 바뀐 경로(이름 + spec 칸 + 레이블)와 그 앞쪽 짧은 값 칸의 전·후
+fn changed(prev: Option<&HistoryRecord>, rec: &HistoryRecord) -> (Vec<String>, Vec<Change>) {
+    let Some(prev) = prev else {
+        return Default::default();
+    };
+    if rec.op != HistoryOp::Update {
+        return Default::default();
+    }
+    let text = |s: &String| Some(Value::String(s.clone()));
+    let mut all: Vec<Change> = Vec::new();
+    if prev.name != rec.name {
+        all.push(Change {
+            path: "name".into(),
+            op: ChangeOp::Replace,
+            old: text(&prev.name),
+            new: text(&rec.name),
+        });
+    }
+    all.extend(diff(&prev.spec, &rec.spec));
+    let keys: BTreeSet<&String> = prev.labels.keys().chain(rec.labels.keys()).collect();
+    for k in keys {
+        let (old, new) = (prev.labels.get(k), rec.labels.get(k));
+        if old != new {
+            all.push(Change {
+                path: format!("labels.{k}"),
+                op: match (old, new) {
+                    (None, _) => ChangeOp::Add,
+                    (_, None) => ChangeOp::Remove,
+                    _ => ChangeOp::Replace,
+                },
+                old: old.and_then(text),
+                new: new.and_then(text),
+            });
+        }
+    }
+    all.truncate(MAX_CHANGED);
+    let paths = all.iter().map(|c| c.path.clone()).collect();
+    let values = all
+        .into_iter()
+        // 비밀 표시(`{"$secret": …}`)의 바뀜은 값이 아니다 — 경로만
+        .filter(|c| !c.path.split('.').any(|p| p == SECRET_MARK))
+        .filter(|c| short_value(c.old.as_ref()) && short_value(c.new.as_ref()))
+        .take(MAX_VALUES)
+        .collect();
+    (paths, values)
+}
+
+fn entry(rec: &HistoryRecord, (changed, values): (Vec<String>, Vec<Change>)) -> HistoryEntry {
     HistoryEntry {
         revision: rec.revision,
         kind: rec.kind,
@@ -297,6 +335,7 @@ fn entry(rec: &HistoryRecord, changed: Vec<String>) -> HistoryEntry {
         apply_set: rec.apply_set,
         restored_from: rec.restored_from,
         changed,
+        values,
     }
 }
 
@@ -1027,6 +1066,7 @@ async fn finish(
 ) -> Result<Response, ApiError> {
     let stored = state.plans.keep(plan);
     if dry_run {
+        audit.dry_run();
         return Ok(Json::<PlanView>(stored.view.clone()).into_response());
     }
     let started: ApplyStarted = start(state, &stored).await?;
@@ -1575,9 +1615,55 @@ mod tests {
         );
         b.labels.insert("tier".into(), "web".into());
         b.name = "web2".into();
-        assert_eq!(changed(Some(&a), &b), ["name", "cpu.cores", "labels.tier"]);
-        assert!(changed(None, &b).is_empty());
-        assert!(changed(Some(&b), &rec(3, HistoryOp::Delete, json!({}))).is_empty());
+        let (paths, values) = changed(Some(&a), &b);
+        assert_eq!(paths, ["name", "cpu.cores", "labels.tier"]);
+        // 앞쪽 짧은 값 칸 셋의 전·후(계획 77-7)
+        let shown: Vec<_> = values
+            .iter()
+            .map(|c| (c.path.as_str(), c.old.clone(), c.new.clone()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("name", Some(json!("web")), Some(json!("web2"))),
+                ("cpu.cores", Some(json!(1)), Some(json!(2))),
+                ("labels.tier", None, Some(json!("web"))),
+            ]
+        );
+        assert_eq!(values[2].op, ChangeOp::Add);
+        assert_eq!(changed(None, &b), Default::default());
+        assert_eq!(
+            changed(Some(&b), &rec(3, HistoryOp::Delete, json!({}))),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn changed_values_skip_long_lists_and_secrets() {
+        let a = rec(
+            1,
+            HistoryOp::Create,
+            json!({ "nics": [1], "auth": { "password": { "$secret": "set" } }, "note": "a", "memory_mib": 4096, "vcpus": 1, "x": false }),
+        );
+        let b = rec(
+            2,
+            HistoryOp::Update,
+            json!({ "nics": [1, 2], "auth": { "password": { "$secret": "changed" } }, "note": "b".repeat(100), "memory_mib": 8192, "vcpus": 2, "x": true }),
+        );
+        let (paths, values) = changed(Some(&a), &b);
+        assert_eq!(
+            paths,
+            [
+                "auth.password.$secret",
+                "memory_mib",
+                "nics",
+                "note",
+                "vcpus",
+                "x"
+            ]
+        );
+        let shown: Vec<_> = values.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(shown, ["memory_mib", "vcpus", "x"]);
     }
 
     #[test]

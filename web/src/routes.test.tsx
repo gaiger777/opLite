@@ -195,8 +195,8 @@ it.each([
 
 // 설정 기록·선언 묶음(계획 73)은 기록 묶음의 항목, 인증서는 관리 › 보안·인증서의 화면 안 탭으로 늦게 받는 화면과 문구로 열린다.
 it.each([
-  ["/history", "Config history", null],
-  ["/apply-sets", "Apply sets", null],
+  ["/history", "Change history", null],
+  ["/apply-sets", "Managed as code (YAML)", null],
   ["/settings/certificates", "Certificates", ["Security", "Certificates"]],
 ] as const)("opens %s lazily", async (path, title, tabs) => {
   server.use(

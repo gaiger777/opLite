@@ -246,7 +246,18 @@ export const appRoutes: RouteObject[] = [
               },
               { path: "tasks", element: <TasksPage /> },
               { path: "alerts", lazy: page(() => import("@/alerts/AlertsPage"), "AlertsPage") },
-              { path: "audit", lazy: page(() => import("@/audit/AuditPage"), "AuditPage") },
+              {
+                path: "audit",
+                // 동작 이름 표(계획 77-7)는 감사 화면을 열 때 받는다
+                lazy: async () => {
+                  const [m, s] = await Promise.all([
+                    import("@/audit/AuditPage"),
+                    import("@/audit/strings"),
+                  ]);
+                  await s.loadAuditStrings();
+                  return { Component: m.AuditPage };
+                },
+              },
               // 설정 기록·선언 묶음(계획 73): 감사 탭의 보기
               { path: "history", lazy: declarativePage("HistoryPage") },
               { path: "apply-sets", lazy: declarativePage("ApplySetsPage") },

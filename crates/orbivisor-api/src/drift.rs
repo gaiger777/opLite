@@ -148,7 +148,9 @@ pub(crate) async fn tick(state: &AppState) -> bool {
             .as_ref()
             .map(|d| &d.items[..])
             .unwrap_or(&[]);
-        if old == items.as_slice() && (set.status.drift.is_some() || items.is_empty()) {
+        // 결과가 같으면 쓰지 않는다. 아직 견준 적이 없는 묶음(적용 직후)은 다른 것이 없어도 한 번 적는다 — 안 그러면 늘
+        // "아직 견주지 않음"으로 보여 같은지 모른다(계획 77-7).
+        if old == items.as_slice() && set.status.drift.is_some() {
             continue;
         }
         let mut status = set.status.clone();

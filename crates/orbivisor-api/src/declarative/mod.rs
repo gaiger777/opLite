@@ -353,6 +353,7 @@ pub async fn apply(
             let made = Box::pin(plan::make_plan(&state, &principal, &request, meta)).await?;
             let stored = state.plans.keep(made);
             if q.dry_run {
+                audit.dry_run();
                 return Ok(Json(stored.view.clone()).into_response());
             }
             stored

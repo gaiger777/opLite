@@ -99,7 +99,7 @@
         "step3": "Pause very briefly and continue on the new node"
       },
       "declarativeApply": {
-        "alt": "Manage-as-code diagram: the YAML file is compared with the cluster to show what will be added, changed and removed; applying makes the cluster match. Removal happens only with --prune.",
+        "alt": "Manage-as-code diagram: 1 the YAML file is 2 compared with the cluster to show what will change, 3 applying makes the cluster match, 4 later changes in the UI show up as 'differs from the file'.",
         "file": "YAML file",
         "diff": "Compare",
         "add": "add",
@@ -107,8 +107,9 @@
         "remove": "remove",
         "apply": "Apply",
         "cluster": "Cluster",
-        "note": "The file is the 'wanted state'; applying makes the cluster match it. Removal happens only with --prune and an apply set (--set), and only for objects that set applied before and the file no longer has (VMs, volumes and stores also need --prune-data).",
-        "note2": "If anyone changes it after an apply (UI, CLI or API), what differs from the last apply shows as 'drift'."
+        "watch": "Drift watch: UI edits show as 'differs from file'",
+        "note": "File = wanted state. Apply makes the cluster match.",
+        "note2": "Removal happens only with --prune."
       },
       "dedupStore": {
         "alt": "Backup store diagram: three backups repeat the same pieces, but the store keeps each different piece only once.",
@@ -1329,8 +1330,8 @@
     "audit": {
       "page": {
         "what": "The audit log records the requests that change something in this cluster (create, change, delete, sign-in) plus console opens and file-restore downloads. Read-only requests (GET) are not kept. It is where you find who did what when something goes wrong.",
-        "how": "Each node records the requests it received; this page gathers every node's records in time order. Filter by user or action (for example POST /vms). Records of nodes that did not answer are missing.",
-        "when": "To find out why a VM suddenly stopped or a setting changed. For before-and-after values, the settings history page is easier."
+        "how": "Every node records the requests it receives; this page gathers all nodes' records newest first and names each action in plain words (\"Start VM web-01\"). Filter by user or part of the address (e.g. /vms/web-01 — everything done to that VM); open a row for the result, IP, time taken and the raw request. Nodes that do not answer are missing.",
+        "when": "To find out why a VM suddenly stopped or a setting changed. For before-and-after values, the change history page is easier."
       }
     },
     "tasks": {
@@ -1350,7 +1351,7 @@
     },
     "history": {
       "page": {
-        "what": "Settings history keeps the before and after of each change to settings such as VMs, networks and rules. By default it keeps up to 100 versions per resource, 365 days and 64 MiB in all; older entries are removed.",
+        "what": "Change history keeps the before and after of each change to settings such as VMs, networks and rules. By default it keeps up to 100 versions per resource, 365 days and 64 MiB in all; older entries are removed.",
         "how": "Each row shows who changed it, when and from where (UI, CLI, YAML apply, Terraform, automatic task). Open a row to compare the changed fields side by side and Restore to go back to that value. You can also restore everything to one point in time. Secrets (passwords, tokens) are not recorded, so a restore keeps their current value.",
         "when": "\"It worked yesterday but not today\" — find what changed and undo it.",
         "caution": "History starts when the cluster was upgraded to this version."

@@ -305,8 +305,8 @@
       "fix": "See the failed step and VMs on the DR run page."
     },
     "apply_set_drift": {
-      "cause": "An apply set drifted from the live settings.",
-      "fix": "See the drifted items on the apply set page; apply again or update the YAML."
+      "cause": "The live settings differ from the files of a YAML set (managed as code).",
+      "fix": "Open Managed as code (YAML) › that set to see what differs; apply again or update the YAML."
     },
     "sdn_quorum_lost": {
       "cause": "The SDN central nodes (OVN central) lost their quorum.",

@@ -444,7 +444,10 @@ orbivisorctl -o json audit --since 7d            # 응답 그대로(항목의 �
   경로는 `null`이다. `detail`은 핸들러가 남긴 짧은 문자열이다: 로그인은 `username=<이름>`(이름 형식이 아니면
   `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), OIDC 콜백은 `realm=<영역> username=<이름>` 또는 `realm=<영역> error=<코드>`, 원격 클러스터 중계는 `remote=<이름> <메서드> /<경로>`, 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
   어디에도 넣지 않는다. 로그인에 성공하면 그 사용자, 로그아웃은 세션의 사용자가 `user`다. `path`·`target.key`·
-  `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`).
+  `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`). 계획 77-7부터 두 칸이 더 있을 수 있다(옛 노드의
+  항목엔 없다): `outcome`은 상태만으로 알 수 없는 결과 — `dry_run`(`POST /apply?dry_run=true`·되돌리기 `dry_run`·SDN 잠금·네트워크
+  옮기기의 미리 보기, 바꾼 것 없음 200), `failed`(302로 끝나는 OIDC 콜백의 실패) — 이고, `task`는 그 요청이 시작한 처음 Task id다(202 —
+  일의 결과는 Task에).
 - **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/orbivisor/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
   요청은 디스크를 기다리지 않는다: 쓰기 스레드가 덧붙이고 1초마다 묶어 `fsync`한다. 줄을 더하면 `max_file_mib`를
   넘을 때 `audit.log` → `audit.log.1` → `.2` …로 밀고, 지금 파일을 포함해 `max_files`개를 넘는 가장 오래된 것을 지운다.
@@ -483,8 +486,9 @@ orbivisorctl -o json audit --since 7d            # 응답 그대로(항목의 �
   on: node4`, `note: more entries match; narrow the range or raise --limit`을 쓴다(`-o json`이면 쓰지 않는다). 표의
   `TARGET`은 대상이 없으면 `detail`(로그인의 `username=…`, `audit.dropped`의 수)이다. 기간 `--since`(`1h` 등)와 `--until`은
   함께 줄 수 없다(`a relative --since cannot be combined with --until; give a time` — `--since`에 시각을 준다).
-- **웹.** 기록 › 감사 로그(admin에게만 보인다 — 같은 묶음의 변경 기록·코드로 관리(YAML)는 [웹 화면](web-ui.md#설정-기록선언-묶음인증서-화면)): 시간 범위(지난 1시간·24시간·7일, 기본 24시간), 사용자·동작 입력(적용을
-  눌러야 거른다), 표(시각은 브라우저의 지역 시간, 대상이 없으면 `detail`, 4xx·5xx 상태는 경고 색), 읽지 못한 노드 경고,
+- **웹.** 기록 › 감사 로그(admin에게만 보인다 — 같은 묶음의 변경 기록·코드로 관리(YAML)는 [웹 화면](web-ui.md#변경-기록코드로-관리yaml인증서-화면)): 시간 범위(지난 1시간·24시간·7일, 기본 24시간), 사용자·동작 입력(적용을
+  눌러야 거른다), 표(시각은 브라우저의 지역 시간, 동작 이름 — "VM web 켜기", 동작 이름에 대상이 없으면 대상 열, 결과는 성공·실패와
+  까닭·미리 보기(바꾼 것 없음)·시작함과 그 작업의 지금 상태(서랍 링크), 실패는 경고 색), 읽지 못한 노드 경고,
   감사 로그를 끈 노드 안내와 잘림 안내, 행을 누르면 항목 JSON. 자동으로 다시 읽지 않는다(새로고침 버튼). 다시 읽기가
   실패하면 마지막 표를 두고 위에 오류를 보인다.
 

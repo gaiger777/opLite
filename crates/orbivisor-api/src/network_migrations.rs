@@ -331,6 +331,7 @@ pub async fn create_network_migration(
     let allowed = configures(&state, &principal);
     let sees = reads(&state, &principal);
     if query.dry_run {
+        audit.dry_run();
         let plan = engine::plan_migration(&state.cluster, &req.spec, &guests, &allowed, &sees)?;
         return Ok((StatusCode::OK, Json(plan)).into_response());
     }

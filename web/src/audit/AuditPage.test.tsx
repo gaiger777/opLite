@@ -4,7 +4,9 @@ import { http, HttpResponse } from "msw";
 
 import type { AuditEntry } from "@/api/types";
 import { AuditPage } from "@/audit/AuditPage";
-import { ADMIN, renderPage } from "@/test/render";
+import { expectNoAxeViolations } from "@/test/axe";
+import { task } from "@/test/fixtures";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
 const START: AuditEntry = {
@@ -64,30 +66,31 @@ function mockAudit(
   return queries;
 }
 
-it("lists entries with their node, user, action, target and status", async () => {
+it("lists entries in plain words: who, what, result, node and IP", async () => {
   mockAudit();
   renderPage(<AuditPage />);
   await screen.findByText("alice");
   const rows = within(screen.getByRole("table", { name: "Audit log" })).getAllByRole("row");
   expect(rows).toHaveLength(3);
-  for (const text of [
-    "node-a",
-    "alice",
-    "10.0.0.5",
-    "POST /vms/{key}/actions/{action}",
-    "vms/web-1",
-    "202",
-  ]) {
-    expect(rows[1]).toHaveTextContent(text);
-  }
+  // "POST /vms/{key}/actions/{action}" 대신 동작 이름(계획 77-7) — 원문은 줄을 열어 본다
+  const cells = within(rows[1]!).getAllByRole("cell");
+  expect(cells[1]).toHaveTextContent("alice");
+  expect(cells[2]).toHaveTextContent(/^Start VM web-1$/);
+  // 대상은 이름에 이미 있으니 따로 쓰지 않는다
+  expect(cells[3]).toHaveTextContent(/^$/);
+  // 202는 "성공"이 아니라 "시작함"(일의 결과는 작업에)
+  expect(cells[4]).toHaveTextContent(/^Started$/);
+  expect(cells[5]).toHaveTextContent("node-a");
+  expect(cells[6]).toHaveTextContent("10.0.0.5");
+  expect(rows[1]).not.toHaveTextContent("POST");
   expect(rows[1]!.querySelector("time")).toHaveAttribute("datetime", "2025-10-23T04:03:37.104Z");
-  // 인증 전 실패: 사용자가 없고, 대상이 없으니 detail을 보이고, 상태는 경고 색이다.
-  const cells = within(rows[2]!).getAllByRole("cell");
-  expect(cells[2]).toHaveTextContent("—");
-  expect(cells[5]).toHaveTextContent("username=mallory");
-  expect(cells[6]).toHaveTextContent("401");
-  expect(cells[6]).toHaveClass("text-destructive");
-  expect(within(rows[1]!).getAllByRole("cell")[6]).not.toHaveClass("text-destructive");
+  // 인증 전 실패: 사용자가 없고, detail을 동작 밑에 보이고, 결과는 까닭과 함께 경고 색이다.
+  const login = within(rows[2]!).getAllByRole("cell");
+  expect(login[1]).toHaveTextContent("—");
+  expect(login[2]).toHaveTextContent("Sign inusername=mallory");
+  expect(login[4]).toHaveTextContent("Failed — wrong sign-in (401)");
+  expect(login[4]!.firstElementChild).toHaveClass("text-destructive");
+  expect(cells[4]!.firstElementChild).not.toHaveClass("text-destructive");
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
@@ -146,9 +149,6 @@ it("says which nodes have the audit log turned off", async () => {
     "The audit log is turned off on these nodes: node-c, node-d",
   );
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  // 대상도 detail도 없으면 줄표
-  const row = within(screen.getByRole("table", { name: "Audit log" })).getAllByRole("row")[1]!;
-  expect(within(row).getAllByRole("cell")[5]).toHaveTextContent("—");
 });
 
 it("keeps the entries and says when reading again failed", async () => {
@@ -170,17 +170,37 @@ it("keeps the entries and says when reading again failed", async () => {
   expect(screen.getByText("alice")).toBeInTheDocument();
 });
 
-it("shows an entry as JSON when its row is clicked", async () => {
+it("opens an entry in plain words with the raw request and the whole JSON", async () => {
   mockAudit();
   renderPage(<AuditPage />);
-  const login = await screen.findByRole("button", { name: "POST /auth/login" });
+  const login = await screen.findByRole("button", { name: "Sign in" });
   await userEvent.click(login.closest("tr")!.querySelector("td")!);
-  const dialog = await screen.findByRole("dialog", { name: "Audit entry" });
-  expect(dialog).toHaveTextContent('"detail": "username=mallory"');
-  expect(dialog).toHaveTextContent('"node": "node-b"');
+  const dialog = await screen.findByRole("dialog", { name: "Sign in" });
+  expect(dialog).toHaveTextContent("ResultFailed — wrong sign-in (401)");
+  expect(dialog).toHaveTextContent("Whonot signed in");
+  expect(dialog).toHaveTextContent("From10.0.0.9 · node node-b");
+  expect(dialog).toHaveTextContent("Took3 ms");
+  expect(dialog).toHaveTextContent("Detailsusername=mallory");
+  expect(dialog).toHaveTextContent("Raw requestPOST /api/v1/auth/login");
+  expect(within(dialog).getByRole("button", { name: "Copy the raw request" })).toBeInTheDocument();
+  // 전체 JSON은 접어 둔다
+  const json = within(dialog).getByText("Whole entry (JSON)").closest("details")!;
+  expect(json).not.toHaveAttribute("open");
+  expect(json).toHaveTextContent('"node": "node-b"');
+  await expectNoAxeViolations(dialog, { disable: ["region"] });
   await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   await vi.waitFor(() => expect(login).toHaveFocus());
+});
+
+it("keeps the raw action for routes it has no name for", async () => {
+  mockAudit({
+    entries: [{ ...START, action: "POST /brand-new/{key}", path: "/brand-new/x", target: null }],
+  });
+  renderPage(<AuditPage />);
+  expect(await screen.findByRole("button", { name: "POST /brand-new/{key}" })).toHaveClass(
+    "font-mono",
+  );
 });
 
 it("says why the log could not be read", async () => {
@@ -235,14 +255,107 @@ it("names the balancer's automatic moves and shows what moved", async () => {
   await screen.findByText("alice");
   const rows = within(screen.getByRole("table", { name: "Audit log" })).getAllByRole("row");
   const cells = within(rows[2]!).getAllByRole("cell");
-  expect(cells[4]).toHaveTextContent("placement.moveAutomatic move by the balancer");
-  expect(cells[5]).toHaveTextContent(
-    "vms/web-1auto: web-1 node-a -> node-b (balance), imbalance 21.0% -> 12.5%, cost 4096 MiB",
+  expect(cells[1]).toHaveTextContent("The node itself (automatic)");
+  expect(cells[2]).toHaveTextContent(
+    "Automatic move by the balancer — VM web-1auto: web-1 node-a -> node-b (balance), imbalance 21.0% -> 12.5%, cost 4096 MiB",
   );
-  // 사용자의 요청은 그대로다.
-  expect(within(rows[1]!).getAllByRole("cell")[4]).toHaveTextContent(
-    /^POST \/vms\/\{key\}\/actions\/\{action\}$/,
+  expect(cells[4]).toHaveTextContent("—");
+});
+
+const TASK_ID = "019a0f3c-0000-7000-8000-0000000000aa";
+
+it("tells a preview, a started task (with its result) and a failed SSO redirect from a success", async () => {
+  const entry = (n: number, extra: Partial<AuditEntry>): AuditEntry => ({
+    ...START,
+    id: `019a0f3c-8a10-7000-8000-00000000010${n}`,
+    time: START.time - n,
+    ...extra,
+  });
+  const history = { action: "POST /history/{kind}/{key}/restore", path: "/history/vm/web/restore" };
+  const sso = { method: "GET", action: "GET /auth/oidc/callback", path: "/auth/oidc/callback" };
+  mockAudit({
+    entries: [
+      // 미리 보기: 서버가 적은 결과, 옛 노드는 미리 보기가 있는 라우트의 200
+      entry(1, { action: "POST /apply", path: "/apply", status: 200, outcome: "dry_run" }),
+      entry(2, { ...history, status: 200 }),
+      // 시작함: 서버가 적은 작업과 그 지금 상태
+      entry(3, { ...history, status: 202, task: TASK_ID }),
+      // SSO 콜백은 실패도 302 — 서버가 적은 결과, 옛 노드는 detail의 error=
+      entry(4, { ...sso, status: 302, outcome: "failed", detail: "realm=okta error=no_role" }),
+      entry(5, { ...sso, status: 302, detail: "realm=<unknown> error=sso_failed" }),
+      entry(6, { ...sso, status: 302, detail: "realm=okta username=alice" }),
+    ],
+  });
+  mockLists({
+    task: [{ ...task(TASK_ID, "apply", "x"), status: { state: "failed", error: "boom" } }],
+  });
+  renderPage(<AuditPage />);
+  const table = await screen.findByRole("table", { name: "Audit log" });
+  const results = () =>
+    within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => within(row).getAllByRole("cell")[4]!.textContent);
+  await vi.waitFor(() =>
+    expect(results()).toEqual([
+      "Preview (nothing changed)",
+      "Preview (nothing changed)",
+      "Started · Task Failed",
+      "Failed (sent back to the sign-in page)",
+      "Failed (sent back to the sign-in page)",
+      "Succeeded",
+    ]),
   );
+  expect(within(table).getByRole("link", { name: "Task Failed" })).toHaveAttribute(
+    "href",
+    expect.stringContaining(`task=${TASK_ID}`),
+  );
+});
+
+it("shows the target when the action's name does not say it, and names the nodes' own entries", async () => {
+  const FOLDER_ID = "019a0f3c-0000-7000-8062-000000000001";
+  const node = (n: number, action: string, kind: string, key: string): AuditEntry => ({
+    ...LOGIN,
+    id: `019a0f3c-8a10-7000-8000-00000000020${n}`,
+    ip: "",
+    method: "",
+    path: "",
+    action,
+    target: { kind, key },
+    status: 0,
+    detail: null,
+  });
+  mockAudit({
+    entries: [
+      // 이름에 대상이 없는 라우트: 대상 열에 — id는 아는 이름으로
+      {
+        ...START,
+        method: "DELETE",
+        action: "DELETE /folders/{id}",
+        path: `/folders/${FOLDER_ID}`,
+        target: { kind: "folders", key: FOLDER_ID },
+        status: 204,
+      },
+      node(1, "apply.update", "vm", "web"),
+      node(2, "vmware-vm.cutover", "vmware-vm", "legacy-db"),
+      node(3, "node.bond-down", "nodes", "node-b"),
+      // 표에 없는 노드 항목: 원문과 대상
+      node(4, "brand.new", "things", "t1"),
+    ],
+  });
+  mockLists({ folder: [{ id: FOLDER_ID, name: FOLDER_ID, spec: { name: "prod", kind: "vm" } }] });
+  renderPage(<AuditPage />);
+  const table = await screen.findByRole("table", { name: "Audit log" });
+  const cells = (i: number) =>
+    within(within(table).getAllByRole("row")[i + 1]!).getAllByRole("cell");
+  await vi.waitFor(() => expect(cells(0)[3]).toHaveTextContent("folders/prod"));
+  expect(cells(0)[2]).toHaveTextContent("Delete a folder");
+  expect(cells(1)[2]).toHaveTextContent("YAML apply: change virtual machine web");
+  expect(cells(1)[3]).toHaveTextContent(/^$/);
+  expect(cells(2)[2]).toHaveTextContent("Cut over VMware VM legacy-db");
+  expect(cells(3)[2]).toHaveTextContent("Node node-b: all bonded ports went down");
+  expect(cells(4)[2]).toHaveTextContent("brand.new");
+  expect(cells(4)[3]).toHaveTextContent("things/t1");
 });
 
 it("explains an empty range", async () => {

@@ -549,6 +549,8 @@ async fn main() -> anyhow::Result<()> {
     let listener =
         orbivisor_peer::tls::TlsListener::new(tcp, orbivisor_peer::tls::api_server_config(&tls)?)?
             .tap_io(|_| {});
+    // 적용 묶음의 드리프트(계획 73 §12.5)를 opld처럼 견준다 — 웹 데모의 "파일과 달라짐"(계획 77-7)
+    let drift = orbivisor_api::DriftChecker::spawn(state.clone(), Default::default());
     let app = orbivisor_api::router(state.clone());
     let server = tokio::spawn(async move {
         let _ = axum::serve(
@@ -588,6 +590,7 @@ async fn main() -> anyhow::Result<()> {
         _ = stdin_closed => {}
     }
     server.abort();
+    drift.shutdown().await;
     runner.shutdown().await;
     drop(reconciler);
     Ok(())

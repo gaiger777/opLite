@@ -33,6 +33,25 @@ pub struct AuditEntry {
     pub duration_ms: u64,
     /// 핸들러가 남긴 짧은 문자열(비밀은 넣지 않는다)
     pub detail: Option<String>,
+    /// 응답 상태만으로는 알 수 없는 결과(계획 77-7 — 핸들러가 적는다). 없으면 상태대로다(옛 노드의 항목도).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub outcome: Option<AuditOutcome>,
+    /// 이 요청이 시작한 Task(202 — 일의 결과는 Task에 남는다). 여럿이면 처음 것.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub task: Option<Uuid>,
+}
+
+/// 상태 번호와 다른 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    /// 미리 보기(`dry_run`) — 계획·확인만 하고 아무것도 바꾸지 않았다(200)
+    DryRun,
+    /// 실패했지만 응답은 성공 꼴(로그인 화면으로 보내는 302 — OIDC 콜백의 실패)
+    Failed,
 }
 
 /// 요청을 인증한 방식
@@ -122,6 +141,8 @@ mod tests {
             status: 200,
             duration_ms: 1,
             detail: None,
+            outcome: None,
+            task: None,
         }
     }
 

@@ -323,6 +323,8 @@ impl AuditSource for FakeAudit {
             status: 201,
             duration_ms: 2,
             detail: None,
+            outcome: None,
+            task: None,
         }])
     }
 }

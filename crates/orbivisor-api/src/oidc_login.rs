@@ -308,6 +308,7 @@ fn failure(state: &AppState, audit: &AuditNote, realm: Option<&str>, f: Failed) 
     let realm = realm.unwrap_or("<unknown>");
     tracing::warn!(realm, code = f.code.as_str(), reason = %f.reason, "an OIDC login failed");
     audit.detail(format!("realm={realm} error={}", f.code.as_str()));
+    audit.failed();
     redirect(
         &format!("/login?error={}", f.code.as_str()),
         state_cookie(state, "", 0),

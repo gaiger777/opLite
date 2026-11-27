@@ -9,16 +9,17 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import type { Change } from "@/history/api";
-import { secretMark, shortValue } from "@/history/diff";
+import { fieldName, valueText } from "@/history/describe";
+import { secretMark } from "@/history/diff";
 
-/** 칸 값 하나: 비밀 표시는 번역한 글, 없음은 "—" */
-function Value({ value, tone }: { value: unknown; tone: "old" | "new" }) {
+/** 칸 값 하나: 비밀 표시는 번역한 글, 크기는 단위(8 GiB), 참거짓은 켬·끔, 없음은 "—" */
+function Value({ path, value, tone }: { path: string; value: unknown; tone: "old" | "new" }) {
   const { t } = useTranslation();
   const mark = secretMark(value);
   if (mark !== null) {
     return <span className="text-muted-foreground italic">{t(`history.secret.${mark}`)}</span>;
   }
-  const text = shortValue(value);
+  const text = valueText(path, value, t);
   if (text === null) {
     return <span className="text-muted-foreground">—</span>;
   }
@@ -32,6 +33,23 @@ function Value({ value, tone }: { value: unknown; tone: "old" | "new" }) {
     >
       {text}
     </code>
+  );
+}
+
+/** 칸 이름: 사람 말(사전에 있으면) 아래 원래 경로를 작게 */
+export function FieldCell({ path }: { path: string }) {
+  const { t } = useTranslation();
+  const { label, raw } = fieldName(path, t);
+  return raw ? (
+    <span className="font-mono break-all">{label}</span>
+  ) : (
+    <>
+      <span className="break-words">{label}</span>
+      {/* 사람 말 이름이 경로와 같으면(영어 "disks") 경로를 다시 쓰지 않는다 */}
+      {path && label.toLowerCase() !== path && (
+        <span className="block font-mono text-[11px] break-all text-muted-foreground">{path}</span>
+      )}
+    </>
   );
 }
 
@@ -63,17 +81,17 @@ export function ChangeTable({
         <TableBody>
           {changes.map((c) => (
             <TableRow key={c.path}>
-              <TableCell className="align-top font-mono break-all whitespace-normal">
-                {c.path || t("history.wholeSpec")}
+              <TableCell className="align-top whitespace-normal">
+                <FieldCell path={c.path} />
               </TableCell>
               <TableCell className="max-w-56 align-top whitespace-normal">
-                <Value value={c.op === "add" ? undefined : c.old} tone="old" />
+                <Value path={c.path} value={c.op === "add" ? undefined : c.old} tone="old" />
               </TableCell>
               <TableCell className="max-w-56 align-top whitespace-normal">
                 {c.op === "remove" && removed !== undefined ? (
                   <span className="text-muted-foreground italic">{removed}</span>
                 ) : (
-                  <Value value={c.op === "remove" ? undefined : c.new} tone="new" />
+                  <Value path={c.path} value={c.op === "remove" ? undefined : c.new} tone="new" />
                 )}
               </TableCell>
             </TableRow>

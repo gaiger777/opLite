@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { StatusChip, type StatusTone } from "@/components/StatusChip";
 import type { PlanView, StepAction, StepView } from "@/declarative/api";
 import { ChangeTable } from "@/history/ChangeTable";
+import { kindName } from "@/history/describe";
 
 const TONE: Record<StepAction, StatusTone> = {
   create: "success",
@@ -14,14 +15,16 @@ const TONE: Record<StepAction, StatusTone> = {
 
 function Step({ step }: { step: StepView }) {
   const { t } = useTranslation();
+  const kind = kindName(step.kind, t);
   const problems = step.problems ?? [];
   const diff = step.diff ?? [];
   return (
     <li className="flex flex-col gap-2 rounded-md border p-3">
       <div className="flex flex-wrap items-center gap-2">
         <StatusChip tone={TONE[step.action]}>{t(`declarative.action.${step.action}`)}</StatusChip>
-        <span className="font-medium break-all">
-          {step.kind} {step.name}
+        <span className="break-all">
+          <span className="text-muted-foreground">{kind}</span>{" "}
+          <span className="font-medium">{step.name}</span>
         </span>
         {step.folder && <span className="text-xs text-muted-foreground">{step.folder}</span>}
         {step.restart && (
@@ -43,7 +46,7 @@ function Step({ step }: { step: StepView }) {
       {diff.length > 0 && (
         <ChangeTable
           changes={diff}
-          label={t("declarative.plan.changesOf", { kind: step.kind, name: step.name })}
+          label={t("declarative.plan.changesOf", { kind, name: step.name })}
           // 되돌리기 계획은 spec 전체를 바꾼다(`replace`) — 바꾸는 단계에서 지운 칸은 기본값으로 돌아간다
           removed={step.action === "update" ? t("declarative.plan.toDefault") : undefined}
         />

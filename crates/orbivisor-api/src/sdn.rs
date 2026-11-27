@@ -927,6 +927,7 @@ pub async fn set_lockdown(
         Vec::new()
     };
     if query.dry_run {
+        audit.dry_run();
         let sets = allow_sets(&nodes, &sdn);
         return Ok(Json(LockdownCheck {
             enabled: req.enabled,
