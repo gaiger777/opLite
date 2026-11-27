@@ -74,9 +74,12 @@ async function clusterMap(page: Page, vm: string) {
   await expect(node).toBeVisible();
   await expect(node).toHaveAttribute("aria-label", /\b1 VM \(1 running\)/);
   // 한 노드·VM 하나는 맞추기 배율이 커서 "자세히" 단계 — 타일 윗면에 VM 이름이 있다.
-  await expect(page.getByRole("status").filter({ hasText: "Detail." })).toBeVisible();
+  // 계획 77-6: 이 단계는 더 알릴 것이 없어 단계 안내 줄("요약 —"·"VM 칸 —")을 두지 않는다.
   const tileText = picture.locator("text").filter({ hasText: new RegExp(`^${vm}$`) });
   await expect(tileText).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: /^(Summary|VM cells) — / })).toHaveCount(
+    0,
+  );
 
   // 키보드: 노드에 초점 → `]`로 그 노드의 VM 타일(화면 초점은 노드에 남고 aria-live 줄이 읽는다) → Enter로 서랍
   const live = page.locator("p[aria-live=polite]").filter({ hasText: /^(Node|VM) / });
@@ -202,6 +205,12 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await dialog.getByLabel("Name").fill("root");
   await dialog.getByLabel("Storage pool").selectOption("local");
   await dialog.getByRole("button", { name: "Upload" }).click();
+  // 계획 77-8: 같은 창이 진행 창이 되어 끝(가져오기 Task 성공)까지 남는다. 끝나면 닫고 목록을 본다.
+  await expect(dialog.getByRole("status").filter({ hasText: "Volume ready" })).toBeVisible({
+    timeout: 60_000,
+  });
+  await dialog.getByRole("button", { name: "Close", exact: true }).first().click();
+  await expect(dialog).toBeHidden();
   const root = page
     .getByRole("row")
     .filter({ has: page.getByRole("cell", { name: "root", exact: true }) });
