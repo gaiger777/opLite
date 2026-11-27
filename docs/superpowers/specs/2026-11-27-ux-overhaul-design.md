@@ -31,6 +31,7 @@
 - **2단 사이드바**: 진단 §1.3 묶음 9개 + 관리. 펼침 상태 사용자별 기억(localStorage, 실패해도 기본 펼침). <1280은 아이콘 레일 + 펼침 창, 휴대폰은 서랍. 2FA·API 토큰은 사용자 메뉴. 경로는 지금 URL을 되도록 유지하고 바뀌는 것만 넘김(`nav.ts` 한 곳의 대응표, 진단 §1.4).
 - **도움말 부품**: `Field`에 `help`(늘 보이는 한 줄)·`info`(ⓘ → 오른쪽 도움말 패널 — 제목·설명·그림(SVG 작은 도식)·"자세히(문서)") 키. 문구는 i18n에 `help.<화면>.<칸>` 키로(ko·en). 그림은 손 SVG 몇 가지(HA 펜싱, 백업 증분 사슬, 복제·DR, SDN 라우터·SNAT, 배치 규칙, 선언 적용) — 늦게 읽기.
 - **Task 실패 원인(77-2)**: 서버 `TaskStatus.failure?: {code, params, step?, retryable}`(옛 `error` 문자열 그대로 둠 — 호환), `started_at`·`finished_at`·`requested_by`(이름)·`target_name`. 웹은 `taskErrors.<code>.{title,cause,fix}` 사전, 없으면 원문. 이벤트 로그는 범위 밖(다음).
+- **요청자 이름은 그 Task를 읽는 사람에게 보인다**(77-1 리뷰 I4): Task 레이블 `requested-by-name`을 사용자 목록 권한과 상관없이 보인다. vSphere 최근 작업 창처럼 "누가 했는지"는 운영 추적에 필요하고, Task를 읽을 수 있으면 그 대상도 이미 보는 사람이다. 사용자 목록·역할은 지금처럼 `user` 읽기 권한이 있어야 보인다.
 - **VM 만들기(77-5)**: 진단 §4.3 그림을 따름. 서버에 배치 미리보기(dry-run — 기존 `vm-checks`/스케줄러 점수 재사용) 하나. 프리셋 리소스는 만들지 않고 템플릿·이미지 + 용도 카드(웹 고정 목록)로.
 - **업로드(77-8)**: 조각 업로드 API(`POST /uploads` → `PUT /uploads/{id}?offset=` → `complete`), raw·ISO는 대상에 바로 씀, qcow2·vmdk는 임시 후 변환 진행을 Task 진행으로. 옛 한 번 올리기 API는 남김.
 
