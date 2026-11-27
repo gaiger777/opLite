@@ -7,6 +7,7 @@ import { grantable } from "@/permissions/grants";
 import { PermissionsPanel, routingGrants, useObjectNames } from "@/permissions/PermissionsPanel";
 import { GroupsPage, RolesPage } from "@/permissions/SettingsPermissionsPage";
 import { floatingIpView, folder, folderId, routerView } from "@/test/fixtures";
+import { expectNoAxeViolations } from "@/test/axe";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -132,10 +133,19 @@ it("creates a custom role from the privilege checklist", async () => {
     }),
   );
   const user = userEvent.setup();
-  renderPage(<RolesPage />, { as: ADMIN });
-  expect(await screen.findByRole("cell", { name: "vm-user" })).toBeInTheDocument();
+  const { container } = renderPage(<RolesPage />, { as: ADMIN });
+  // 역할을 고르면 그 권한이 묶음별 체크 트리로 보인다(계획 77-6). 처음엔 첫 역할이다.
+  await user.click(await screen.findByRole("button", { name: /^vm-user/ }));
+  const detail = screen.getByRole("region", { name: "vm-user" });
+  expect(within(detail).getByRole("list", { name: "vm" })).toHaveTextContent("vm.power(granted)");
+  expect(within(detail).getByRole("list", { name: "vm" })).toHaveTextContent(
+    "vm.snapshot(not granted)",
+  );
+  expect(within(detail).getByRole("button", { name: "Edit vm-user" })).toBeInTheDocument();
+  await expectNoAxeViolations(container);
   // 내장 역할은 고칠 수 없다.
-  expect(screen.queryByRole("button", { name: "Edit operator" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /^Operator/ }));
+  expect(screen.queryByRole("button", { name: /^Edit / })).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Create" }));
   const dialog = screen.getByRole("dialog", { name: "Create a role" });
   await user.type(within(dialog).getByLabelText("Name"), "operator");
@@ -169,7 +179,8 @@ it("keeps privileges this web build does not know when saving a role", async () 
   );
   const user = userEvent.setup();
   renderPage(<RolesPage />, { as: ADMIN });
-  await user.click(await screen.findByRole("button", { name: "Edit vm-user" }));
+  await user.click(await screen.findByRole("button", { name: /^vm-user/ }));
+  await user.click(screen.getByRole("button", { name: "Edit vm-user" }));
   const dialog = screen.getByRole("dialog", { name: "Edit role vm-user" });
   expect(within(dialog).getByText(/Kept: net\.future/)).toBeInTheDocument();
   await user.click(within(dialog).getByRole("checkbox", { name: "vm.console" }));

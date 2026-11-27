@@ -3788,7 +3788,11 @@
     "saved": "Saved role {{name}}.",
     "deleteTitle": "Delete role {{name}}?",
     "deleteDescription": "A role that permissions use cannot be deleted.",
-    "deleted": "Deleted role {{name}}."
+    "deleted": "Deleted role {{name}}.",
+    "groupCount": "{{count}}/{{total}}",
+    "granted": "(granted)",
+    "notGranted": "(not granted)",
+    "edit": "Edit"
   },
   "groupEditor": {
     "members": "Members",

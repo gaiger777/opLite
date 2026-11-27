@@ -3788,7 +3788,11 @@
     "saved": "역할 {{name}}을(를) 저장했습니다.",
     "deleteTitle": "역할 {{name}}을(를) 지울까요?",
     "deleteDescription": "권한이 쓰는 역할은 지울 수 없습니다.",
-    "deleted": "역할 {{name}}을(를) 지웠습니다."
+    "deleted": "역할 {{name}}을(를) 지웠습니다.",
+    "groupCount": "{{count}}/{{total}}",
+    "granted": "(있음)",
+    "notGranted": "(없음)",
+    "edit": "고치기"
   },
   "groupEditor": {
     "members": "멤버",

@@ -1,6 +1,7 @@
 // 설정 › 권한·역할·그룹(계획 62 설계 §13 웹): 모든 grant 표, 사용자 정의 역할(권한 체크 표), 로컬 그룹과 외부 그룹 연결.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, ShieldCheck, Trash2, Users } from "lucide-react";
+import { cn } from "cn";
+import { Check, Pencil, Plus, ShieldCheck, Trash2, Users } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -50,6 +51,7 @@ import {
   useObjectNames,
   usePrincipalNames,
 } from "@/permissions/PermissionsPanel";
+import { errorMessage } from "@/i18n/errors";
 import { validName } from "@/vms/form";
 
 /** 디렉터리 그룹 이름의 최대 길이(서버 `MAX_EXTERNAL_GROUP`) */
@@ -245,7 +247,60 @@ const PRIVILEGE_GROUPS: { id: string; privileges: Privilege[] }[] = (() => {
   return [...groups].map(([id, privileges]) => ({ id, privileges }));
 })();
 
-/** 설정 › 역할: 내장 역할(읽기만)과 사용자 정의 역할(권한 체크 표) */
+/** 역할이 가진 권한을 묶음(접두사)별 체크 트리로(읽기만). 이 웹이 모르는 권한은 끝에 그대로 적는다. */
+function PrivilegeTree({ privileges }: { privileges: readonly string[] }) {
+  const { t } = useTranslation();
+  const has = new Set(privileges);
+  const unknown = privileges.filter((p) => !(PRIVILEGES as readonly string[]).includes(p));
+  return (
+    <div className="flex flex-col gap-2">
+      <h3 className="text-sm font-medium">{t("roleEditor.privileges")}</h3>
+      <ul className="grid gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-3">
+        {PRIVILEGE_GROUPS.map((group) => {
+          const count = group.privileges.filter((p) => has.has(p)).length;
+          return (
+            <li key={group.id} className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-muted-foreground uppercase">
+                {group.id}{" "}
+                <span className="tabular-nums normal-case">
+                  {t("roleEditor.groupCount", { count, total: group.privileges.length })}
+                </span>
+              </span>
+              <ul aria-label={group.id} className="flex flex-col gap-0.5 border-l pl-3">
+                {group.privileges.map((p) => (
+                  <li
+                    key={p}
+                    className={cn(
+                      "flex items-center gap-1.5 font-mono text-xs",
+                      !has.has(p) && "text-muted-foreground/60",
+                    )}
+                  >
+                    {has.has(p) ? (
+                      <Check aria-hidden className="size-3.5 text-success-fg" />
+                    ) : (
+                      <span aria-hidden className="inline-block size-3.5" />
+                    )}
+                    {p}
+                    <span className="sr-only">
+                      {has.has(p) ? t("roleEditor.granted") : t("roleEditor.notGranted")}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          );
+        })}
+      </ul>
+      {unknown.length > 0 && (
+        <p className="text-xs text-muted-foreground">
+          {t("roleEditor.kept", { privileges: unknown.join(", ") })}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** 설정 › 역할: 역할 목록(고르기) + 고른 역할의 권한 체크 트리. 내장 역할은 읽기만, 사용자 정의 역할은 고치기·지우기 */
 export function RolesPage() {
   const { t } = useTranslation();
   const perms = usePermissions();
@@ -255,6 +310,10 @@ export function RolesPage() {
   const [editing, setEditing] = useState<AccessRole | "new" | null>(null);
   const [removing, setRemoving] = useState<AccessRole | null>(null);
   const changed = () => queryClient.invalidateQueries({ queryKey: ["access-roles"] });
+  // 고른 역할(이름). 없거나 지워졌으면 첫 역할
+  const [picked, setPicked] = useState<string | null>(null);
+  const current = roles.data?.find((r) => r.name === picked) ?? roles.data?.[0];
+  const roleName = (role: AccessRole) => (role.builtin ? t(`roles.${role.name}`) : role.name);
 
   if (!admin) {
     return <AdminOnly title={t("nav.roles")} />;
@@ -287,61 +346,79 @@ export function RolesPage() {
           }
         />
       ) : (
-        <Table aria-labelledby="roles-title">
-          <TableHeader>
-            <TableRow>
-              <TableHead>{t("common.name")}</TableHead>
-              <TableHead>{t("roleEditor.privileges")}</TableHead>
-              <TableHead>{t("roleEditor.description")}</TableHead>
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
+        // 역할 하나를 고르면 오른쪽에 권한을 묶음별 체크 트리로 보인다(계획 77-6 — 권한을 한 줄로 늘어놓은 표가 1440px에서도
+        // 1000px 넘게 가로로 넘치던 것).
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[16rem_minmax(0,1fr)]">
+          <nav aria-labelledby="roles-title" className="flex flex-col gap-1">
             {(roles.data ?? []).length === 0 && (
-              <TableMessage colSpan={4} query={roles} empty={t("roleEditor.empty")} />
+              <p className="text-sm text-muted-foreground">
+                {roles.isError ? errorMessage(t, roles.error) : t("common.loading")}
+              </p>
             )}
-            {(roles.data ?? []).map((role) => (
-              <TableRow key={role.id ?? role.name}>
-                <TableCell className="font-medium">
-                  {role.builtin ? t(`roles.${role.name}`) : role.name}
-                  {role.builtin && (
-                    <span className="ml-2 text-xs text-muted-foreground">
-                      {t("roleEditor.builtin")}
-                    </span>
+            {(roles.data ?? []).map((role) => {
+              const key = role.id ?? role.name;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  aria-current={current?.name === role.name ? "true" : undefined}
+                  onClick={() => setPicked(role.name)}
+                  className="flex items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm hover:bg-muted aria-[current]:bg-muted aria-[current]:font-medium"
+                >
+                  <span className="min-w-0 truncate">{roleName(role)}</span>
+                  <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                    {role.builtin ? t("roleEditor.builtin") : role.privileges.length}
+                  </span>
+                </button>
+              );
+            })}
+          </nav>
+          {current && (
+            <section
+              aria-labelledby="role-detail-title"
+              className="flex min-w-0 flex-col gap-4 rounded-lg border p-4"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex min-w-0 flex-col gap-1">
+                  <h2 id="role-detail-title" className="text-lg font-semibold">
+                    {roleName(current)}
+                    {current.builtin && (
+                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                        {t("roleEditor.builtin")}
+                      </span>
+                    )}
+                  </h2>
+                  {current.description && (
+                    <p className="text-sm text-muted-foreground">{current.description}</p>
                   )}
-                </TableCell>
-                <TableCell className="max-w-md text-xs break-words">
-                  {role.privileges.join(", ")}
-                </TableCell>
-                <TableCell className="text-sm">{role.description}</TableCell>
-                <TableCell className="text-right whitespace-nowrap">
-                  {!role.builtin && (
-                    <>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("roleEditor.editNamed", { name: role.name })}
-                        onClick={() => setEditing(role)}
-                      >
-                        <Pencil />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("common.deleteNamed", { name: role.name })}
-                        onClick={() => setRemoving(role)}
-                      >
-                        <Trash2 />
-                      </Button>
-                    </>
-                  )}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+                </div>
+                {!current.builtin && (
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label={t("roleEditor.editNamed", { name: current.name })}
+                      onClick={() => setEditing(current)}
+                    >
+                      <Pencil />
+                      {t("roleEditor.edit")}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={t("common.deleteNamed", { name: current.name })}
+                      onClick={() => setRemoving(current)}
+                    >
+                      <Trash2 />
+                      {t("common.delete")}
+                    </Button>
+                  </div>
+                )}
+              </div>
+              <PrivilegeTree privileges={current.privileges} />
+            </section>
+          )}
+        </div>
       )}
       {editing && (
         <RoleDialog
