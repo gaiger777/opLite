@@ -2240,7 +2240,7 @@ async fn dr_rpo_alerts_fire_per_plan_and_resolve() {
     assert_eq!(v["subject"]["id"], web.to_string());
     assert_eq!(
         v["detail"],
-        "plan web-tier: 2 of 2 VMs over RPO 24h (web3 34h, db1 no recovery point)\nPlan: /api/v1/dr-plans/web-tier/report"
+        "plan web-tier: 2 of 2 VMs over RPO 24h (web3 34h, db1 no recovery point)\nPlan: /dr-plans/web-tier"
     );
     let a = rig.wait_alerts(|a| state_of(a) == ["firing"]).await;
     assert_eq!(a["alerts"][0]["subject"]["name"], "web-tier");
@@ -2343,7 +2343,7 @@ async fn dr_run_failures_are_sent_once() {
     assert_eq!(
         v["detail"],
         format!(
-            "DR test failover t2 of plan web-tier finished partially: 1 of 2 VMs failed\n- db1: restore failed: no space\nPlan: /api/v1/dr-plans/web-tier/report\nRun: /api/v1/dr-runs/{run_id}"
+            "DR test failover t2 of plan web-tier finished partially: 1 of 2 VMs failed\n- db1: restore failed: no space\nPlan: /dr-plans/web-tier\nRun: /dr-runs/{run_id}"
         )
     );
     settle().await;

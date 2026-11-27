@@ -7,7 +7,8 @@
 //!   `name_taken`이면 그 백업)과 이미 이 클러스터로 가는 사본. 그래서 기록을 저장하기 전에 리더가 바뀌어도 같은 일을 두 번
 //!   하지 않는다.
 //! - 되살린 VM: 복원 Task가 끝나면 그 VM(Task 대상 id)에 라벨(`orbivisor.io/dr`·`orbivisor.io/dr-test` = 계획)을 단다.
-//!   `ha`는 복원이 늘 뺀다. 시험 폴더 `dr-test/<plan>`는 없으면 만들고, 계획의 `folder`(장애 조치)는 있어야 한다.
+//!   `ha`는 복원이 늘 뺀다. 시험 폴더 `dr-test/<plan>`는 없으면 만들고, 계획의 `folder`(장애 조치)가 없으면 복원 기본(이곳에
+//!   있는 백업한 VM의 폴더, 아니면 루트)에 둔다(경고 로그).
 //! - 거품 네트워크: 라우터·업링크 없는 SDN 네트워크. 서브넷은 본뜰 DR 네트워크(`like`)의 서브넷(유동 IP 풀·IPv6 알리기
 //!   빼고), 그것이 없으면 그 원본 네트워크에 붙는 NIC의 IP 규칙 주소에서 셈(`10.20.0.5/24` → `10.20.0.0/24`), 둘 다 없으면
 //!   서브넷 없음(L2만).
@@ -469,7 +470,8 @@ fn api_error(e: ApiError) -> String {
     }
 }
 
-/// 시험 폴더(만듦)나 계획의 폴더(있어야 함)의 id. id나 경로(`/a/b`), 빈 경로는 루트.
+/// 시험 폴더(만듦)나 계획의 폴더의 id. id나 경로(`/a/b`), 빈 경로는 루트. 계획의 폴더가 없으면 `None` — VM을 실패시키지
+/// 않고 복원 기본(백업한 VM의 폴더가 있으면 그것, 아니면 루트)에 둔다(설계 §3.1 `folder`는 고르는 것).
 async fn resolve_folder(
     cluster: &Cluster,
     folder: &str,
@@ -479,7 +481,10 @@ async fn resolve_folder(
     if let Ok(id) = folder.parse::<Uuid>() {
         return match folders.iter().find(|f| f.id == id) {
             Some(f) if f.spec.kind == FolderKind::Vm => Ok(Some(id)),
-            _ => Err(format!("VM folder {id} not found")),
+            _ => {
+                tracing::warn!(%folder, "DR plan folder not found; restoring to the default folder");
+                Ok(None)
+            }
         };
     }
     let parts = parse_folder_path(folder).map_err(|e| e.to_string())?;
@@ -506,7 +511,10 @@ async fn resolve_folder(
                 cluster.create(&f).await.map_err(|e| e.to_string())?;
                 id
             }
-            None => return Err(format!("VM folder {folder:?} not found")),
+            None => {
+                tracing::warn!(%folder, "DR plan folder not found; restoring to the default folder");
+                return Ok(None);
+            }
         });
     }
     Ok(cur)

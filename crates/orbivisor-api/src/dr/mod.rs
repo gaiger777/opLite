@@ -72,10 +72,9 @@ fn bad(e: impl std::fmt::Display) -> ApiError {
     ApiError::bad_request(e.to_string())
 }
 
-/// 계획 검사: 기능(409, 검증보다 먼저), 형식(400), 원격(409 `dr_source_missing`), 이 클러스터의 풀·노드·네트워크·보안
-/// 그룹 이름이 있는지(400). 폴더는 복원 때 본다(경로의 폴더는 복원이 만들지 않으므로 그 VM이 실패한다).
+/// 계획 검사: 형식(400), 원격(409 `dr_source_missing`), 이 클러스터의 풀·노드·네트워크·보안 그룹 이름이 있는지(400).
+/// 기능 검사(409)는 부르는 쪽이 이름·키 검사보다 먼저 한다. 폴더는 복원 때 본다(없으면 복원 기본 폴더에 둔다).
 fn check_plan(state: &AppState, spec: &RecoveryPlanSpec) -> Result<(), ApiError> {
-    require_feature(&state.cluster, DR_PLANS)?;
     spec.validate().map_err(bad)?;
     let c = &state.cluster;
     if c.get_by_name::<RemoteSpec>(&spec.source)?.is_none() {
@@ -134,6 +133,7 @@ pub async fn create_plan(
     Json(req): Json<CreateRequest<RecoveryPlanSpec>>,
 ) -> Result<(StatusCode, Json<RecoveryPlan>), ApiError> {
     state.authorize(&principal, Action::Write, RecoveryPlanSpec::KIND)?;
+    require_feature(&state.cluster, DR_PLANS)?;
     check_name(&req.name)?;
     audit.detail(format!("dr-plan create {}", req.name));
     check_plan(&state, &req.spec)?;
@@ -158,6 +158,7 @@ pub async fn update_plan(
     Json(req): Json<UpdateRequest<RecoveryPlanSpec>>,
 ) -> Result<Json<RecoveryPlan>, ApiError> {
     state.authorize(&principal, Action::Write, RecoveryPlanSpec::KIND)?;
+    require_feature(&state.cluster, DR_PLANS)?;
     let plan = lookup::<RecoveryPlanSpec>(&state.cluster, &key)?;
     audit.detail(format!("dr-plan update {}", plan.name));
     check_plan(&state, &req.spec)?;

@@ -376,11 +376,22 @@ async fn plans_are_checked() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    // 모든 노드가 dr-plans를 알아야 쓴다(검증보다 먼저).
+    // 모든 노드가 dr-plans를 알아야 쓴다(이름 검사·검증·키 찾기보다 먼저).
     set_dr(&env, false).await;
-    for body in [plan("q"), with(&|s| s["groups"] = json!([]))] {
+    for body in [
+        plan("q"),
+        plan("Bad Name!"),
+        with(&|s| s["groups"] = json!([])),
+    ] {
         assert_error(&post(body).await, StatusCode::CONFLICT, "cluster_upgrading");
     }
+    assert_error(
+        &admin
+            .put("/dr-plans/nope", json!({ "spec": plan("p")["spec"] }), None)
+            .await,
+        StatusCode::CONFLICT,
+        "cluster_upgrading",
+    );
     assert_error(
         &admin
             .put("/dr-plans/p", json!({ "spec": plan("p")["spec"] }), None)
@@ -1495,6 +1506,7 @@ async fn cancelling_a_test_cleans_up_after_it() {
 
 /// 재해 장애 조치: 원본 이름·라벨 `orbivisor.io/dr`, 네트워크 맵(`lan` → `dr-lan`)과 그 서브넷의 고정 IP. 이름이 이미
 /// 쓰인 VM(db1)만 `dr_name_taken`으로 실패하고(그 VM은 건드리지 않음) 실행은 `partial`. 시험이 아니라 `last_test`는 없다.
+/// 계획의 폴더가 없으면 복원 기본(백업한 VM의 폴더 — 여기서는 없음, 루트)에 둔다(VM을 실패시키지 않음).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_disaster_failover_uses_source_names_and_maps() {
     let env = engine_env(std::sync::Arc::new(Agent::default())).await;
@@ -1504,6 +1516,7 @@ async fn a_disaster_failover_uses_source_names_and_maps() {
     let theirs = labelled_vm(&env, "db1", "owner", "someone").await;
     let mut spec = engine_plan();
     spec["networks"] = json!({ "lan": "dr-lan" });
+    spec["folder"] = json!("/dr/missing");
     spec["groups"][0]["wait"] = json!("running");
     spec["groups"][1]["vms"][0]["ip"] =
         json!([ { "nic": 0, "address": "10.30.0.7/24", "gateway": "10.30.0.1" } ]);
@@ -1529,6 +1542,7 @@ async fn a_disaster_failover_uses_source_names_and_maps() {
     assert_eq!(done.status.steps[1].phase, DrPhase::Ready);
     let web = vm_named(&env, "web1").unwrap();
     assert_eq!(web.labels[DR_LABEL], "web-tier");
+    assert_eq!(web.spec.folder, None);
     assert_eq!(web.spec.nics[0].network, "dr-lan");
     assert_eq!(
         web.spec.nics[0].ips,

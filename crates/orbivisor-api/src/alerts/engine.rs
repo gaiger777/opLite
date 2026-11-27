@@ -1323,7 +1323,7 @@ impl Engine {
     }
 
     /// 계획마다(규칙의 `plans`에 드는 것): 보호 상태에 RPO를 지키지 못하는 VM(복구 지점 없음·RPO 넘음)이 있으면 참.
-    /// RPO 목표가 0(끔)인 계획은 거짓이다. 문구는 [`dr::rpo_summary`]에 보고 경로를 붙인다.
+    /// RPO 목표가 0(끔)인 계획은 거짓이다. 문구는 [`dr::rpo_summary`]에 계획 화면의 웹 경로를 붙인다.
     fn rpo_findings(&self, rule: &AlertRule) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
         let (_, plans) = self.cluster().list::<RecoveryPlanSpec>().ok()?;
         Some(
@@ -1409,7 +1409,7 @@ impl Engine {
                 detail.push_str(&format!("\n- +{} more", bad.len() - 5));
             }
             detail.push_str(&format!(
-                "\nPlan: {}\nRun: /api/v1/dr-runs/{}",
+                "\nPlan: {}\nRun: /dr-runs/{}",
                 plan_path(&run.spec.plan_name),
                 run.id
             ));
@@ -1596,9 +1596,9 @@ fn new_failures<'j>(
     out
 }
 
-/// 복구 계획 보고의 API 경로(알림 본문의 계획 링크)
+/// 복구 계획 화면의 웹 경로(알림 본문의 계획 링크)
 fn plan_path(plan: &str) -> String {
-    format!("/api/v1/dr-plans/{plan}/report")
+    format!("/dr-plans/{plan}")
 }
 
 /// 아직 알리지 않은 `failed`·`partial`로 끝난 DR 실행(규칙을 만든 뒤 끝난 것)을 `notified`에 적고 돌려준다(끝난 차례).
