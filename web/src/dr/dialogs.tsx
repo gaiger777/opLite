@@ -582,7 +582,7 @@ export function ReprotectDialog({ plan, onClose }: { plan: RecoveryPlan; onClose
       <Field
         id={`${id}-bpool`}
         label={t("dr.reprotect.backupPool")}
-        hint={t("dr.reprotect.backupPoolHint")}
+        help={t("dr.reprotect.backupPoolHint")}
         error={errors.backupPool}
       >
         {(a11y) => (

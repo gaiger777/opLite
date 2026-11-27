@@ -265,7 +265,7 @@ function RemoteDialog({
         label={t("remotes.url")}
         error={probeError ? "remotes.errors.probe" : errors.url}
         errorValues={probeError ? { error: probeError } : undefined}
-        hint={t("remotes.urlHint")}
+        help={t("remotes.urlHint")}
       >
         {(a11y) => (
           <div className="flex gap-2">
@@ -330,7 +330,7 @@ function RemoteDialog({
         id="remote-token"
         label={t("remotes.token")}
         error={errors.token}
-        hint={t(remote ? "remotes.tokenSaved" : "remotes.tokenHint")}
+        help={t(remote ? "remotes.tokenSaved" : "remotes.tokenHint")}
       >
         {(a11y) => (
           <Input

@@ -212,7 +212,7 @@ function OvaUploadDialog({ onClose }: { onClose(): void }) {
         id="ova-file"
         label={t("imports.file")}
         error={errors.file}
-        hint={file ? formatBytes(file.size) : undefined}
+        help={file ? formatBytes(file.size) : undefined}
       >
         {(a11y) => (
           <Input

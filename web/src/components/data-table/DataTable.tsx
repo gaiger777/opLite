@@ -87,6 +87,8 @@ interface Props<T> {
   /** 처음 읽는 중이면 스켈레톤 행, 읽지 못했으면 그 이유 */
   query?: { isPending: boolean; isError: boolean; error: unknown };
   empty: string;
+  /** 목록이 정말 비었을 때(읽었고 행이 0) 표 대신 보일 것 — 보통 `EmptyState`(그림·만들기·자세히, 계획 77-4) */
+  emptyState?: ReactNode;
   labelledBy?: string;
   /** 주면 검색·정렬·거름·저장 보기를 쓴다(`useTableState`). */
   state?: TableState;
@@ -387,6 +389,13 @@ export function DataTable<T>(props: Props<T>) {
     </div>
   );
 
+  // 읽었는데 하나도 없으면 빈 상태 판(검색·거름으로 0이면 표 안에서 "맞는 것 없음")
+  if (props.emptyState && props.rows.length === 0 && !loading && !props.query?.isError) {
+    return props.emptyState;
+  }
+  // 행은 있는데 검색·거름으로 모두 빠졌을 때의 문장(빈 목록 문장과 구분 — Cloudscape 빈 상태)
+  const empty = props.rows.length > 0 ? t("table.noMatch") : props.empty;
+
   return (
     <div className="flex min-w-0 flex-col gap-2">
       {toolbar}
@@ -411,7 +420,7 @@ export function DataTable<T>(props: Props<T>) {
         <ul aria-labelledby={props.labelledBy} className="flex flex-col gap-2">
           {(loading || rows.length === 0) && (
             <li className="text-center text-sm text-muted-foreground">
-              {tableMessage(t, props.query ?? NO_QUERY, props.empty)}
+              {tableMessage(t, props.query ?? NO_QUERY, empty)}
             </li>
           )}
           {rows.map((row, index) => {
@@ -508,11 +517,7 @@ export function DataTable<T>(props: Props<T>) {
               </>
             ) : (
               rows.length === 0 && (
-                <TableMessage
-                  colSpan={colSpan}
-                  query={props.query ?? NO_QUERY}
-                  empty={props.empty}
-                />
+                <TableMessage colSpan={colSpan} query={props.query ?? NO_QUERY} empty={empty} />
               )
             )}
             {rows.map((row, index) => {

@@ -259,7 +259,7 @@ function RealmDialog({
   }
 
   const text = (id: string, key: keyof RealmForm, label: string, hint?: string) => (
-    <Field id={id} label={label} error={errors[key]} hint={hint}>
+    <Field id={id} label={label} error={errors[key]} help={hint}>
       {(a11y) => (
         <Input
           id={id}
@@ -326,7 +326,7 @@ function RealmDialog({
               id="realm-client-secret"
               label={t("realms.clientSecret")}
               error={errors.clientSecret}
-              hint={t(savedSecret ? "realms.clientSecretSaved" : "realms.clientSecretHint")}
+              help={t(savedSecret ? "realms.clientSecretSaved" : "realms.clientSecretHint")}
             >
               {(a11y) => (
                 <Input
@@ -361,7 +361,7 @@ function RealmDialog({
             <Field
               id="realm-redirect-uri"
               label={t("realms.redirectUri")}
-              hint={t("realms.redirectUriHint")}
+              help={t("realms.redirectUriHint")}
             >
               {(a11y) => (
                 <div className="flex items-center gap-2">
@@ -387,7 +387,7 @@ function RealmDialog({
               id="realm-bind-password"
               label={t("realms.bindPassword")}
               error={errors.bindPassword}
-              hint={saved ? t("realms.bindPasswordSaved") : undefined}
+              help={saved ? t("realms.bindPasswordSaved") : undefined}
             >
               {(a11y) => (
                 <Input
@@ -423,7 +423,7 @@ function RealmDialog({
         <Field
           id="realm-ca"
           label={t("realms.caPem")}
-          hint={t(oidc ? "realms.oidcCaPemHint" : "realms.caPemHint")}
+          help={t(oidc ? "realms.oidcCaPemHint" : "realms.caPemHint")}
         >
           {(a11y) => (
             <textarea

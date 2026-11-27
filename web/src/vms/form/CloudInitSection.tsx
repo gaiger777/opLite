@@ -77,7 +77,7 @@ export function CloudInitSection({
                 id="ci-hostname"
                 label={t("vmForm.ciHostname")}
                 error={errors["ci.hostname"]}
-                hint={t("vmForm.ciHostnameHint", { name: values.name || "—" })}
+                help={t("vmForm.ciHostnameHint", { name: values.name || "—" })}
               >
                 {(a11y) => (
                   <Input
@@ -92,7 +92,7 @@ export function CloudInitSection({
                 id="ci-user"
                 label={t("vmForm.ciUser")}
                 error={errors["ci.user"]}
-                hint={t("vmForm.ciUserHint")}
+                help={t("vmForm.ciUserHint")}
               >
                 {(a11y) => (
                   <Input
@@ -121,7 +121,7 @@ export function CloudInitSection({
                 id="ci-password"
                 label={t("vmForm.ciPassword")}
                 error={errors["ci.password"]}
-                hint={t("vmForm.ciPasswordHint")}
+                help={t("vmForm.ciPasswordHint")}
               >
                 {(a11y) => (
                   <Input
@@ -140,7 +140,7 @@ export function CloudInitSection({
               label={t("vmForm.ciKeys")}
               error={errors["ci.sshKeys"]}
               errorValues={keyError?.values}
-              hint={t("vmForm.ciKeysHint")}
+              help={t("vmForm.ciKeysHint")}
             >
               {(a11y) => (
                 <textarea
@@ -276,7 +276,7 @@ export function CloudInitSection({
                 id="ci-dns"
                 label={t("vmForm.ciDns")}
                 error={errors["ci.dns"]}
-                hint={t("vmForm.ciListHint")}
+                help={t("vmForm.ciListHint")}
               >
                 {(a11y) => (
                   <Input
@@ -291,7 +291,7 @@ export function CloudInitSection({
                 id="ci-search"
                 label={t("vmForm.ciSearch")}
                 error={errors["ci.search"]}
-                hint={t("vmForm.ciListHint")}
+                help={t("vmForm.ciListHint")}
               >
                 {(a11y) => (
                   <Input
@@ -315,7 +315,7 @@ export function CloudInitSection({
                   id="ci-user-data"
                   label={t("vmForm.ciUserData")}
                   error={errors["ci.userData"]}
-                  hint={t("vmForm.ciUserDataHint")}
+                  help={t("vmForm.ciUserDataHint")}
                 >
                   {(a11y) => (
                     <textarea
@@ -331,7 +331,7 @@ export function CloudInitSection({
                   id="ci-vendor-data"
                   label={t("vmForm.ciVendorData")}
                   error={errors["ci.vendorData"]}
-                  hint={t("vmForm.ciVendorDataHint")}
+                  help={t("vmForm.ciVendorDataHint")}
                 >
                   {(a11y) => (
                     <textarea

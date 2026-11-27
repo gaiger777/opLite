@@ -214,7 +214,7 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
       <Field
         id="settings-cpu-mode"
         label={t("cpu.settings.mode")}
-        hint={t(`cpu.settings.modeHint.${values.mode}`)}
+        help={t(`cpu.settings.modeHint.${values.mode}`)}
       >
         {(a11y) => (
           <NativeSelect
@@ -307,7 +307,7 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
       <CpuFlagsInput
         id="settings-cpu-mask"
         label={t("cpu.settings.mask")}
-        hint={t("cpu.settings.maskHint")}
+        help={t("cpu.settings.maskHint")}
         flags={values.mask}
         arches={arches.length > 0 ? arches : [undefined]}
         signed={false}

@@ -267,7 +267,7 @@ function MethodRow({
   const n = { n: i + 1 };
   const id = (field: string) => `fence-${i}-${field}`;
   const text = (field: keyof FenceRow & string, label: string, hint?: string) => (
-    <Field id={id(field)} label={label} error={errors[`${i}.${field}`]} hint={hint}>
+    <Field id={id(field)} label={label} error={errors[`${i}.${field}`]} help={hint}>
       {(a11y) => (
         <Input
           id={id(field)}
@@ -284,7 +284,7 @@ function MethodRow({
       <Field
         id={id("password")}
         label={t("nodes.fence.password")}
-        hint={row.hasPassword ? t("nodes.fence.passwordSaved") : undefined}
+        help={row.hasPassword ? t("nodes.fence.passwordSaved") : undefined}
       >
         {(a11y) => (
           <Input

@@ -29,7 +29,7 @@ export function RemoteTargetFields({
   id,
   label,
   none,
-  hint,
+  help,
   value,
   errors,
   onChange,
@@ -39,7 +39,7 @@ export function RemoteTargetFields({
   id: string;
   label: string;
   none: string;
-  hint?: string;
+  help?: string;
   kind?: "pool" | "store";
   fingerprint?: string | null;
   value: RemoteTarget;
@@ -97,7 +97,7 @@ export function RemoteTargetFields({
   return (
     <>
       {!remotes.isSuccess && <ListPending error={remotes.error} />}
-      <Field id={`${id}-remote`} label={label} error={errors.remote} hint={hint}>
+      <Field id={`${id}-remote`} label={label} error={errors.remote} help={help}>
         {(a11y) => (
           <NativeSelect
             id={`${id}-remote`}

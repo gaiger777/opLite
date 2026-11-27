@@ -581,7 +581,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
             id="settings-gc-at"
             label={t("backupStores.gcAt")}
             error={errors.gcAt}
-            hint={t("backupJobs.atHint")}
+            help={t("backupJobs.atHint")}
           >
             {(a11y) => (
               <Input
@@ -607,7 +607,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
             id="settings-streams"
             label={t("backupStores.maxStreams")}
             error={errors.maxStreams}
-            hint={t("backupStores.maxStreamsHint")}
+            help={t("backupStores.maxStreamsHint")}
           >
             {(a11y) => (
               <Input
@@ -622,7 +622,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
           <Field
             id="settings-access-key"
             label={t("backupStores.newAccessKeyId")}
-            hint={t("backupStores.credentialsHint")}
+            help={t("backupStores.credentialsHint")}
             error={errors.accessKeyId}
           >
             {(a11y) => (

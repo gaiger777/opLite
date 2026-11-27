@@ -327,7 +327,7 @@ function SettingsCard({ onSaved }: { onSaved(): Promise<void> }) {
           <Field
             id="placement-mode"
             label={t("placement.mode")}
-            hint={t(`placement.modeHint.${values.mode}`)}
+            help={t(`placement.modeHint.${values.mode}`)}
           >
             {(a11y) => (
               <NativeSelect
@@ -348,7 +348,7 @@ function SettingsCard({ onSaved }: { onSaved(): Promise<void> }) {
           <Field
             id="placement-policy"
             label={t("placement.policy")}
-            hint={t(`placement.policyHint.${values.policy}`)}
+            help={t(`placement.policyHint.${values.policy}`)}
           >
             {(a11y) => (
               <NativeSelect
@@ -370,7 +370,7 @@ function SettingsCard({ onSaved }: { onSaved(): Promise<void> }) {
             id="placement-threshold"
             label={t("placement.threshold")}
             error={shown ?? undefined}
-            hint={t("placement.thresholdHint")}
+            help={t("placement.thresholdHint")}
           >
             {(a11y) => (
               <Input

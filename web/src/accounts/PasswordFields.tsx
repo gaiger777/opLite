@@ -26,7 +26,7 @@ export function PasswordFields({
         id={`${id}-password`}
         label={t("accounts.newPassword")}
         error={errors.password}
-        hint={t("accounts.passwordHint")}
+        help={t("accounts.passwordHint")}
       >
         {(a11y) => (
           <Input

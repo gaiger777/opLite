@@ -561,7 +561,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
         id="network-kind"
         label={t("networks.kind")}
         error={errors.kind}
-        hint={t(`networks.kindHint.${kind}`)}
+        help={t(`networks.kindHint.${kind}`)}
       >
         {(a11y) => (
           <NativeSelect
@@ -626,7 +626,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             id="network-vlan"
             label={t("networks.vlanOptional")}
             error={errors.vlan}
-            hint={t("networks.vlanHint")}
+            help={t("networks.vlanHint")}
           >
             {(a11y) => (
               <Input
@@ -647,7 +647,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
                 id="network-physnet"
                 label={t("sdn.physnet.name")}
                 error={errors.physnet}
-                hint={t(physnets.length > 0 ? "sdn.physnet.pickHint" : "sdn.physnet.noneHint")}
+                help={t(physnets.length > 0 ? "sdn.physnet.pickHint" : "sdn.physnet.noneHint")}
               >
                 {(a11y) => (
                   <Input
@@ -669,7 +669,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
                 id="network-vlan"
                 label={t("networks.vlanOptional")}
                 error={errors.vlan}
-                hint={t("sdn.physnet.vlanHint")}
+                help={t("sdn.physnet.vlanHint")}
               >
                 {(a11y) => (
                   <Input
@@ -688,7 +688,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
               id="network-vni"
               label={t("networks.vni")}
               error={errors.vni}
-              hint={t("networks.vniHint")}
+              help={t("networks.vniHint")}
             >
               {(a11y) => (
                 <Input
@@ -705,7 +705,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             id="network-mtu"
             label={t("networks.mtuOptional")}
             error={errors.mtu}
-            hint={t(
+            help={t(
               kind === "provider"
                 ? "sdn.physnet.mtuHint"
                 : kind === "sdn"

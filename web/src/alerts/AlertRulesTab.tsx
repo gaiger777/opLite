@@ -278,7 +278,7 @@ function RuleDialog({
     label: string,
     hint?: string,
   ) => (
-    <Field id={id} label={label} error={errors[key]} hint={hint}>
+    <Field id={id} label={label} error={errors[key]} help={hint}>
       {(a11y) => (
         <Input
           id={id}
@@ -426,7 +426,7 @@ function RuleDialog({
         <Field
           id="rule-severity"
           label={t("alerts.rules.severity")}
-          hint={
+          help={
             SUGGESTED_SEVERITY[form.kind]
               ? t("alerts.rules.suggestedSeverity", {
                   severity: t(`alerts.severity.${SUGGESTED_SEVERITY[form.kind]}`),

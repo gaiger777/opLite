@@ -173,7 +173,7 @@ export function VmCloneDialog({
       <Field
         id="clone-source"
         label={t("clone.source")}
-        hint={running ? t("clone.running") : gone ? t("clone.gone") : undefined}
+        help={running ? t("clone.running") : gone ? t("clone.gone") : undefined}
       >
         {(a11y) => (
           <NativeSelect
@@ -230,7 +230,7 @@ export function VmCloneDialog({
               id={`clone-ips-${i}`}
               label={t("clone.nicIps", { n: i + 1, network: nic.network })}
               error={errors[`ips${i}`]}
-              hint={t("vmForm.nicIpsHint")}
+              help={t("vmForm.nicIpsHint")}
             >
               {(a11y) => (
                 <Input

@@ -245,7 +245,7 @@ export function DeployDialog({
               id="deploy-name"
               label={t("templates.name")}
               error={errors.name}
-              hint={
+              help={
                 preview.length > 0
                   ? t("templates.preview", {
                       names:
@@ -294,7 +294,7 @@ export function DeployDialog({
           id="deploy-mode"
           label={t("templates.mode")}
           error={errors.mode}
-          hint={t(`templates.modeHint.${mode}`)}
+          help={t(`templates.modeHint.${mode}`)}
         >
           {(a11y) => (
             <NativeSelect
@@ -326,7 +326,7 @@ export function DeployDialog({
               ))}
             </NativeSelect>
           </Field>
-          <Field id="deploy-node" label={t("templates.node")} hint={t("templates.nodeHint")}>
+          <Field id="deploy-node" label={t("templates.node")} help={t("templates.nodeHint")}>
             {(a11y) => (
               <NativeSelect
                 id="deploy-node"
@@ -465,7 +465,7 @@ export function DeployDialog({
                     id={`deploy-ips-${i}`}
                     label={t("templates.nicIps", { n: i + 1 })}
                     error={errors[`ips${i}`]}
-                    hint={t("vmForm.nicIpsHint")}
+                    help={t("vmForm.nicIpsHint")}
                   >
                     {(a11y) => (
                       <Input

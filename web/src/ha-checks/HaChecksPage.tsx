@@ -413,7 +413,7 @@ function CheckDialog({
           )}
         </Field>
       )}
-      <Field id="check-role" label={t("haChecks.role")} hint={t(`haChecks.roleHint.${form.role}`)}>
+      <Field id="check-role" label={t("haChecks.role")} help={t(`haChecks.roleHint.${form.role}`)}>
         {(a11y) => (
           <NativeSelect
             id="check-role"
@@ -433,7 +433,7 @@ function CheckDialog({
       <Field
         id="check-kind"
         label={t("haChecks.targetKind")}
-        hint={t(`haChecks.kindHint.${form.kind}`)}
+        help={t(`haChecks.kindHint.${form.kind}`)}
       >
         {(a11y) => (
           <NativeSelect
@@ -488,7 +488,7 @@ function CheckDialog({
         id="check-grace"
         label={t("haChecks.graceLabel")}
         error={errors.grace}
-        hint={t("haChecks.graceHint")}
+        help={t("haChecks.graceHint")}
       >
         {(a11y) => (
           <Input

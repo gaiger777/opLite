@@ -145,7 +145,7 @@ function NetworkStep({ onCreated }: { onCreated(task: string): void }) {
         <Field
           id="ceph-public-network"
           label={t("ceph.publicNetwork")}
-          hint={t("ceph.wizard.publicHint")}
+          help={t("ceph.wizard.publicHint")}
         >
           {(a11y) => (
             <Input
@@ -160,7 +160,7 @@ function NetworkStep({ onCreated }: { onCreated(task: string): void }) {
         <Field
           id="ceph-cluster-network"
           label={t("ceph.clusterNetwork")}
-          hint={t("ceph.wizard.clusterHint")}
+          help={t("ceph.wizard.clusterHint")}
         >
           {(a11y) => (
             <Input

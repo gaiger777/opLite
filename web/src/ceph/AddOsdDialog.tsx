@@ -213,7 +213,7 @@ export function AddOsdDialog({
             <Field
               id="ceph-osd-confirm"
               label={t("ceph.osd.typeDevice", { device: disk.path })}
-              hint={t("ceph.osd.wipeWarning", { reasons: diskReasons(disk) })}
+              help={t("ceph.osd.wipeWarning", { reasons: diskReasons(disk) })}
             >
               {(a11y) => (
                 <Input

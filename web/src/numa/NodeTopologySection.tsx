@@ -536,7 +536,7 @@ function HostResourcesDialog({
           id="res-reserved"
           label={t("numa.sets.reserved")}
           error={errors.reserved}
-          hint={t("numa.resources.reservedHint")}
+          help={t("numa.resources.reservedHint")}
         >
           {(a11y) => (
             <Input
@@ -553,7 +553,7 @@ function HostResourcesDialog({
           id="res-dedicated"
           label={t("numa.sets.dedicated")}
           error={errors.dedicated}
-          hint={t("numa.resources.dedicatedHint")}
+          help={t("numa.resources.dedicatedHint")}
         >
           {(a11y) => (
             <Input

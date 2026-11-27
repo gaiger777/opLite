@@ -265,7 +265,7 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
             id="esxi-datacenter"
             label={t("imports.datacenter")}
             error={errors.datacenter}
-            hint={t("imports.datacenterHint")}
+            help={t("imports.datacenterHint")}
           >
             {(a11y) => (
               <Input

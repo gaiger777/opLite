@@ -105,7 +105,7 @@ export function TelemetrySection({ write }: { write: boolean }) {
             <Field
               id="settings-telemetry-endpoint"
               label={t("settings.telemetry.endpoint")}
-              hint={t("settings.telemetry.endpointHint")}
+              help={t("settings.telemetry.endpointHint")}
             >
               {(a11y) => (
                 <Input

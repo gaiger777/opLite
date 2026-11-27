@@ -56,7 +56,7 @@ export function ShutdownSection({ write }: { write: boolean }) {
       <Field
         id="settings-shutdown-policy"
         label={t("settings.shutdown.policy")}
-        hint={t(`settings.shutdown.hint.${policy}`)}
+        help={t(`settings.shutdown.hint.${policy}`)}
       >
         {(a11y) => (
           <NativeSelect

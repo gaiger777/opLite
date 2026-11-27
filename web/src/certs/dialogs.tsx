@@ -164,7 +164,7 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="account-hmac" label={t("certs.account.hmac")} hint={t("certs.secretOnce")}>
+          <Field id="account-hmac" label={t("certs.account.hmac")} help={t("certs.secretOnce")}>
             {(a11y) => (
               <Input
                 id="account-hmac"
@@ -178,7 +178,7 @@ export function AccountDialog({ onClose }: { onClose(): void }) {
           </Field>
         </div>
       </fieldset>
-      <Field id="account-ca" label={t("certs.account.ca")} hint={t("certs.account.caHint")}>
+      <Field id="account-ca" label={t("certs.account.ca")} help={t("certs.account.caHint")}>
         {(a11y) => (
           <textarea
             id="account-ca"
@@ -296,7 +296,7 @@ export function DnsDialog({ onClose }: { onClose(): void }) {
           key={`${kind}-${f.key}`}
           id={`dns-${f.key}`}
           label={t(`certs.dnsFields.${f.key}`)}
-          hint={
+          help={
             f.secret
               ? t("certs.secretOnce")
               : f.key === "path"
@@ -323,7 +323,7 @@ export function DnsDialog({ onClose }: { onClose(): void }) {
           )}
         </Field>
       ))}
-      <Field id="dns-zones" label={t("certs.dns.zones")} hint={t("certs.dns.zonesHint")}>
+      <Field id="dns-zones" label={t("certs.dns.zones")} help={t("certs.dns.zonesHint")}>
         {(a11y) => (
           <Input
             id="dns-zones"
@@ -416,7 +416,7 @@ export function CertificateDialog({
       <Field
         id="cert-names"
         label={t("certs.cert.names")}
-        hint={t("certs.cert.namesHint")}
+        help={t("certs.cert.namesHint")}
         error={tried ? (errors.names ?? errors.wildcard) : undefined}
       >
         {(a11y) => (
@@ -489,7 +489,7 @@ export function CertificateDialog({
         </p>
       )}
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field id="cert-key" label={t("certs.cert.key")} hint={t("certs.cert.keyHint")}>
+        <Field id="cert-key" label={t("certs.cert.key")} help={t("certs.cert.keyHint")}>
           {(a11y) => (
             <NativeSelect
               id="cert-key"

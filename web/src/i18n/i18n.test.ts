@@ -26,6 +26,8 @@ import physicalEn from "@/physical/i18n/en.json";
 import physicalKo from "@/physical/i18n/ko.json";
 import drEn from "@/dr/i18n/en.json";
 import drKo from "@/dr/i18n/ko.json";
+import helpEn from "@/help/i18n/en.json";
+import helpKo from "@/help/i18n/ko.json";
 
 function keys(value: unknown, prefix = ""): string[] {
   if (typeof value !== "object" || value === null) {
@@ -63,6 +65,8 @@ it("has the same keys in every language", () => {
     [physicalEn, physicalKo, "physical"],
     // DR(계획 76 — `dr/strings.ts`)
     [drEn, drKo, "dr"],
+    // 도움말 패널·그림(계획 77-4 — `help/strings.ts`)
+    [helpEn, helpKo, "helpInfo"],
   ] as const) {
     expect(keys(two).sort()).toEqual(keys(one).sort());
     expect(Object.keys(one)).toEqual([top]);

@@ -312,7 +312,7 @@ function NodeSdnDialog({ node, onClose }: { node: Node; onClose(): void }) {
           id="node-sdn-priority"
           label={t("sdn.physnet.priority")}
           error={errors.priority}
-          hint={t("sdn.physnet.priorityHint")}
+          help={t("sdn.physnet.priorityHint")}
         >
           {(a11y) => (
             <Input

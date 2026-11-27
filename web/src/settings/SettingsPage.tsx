@@ -70,7 +70,7 @@ export function SettingsPage() {
         <Field
           id="settings-channel"
           label={t("settings.channel")}
-          hint={
+          help={
             subscribed
               ? t("settings.channelHint")
               : `${t("settings.channelHint")} ${t("settings.enterpriseHint")}`

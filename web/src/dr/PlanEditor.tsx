@@ -101,7 +101,7 @@ export function PlanEditor({
             id={`${id}-source`}
             label={t("dr.plan.source")}
             error={errors.source}
-            hint={t("dr.edit.sourceHint")}
+            help={t("dr.edit.sourceHint")}
           >
             {(a11y) => (
               <NativeSelect
@@ -140,7 +140,7 @@ export function PlanEditor({
               </NativeSelect>
             )}
           </Field>
-          <Field id={`${id}-folder`} label={t("dr.edit.folder")} hint={t("dr.edit.folderHint")}>
+          <Field id={`${id}-folder`} label={t("dr.edit.folder")} help={t("dr.edit.folderHint")}>
             {(a11y) => (
               <Input
                 id={`${id}-folder`}
@@ -155,7 +155,7 @@ export function PlanEditor({
             id={`${id}-sbpool`}
             label={t("dr.edit.sourceBackupPool")}
             error={errors.sourceBackupPool}
-            hint={t("dr.edit.sourceBackupPoolHint")}
+            help={t("dr.edit.sourceBackupPoolHint")}
           >
             {(a11y) => (
               <Input
@@ -171,7 +171,7 @@ export function PlanEditor({
             id={`${id}-rpo`}
             label={t("dr.edit.rpo")}
             error={errors.rpo}
-            hint={t("dr.edit.rpoHint")}
+            help={t("dr.edit.rpoHint")}
           >
             {(a11y) => (
               <Input
@@ -245,7 +245,7 @@ export function PlanEditor({
 
       <MapTable
         title={t("dr.edit.networks")}
-        hint={t("dr.edit.networksHint")}
+        help={t("dr.edit.networksHint")}
         pairs={draft.networks}
         targets={networkNames}
         errors={rowErrors("net")}
@@ -254,7 +254,7 @@ export function PlanEditor({
       />
       <MapTable
         title={t("dr.edit.securityGroups")}
-        hint={t("dr.edit.securityGroupsHint")}
+        help={t("dr.edit.securityGroupsHint")}
         pairs={draft.securityGroups}
         targets={groupNames}
         errors={rowErrors("sg")}
@@ -263,7 +263,7 @@ export function PlanEditor({
       />
       <MapTable
         title={t("dr.edit.testNetworks")}
-        hint={t("dr.edit.testNetworksHint")}
+        help={t("dr.edit.testNetworksHint")}
         pairs={draft.testNetworks}
         targets={networkNames}
         errors={rowErrors("tnet")}
@@ -653,7 +653,7 @@ function IpHelp() {
  */
 function MapTable({
   title,
-  hint,
+  help,
   pairs,
   targets,
   errors,
@@ -662,7 +662,7 @@ function MapTable({
   onChange,
 }: {
   title: string;
-  hint: string;
+  help: string;
   pairs: Pair[];
   targets: string[];
   /** 줄 번호 → 번역한 오류 */
@@ -694,7 +694,7 @@ function MapTable({
           </Button>
         )}
       </div>
-      <p className="text-xs text-muted-foreground">{hint}</p>
+      <p className="text-xs text-muted-foreground">{help}</p>
       <datalist id={`${id}-targets`}>
         {targets.map((n) => (
           <option key={n} value={n} />

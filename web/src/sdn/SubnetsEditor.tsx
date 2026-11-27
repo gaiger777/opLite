@@ -70,7 +70,7 @@ export function SubnetsEditor({
               id={at("gateway")}
               label={t("sdn.subnets.gateway")}
               error={err("gateway")}
-              hint={row.saved ? undefined : t("sdn.subnets.gatewayHint")}
+              help={row.saved ? undefined : t("sdn.subnets.gatewayHint")}
             >
               {(a11y) => (
                 <Input
@@ -86,7 +86,7 @@ export function SubnetsEditor({
               id={at("dns")}
               label={t("sdn.subnets.dns")}
               error={err("dns")}
-              hint={t("sdn.subnets.dnsHint")}
+              help={t("sdn.subnets.dnsHint")}
             >
               {(a11y) => (
                 <Input
@@ -101,7 +101,7 @@ export function SubnetsEditor({
               id={at("pools")}
               label={t("sdn.subnets.pools")}
               error={err("pools")}
-              hint={t("sdn.subnets.poolsHint")}
+              help={t("sdn.subnets.poolsHint")}
             >
               {(a11y) => (
                 <Input
@@ -118,7 +118,7 @@ export function SubnetsEditor({
                 id={at("floating")}
                 label={t("sdn.subnets.floating")}
                 error={err("floating")}
-                hint={t("sdn.subnets.floatingHint")}
+                help={t("sdn.subnets.floatingHint")}
               >
                 {(a11y) => (
                   <Input
@@ -136,7 +136,7 @@ export function SubnetsEditor({
                 id={at("ipv6Mode")}
                 label={t("sdn.subnets.ipv6Mode")}
                 error={err("ipv6Mode")}
-                hint={t("sdn.subnets.ipv6ModeHint")}
+                help={t("sdn.subnets.ipv6ModeHint")}
               >
                 {(a11y) => (
                   <NativeSelect

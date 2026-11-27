@@ -472,7 +472,7 @@ function ExternalFields({
   const names = [...new Set([...externals.map((n) => n.name), ...(network ? [network] : [])])];
   return (
     <>
-      <Field id={id} label={t("router.external")} hint={t("router.externalHint")}>
+      <Field id={id} label={t("router.external")} help={t("router.externalHint")}>
         {(a11y) => (
           <NativeSelect
             id={id}

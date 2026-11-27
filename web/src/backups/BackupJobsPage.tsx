@@ -470,7 +470,7 @@ function JobDialog({
           id="job-names"
           label={t("backupJobs.names")}
           error={errors.names}
-          hint={t("backupJobs.namesHint")}
+          help={t("backupJobs.namesHint")}
         >
           {(a11y) => (
             <Input
@@ -488,7 +488,7 @@ function JobDialog({
           id="job-labels"
           label={t("backupJobs.labels")}
           error={errors.labels}
-          hint={t("backupJobs.labelsHint")}
+          help={t("backupJobs.labelsHint")}
         >
           {(a11y) => (
             <Input
@@ -501,7 +501,7 @@ function JobDialog({
           )}
         </Field>
       )}
-      <Field id="job-at" label={t("backupJobs.at")} error={errors.at} hint={t("backupJobs.atHint")}>
+      <Field id="job-at" label={t("backupJobs.at")} error={errors.at} help={t("backupJobs.atHint")}>
         {(a11y) => (
           <Input
             id="job-at"
@@ -559,7 +559,7 @@ function JobDialog({
         id="job-full-every"
         label={t("backupJobs.fullEvery")}
         error={errors.fullEvery}
-        hint={t("backupJobs.fullEveryHint")}
+        help={t("backupJobs.fullEveryHint")}
       >
         {(a11y) => (
           <Input
@@ -579,7 +579,7 @@ function JobDialog({
             id="job-copy-store"
             label={t("backupJobs.copyStore")}
             error={errors.copyStore}
-            hint={t("backupJobs.copyHint")}
+            help={t("backupJobs.copyHint")}
           >
             {(a11y) => (
               <NativeSelect
@@ -634,7 +634,7 @@ function JobDialog({
         id="job-replicate"
         label={t("backupJobs.replicateLabel")}
         none={t("backupJobs.noReplicate")}
-        hint={t(
+        help={t(
           form.targetKind === "store"
             ? "backupJobs.replicateStoreHint"
             : "backupJobs.replicateHint",

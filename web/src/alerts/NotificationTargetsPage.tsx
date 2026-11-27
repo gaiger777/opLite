@@ -261,7 +261,7 @@ function TargetDialog({
     label: string,
     hint?: string,
   ) => (
-    <Field id={id} label={label} error={errors[key]} hint={hint}>
+    <Field id={id} label={label} error={errors[key]} help={hint}>
       {(a11y) => (
         <Input
           id={id}
@@ -348,7 +348,7 @@ function TargetDialog({
               id="target-password"
               label={t("alerts.targets.password")}
               error={errors.password}
-              hint={hasPassword ? t("alerts.targets.secretSaved") : undefined}
+              help={hasPassword ? t("alerts.targets.secretSaved") : undefined}
             >
               {(a11y) => (
                 <Input
@@ -403,7 +403,7 @@ function TargetDialog({
                   id="target-token"
                   label={t("alerts.targets.token")}
                   error={errors.token}
-                  hint={hasToken ? t("alerts.targets.secretSaved") : undefined}
+                  help={hasToken ? t("alerts.targets.secretSaved") : undefined}
                 >
                   {(a11y) => (
                     <Input
@@ -481,7 +481,7 @@ function TargetDialog({
             <Field
               id="target-ca"
               label={t("alerts.targets.caPem")}
-              hint={t("alerts.targets.caPemHint")}
+              help={t("alerts.targets.caPemHint")}
             >
               {(a11y) => (
                 <textarea

@@ -101,7 +101,7 @@ export function UploadDialog({
         id="upload-file"
         label={t("uploads.file")}
         error={errors.file}
-        hint={file ? formatBytes(file.size) : undefined}
+        help={file ? formatBytes(file.size) : undefined}
       >
         {(a11y) => (
           <Input
@@ -128,7 +128,7 @@ export function UploadDialog({
         id="upload-pool"
         label={t("volumes.pool")}
         error={errors.pool}
-        hint={
+        help={
           usable.length === 0 && serving && pools.isSuccess
             ? t(iso ? "uploads.noIsoPool" : "uploads.noPool")
             : undefined

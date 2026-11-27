@@ -295,7 +295,7 @@ function CreateUserDialog({ onClose, onDone }: { onClose(): void; onDone(): Prom
           />
         )}
       </Field>
-      <Field id="user-role" label={t("users.role")} hint={t("users.roleHint")}>
+      <Field id="user-role" label={t("users.role")} help={t("users.roleHint")}>
         {(a11y) => <RoleSelect value={role} onChange={setRole} a11y={a11y} />}
       </Field>
       <PasswordFields
@@ -339,7 +339,7 @@ function RoleDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      <Field id="user-role" label={t("users.role")} hint={t("users.roleHint")}>
+      <Field id="user-role" label={t("users.role")} help={t("users.roleHint")}>
         {(a11y) => <RoleSelect value={role} onChange={setRole} a11y={a11y} />}
       </Field>
     </FormDialog>

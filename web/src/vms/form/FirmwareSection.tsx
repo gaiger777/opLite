@@ -14,7 +14,7 @@ type Reason = { key: string; values?: Record<string, string> } | null;
 function Toggle({
   id,
   label,
-  hint,
+  help,
   checked,
   disabled,
   reason,
@@ -23,7 +23,7 @@ function Toggle({
 }: {
   id: string;
   label: string;
-  hint: string;
+  help: string;
   checked: boolean;
   disabled: boolean;
   reason: Reason;
@@ -45,7 +45,7 @@ function Toggle({
         <Label htmlFor={id}>{label}</Label>
       </div>
       <p id={`${id}-hint`} className="text-xs text-muted-foreground">
-        {hint}
+        {help}
       </p>
       {reason && (
         // 켠 채로 쓸 수 없으면 오류처럼 알린다.
@@ -105,7 +105,7 @@ export function SecuritySection({
         <Toggle
           id="vm-tpm"
           label={t("vmForm.tpm")}
-          hint={t("vmForm.tpmHint")}
+          help={t("vmForm.tpmHint")}
           checked={values.tpm}
           disabled={tpmReason !== null && !values.tpm}
           reason={tpmReason}
@@ -115,7 +115,7 @@ export function SecuritySection({
         <Toggle
           id="vm-secure-boot"
           label={t("vmForm.secureBoot")}
-          hint={t("vmForm.secureBootHint")}
+          help={t("vmForm.secureBootHint")}
           checked={values.secureBoot}
           disabled={sbLocked !== null || (sbReason !== null && !values.secureBoot)}
           reason={sbReason}
@@ -151,7 +151,7 @@ export function GuestAgentSection({
           <Toggle
             id="vm-guest-agent"
             label={t("vmForm.guestAgentOn")}
-            hint={t(live ? "vmForm.guestAgentLive" : "vmForm.guestAgentHint")}
+            help={t(live ? "vmForm.guestAgentLive" : "vmForm.guestAgentHint")}
             checked={values.guestAgent}
             disabled={false}
             reason={null}
@@ -164,7 +164,7 @@ export function GuestAgentSection({
               <Toggle
                 id="vm-agent-freeze"
                 label={t("vmForm.agentFreeze")}
-                hint={t("vmForm.agentFreezeHint")}
+                help={t("vmForm.agentFreezeHint")}
                 checked={values.agentFreeze}
                 disabled={false}
                 reason={null}

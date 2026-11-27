@@ -156,7 +156,7 @@ export function GeneralSection({
           id="vm-cores"
           label={values.sockets > 1 ? t("vmForm.coresPerSocket") : t("vmForm.cores")}
           error={errors.cores}
-          hint={
+          help={
             values.sockets > 1 && /^\d+$/.test(values.cores)
               ? t("vmForm.totalVcpus", {
                   sockets: values.sockets,
@@ -194,7 +194,7 @@ export function GeneralSection({
           id="vm-max-vcpus"
           label={t("vmForm.maxVcpus")}
           error={errors.maxVcpus}
-          hint={t("vmForm.maxVcpusHint")}
+          help={t("vmForm.maxVcpusHint")}
         >
           {(a11y) => (
             <Input
@@ -212,7 +212,7 @@ export function GeneralSection({
           id="vm-max-memory"
           label={t("vmForm.maxMemory")}
           error={errors.maxMemory}
-          hint={t("vmForm.maxMemoryHint")}
+          help={t("vmForm.maxMemoryHint")}
         >
           {(a11y) => (
             <Input
@@ -276,7 +276,7 @@ export function GeneralSection({
         <CpuFlagsInput
           id="vm-cpu-flags"
           label={t("cpu.flags.label")}
-          hint={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
+          help={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
           flags={values.cpuFlags}
           arches={[archOf(values.machine)]}
           signed
@@ -392,7 +392,7 @@ export function GeneralSection({
             <Field
               id="vm-ha-state"
               label={t("vmForm.haState")}
-              hint={t(`vmForm.haStateHint.${values.haState}`)}
+              help={t(`vmForm.haStateHint.${values.haState}`)}
             >
               {(a11y) => (
                 <NativeSelect
@@ -415,7 +415,7 @@ export function GeneralSection({
                 </NativeSelect>
               )}
             </Field>
-            <Field id="vm-ha-group" label={t("vmForm.haGroup")} hint={t("vmForm.haGroupHint")}>
+            <Field id="vm-ha-group" label={t("vmForm.haGroup")} help={t("vmForm.haGroupHint")}>
               {(a11y) => (
                 <NativeSelect
                   id="vm-ha-group"
@@ -437,7 +437,7 @@ export function GeneralSection({
               id="vm-max-restart"
               label={t("vmForm.maxRestart")}
               error={errors.maxRestart}
-              hint={t("vmForm.maxRestartHint")}
+              help={t("vmForm.maxRestartHint")}
             >
               {(a11y) => (
                 <Input
@@ -455,7 +455,7 @@ export function GeneralSection({
               id="vm-max-relocate"
               label={t("vmForm.maxRelocate")}
               error={errors.maxRelocate}
-              hint={t("vmForm.maxRelocateHint")}
+              help={t("vmForm.maxRelocateHint")}
             >
               {(a11y) => (
                 <Input
@@ -473,7 +473,7 @@ export function GeneralSection({
               id="vm-ha-priority"
               label={t("vmForm.haPriority")}
               error={errors.haPriority}
-              hint={t("vmForm.haPriorityHint")}
+              help={t("vmForm.haPriorityHint")}
             >
               {(a11y) => (
                 <Input
@@ -506,7 +506,7 @@ export function GeneralSection({
                 id="vm-guest-watch-secs"
                 label={t("vmForm.guestWatchSecs")}
                 error={errors.guestWatchSecs}
-                hint={t("vmForm.guestWatchSecsHint")}
+                help={t("vmForm.guestWatchSecsHint")}
               >
                 {(a11y) => (
                   <Input

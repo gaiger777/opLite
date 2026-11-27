@@ -1,0 +1,132 @@
+{
+  "helpInfo": {
+    "panel": {
+      "what": "What is it",
+      "how": "How it works",
+      "when": "When to use it",
+      "example": "Example",
+      "caution": "Watch out",
+      "noMore": "There is no more help for this field."
+    },
+    "diagram": {
+      "haFencing": {
+        "alt": "HA diagram: when a node dies, it is cut off (fenced) and its VMs start again on another node.",
+        "step1": "No answer",
+        "step2": "Cut it off",
+        "step3": "Start here",
+        "nodeA": "Node A",
+        "nodeB": "Node B",
+        "dead": "down",
+        "fence": "Fence",
+        "note": "Fencing stops a node we think is dead from running the",
+        "note2": "same VM at the same time and corrupting its disk."
+      },
+      "backupChain": {
+        "alt": "Backup diagram: the first backup copies everything; later ones add only what changed (incremental).",
+        "full": "Full",
+        "fullSize": "whole disk",
+        "inc": "Incr.",
+        "restore": "Restore = full + the increments after it",
+        "note": "Longer chains: faster, smaller backups but slower restores."
+      },
+      "replicationDr": {
+        "alt": "Replication and DR diagram: VMs at the main site are copied to a standby site on a schedule and started there in a disaster.",
+        "siteA": "Main site",
+        "siteB": "Standby site",
+        "running": "VMs run here",
+        "standby": "copies wait",
+        "copy": "copy",
+        "replicate": "copy often",
+        "failback": "start on failure",
+        "note": "A shorter schedule means less data lost in a disaster (RPO).",
+        "note2": "Run a test now and then to check the copies start."
+      },
+      "sdn": {
+        "alt": "SDN diagram: VMs on several nodes join one virtual switch; a virtual router sends traffic out with SNAT; a public IP brings traffic in.",
+        "node": "Node",
+        "switch": "Virtual switch (one private network)",
+        "router": "Virtual router",
+        "snat": "SNAT",
+        "internet": "Internet",
+        "floating": "Public IP: internet → router → VM",
+        "note": "VMs share one private network on any node."
+      },
+      "securityGroup": {
+        "alt": "Security group diagram: incoming connections reach the VM only if a rule allows them; outgoing connections are allowed by default.",
+        "vm": "VM",
+        "group": "Security group (firewall rules)",
+        "allowed": "Matches a rule (e.g. 443)",
+        "blocked": "Anything else",
+        "outbound": "Outgoing",
+        "note": "Rules are set separately for incoming and outgoing traffic.",
+        "note2": "Incoming connections with no matching rule are blocked."
+      },
+      "placement": {
+        "alt": "Placement diagram: 'together' keeps VMs on the same node; 'apart' keeps them on different nodes.",
+        "together": "Together (same node)",
+        "apart": "Apart (different nodes)",
+        "node": "Node",
+        "togetherNote": "VMs that talk a lot",
+        "apartNote": "one survives a node failure",
+        "note": "'Must' rules block the start if broken; 'prefer' rules apply when possible."
+      },
+      "storageSharing": {
+        "alt": "Storage diagram: local storage is separate on each node, so moving a VM copies its disk; shared storage is used by all nodes, so only memory moves.",
+        "local": "Local (per node)",
+        "shared": "Shared (all nodes)",
+        "node": "Node",
+        "disk": "Disk",
+        "sharedDisk": "Shared disk",
+        "localMove": "Moving copies the disk (slow)",
+        "sharedMove": "Only memory moves (fast)",
+        "note": "HA restarts on another node need shared storage."
+      },
+      "thinOvercommit": {
+        "alt": "Thin provisioning diagram: three VMs are promised 60 GiB each but the real disk is 100 GiB; each uses only what it writes.",
+        "promised": "Size promised to VMs (180 GiB total)",
+        "actual": "Real disk 100 GiB",
+        "actualNote": "64 GiB used now",
+        "note": "Disks use only what they write, so you can promise more than you have.",
+        "warn": "If the real disk fills up, VMs cannot write and pause."
+      },
+      "liveMigration": {
+        "alt": "Live migration diagram: the VM keeps running while its memory is copied, changed pages are sent again, then it pauses briefly and continues on the new node.",
+        "node": "Node",
+        "copy": "Copy memory",
+        "delta": "Send changes again",
+        "step1": "Send all memory while it runs",
+        "step2": "Keep sending what changed meanwhile",
+        "step3": "Pause very briefly and continue on the new node"
+      },
+      "declarativeApply": {
+        "alt": "Manage-as-code diagram: the YAML file is compared with the cluster to show what will be added, changed and removed; applying makes the cluster match.",
+        "file": "YAML file",
+        "diff": "Compare",
+        "add": "add",
+        "change": "change",
+        "remove": "remove",
+        "apply": "Apply",
+        "cluster": "Cluster",
+        "note": "The file is the 'wanted state'; applying makes the cluster match it.",
+        "note2": "If someone changes it in the UI, you see 'differs from file'."
+      },
+      "dedupStore": {
+        "alt": "Backup store diagram: three backups repeat the same pieces, but the store keeps each different piece only once.",
+        "backup": "Backup",
+        "dedup": "once each",
+        "store": "Backup store",
+        "note": "Identical data is stored once, so many backups take little space.",
+        "note2": "Clean-up (GC) removes pieces no backup uses."
+      },
+      "quorum": {
+        "alt": "Voting diagram: with two of three nodes up there is a majority, so the cluster keeps running.",
+        "node": "Node",
+        "vote": "votes",
+        "down": "down",
+        "majority": "2 of 3 votes = majority → keeps running",
+        "note": "With 2 nodes, losing one breaks the majority and stops.",
+        "note2": "Use 3 or more nodes, or a vote-only node (witness)."
+      }
+    }
+  }
+}

@@ -533,7 +533,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
           <Input id="pool-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}
       </Field>
-      <Field id="pool-kind" label={t("pools.kind")} hint={t(`pools.kindHint.${kind}`)}>
+      <Field id="pool-kind" label={t("pools.kind")} help={t(`pools.kindHint.${kind}`)}>
         {(a11y) => (
           <NativeSelect
             id="pool-kind"
@@ -622,7 +622,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
                 id="pool-portal"
                 label={t("pools.portal")}
                 error={errors.portal}
-                hint={t("pools.portalHint")}
+                help={t("pools.portalHint")}
               >
                 {(a11y) => (
                   <Input
@@ -638,7 +638,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
                 id="pool-target"
                 label={t("pools.target")}
                 error={errors.target}
-                hint={t("pools.targetHint")}
+                help={t("pools.targetHint")}
               >
                 {(a11y) => (
                   <Input
@@ -694,7 +694,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-ceph-user"
             label={t("pools.cephUser")}
             error={errors.cephUser}
-            hint={t("pools.cephUserHint")}
+            help={t("pools.cephUserHint")}
           >
             {(a11y) => (
               <Input
@@ -709,7 +709,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-ceph-conf"
             label={t("pools.cephConf")}
             error={errors.cephConf}
-            hint={t("pools.cephConfHint")}
+            help={t("pools.cephConfHint")}
           >
             {(a11y) => (
               <Input
@@ -728,7 +728,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-path"
             label={t("pools.path")}
             error={errors.path}
-            hint={t("pools.pathHint")}
+            help={t("pools.pathHint")}
           >
             {(a11y) => (
               <Input
@@ -763,7 +763,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-server"
             label={t("pools.server")}
             error={errors.server}
-            hint={t("pools.serverHint")}
+            help={t("pools.serverHint")}
           >
             {(a11y) => (
               <Input
@@ -779,7 +779,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-export"
             label={t("pools.export")}
             error={errors.export}
-            hint={t("pools.exportHint")}
+            help={t("pools.exportHint")}
           >
             {(a11y) => (
               <Input
@@ -795,7 +795,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             id="pool-options"
             label={t("pools.options")}
             error={errors.options}
-            hint={t("pools.optionsHint")}
+            help={t("pools.optionsHint")}
           >
             {(a11y) => (
               <Input

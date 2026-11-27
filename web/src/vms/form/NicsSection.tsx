@@ -164,7 +164,7 @@ export function NicsSection({
                       label={t("vmForm.nicIps")}
                       error={errors[`nics.${i}.ips`]}
                       // 저장된 NIC를 비워 보내면 서버가 지금 주소를 둔다(새 NIC만 자동으로 받는다).
-                      hint={t(
+                      help={t(
                         ipsFixed
                           ? "vmForm.nicIpsRunning"
                           : bare && mode !== "free"
@@ -260,7 +260,7 @@ function NicQos({
       id={`nic-${index}-qos-${key}`}
       label={label}
       error={errors[`nics.${index}.qos.${key}`]}
-      hint={hint}
+      help={hint}
     >
       {(a11y) => (
         <Input

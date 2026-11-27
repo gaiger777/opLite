@@ -202,7 +202,7 @@ export function SourceDialog({
     props: Partial<React.ComponentProps<"input">> = {},
     hint?: string,
   ) => (
-    <Field id={`vmware-source-${key}`} label={label} error={errors[key]} hint={hint}>
+    <Field id={`vmware-source-${key}`} label={label} error={errors[key]} help={hint}>
       {(a11y) => (
         <Input
           id={`vmware-source-${key}`}

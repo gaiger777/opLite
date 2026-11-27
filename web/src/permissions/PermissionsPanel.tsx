@@ -439,7 +439,7 @@ export function AddGrantDialog({
         id="grant-principal"
         label={t(kind === "user" ? "permissions.user" : "permissions.group")}
         error={error}
-        hint={typed ? t("permissions.typedHint") : undefined}
+        help={typed ? t("permissions.typedHint") : undefined}
       >
         {(a11y) =>
           typed ? (

@@ -272,7 +272,7 @@ function RuleDialog({
       <Field
         id="rule-kind"
         label={t("placementRules.kind")}
-        hint={t(`placementRules.kindHint.${form.kind}`)}
+        help={t(`placementRules.kindHint.${form.kind}`)}
       >
         {(a11y) => (
           <NativeSelect
@@ -306,7 +306,7 @@ function RuleDialog({
           id="rule-vms"
           label={t("placementRules.vmNames")}
           error={errors.vms}
-          hint={t("placementRules.vmNamesHint")}
+          help={t("placementRules.vmNamesHint")}
         >
           {(a11y) => (
             <Input
@@ -323,7 +323,7 @@ function RuleDialog({
           id="rule-vm-tag"
           label={t("placementRules.vmTag")}
           error={errors.vms}
-          hint={t("placementRules.vmTagHint")}
+          help={t("placementRules.vmTagHint")}
         >
           {(a11y) => (
             <Input
@@ -378,7 +378,7 @@ function RuleDialog({
               id="rule-node-tag"
               label={t("placementRules.nodeTag")}
               error={errors.nodes}
-              hint={t("placementRules.nodeTagHint")}
+              help={t("placementRules.nodeTagHint")}
             >
               {(a11y) => (
                 <Input
@@ -398,7 +398,7 @@ function RuleDialog({
           id="rule-weight"
           label={t("placementRules.weight")}
           error={errors.weight}
-          hint={t("placementRules.weightHint")}
+          help={t("placementRules.weightHint")}
         >
           {(a11y) => (
             <Input

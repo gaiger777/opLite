@@ -318,7 +318,7 @@ function NicSelect({
         id={id}
         label={t(optional ? "fip.attachOptional" : "fip.nic")}
         error={error}
-        hint={t("fip.nicHint")}
+        help={t("fip.nicHint")}
       >
         {(a11y) => (
           <NativeSelect
@@ -445,7 +445,7 @@ function CreateFipDialog({ onClose }: { onClose(): void }) {
         id="fip-address"
         label={t("fip.addressOptional")}
         error={errors.address}
-        hint={t("fip.addressHint")}
+        help={t("fip.addressHint")}
       >
         {(a11y) => (
           <Input
@@ -461,7 +461,7 @@ function CreateFipDialog({ onClose }: { onClose(): void }) {
         id="fip-name"
         label={t("fip.nameOptional")}
         error={errors.name}
-        hint={t("fip.nameHint")}
+        help={t("fip.nameHint")}
       >
         {(a11y) => (
           <Input id="fip-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />

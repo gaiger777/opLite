@@ -420,7 +420,7 @@ function RunSection({
               id="run-pool"
               label={t("imports.pool")}
               error={errors.pool}
-              hint={t("imports.poolHint", { node })}
+              help={t("imports.poolHint", { node })}
             >
               {(a11y) => (
                 <NativeSelect
@@ -534,7 +534,7 @@ function RunSection({
                       id={`run-ips-${i}`}
                       label={t("imports.nicIps", { n: i + 1, network: nic.network })}
                       error={errors[`ips${i}`]}
-                      hint={t("vmForm.nicIpsHint")}
+                      help={t("vmForm.nicIpsHint")}
                     >
                       {(a11y) => (
                         <Input

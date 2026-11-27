@@ -78,7 +78,7 @@ export function CreateCephPoolDialog({
         id="ceph-pool-pool"
         label={t("ceph.pool.cephPool")}
         error={errors.pool}
-        hint={t("ceph.pool.cephPoolHint")}
+        help={t("ceph.pool.cephPoolHint")}
       >
         {(a11y) => (
           <Input
@@ -93,7 +93,7 @@ export function CreateCephPoolDialog({
       <Field
         id="ceph-pool-size"
         label={t("ceph.pool.size")}
-        hint={hosts === undefined ? undefined : t("ceph.pool.sizeHint", { hosts })}
+        help={hosts === undefined ? undefined : t("ceph.pool.sizeHint", { hosts })}
       >
         {(a11y) => (
           <NativeSelect

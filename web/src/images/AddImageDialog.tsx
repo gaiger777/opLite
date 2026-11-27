@@ -94,7 +94,7 @@ export function AddImageDialog({ onClose }: { onClose(): void }) {
     set: (v: string) => void,
     extra: { hint?: string; mono?: boolean; type?: string } = {},
   ) => (
-    <Field id={`catalog-${field}`} label={label} error={errors[field]} hint={extra.hint}>
+    <Field id={`catalog-${field}`} label={label} error={errors[field]} help={extra.hint}>
       {(a11y) => (
         <Input
           id={`catalog-${field}`}

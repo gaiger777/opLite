@@ -161,7 +161,7 @@ function CreateBackupDialog({
         </Field>
       ) : (
         // 백업 풀 | 저장소(계획 68 §14 웹)
-        <Field id="backup-target" label={t("backups.target")} hint={t("backups.targetHint")}>
+        <Field id="backup-target" label={t("backups.target")} help={t("backups.targetHint")}>
           {(a11y) => (
             <NativeSelect
               id="backup-target"
@@ -194,7 +194,7 @@ function CreateBackupDialog({
         id="backup-name"
         label={t("backups.name")}
         error={errors.name}
-        hint={t("backups.nameHint")}
+        help={t("backups.nameHint")}
       >
         {(a11y) => (
           <Input

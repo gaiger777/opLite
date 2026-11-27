@@ -406,7 +406,7 @@ function PolicyForm({
           </div>
         ))}
       </fieldset>
-      <Field id="policy-rp" label={t("twoFactor.rpId")} hint={t("twoFactor.rpIdHint")}>
+      <Field id="policy-rp" label={t("twoFactor.rpId")} help={t("twoFactor.rpIdHint")}>
         {(a11y) => (
           <Input
             id="policy-rp"

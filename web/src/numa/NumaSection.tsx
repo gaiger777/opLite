@@ -71,7 +71,7 @@ function NumaFields({
       <Field
         id={`${id}-policy`}
         label={t("numa.policy.label")}
-        hint={t(canDedicate ? "numa.policy.hint" : "numa.needsPrivilege")}
+        help={t(canDedicate ? "numa.policy.hint" : "numa.needsPrivilege")}
       >
         {(a11y) => (
           <NativeSelect
@@ -98,7 +98,7 @@ function NumaFields({
             id={`${id}-threads`}
             label={t("numa.threads.label")}
             error={errors["numa.threads"]}
-            hint={t(`numa.threads.hint.${value.threadPolicy || "prefer"}`)}
+            help={t(`numa.threads.hint.${value.threadPolicy || "prefer"}`)}
           >
             {(a11y) => (
               <NativeSelect
@@ -122,7 +122,7 @@ function NumaFields({
           <Field
             id={`${id}-emulator`}
             label={t("numa.emulator.label")}
-            hint={t("numa.emulator.hint")}
+            help={t("numa.emulator.hint")}
           >
             {(a11y) => (
               <NativeSelect
@@ -148,7 +148,7 @@ function NumaFields({
         id={`${id}-nodes`}
         label={t("numa.nodes.label")}
         error={errors["numa.count"]}
-        hint={
+        help={
           sockets === 1
             ? t("numa.nodes.oneSocket")
             : value.mode === "off" && (dedicated || value.hugepages !== "")
@@ -184,7 +184,7 @@ function NumaFields({
           </NativeSelect>
         )}
       </Field>
-      <Field id={`${id}-memory`} label={t("numa.memory.label")} hint={t("numa.memory.hint")}>
+      <Field id={`${id}-memory`} label={t("numa.memory.label")} help={t("numa.memory.hint")}>
         {(a11y) => (
           <NativeSelect
             id={`${id}-memory`}
@@ -204,7 +204,7 @@ function NumaFields({
         id={`${id}-hugepages`}
         label={t("numa.hugepages.label")}
         error={errors["numa.hugepages"]}
-        hint={
+        help={
           !canDedicate
             ? t("numa.needsPrivilege")
             : value.hugepages === "any" && hotplug
@@ -398,7 +398,7 @@ export function NumaSection({
         <Field
           id="vm-sockets"
           label={t("numa.form.sockets")}
-          hint={t("numa.form.socketsHint", {
+          help={t("numa.form.socketsHint", {
             count: sockets * (Number(cores) || 0),
           })}
         >

@@ -100,7 +100,7 @@ export function VerifyFields({
             id={`${id}-at`}
             label={t("backupStores.verifyAt")}
             error={errors.verifyAt}
-            hint={t("backupJobs.atHint")}
+            help={t("backupJobs.atHint")}
           >
             {(a11y) => (
               <Input
@@ -122,7 +122,7 @@ export function VerifyFields({
             id={`${id}-reverify`}
             label={t("backupStores.reverifyDays")}
             error={errors.reverifyDays}
-            hint={t("backupStores.reverifyHint")}
+            help={t("backupStores.reverifyHint")}
           >
             {(a11y) => (
               <Input
@@ -372,7 +372,7 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
     label: string,
     extra: { hint?: string; placeholder?: string; type?: string } = {},
   ) => (
-    <Field id={id} label={label} error={errors[key]} hint={extra.hint}>
+    <Field id={id} label={label} error={errors[key]} help={extra.hint}>
       {(a11y) => (
         <Input
           id={id}
@@ -416,7 +416,7 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
             id="store-pool"
             label={t("backups.pool")}
             error={errors.pool}
-            hint={t("backupStores.poolHint")}
+            help={t("backupStores.poolHint")}
           >
             {(a11y) => (
               <NativeSelect
@@ -463,7 +463,7 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
             id="store-ca"
             label={t("backupStores.caPem")}
             error={errors.caPem}
-            hint={t("backupStores.caHint")}
+            help={t("backupStores.caHint")}
           >
             {(a11y) => (
               <textarea
@@ -545,7 +545,7 @@ function EncryptionStep({ form, errors, onChange }: StepProps) {
           id="store-recovery-key"
           label={t("backupStores.key.recoveryKey")}
           error={errors.recoveryKey}
-          hint={t("backupStores.recoveryKeyHint")}
+          help={t("backupStores.recoveryKeyHint")}
         >
           {(a11y) => (
             <Input
@@ -566,7 +566,7 @@ function EncryptionStep({ form, errors, onChange }: StepProps) {
           id="store-unlock"
           label={t("backupStores.unlockPassphrase")}
           error={errors.unlockPassphrase}
-          hint={t("backupStores.unlockHint")}
+          help={t("backupStores.unlockHint")}
         >
           {(a11y) => (
             <Input
@@ -585,7 +585,7 @@ function EncryptionStep({ form, errors, onChange }: StepProps) {
           id="store-escrow"
           label={t("backupStores.escrowPassphrase")}
           error={errors.escrowPassphrase}
-          hint={t("backupStores.escrowHint")}
+          help={t("backupStores.escrowHint")}
         >
           {(a11y) => (
             <Input
@@ -613,7 +613,7 @@ function ScheduleStep({ form, errors, onChange }: StepProps) {
         id="store-gc-at"
         label={t("backupStores.gcAt")}
         error={errors.gcAt}
-        hint={t("backupJobs.atHint")}
+        help={t("backupJobs.atHint")}
       >
         {(a11y) => (
           <Input

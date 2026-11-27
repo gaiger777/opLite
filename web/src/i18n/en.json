@@ -3589,7 +3589,8 @@
     "columns": "Columns",
     "open": "Open",
     "addresses": "Addresses",
-    "viewDeleted": "View {{name}} deleted."
+    "viewDeleted": "View {{name}} deleted.",
+    "noMatch": "Nothing matches the search or filter."
   },
   "impact": {
     "vmsAssigned": "VMs assigned to it: {{count}}",
@@ -5405,5 +5406,12 @@
       "volume_not_found": "This volume is no longer in the session. Open the backup again.",
       "file_restore_too_large": "The selection is too large: {{message}}"
     }
+  },
+  "help": {
+    "open": "Help: {{name}}",
+    "title": "Help",
+    "aboutPage": "About this page",
+    "closeIntro": "Hide the introduction (the ⓘ next to the title shows it again)",
+    "more": "Learn more"
   }
 }

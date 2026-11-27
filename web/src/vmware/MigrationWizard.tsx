@@ -63,13 +63,13 @@ interface Draft {
 function Check({
   id,
   label,
-  hint,
+  help,
   checked,
   onChange,
 }: {
   id: string;
   label: string;
-  hint?: string;
+  help?: string;
   checked: boolean;
   onChange(on: boolean): void;
 }) {
@@ -79,13 +79,13 @@ function Check({
         id={id}
         checked={checked}
         onCheckedChange={(c) => onChange(c === true)}
-        aria-describedby={hint ? `${id}-hint` : undefined}
+        aria-describedby={help ? `${id}-hint` : undefined}
       />
       <div className="flex flex-col gap-0.5">
         <Label htmlFor={id}>{label}</Label>
-        {hint && (
+        {help && (
           <p id={`${id}-hint`} className="text-xs text-muted-foreground">
-            {hint}
+            {help}
           </p>
         )}
       </div>
@@ -642,14 +642,14 @@ export function MigrationWizard() {
               <Check
                 id="vmware-keep-macs"
                 label={t("vmware.mapping.keepMacs")}
-                hint={t("vmware.mapping.keepMacsHint")}
+                help={t("vmware.mapping.keepMacsHint")}
                 checked={form.keepMacs}
                 onChange={(keepMacs) => set({ keepMacs })}
               />
               <Check
                 id="vmware-reserve-ips"
                 label={t("vmware.mapping.reserveIps")}
-                hint={t("vmware.mapping.reserveIpsHint")}
+                help={t("vmware.mapping.reserveIpsHint")}
                 checked={form.reserveIps}
                 onChange={(reserveIps) => set({ reserveIps })}
               />
@@ -687,7 +687,7 @@ export function MigrationWizard() {
                   id={`vmware-${key}`}
                   label={t(label)}
                   error={errors[key]}
-                  hint={t(`${label}Hint`)}
+                  help={t(`${label}Hint`)}
                 >
                   {(a11y) => (
                     <Input
@@ -719,7 +719,7 @@ export function MigrationWizard() {
                 id="vmware-cutover-at"
                 label={t("vmware.policy.cutoverAt")}
                 error={errors.cutoverAt}
-                hint={t("vmware.policy.cutoverAtHint")}
+                help={t("vmware.policy.cutoverAtHint")}
               >
                 {(a11y) => (
                   <Input
@@ -735,7 +735,7 @@ export function MigrationWizard() {
             <Check
               id="vmware-protect-source"
               label={t("vmware.policy.protectSource")}
-              hint={t("vmware.policy.protectSourceHint")}
+              help={t("vmware.policy.protectSourceHint")}
               checked={form.protectSource}
               onChange={(protectSource) => set({ protectSource })}
             />

@@ -257,7 +257,7 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
               id="image-user"
               label={t("vmForm.ciUser")}
               error={errors["ci.user"]}
-              hint={t("vmForm.ciUserHint")}
+              help={t("vmForm.ciUserHint")}
             >
               {(a11y) => (
                 <Input
@@ -273,7 +273,7 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
               id="image-password"
               label={t("vmForm.ciPassword")}
               error={errors["ci.password"]}
-              hint={t("vmForm.ciPasswordHint")}
+              help={t("vmForm.ciPasswordHint")}
             >
               {(a11y) => (
                 <Input
@@ -291,7 +291,7 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
               label={t("vmForm.ciKeys")}
               error={errors["ci.sshKeys"]}
               errorValues={validateKeys(sshKeys)?.values}
-              hint={t("vmForm.ciKeysHint")}
+              help={t("vmForm.ciKeysHint")}
             >
               {(a11y) => (
                 <textarea

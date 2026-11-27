@@ -633,7 +633,7 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           id="lb-network"
           label={t("lb.vipNetwork")}
           error={errors.network}
-          hint={t("lb.vipNetworkHint")}
+          help={t("lb.vipNetworkHint")}
         >
           {(a11y) => (
             <NativeSelect
@@ -661,7 +661,7 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
             </NativeSelect>
           )}
         </Field>
-        <Field id="lb-vip" label={t("lb.vipOptional")} error={errors.vip} hint={t("lb.vipHint")}>
+        <Field id="lb-vip" label={t("lb.vipOptional")} error={errors.vip} help={t("lb.vipHint")}>
           {(a11y) => (
             <Input
               id="lb-vip"
@@ -695,7 +695,7 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
               id="lb-external-ip"
               label={t("lb.externalIpOptional")}
               error={errors.externalIp}
-              hint={t("lb.externalIpHint")}
+              help={t("lb.externalIpHint")}
             >
               {(a11y) => (
                 <Input
@@ -713,7 +713,7 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           id="lb-affinity"
           label={t("lb.affinityOptional")}
           error={errors.affinity}
-          hint={t("lb.affinityHint")}
+          help={t("lb.affinityHint")}
         >
           {(a11y) => (
             <Input
@@ -917,7 +917,7 @@ function ListenerEditor({
           <Field
             id={`lb-l${i}-pick`}
             label={t("lb.addNicMember")}
-            hint={usable ? undefined : t("lb.noUsableNic")}
+            help={usable ? undefined : t("lb.noUsableNic")}
           >
             {(a11y) => (
               <NativeSelect

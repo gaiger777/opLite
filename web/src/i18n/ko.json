@@ -3589,7 +3589,8 @@
     "columns": "열",
     "open": "열기",
     "addresses": "주소",
-    "viewDeleted": "보기 {{name}}을(를) 지웠습니다."
+    "viewDeleted": "보기 {{name}}을(를) 지웠습니다.",
+    "noMatch": "검색·거름에 맞는 것이 없습니다."
   },
   "impact": {
     "vmsAssigned": "배정된 VM: {{count}}개",
@@ -5405,5 +5406,12 @@
       "volume_not_found": "이 볼륨이 이제 세션에 없습니다. 백업을 다시 여세요.",
       "file_restore_too_large": "고른 것이 너무 큽니다: {{message}}"
     }
+  },
+  "help": {
+    "open": "{{name}} 도움말",
+    "title": "도움말",
+    "aboutPage": "이 화면은?",
+    "closeIntro": "소개 접기(제목 옆 ⓘ로 다시 볼 수 있습니다)",
+    "more": "자세히"
   }
 }

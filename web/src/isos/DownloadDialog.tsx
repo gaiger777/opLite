@@ -129,7 +129,7 @@ export function DownloadDialog({
         id="download-pool"
         label={t("volumes.pool")}
         error={errors.pool}
-        hint={usable.length === 0 && pools.isSuccess && iso ? t("uploads.noIsoPool") : undefined}
+        help={usable.length === 0 && pools.isSuccess && iso ? t("uploads.noIsoPool") : undefined}
       >
         {(a11y) => (
           <NativeSelect
@@ -152,7 +152,7 @@ export function DownloadDialog({
         id="download-sha256"
         label={t("downloads.sha256")}
         error={errors.sha256}
-        hint={t("downloads.sha256Hint")}
+        help={t("downloads.sha256Hint")}
       >
         {(a11y) => (
           <Input

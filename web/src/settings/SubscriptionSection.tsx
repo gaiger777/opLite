@@ -109,7 +109,7 @@ export function SubscriptionSection({ write }: { write: boolean }) {
           <Field
             id="settings-subscription-key"
             label={t("settings.subscription.key")}
-            hint={t("settings.subscription.keyHint")}
+            help={t("settings.subscription.keyHint")}
           >
             {(a11y) => (
               <textarea

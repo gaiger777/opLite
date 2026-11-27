@@ -352,7 +352,7 @@ function TargetStep({
               id="mig-new-cidr"
               label={t("migration.cidr")}
               error={errors.cidr}
-              hint={t("migration.cidrHint")}
+              help={t("migration.cidrHint")}
             >
               {(a11y) => (
                 <Input
@@ -367,7 +367,7 @@ function TargetStep({
             <Field
               id="mig-new-gateway"
               label={t("migration.gateway")}
-              hint={t("migration.gatewayHint")}
+              help={t("migration.gatewayHint")}
             >
               {(a11y) => (
                 <Input
@@ -383,7 +383,7 @@ function TargetStep({
         )}
       </fieldset>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field id="mig-mode" label={t("migration.mode")} hint={t(`migration.modeHint.${mode}`)}>
+        <Field id="mig-mode" label={t("migration.mode")} help={t(`migration.modeHint.${mode}`)}>
           {(a11y) => (
             <NativeSelect
               id="mig-mode"
@@ -1042,7 +1042,7 @@ function ProgressStep({
         <Field
           id="mig-resume-node"
           label={t("migration.newBridgeNode")}
-          hint={
+          help={
             bridgeOffline
               ? t("migration.newBridgeNodeOffline", { node: bridgeHost.name })
               : t("migration.newBridgeNodeHint")
@@ -1231,7 +1231,7 @@ function FinishStep({
           {t("migration.finishLeft", { count: left })}
         </p>
       )}
-      <Field id="mig-router" label={t("migration.router")} hint={t("migration.routerHint")}>
+      <Field id="mig-router" label={t("migration.router")} help={t("migration.routerHint")}>
         {(a11y) => (
           <NativeSelect
             id="mig-router"
