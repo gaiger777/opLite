@@ -32,6 +32,10 @@ export const TIMELINE: HistoryEntry[] = [
     source: "apply",
     actor: { user: "ci", auth: { kind: "token", name: "gitops" } },
     changed: ["vcpus", "labels.tier", "nics", "disks", "cloud_init.password"],
+    values: [
+      { path: "vcpus", op: "replace", old: 2, new: 4 },
+      { path: "labels.tier", op: "add", new: "web" },
+    ],
   }),
   entry(60, { at_ms: AT - DAY - 3_600_000, op: "create", changed: [], source: "cli" }),
 ];

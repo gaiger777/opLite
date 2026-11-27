@@ -62,7 +62,7 @@ it("shows each object's state, who changed it, and adopts the chosen ones", asyn
   const web = within(table).getByRole("row", { name: /web/ });
   expect(web).toHaveTextContent("Different");
   expect(web).toHaveTextContent("Changed by admin");
-  expect(web).toHaveTextContent("Web, revision 81");
+  expect(web).toHaveTextContent("Web UI, revision 81");
   expect(web).toHaveTextContent("“more memory for the sale”");
   await user.click(within(web).getByText("2 fields differ"));
   expect(within(web).getByText("vcpus")).toBeInTheDocument();

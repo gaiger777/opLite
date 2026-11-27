@@ -56,7 +56,7 @@ it("opens the resource's config history drawer from the VM menu", async () => {
   await user.click(within(list).getAllByRole("button")[0]!);
   expect(
     await within(drawer).findByRole("table", { name: "Changed fields of web" }),
-  ).toHaveTextContent("8192");
+  ).toHaveTextContent("8 GiB");
   await user.click(within(drawer).getByRole("button", { name: "All changes" }));
   expect(within(drawer).getByRole("list", { name: "Config history of web" })).toBeInTheDocument();
 });

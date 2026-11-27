@@ -23,6 +23,7 @@ import {
   useTimeline,
 } from "@/history/api";
 import { ChangeDrawer } from "@/history/ChangeDrawer";
+import { kindName } from "@/history/describe";
 import { EntryLine } from "@/history/EntryLine";
 import { PointInTimeDialog } from "@/history/PointInTimeDialog";
 import { errorMessage } from "@/i18n/errors";
@@ -113,7 +114,7 @@ export function HistoryPage() {
             <NativeSelectOption value="">{t("history.any")}</NativeSelectOption>
             {HISTORY_KINDS.map((k) => (
               <NativeSelectOption key={k} value={k}>
-                {k}
+                {kindName(k, t)}
               </NativeSelectOption>
             ))}
           </NativeSelect>
@@ -198,7 +199,7 @@ export function HistoryPage() {
         <p role="status" className="text-sm text-muted-foreground">
           {filter.applySet
             ? t("history.onlySet", { name: filter.applySet })
-            : t("history.onlyKey", { kind: filter.kind, key: filter.key })}{" "}
+            : t("history.onlyKey", { kind: kindName(filter.kind ?? "", t), key: filter.key })}{" "}
           <Button
             variant="link"
             className="h-auto p-0"
