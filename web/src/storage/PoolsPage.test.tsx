@@ -190,7 +190,9 @@ it("creates a directory pool on shared storage", async () => {
   await userEvent.type(within(dialog).getByLabelText("Directory"), "/mnt/vm");
   const shared = within(dialog).getByRole("checkbox", { name: "Shared storage" });
   expect(shared).toHaveAccessibleDescription(
-    "Check when every node sees the same files at this path, such as an NFS share mounted outside Orbivisor.",
+    expect.stringContaining(
+      "Check when every node sees the same files at this path, such as an NFS share mounted outside Orbivisor.",
+    ),
   );
   await userEvent.click(shared);
   // NFS 풀은 늘 공유라 고를 것이 없다.
@@ -227,22 +229,24 @@ it("creates an NFS pool", async () => {
   await userEvent.type(within(dialog).getByLabelText("Mount options (optional)"), "vers=4.2, hard");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("NFS server")).toHaveAccessibleDescription(
-    "Enter a host name or IP address without spaces, commas, slashes or brackets.",
+    expect.stringContaining(
+      "Enter a host name or IP address without spaces, commas, slashes or brackets.",
+    ),
   );
   expect(within(dialog).getByLabelText("Export path")).toHaveAccessibleDescription(
-    "Enter an absolute path (starting with /) without control characters.",
+    expect.stringContaining("Enter an absolute path (starting with /) without control characters."),
   );
   const optionsError =
     "Separate the options with commas, without spaces. bind, rbind, remount, move, suid, dev, exec, helper, bg and x-* options are not allowed.";
   expect(within(dialog).getByLabelText("Mount options (optional)")).toHaveAccessibleDescription(
-    optionsError,
+    expect.stringContaining(optionsError),
   );
   // 서버처럼 마운트의 성격을 바꾸는 옵션도 받지 않는다.
   await userEvent.clear(within(dialog).getByLabelText("Mount options (optional)"));
   await userEvent.type(within(dialog).getByLabelText("Mount options (optional)"), "vers=4.2,Exec");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("Mount options (optional)")).toHaveAccessibleDescription(
-    optionsError,
+    expect.stringContaining(optionsError),
   );
   expect(body).toBeUndefined();
 
@@ -276,7 +280,9 @@ it("creates an LVM-thin pool", async () => {
   await userEvent.click(within(dialog).getByRole("checkbox", { name: "Shared storage" }));
   await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "lvm-thin");
   expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
-    "Create the volume group and thin pool on each node first. Volumes are raw thin volumes kept on the node that creates them, and their snapshots hold disks only. Needs Linux nodes running as root.",
+    expect.stringContaining(
+      "Create the volume group and thin pool on each node first. Volumes are raw thin volumes kept on the node that creates them, and their snapshots hold disks only. Needs Linux nodes running as root.",
+    ),
   );
   // 노드 로컬 풀이라 공유를 고를 수 없고, 디렉터리·NFS 입력도 없다.
   expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
@@ -287,8 +293,12 @@ it("creates an LVM-thin pool", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   const nameError =
     "Use 1 to 127 letters, digits, +, _, . or -, not starting with -, snapshot or pvmove. LVM also reserves . and .. and names containing parts like _tdata or _tmeta.";
-  expect(within(dialog).getByLabelText("Volume group")).toHaveAccessibleDescription(nameError);
-  expect(within(dialog).getByLabelText("Thin pool")).toHaveAccessibleDescription(nameError);
+  expect(within(dialog).getByLabelText("Volume group")).toHaveAccessibleDescription(
+    expect.stringContaining(nameError),
+  );
+  expect(within(dialog).getByLabelText("Thin pool")).toHaveAccessibleDescription(
+    expect.stringContaining(nameError),
+  );
   expect(body).toBeUndefined();
 
   await userEvent.clear(within(dialog).getByLabelText("Volume group"));
@@ -321,7 +331,9 @@ it("creates a ZFS pool", async () => {
   await userEvent.click(within(dialog).getByRole("checkbox", { name: "Shared storage" }));
   await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "zfs");
   expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
-    "Create the dataset on each node first. Volumes are raw zvols kept on the node that creates them, and their snapshots hold disks only. Disks can only revert to their latest snapshot. Needs Linux nodes running as root.",
+    expect.stringContaining(
+      "Create the dataset on each node first. Volumes are raw zvols kept on the node that creates them, and their snapshots hold disks only. Disks can only revert to their latest snapshot. Needs Linux nodes running as root.",
+    ),
   );
   // 노드 로컬 풀이라 공유를 고를 수 없고, 다른 종류의 입력도 없다.
   expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
@@ -330,7 +342,9 @@ it("creates a ZFS pool", async () => {
   await userEvent.type(within(dialog).getByLabelText("Dataset"), "tank/-opl");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("Dataset")).toHaveAccessibleDescription(
-    "Use a dataset name such as tank/opl, at most 177 characters: parts separated by / with letters, digits, _, ., : or -, none empty, . or .. or starting with -. The pool name comes first and starts with a letter.",
+    expect.stringContaining(
+      "Use a dataset name such as tank/opl, at most 177 characters: parts separated by / with letters, digits, _, ., : or -, none empty, . or .. or starting with -. The pool name comes first and starts with a letter.",
+    ),
   );
   expect(body).toBeUndefined();
 
@@ -361,17 +375,21 @@ it("creates a Ceph RBD pool", async () => {
   await userEvent.type(within(dialog).getByLabelText("Name"), "ceph");
   await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "rbd");
   expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
-    "Create the Ceph pool first and put ceph.conf and the keyring on each node. Volumes are raw RBD images that every node of the pool can use, and their snapshots hold disks only. Needs Linux nodes with QEMU's rbd driver (qemu-block-extra) and the rbd command (ceph-common).",
+    expect.stringContaining(
+      "Create the Ceph pool first and put ceph.conf and the keyring on each node. Volumes are raw RBD images that every node of the pool can use, and their snapshots hold disks only. Needs Linux nodes with QEMU's rbd driver (qemu-block-extra) and the rbd command (ceph-common).",
+    ),
   );
   // 늘 공유라 고를 것이 없고, 다른 종류의 입력도 없다.
   expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
   expect(within(dialog).queryByLabelText("Directory")).toBeNull();
   expect(within(dialog).queryByLabelText("Dataset")).toBeNull();
   expect(within(dialog).getByLabelText("Ceph user (optional)")).toHaveAccessibleDescription(
-    'The Ceph client ID without the "client." prefix. Uses admin if empty.',
+    expect.stringContaining(
+      'The Ceph client ID without the "client." prefix. Uses admin if empty.',
+    ),
   );
   expect(within(dialog).getByLabelText("ceph.conf path (optional)")).toHaveAccessibleDescription(
-    "An absolute path on the nodes, /etc/ceph/ceph.conf if empty.",
+    expect.stringContaining("An absolute path on the nodes, /etc/ceph/ceph.conf if empty."),
   );
   // 서버처럼 이름과 conf 경로를 검사한다.
   await userEvent.type(within(dialog).getByLabelText("Ceph pool"), "rbd/opl");
@@ -380,15 +398,19 @@ it("creates a Ceph RBD pool", async () => {
   await userEvent.type(within(dialog).getByLabelText("ceph.conf path (optional)"), "ceph.conf");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   const nameError = "Use 1 to 63 letters, digits, _, . or -, not starting with -.";
-  expect(within(dialog).getByLabelText("Ceph pool")).toHaveAccessibleDescription(nameError);
+  expect(within(dialog).getByLabelText("Ceph pool")).toHaveAccessibleDescription(
+    expect.stringContaining(nameError),
+  );
   expect(within(dialog).getByLabelText("Namespace (optional)")).toHaveAccessibleDescription(
-    nameError,
+    expect.stringContaining(nameError),
   );
   expect(within(dialog).getByLabelText("Ceph user (optional)")).toHaveAccessibleDescription(
-    nameError,
+    expect.stringContaining(nameError),
   );
   expect(within(dialog).getByLabelText("ceph.conf path (optional)")).toHaveAccessibleDescription(
-    "Enter an absolute path (starting with /) without control characters, commas, colons or equals signs.",
+    expect.stringContaining(
+      "Enter an absolute path (starting with /) without control characters, commas, colons or equals signs.",
+    ),
   );
   expect(body).toBeUndefined();
   // 사용자는 `client.` 없이 쓴다.
@@ -396,7 +418,9 @@ it("creates a Ceph RBD pool", async () => {
   await userEvent.type(within(dialog).getByLabelText("Ceph user (optional)"), "client.opl");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("Ceph user (optional)")).toHaveAccessibleDescription(
-    'Write the Ceph user without the "client." prefix, for example opl instead of client.opl.',
+    expect.stringContaining(
+      'Write the Ceph user without the "client." prefix, for example opl instead of client.opl.',
+    ),
   );
   expect(body).toBeUndefined();
 
@@ -469,7 +493,9 @@ it("creates a shared LVM pool", async () => {
   await userEvent.type(within(dialog).getByLabelText("Name"), "san");
   await userEvent.selectOptions(within(dialog).getByLabelText("Kind"), "lvm-shared");
   expect(within(dialog).getByLabelText("Kind")).toHaveAccessibleDescription(
-    "Create the shared volume group (vgcreate --shared) on a LUN every node sees first, and run lvmlockd with sanlock or dlm on each node. Volumes are raw logical volumes that every node of the pool can use, without snapshots. Needs Linux nodes running as root.",
+    expect.stringContaining(
+      "Create the shared volume group (vgcreate --shared) on a LUN every node sees first, and run lvmlockd with sanlock or dlm on each node. Volumes are raw logical volumes that every node of the pool can use, without snapshots. Needs Linux nodes running as root.",
+    ),
   );
   // 늘 공유라 고를 것이 없고, 다른 종류의 입력도 없다.
   expect(within(dialog).queryByRole("checkbox", { name: "Shared storage" })).toBeNull();
@@ -477,32 +503,42 @@ it("creates a shared LVM pool", async () => {
   // iSCSI는 고를 때만 묻는다.
   const iscsi = within(dialog).getByRole("checkbox", { name: "Log in to an iSCSI target" });
   expect(iscsi).toHaveAccessibleDescription(
-    "Each node logs in to the target before using the volume group. Leave unchecked when the nodes already see the LUN, such as over Fibre Channel.",
+    expect.stringContaining(
+      "Each node logs in to the target before using the volume group. Leave unchecked when the nodes already see the LUN, such as over Fibre Channel.",
+    ),
   );
   expect(within(dialog).queryByLabelText("iSCSI portal")).toBeNull();
   await userEvent.type(within(dialog).getByLabelText("Volume group"), "-san");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("Volume group")).toHaveAccessibleDescription(
-    "Use 1 to 127 letters, digits, +, _, . or -, not starting with -, snapshot or pvmove. LVM also reserves . and .. and names containing parts like _tdata or _tmeta.",
+    expect.stringContaining(
+      "Use 1 to 127 letters, digits, +, _, . or -, not starting with -, snapshot or pvmove. LVM also reserves . and .. and names containing parts like _tdata or _tmeta.",
+    ),
   );
   expect(body).toBeUndefined();
 
   // 서버처럼 포털과 타깃을 검사한다.
   await userEvent.click(iscsi);
   expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
-    "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+    expect.stringContaining(
+      "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+    ),
   );
   expect(within(dialog).getByLabelText("iSCSI target")).toHaveAccessibleDescription(
-    "The target name, such as iqn.2003-01.org.example:storage.",
+    expect.stringContaining("The target name, such as iqn.2003-01.org.example:storage."),
   );
   await userEvent.type(within(dialog).getByLabelText("iSCSI portal"), "fd00::5");
   await userEvent.type(within(dialog).getByLabelText("iSCSI target"), "IQN.2003-01.org:opl");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
-    "Enter a host name or IP address with an optional :port (1–65535), without spaces, commas or slashes. Put IPv6 addresses in brackets, such as [fd00::5]:3260.",
+    expect.stringContaining(
+      "Enter a host name or IP address with an optional :port (1–65535), without spaces, commas or slashes. Put IPv6 addresses in brackets, such as [fd00::5]:3260.",
+    ),
   );
   expect(within(dialog).getByLabelText("iSCSI target")).toHaveAccessibleDescription(
-    "Use a target name starting with iqn., eui. or naa., at most 223 characters of lowercase letters, digits, ., : or -.",
+    expect.stringContaining(
+      "Use a target name starting with iqn., eui. or naa., at most 223 characters of lowercase letters, digits, ., : or -.",
+    ),
   );
   expect(body).toBeUndefined();
 
@@ -548,17 +584,19 @@ it("creates a shared LVM pool without iSCSI, ignoring a portal typed before unch
   await userEvent.type(within(dialog).getByLabelText("iSCSI portal"), "bad portal");
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
-    /^Enter a host name/,
+    /Enter a host name/,
   );
   expect(body).toBeUndefined();
   // iSCSI를 바꾸면 포털·타깃의 오류를 지운다(다시 골라도 남지 않는다).
   await userEvent.click(iscsi);
   await userEvent.click(iscsi);
   expect(within(dialog).getByLabelText("iSCSI portal")).toHaveAccessibleDescription(
-    "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+    expect.stringContaining(
+      "Host name or IP address with an optional port, such as san.lan:3260 or [fd00::5]:3260.",
+    ),
   );
   expect(within(dialog).getByLabelText("iSCSI target")).toHaveAccessibleDescription(
-    "The target name, such as iqn.2003-01.org.example:storage.",
+    expect.stringContaining("The target name, such as iqn.2003-01.org.example:storage."),
   );
   await userEvent.click(iscsi);
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
@@ -620,7 +658,7 @@ it("does not create a pool when the chosen nodes are gone", async () => {
   });
   await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(within(dialog).getByRole("group", { name: "Nodes" })).toHaveAccessibleDescription(
-    "The chosen nodes are no longer in the cluster. Choose again.",
+    expect.stringContaining("The chosen nodes are no longer in the cluster. Choose again."),
   );
   expect(body).toBeUndefined();
   // 빠진 노드는 고른 목록에서도 지웠으므로 다시 보내면 모든 노드의 풀이 된다.

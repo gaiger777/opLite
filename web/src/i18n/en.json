@@ -5412,6 +5412,17 @@
     "title": "Help",
     "aboutPage": "About this page",
     "closeIntro": "Hide the introduction (the ⓘ next to the title shows it again)",
-    "more": "Learn more"
+    "more": "Learn more",
+    "pools": {
+      "intro": "Where VM disks (volumes) and backups are kept. A 'local' pool is separate on each node; a 'shared' pool is used by all nodes. VMs on shared pools move between nodes quickly and can be restarted by HA.",
+      "empty": "To create VMs you need a pool for their disks. The simplest is a folder (directory) on each node.",
+      "name": "The name screens and VM settings use for this pool. Lowercase letters, digits and - only; it cannot be changed later.",
+      "vg": "An LVM volume group that already exists on the nodes (check with `vgs`).",
+      "thinpool": "The LVM area that only takes the space VMs actually write. In `lvs`, its attributes start with 'twi'.",
+      "sharedVg": "The shared volume group on a LUN every node sees (check with `vgs`).",
+      "dataset": "A ZFS dataset that already exists on the nodes (e.g. tank/opl, see `zfs list`). VM disks become zvols under it.",
+      "cephPool": "An RBD pool that already exists in Ceph. With Orbivisor-managed Ceph, use a pool made on the Ceph page.",
+      "namespace": "Separates names when several clusters share one Ceph pool. Usually left empty."
+    }
   }
 }

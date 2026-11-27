@@ -26,6 +26,8 @@ export function HelpPanel() {
       <SheetContent
         side={phone ? "bottom" : "right"}
         data-help-panel
+        // 패널 뒤의 칸·대화상자를 읽으며 볼 수 있게 흐리게 하지 않는다.
+        overlayClassName="bg-transparent supports-backdrop-filter:backdrop-blur-none"
         aria-describedby={undefined}
         onCloseAutoFocus={(event) => {
           // 연 단추(ⓘ·"자세히")로 돌아간다. 그 단추가 없어졌으면(대화상자가 닫힘) 브라우저에 맡긴다.

@@ -12,6 +12,7 @@ import { FolderSelect, useNewFolder } from "@/folders/FolderSelect";
 import { PermissionsButton, PermissionsSheet } from "@/permissions/PermissionsSheet";
 import { isManagedPool, useCeph } from "@/ceph/ceph";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
@@ -279,6 +280,8 @@ export function PoolsPage() {
       <PageHeader
         id="pools-title"
         title={t("nav.pools")}
+        help="pools"
+        intro={t("help.pools.intro")}
         actions={
           <>
             <ViewToggle />
@@ -299,6 +302,22 @@ export function PoolsPage() {
         rowName={(pool) => pool.name}
         query={pools}
         empty={t("pools.empty")}
+        emptyState={
+          <EmptyState
+            title={t("pools.empty")}
+            description={t("help.pools.empty")}
+            diagram="storageSharing"
+            help="pools.page"
+            action={
+              create && (
+                <Button onClick={() => setCreating(true)}>
+                  <Plus />
+                  {t("pools.createTitle")}
+                </Button>
+              )
+            }
+          />
+        }
         labelledBy="pools-title"
         state={state}
         search={(pool) => `${pool.name} ${poolLocation(pool)}`}
@@ -528,12 +547,22 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       onSubmit={submit}
     >
       <FolderSelect id="pool-folder" state={folder} />
-      <Field id="pool-name" label={t("common.name")} error={errors.name}>
+      <Field
+        id="pool-name"
+        label={t("common.name")}
+        error={errors.name}
+        help={t("help.pools.name")}
+      >
         {(a11y) => (
           <Input id="pool-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />
         )}
       </Field>
-      <Field id="pool-kind" label={t("pools.kind")} help={t(`pools.kindHint.${kind}`)}>
+      <Field
+        id="pool-kind"
+        label={t("pools.kind")}
+        help={t(`pools.kindHint.${kind}`)}
+        info="pools.kind"
+      >
         {(a11y) => (
           <NativeSelect
             id="pool-kind"
@@ -555,7 +584,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       </Field>
       {kind === "lvm-thin" && (
         <>
-          <Field id="pool-vg" label={t("pools.vg")} error={errors.vg}>
+          <Field id="pool-vg" label={t("pools.vg")} error={errors.vg} help={t("help.pools.vg")}>
             {(a11y) => (
               <Input
                 id="pool-vg"
@@ -566,7 +595,13 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="pool-thinpool" label={t("pools.thinpool")} error={errors.thinpool}>
+          <Field
+            id="pool-thinpool"
+            label={t("pools.thinpool")}
+            error={errors.thinpool}
+            help={t("help.pools.thinpool")}
+            info="pools.thinpool"
+          >
             {(a11y) => (
               <Input
                 id="pool-thinpool"
@@ -581,7 +616,12 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       )}
       {kind === "lvm-shared" && (
         <>
-          <Field id="pool-vg" label={t("pools.vg")} error={errors.vg}>
+          <Field
+            id="pool-vg"
+            label={t("pools.vg")}
+            error={errors.vg}
+            help={t("help.pools.sharedVg")}
+          >
             {(a11y) => (
               <Input
                 id="pool-vg"
@@ -655,7 +695,12 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
         </>
       )}
       {kind === "zfs" && (
-        <Field id="pool-dataset" label={t("pools.dataset")} error={errors.dataset}>
+        <Field
+          id="pool-dataset"
+          label={t("pools.dataset")}
+          error={errors.dataset}
+          help={t("help.pools.dataset")}
+        >
           {(a11y) => (
             <Input
               id="pool-dataset"
@@ -669,7 +714,12 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       )}
       {kind === "rbd" && (
         <>
-          <Field id="pool-ceph-pool" label={t("pools.cephPool")} error={errors.cephPool}>
+          <Field
+            id="pool-ceph-pool"
+            label={t("pools.cephPool")}
+            error={errors.cephPool}
+            help={t("help.pools.cephPool")}
+          >
             {(a11y) => (
               <Input
                 id="pool-ceph-pool"
@@ -680,7 +730,12 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
               />
             )}
           </Field>
-          <Field id="pool-namespace" label={t("pools.namespace")} error={errors.namespace}>
+          <Field
+            id="pool-namespace"
+            label={t("pools.namespace")}
+            error={errors.namespace}
+            help={t("help.pools.namespace")}
+          >
             {(a11y) => (
               <Input
                 id="pool-namespace"

@@ -127,6 +127,29 @@
         "note": "With 2 nodes, losing one breaks the majority and stops.",
         "note2": "Use 3 or more nodes, or a vote-only node (witness)."
       }
+    },
+    "pools": {
+      "page": {
+        "what": "A storage pool tells Orbivisor about one place to keep VM disks. Creating a pool does not wipe or format anything — it uses a folder, volume group, dataset, NFS export or Ceph pool that already exists.",
+        "how": "Local pools (directory, LVM-thin, ZFS) are separate on each node, so moving a VM to another node copies its whole disk. Shared pools (NFS, Ceph RBD, shared LVM, directories marked shared) are seen by every node, so only memory moves.",
+        "when": "With one node or for a test, start with a directory pool. With several nodes that need HA or fast migration, add one shared pool.",
+        "diagram": "storageSharing",
+        "caution": "Deleting a pool keeps its files and images. A pool that still holds volumes or backups cannot be deleted."
+      },
+      "kind": {
+        "what": "Chooses where and how disks are stored.",
+        "how": "Directory: simplest, a folder on the node's disk (qcow2 files — snapshots).\nLVM-thin: fast, takes only what is written, snapshots (per node).\nZFS: compression and snapshots (per node).\nNFS: a NAS share used by all nodes.\nCeph RBD: distributed storage across several nodes' disks, used by all nodes.\nShared LVM: a SAN (iSCSI/FC) LUN used by all nodes, no snapshots.",
+        "when": "Start with Directory. With several nodes and a NAS use NFS; with 3+ nodes that each have spare disks use Ceph.",
+        "diagram": "storageSharing",
+        "caution": "The kind cannot be changed later. VMs on a per-node pool are not restarted on another node by HA."
+      },
+      "thinpool": {
+        "what": "A 'thin pool' inside LVM — VM disks are promised a size but only take the space they actually write.",
+        "how": "A VM with a 100 GiB disk that wrote 10 GiB uses only 10 GiB of the thin pool, so you can hand out more than the pool holds (overcommit).",
+        "diagram": "thinOvercommit",
+        "example": "lvcreate -L 500G --thinpool thinpool vg0",
+        "caution": "If the thin pool fills up, the VMs on it cannot write and pause. Turn on a usage alert."
+      }
     }
   }
 }
