@@ -153,10 +153,10 @@ export function BackupStoresPage() {
                   <TableCell>{usage ? usage.snapshots : "—"}</TableCell>
                   <TableCell>{usage ? formatBytes(usage.stored_bytes) : "—"}</TableCell>
                   <TableCell>{ratio !== undefined ? formatRatio(ratio) : "—"}</TableCell>
-                  <TableCell>
+                  <TableCell className="min-w-32 whitespace-normal">
                     <LastGc store={store} />
                   </TableCell>
-                  <TableCell>
+                  <TableCell className="min-w-32 whitespace-normal">
                     <LastVerify store={store} />
                   </TableCell>
                   <TableCell>
