@@ -63,7 +63,7 @@ function Stat({
     <div
       role="group"
       aria-labelledby={id}
-      className="flex min-w-0 flex-col gap-1 rounded-lg border bg-surface-2 px-4 py-3"
+      className="flex min-w-0 flex-col gap-0.5 rounded-lg border bg-surface-2 px-4 py-2"
     >
       <span id={id} className="text-xs text-muted-foreground">
         {title}
