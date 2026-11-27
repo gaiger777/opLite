@@ -104,11 +104,12 @@ pub(crate) async fn run(
         .map(|()| None)
 }
 
-fn now_secs() -> u64 {
+/// 유닉스 밀리초(`ApplySetStatus.applied_at`의 단위 — 계획 77-7 전에는 초로 적었다, 웹이 둘 다 읽는다)
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis() as u64
 }
 
 fn verb(action: StepAction) -> &'static str {
@@ -519,7 +520,7 @@ async fn record_set(
             .collect();
         objects.extend(applied.iter().cloned());
         let status = ApplySetStatus {
-            applied_at: Some(now_secs()),
+            applied_at: Some(now_ms()),
             applied_by: Some(plan.owner.name.clone()),
             applied_revision: state.cluster.revision(),
             objects,
