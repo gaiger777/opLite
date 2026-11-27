@@ -87,14 +87,21 @@ test("a folder user sees only their folder and signs in with a second factor", a
   await page.getByRole("button", { name: "Create new" }).click();
   await page.getByRole("menuitem", { name: "Virtual machine" }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
+  // VM 만들기 한 화면(계획 77-5): 용도 카드 "빈 VM" → 그림과 오른쪽 요약(폴더·노드)
+  await page.getByRole("button", { name: /^Blank VM/ }).click();
   await expect(page.getByLabel("Folder", { exact: true })).toHaveValue(/.+/);
   await expect(page.getByLabel("Folder", { exact: true }).locator("option:checked")).toHaveText(
     "/teamA",
   );
   await expect(page.getByLabel("Node", { exact: true })).toHaveCount(0);
   await page.getByLabel("Name", { exact: true }).fill("a2");
-  await page.getByLabel("Memory (MiB)", { exact: true }).fill("256");
+  await page.getByRole("button", { name: "Edit CPU & memory" }).click();
+  await page.getByRole("textbox", { name: "Memory (MiB)" }).fill("256");
+  await page.getByRole("button", { name: "Close settings" }).click();
   await page.getByRole("checkbox", { name: "Start after creating" }).uncheck();
+  await expect(
+    page.getByRole("complementary").getByText("Server check: passed.", { exact: true }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "a2" })).toBeVisible();
 

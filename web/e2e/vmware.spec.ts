@@ -49,25 +49,25 @@ test("migrates a running VMware VM warm, cuts it over and exports it as OVA", as
 
   // ① 원본: 지문 없이 연결하면 서버가 인증서 지문을 보이고, 믿으면 저장한다.
   await importsView(page, "VMware sources");
-  await page.getByRole("button", { name: "Add source" }).click();
-  const add = page.getByRole("dialog", { name: "Add a VMware source" });
-  await add.getByLabel("Name").fill("vc1");
-  await add.getByLabel("Host").fill(vsphere.host);
-  await add.getByLabel("Port").fill(vsphere.port);
-  await add.getByLabel("User").fill(vsphere.user);
-  await add.getByLabel("Password").fill(vsphere.password);
+  await page.getByRole("button", { name: "Connect vCenter or ESXi" }).click();
+  const add = page.getByRole("dialog", { name: "Connect a vCenter or ESXi" });
+  await add.getByLabel("Name", { exact: true }).fill("vc1");
+  await add.getByLabel("Host", { exact: true }).fill(vsphere.host);
+  await add.getByLabel("Port", { exact: true }).fill(vsphere.port);
+  await add.getByLabel("User", { exact: true }).fill(vsphere.user);
+  await add.getByLabel("Password", { exact: true }).fill(vsphere.password);
   await add.getByRole("button", { name: "Connect" }).click();
   await expect(add.getByText(vsphere.fingerprint)).toBeVisible();
   await add.getByRole("button", { name: "Trust and connect" }).click();
   await expect(add).toBeHidden();
-  const sources = page.getByRole("table", { name: "VMware sources" });
+  const sources = page.getByRole("table", { name: "Connected vCenter & ESXi" });
   await expect(sources.getByRole("row", { name: /vc1/ })).toContainText("Connected");
 
   // ② 마법사: 원본·이름 → 나무에서 Prod 폴더의 web01 → 기본 풀·켜지 않기 → 한도 → 미리 확인 → 시작
   await importsView(page, "VMware migrations");
   await page.getByRole("link", { name: "New migration" }).click();
   await expect(page.getByRole("heading", { name: "New VMware migration" })).toBeVisible();
-  await page.getByLabel("Name").fill("wave1");
+  await page.getByLabel("Name", { exact: true }).fill("wave1");
   await page
     .getByRole("combobox", { name: "Source" })
     .selectOption({ label: `vc1 (${vsphere.host})` });
@@ -79,10 +79,10 @@ test("migrates a running VMware VM warm, cuts it over and exports it as OVA", as
     .click();
   await vms.getByRole("checkbox", { name: "web01" }).check();
   await page.getByRole("button", { name: "Next" }).click();
-  await page.getByLabel("VM Network").selectOption(network);
-  await page.getByLabel("dvpg-web").selectOption(network);
-  await page.getByLabel("Default pool").selectOption(pool);
-  await page.getByLabel("Start the new VM after cutover").uncheck();
+  await page.getByLabel("VM Network", { exact: true }).selectOption(network);
+  await page.getByLabel("dvpg-web", { exact: true }).selectOption(network);
+  await page.getByLabel("Default pool", { exact: true }).selectOption(pool);
+  await page.getByLabel("Start the new VM after cutover", { exact: true }).uncheck();
   await page.getByRole("button", { name: "Next" }).click();
   await page.getByRole("button", { name: "Next" }).click();
   const results = page.getByRole("table", { name: "Check results" });
@@ -115,8 +115,8 @@ test("migrates a running VMware VM warm, cuts it over and exports it as OVA", as
   await page.getByRole("menuitem", { name: "Export as OVA…", exact: true }).click();
   await expect(page).toHaveURL(/\/vm-exports/);
   const dialog = page.getByRole("dialog", { name: "Export web01 as OVA" });
-  await dialog.getByLabel("Pool").selectOption({ label: `${pool} (dir)` });
-  await dialog.getByLabel("Name").fill("web01-ova");
+  await dialog.getByLabel("Pool", { exact: true }).selectOption({ label: `${pool} (dir)` });
+  await dialog.getByLabel("Name", { exact: true }).fill("web01-ova");
   await dialog.getByRole("button", { name: "Export", exact: true }).click();
   await expect(dialog).toBeHidden();
   const exports = page.getByRole("table", { name: "Exports" });

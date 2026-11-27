@@ -213,10 +213,19 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await openItem(page, "Virtual machines", "All VMs");
   await page.getByRole("link", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
+  // VM 만들기 한 화면(계획 77-5): 용도 카드 "빈 VM" → 그림에 이름·메모리(살피기 칸)·올린 볼륨 root(부품을 누르면 디스크 칸에 붙음)
+  await page.getByRole("button", { name: /^Blank VM/ }).click();
   await page.getByLabel("Name", { exact: true }).fill("web");
-  await page.getByLabel("Memory (MiB)", { exact: true }).fill("256");
-  await page.getByRole("button", { name: "Attach a volume" }).click();
-  await page.getByRole("group", { name: "Disk 1" }).getByLabel("Volume").selectOption("root");
+  await page.getByRole("button", { name: "Edit CPU & memory" }).click();
+  await page.getByRole("textbox", { name: "Memory (MiB)" }).fill("256");
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await page.getByRole("searchbox", { name: "Filter parts" }).fill("root");
+  await page.getByRole("button", { name: /^root\b/ }).click();
+  await expect(page.getByRole("button", { name: /^Disk 1 \(root\) / })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Start after creating" })).toBeChecked();
+  await expect(
+    page.getByRole("complementary").getByText("Server check: passed.", { exact: true }),
+  ).toBeVisible({ timeout: 15_000 });
   await page.getByRole("button", { name: "Create", exact: true }).click();
 
   // 만든 뒤 시작한다. watch가 상태를 바꿔 준다.
@@ -344,7 +353,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await page.getByRole("tab", { name: "Snapshots" }).click();
   await page.getByRole("button", { name: "Take snapshot" }).click();
   dialog = page.getByRole("dialog", { name: "Take a snapshot of web" });
-  await dialog.getByLabel("Name").fill("off");
+  await dialog.getByLabel("Name", { exact: true }).fill("off");
   await expect(dialog.getByRole("checkbox", { name: "Include memory" })).toHaveCount(0);
   await dialog.getByRole("button", { name: "Take snapshot" }).click();
   await expect(dialog).toBeHidden();
@@ -356,8 +365,8 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("No snapshot schedule.")).toBeVisible();
   await page.getByRole("link", { name: "Change schedule" }).click();
   await expect(page.getByRole("heading", { name: "Edit web" })).toBeVisible();
-  await page.getByLabel("Take snapshots").selectOption("hourly");
-  await page.getByLabel("Snapshots to keep").fill("2");
+  await page.getByLabel("Take snapshots", { exact: true }).selectOption("hourly");
+  await page.getByLabel("Snapshots to keep", { exact: true }).fill("2");
   await page.getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("heading", { name: "web" })).toBeVisible();
   await page.getByRole("tab", { name: "Snapshots" }).click();
@@ -390,7 +399,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
       await page.getByRole("link", { name: "Cancel" }).click();
     }
     await vmMenu(page, "web", "Edit");
-    await page.getByLabel("Take snapshots").selectOption("off");
+    await page.getByLabel("Take snapshots", { exact: true }).selectOption("off");
     await page.getByRole("button", { name: "Save" }).click();
     await expect(page.getByRole("heading", { name: "Edit web" })).toHaveCount(0, {
       timeout: 5_000,
@@ -466,7 +475,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
     topology.getByText(/NUMA nodes ·|has not reported a NUMA topology/).first(),
   ).toBeVisible();
   await page.goto("/settings");
-  await expect(page.getByLabel("Cluster CPU baseline")).toHaveValue("off");
+  await expect(page.getByLabel("Cluster CPU baseline", { exact: true })).toHaveValue("off");
 
   // 로그아웃하면 보호된 화면은 로그인으로 보낸다.
   await page.getByRole("button", { name: /^Account/ }).click();
@@ -498,7 +507,7 @@ test("routers and floating IPs before SDN is set up", async ({ page }) => {
   await expect(page.getByText("No routers")).toBeVisible();
   await expect(
     page.getByText(
-      "Routers and floating IPs need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+      "Routers and floating IPs need SDN set up first, under Networking › SDN (virtual networks).",
     ),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a router" })).toBeDisabled();
@@ -515,8 +524,8 @@ test("network topology and load balancers before SDN is set up", async ({ page }
   await openItem(page, "Networking", "Networks");
   await page.getByRole("main").getByRole("button", { name: "Create", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Create a network" });
-  await dialog.getByLabel("Name").fill("e2e-lan");
-  await dialog.getByLabel("Bridge").fill("e2ebr0");
+  await dialog.getByLabel("Name", { exact: true }).fill("e2e-lan");
+  await dialog.getByLabel("Bridge", { exact: true }).fill("e2ebr0");
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(page.getByRole("cell", { name: "e2e-lan", exact: true })).toBeVisible();
 
@@ -537,7 +546,7 @@ test("network topology and load balancers before SDN is set up", async ({ page }
   await expect(page.getByText("No load balancers")).toBeVisible();
   await expect(
     page.getByText(
-      "Load balancers need SDN (OVN) set up first, under Networking › SDN (virtual networks).",
+      "Load balancers need SDN set up first, under Networking › SDN (virtual networks).",
     ),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a load balancer" })).toBeDisabled();
@@ -555,9 +564,9 @@ test("create a local backup store and see it in the list", async ({ page }) => {
   await openItem(page, "Storage", "Storage pools");
   await page.getByRole("button", { name: "Create", exact: true }).click();
   const poolDialog = page.getByRole("dialog", { name: "Create a storage pool" });
-  await poolDialog.getByLabel("Name").fill("e2e-bk");
-  await poolDialog.getByLabel("Directory").fill(backupPoolPath);
-  await poolDialog.getByLabel("Store backups").check();
+  await poolDialog.getByLabel("Name", { exact: true }).fill("e2e-bk");
+  await poolDialog.getByLabel("Directory", { exact: true }).fill(backupPoolPath);
+  await poolDialog.getByLabel("Store backups", { exact: true }).check();
   await poolDialog.getByRole("button", { name: "Create" }).click();
   await expect(poolDialog).toBeHidden();
 
@@ -566,8 +575,8 @@ test("create a local backup store and see it in the list", async ({ page }) => {
   await expect(page.getByText("No backup stores")).toBeVisible();
   await page.getByRole("button", { name: "Create a backup store" }).click();
   const wizard = page.getByRole("dialog", { name: "Create a backup store" });
-  await wizard.getByLabel("Name").fill("e2e-st");
-  await expect(wizard.getByLabel("Backup pool")).toHaveValue("e2e-bk");
+  await wizard.getByLabel("Name", { exact: true }).fill("e2e-st");
+  await expect(wizard.getByLabel("Backup pool", { exact: true })).toHaveValue("e2e-bk");
   await wizard.getByRole("button", { name: "Next" }).click();
   await wizard.getByRole("button", { name: "Next" }).click();
   await wizard.getByRole("button", { name: "Create" }).click();
