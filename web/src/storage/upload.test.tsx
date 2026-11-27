@@ -249,7 +249,7 @@ it("does not send the file when the check rejects it", async () => {
   act(() => startUpload(new File(["x"], "img.raw"), PARAMS, i18n.t));
   expect(
     await screen.findByText(
-      "Upload of img failed. The node does not have enough free space for this upload.",
+      /^Upload of img failed\. The node does not have enough free space for this upload\. Details: /,
     ),
   ).toBeInTheDocument();
   expect(FakeXhr.last).toBeUndefined();

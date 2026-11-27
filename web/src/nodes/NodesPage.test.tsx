@@ -367,7 +367,9 @@ it("says why maintenance could not change", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Actions for node-b" }));
   await userEvent.click(await screen.findByRole("menuitem", { name: "Enter maintenance" }));
   expect(
-    await screen.findByText("node-b: Someone else changed it first. Reload and try again."),
+    await screen.findByText(
+      /^node-b: Someone else changed it first\. Reload and try again\. Details: /,
+    ),
   ).toBeInTheDocument();
 });
 

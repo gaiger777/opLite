@@ -97,8 +97,13 @@ it("keeps common words only under common", () => {
 
 it("translates API error codes and falls back to the server message", async () => {
   const t = i18n.t;
+  // 번역이 서버 설명을 담지 않으면 설명을 "자세히"로 덧붙인다(계획 77).
   expect(errorMessage(t, new ApiError(409, "vm_running", "cannot delete VM"))).toBe(
-    "Stop the VM first.",
+    "Stop the VM first. Details: cannot delete VM",
+  );
+  // 늘 같은 설명(로그인 실패 등)은 덧붙이지 않는다.
+  expect(errorMessage(t, new ApiError(401, "invalid_credentials", "invalid credentials"))).toBe(
+    "Wrong username or password.",
   );
   // 서버 문장이 이미 "another SDN central task is running"이라 앞말을 되풀이하지 않는다(리뷰 1 #11).
   expect(
@@ -111,22 +116,24 @@ it("translates API error codes and falls back to the server message", async () =
     "No node can run this VM: no node has bridge br0",
   );
   expect(errorMessage(t, new ApiError(429, "too_many_attempts", "try again in 30 seconds"))).toBe(
-    "Too many attempts. Try again later.",
+    "Too many attempts. Try again later. Details: try again in 30 seconds",
   );
   expect(
     errorMessage(t, new ApiError(409, "pool_unavailable", 'storage pool "nas" is not ready')),
   ).toBe('storage pool "nas" is not ready');
   expect(errorMessage(t, new ApiError(400, "machine_arch_mismatch", "virt on x86_64"))).toBe(
-    "The machine type doesn't match the selected node's architecture.",
+    "The machine type doesn't match the selected node's architecture. Details: virt on x86_64",
   );
   expect(
     errorMessage(t, new ApiError(409, "firewall_unsupported", 'node "n1" has no firewall')),
-  ).toBe("The node has no firewall (nftables) and cannot run VMs with security groups.");
+  ).toBe(
+    'The node has no firewall (nftables) and cannot run VMs with security groups. Details: node "n1" has no firewall',
+  );
   expect(errorMessage(t, new ApiError(409, "backup_not_ready", 'backup "b" is not ready'))).toBe(
-    "The backup is not ready. Only finished backups can be restored or copied.",
+    'The backup is not ready. Only finished backups can be restored or copied. Details: backup "b" is not ready',
   );
   expect(errorMessage(t, new ApiError(409, "job_disabled", 'backup job "n" is disabled'))).toBe(
-    'The backup job is off. Turn on "Run on schedule" first.',
+    'The backup job is off. Turn on "Run on schedule" first. Details: backup job "n" is disabled',
   );
   expect(errorMessage(t, new ApiError(400, "invalid_ova", "the OVA has no .ovf file"))).toBe(
     "The file is not a usable OVA: the OVA has no .ovf file",
@@ -182,7 +189,7 @@ it("translates API error codes and falls back to the server message", async () =
     "Starting this HA VM would use memory reserved for HA recovery. It needs 2 GiB, but only 1 GiB of 16 GiB is left outside the 8 GiB reserve.",
   );
   expect(errorMessage(t, new ApiError(409, "ha_capacity", "x"))).toBe(
-    "Starting this HA VM would use memory reserved for HA recovery.",
+    "Starting this HA VM would use memory reserved for HA recovery. Details: x",
   );
   expect(errorMessage(t, new ApiError(400, "invalid_request", "memory_mib must be > 0"))).toBe(
     "memory_mib must be > 0",
@@ -193,7 +200,9 @@ it("translates API error codes and falls back to the server message", async () =
   // 코드 버그의 TypeError는 네트워크 오류로 숨기지 않는다.
   expect(errorMessage(t, new TypeError("x is undefined"))).toBe("x is undefined");
   await i18n.changeLanguage("ko");
-  expect(errorMessage(i18n.t, new ApiError(409, "vm_running", "x"))).toBe("먼저 VM을 정지하세요.");
+  expect(errorMessage(i18n.t, new ApiError(409, "vm_running", "x"))).toBe(
+    "먼저 VM을 정지하세요. 자세히: x",
+  );
 });
 
 it("shows untranslated server messages verbatim", () => {
@@ -242,7 +251,7 @@ it("translates the plan-67 error codes (review 2 m2)", () => {
   const t = i18n.getFixedT("ko");
   expect(
     errorMessage(t, new ApiError(409, "qos_unsupported", 'node "mac" cannot rate-limit NICs')),
-  ).toBe(ko.errors.qos_unsupported);
+  ).toBe(`${ko.errors.qos_unsupported} 자세히: node "mac" cannot rate-limit NICs`);
   expect(errorMessage(t, new ApiError(400, "invalid_load_balancer", "listener tcp/80 twice"))).toBe(
     "부하 분산기 설정이 올바르지 않습니다: listener tcp/80 twice",
   );

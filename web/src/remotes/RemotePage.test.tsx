@@ -101,7 +101,7 @@ it("shows a token the remote refused as an error, not a sign-out", async () => {
   // 서버 오류라 두 번 더 읽어 본 뒤(1초·2초 뒤) 보인다.
   expect(
     await screen.findByText(
-      "The remote cluster rejected the API token. Check that the token still exists there.",
+      /^The remote cluster rejected the API token\. Check that the token still exists there\. Details: /,
       {},
       { timeout: 6000 },
     ),

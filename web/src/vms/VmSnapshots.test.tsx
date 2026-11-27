@@ -522,12 +522,11 @@ it("shows the schedule, its last failure and the snapshots it took", async () =>
   expect(
     await screen.findByText("Snapshot schedule: Daily, keep 7, with memory"),
   ).toBeInTheDocument();
-  // 서버가 남긴 code를 예약 전용 문구로 번역해, 무엇의 실패인지와 함께 보인다.
+  // 서버가 남긴 code를 예약 전용 문구로 번역해, 무엇의 실패인지와 함께 보인다. 서버 설명은 "자세히"로 뒤에(계획 77).
   const shown = screen.getByText("Last scheduled snapshot failed:").parentElement;
   expect(shown).toHaveTextContent(
-    "Last scheduled snapshot failed: Skipped because the VM was busy; it will try again later.",
+    `Last scheduled snapshot failed: Skipped because the VM was busy; it will try again later. Details: ${failure}`,
   );
-  expect(shown).not.toHaveTextContent(failure);
   expect(screen.getByRole("link", { name: "Change schedule" })).toHaveAttribute(
     "href",
     "/vms/web/edit",

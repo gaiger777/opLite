@@ -59,13 +59,59 @@ export function serverErrorMessage(t: TFunction, error: unknown, codes: readonly
 }
 
 /**
- * 서버의 오류 code와 설명을 문장으로: `errors.<code>` 번역, 번역이 없으면 설명 그대로. 예약 오류도 쓴다.
- * `own`이 있으면 `<own>.<code>` 전용 문구를 먼저 찾는다.
+ * 서버 설명이 늘 같은 글(이름·값을 넣지 않음)이라 덧붙여도 번역보다 더 알려 주지 않는 code(서버 코드에서 모음, 계획 77).
+ * 로그인·2단계 인증 오류처럼 번역이 이미 다 말하는 것이다.
  */
-export function codeMessage(t: TFunction, code: string, message: string, own?: string): string {
+const FIXED_MESSAGE = new Set([
+  "unauthorized",
+  "forbidden",
+  "internal",
+  "invalid_credentials",
+  "cross_origin",
+  "cluster_no_quorum",
+  "not_leader",
+  "last_admin",
+  "cannot_delete_self",
+  "untrusted_certificate",
+  "subscription_required",
+  "telemetry_endpoint_required",
+  "no_role",
+  "external_user",
+  "remote_is_local",
+  "recommendation_not_found",
+  "invalid_second_factor",
+  "second_factor_required",
+  "enrollment_required",
+  "two_factor_required",
+  "totp_enabled",
+  "cannot_reset_self",
+  "webauthn_unavailable",
+  "passkey_exists",
+  "no_second_factor",
+  "already_enrolled",
+  "sdn_last_central",
+]);
+
+/**
+ * 서버의 오류 code와 설명을 문장으로: `errors.<code>` 번역, 번역이 없으면 설명 그대로. 예약 오류도 쓴다.
+ * `own`이 있으면 `<own>.<code>` 전용 문구를 먼저 찾는다. 번역이 서버 설명을 담지 않으면 설명을 "자세히"로 덧붙인다
+ * (계획 77 — 무엇이 이미 있는지·어느 칸이 틀렸는지 같은 구체 설명을 버리지 않는다).
+ */
+export function codeMessage(
+  t: TFunction,
+  code: string,
+  message: string,
+  own?: string,
+  /** false면 설명을 덧붙이지 않는다(부르는 쪽이 `details`로 더 자세히 보일 때) */
+  withDetail = true,
+): string {
   for (const key of [own && `${own}.${code}`, `errors.${code}`]) {
     if (key && i18n.exists(key)) {
-      return t(key, { message });
+      const text = t(key, { message });
+      const detail = message.trim();
+      return !withDetail || detail === "" || FIXED_MESSAGE.has(code) || text.includes(detail)
+        ? text
+        : t("errors.withDetail", { text, detail });
     }
   }
   // 번역이 없으면 서버의 설명을 그대로 쓴다(번역 틀로 해석하지 않는다).

@@ -317,7 +317,7 @@ it("cannot run while importing and lets the server decide on deleting", async ()
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(
     await within(dialog).findByText(
-      "The import is running, or another task on it has not finished.",
+      /^The import is running, or another task on it has not finished\. Details: /,
     ),
   ).toBeVisible();
 });

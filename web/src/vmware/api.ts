@@ -103,8 +103,9 @@ function blockedProblems(err: ApiError): string[] {
 
 /** API 오류 하나의 문장. 막힌 전환은 문제를 `; `로 이어 덧붙인다(대화상자의 오류 줄은 한 문단이다). */
 function apiErrorText(t: TFunction, err: ApiError): string {
-  const text = codeMessage(t, err.code, err.message, "vmware.errors");
   const problems = err.code === "preflight_blocked" ? blockedProblems(err) : [];
+  // 막힌 전환은 문제 목록이 서버 설명보다 자세하다.
+  const text = codeMessage(t, err.code, err.message, "vmware.errors", problems.length === 0);
   return problems.length > 0 ? `${text} ${problems.join("; ")}` : text;
 }
 

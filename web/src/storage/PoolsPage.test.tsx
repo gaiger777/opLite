@@ -819,7 +819,7 @@ it("says why backups cannot be turned off and keeps the pool while it holds back
   await userEvent.click(within(row).getByRole("switch", { name: "Store backups: bk" }));
   // 지우기의 pool_in_use 문구(볼륨이 남음)가 아니라 이 동작의 문구
   expect(
-    await screen.findByText("The pool still holds backups. Delete them first."),
+    await screen.findByText(/^The pool still holds backups\. Delete them first\. Details: /),
   ).toBeInTheDocument();
 });
 

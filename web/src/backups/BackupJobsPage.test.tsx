@@ -249,7 +249,9 @@ it("runs a job now and explains a refusal", async () => {
   ).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Run nightly now" }));
   expect(
-    await screen.findByText("The backup job is already running. Wait for the run to finish."),
+    await screen.findByText(
+      /^The backup job is already running\. Wait for the run to finish\. Details: /,
+    ),
   ).toBeInTheDocument();
 });
 
