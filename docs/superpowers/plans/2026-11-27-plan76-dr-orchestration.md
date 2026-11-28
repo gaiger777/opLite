@@ -66,7 +66,12 @@
   운영 VM 다시 켜기 한 번뿐. 고침: DR 쪽 준비·이름 겹침도 사전 검사, 준비는 전부 아니면 전무, fence는 운영 쪽 VM id·CA, `clear-fence`, 한 VM 한 계획, 만들 때 라벨, `lost_secs`·`partial`, 다시 켜기 30분.
 - **이 Mac**: fmt·clippy·Rust 4681·웹 2481·Go vet·이름 시험·web-it 6 통과. **svc01**: 13단계 4820개 통과. **GitHub 탐침**: 21작업 모두 통과(한 번에). main CI 18작업 통과.
 - **배포**: svc02 → svc01(업그레이드 길), 두 노드 `dr-plans`·`restore-remap` 알림, svc01 test-vm 그대로.
-- **실험실 DR 시험은 미룸**: 사용자가 화면 개편(계획 77)을 가장 높은 우선순위로 올려서, DR 클러스터를 따로 띄워 하는 시험 장애 조치·재해 장애 조치 확인은 계획 77 뒤로. 그때까지 원격 쪽은 API 시험(가짜 원격·두 Env)이 맡는다.
+- **실험실 DR 시험**(2026-11-28, 계획 77 뒤): svc02에 두 번째 데몬(dr1 — 설정 `/etc/orbivisor-dr`, 포트 8016/8017, 데이터·run 디렉터리 따로, HA 펜싱 끔, systemd-run 임시 유닛)으로
+  한 노드 클러스터 dr을 띄우고 lab(prod)과 서로 원격 등록(prod→dr operator 토큰, dr→prod viewer 토큰). test-vm 백업 → dr로 복제(출처 CA 지문 맞음) → 계획 `lab-app`(RPO ok).
+  - 시험 장애 조치: 브리지 시험망은 `dr_test_network_not_isolated`로 먼저 막힘(업링크 없는 `drtest0`이라 `allow_routed_test_networks`로 진행) → RTO 11초, 시험 VM `test-vm-drt`는 새 MAC·시험망·dr에 없는 ISO는 빈 CD, prod 그대로. 뒷정리로 VM·볼륨·tap 모두 지워짐.
+  - 재해 장애 조치: RTO 14초, dr-lan에 test-vm. prod가 살아 있어 `dr_source_returned`(critical)가 뜸, fence-source는 viewer 토큰이라 `dr_fence_preflight`로 분명히 거절, `clear-fence`로 경보 풀림.
+  - prod에서 원본 백업을 지우자 dr 사본도 지워짐. 끝나고 dr 데몬·디렉터리·브리지·방화벽 규칙·원격·사용자를 걷어 냄.
+  - **찾은 것**: 새 DR 클러스터에는 경보 규칙이 없어서 `alert rule add-dr-defaults`(알림 대상 1개 이상 필요)를 하기 전에는 `dr_source_returned`가 뜨지 않는다 — 두 벌이 도는 위험을 알리는 경보가 기본으로 없다. 계획 만들 때 DR 경보 규칙이 없으면 알리는 것을 계획 79(신뢰성)에.
 
 ## 다음 계획으로 넘길 사항
 
