@@ -1275,6 +1275,23 @@ fn item_busy(state: &AppState, item: Uuid) -> Result<bool, ApiError> {
     }))
 }
 
+/// 적힌 다시 하기 되돌림(`rollback_task`)이 아직 오는 중인지: 그 Task가 끝나지 않았거나, 아직 없지만 방금(1분 안) 적힌 것.
+/// 겹친 다시 하기의 뒤 요청이 앞 요청의 적기와 Task 만들기 사이에 항목을 읽으면 `item_busy`로는 못 보고 Task를 하나 더
+/// 만들었다(GitHub CI). id는 UUIDv7이라 적은 시각이 들어 있다 — Task 만들기가 실패해 id만 남은 항목은 1분 뒤 다시 할 수 있다.
+fn rollback_pending(state: &AppState, item: &VmwareVm) -> Result<bool, ApiError> {
+    let Some(id) = item.status.rollback_task else {
+        return Ok(false);
+    };
+    if let Some(task) = state.cluster.get::<orbivisor_types::task::TaskSpec>(id)? {
+        return Ok(!task.status.state.is_finished());
+    }
+    let written = id
+        .get_timestamp()
+        .map(|t| t.to_unix().0.saturating_mul(1000))
+        .unwrap_or(0);
+    Ok(now().saturating_sub(written) < 60_000)
+}
+
 /// 실패한 항목을 다시 한다(계획이 `running`·`paused`일 때, 아니면 409 `migration_state`). 복사를 시작하지 않은 항목(미리
 /// 확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
 /// (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
@@ -1325,6 +1342,15 @@ pub async fn retry_item(
     // (`rollback_task` — 전환 Task는 그 id일 때만 되돌리고, 그 Task가 항목을 다른 상태에서 보면 아무것도 하지 않는다).
     if item.status.state == VmwareVmState::Failed && item.status.cutover_step.is_some() {
         require_item_power(&state, &principal, &m, &item)?;
+        if rollback_pending(&state, &item)? {
+            return Err(ApiError::conflict(
+                "migration_busy",
+                format!(
+                    "vmware-vm {:?} already has a rollback retry requested; try again later",
+                    item.name
+                ),
+            ));
+        }
         let id = Uuid::now_v7();
         let mut status = item.status.clone();
         status.rollback_task = Some(id);
